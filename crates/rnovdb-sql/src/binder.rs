@@ -5,7 +5,8 @@ use rnovdb_common::{
 };
 
 use crate::ast::{
-    BoundColumn, BoundSelect, BoundStatement, Expr, ObjectName, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundSelect, BoundStatement,
+    BoundUpdate, Expr, ObjectName, SelectItem, Statement,
 };
 
 pub struct Binder<'a> {
@@ -81,11 +82,20 @@ impl<'a> Binder<'a> {
                 columns,
                 values,
             } => self.bind_insert(table, columns, values),
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+            } => self.bind_update(table, assignments, selection, role_id),
+            Statement::Delete { table, selection } => self.bind_delete(table, selection, role_id),
             Statement::Select {
                 projection,
                 from,
                 selection,
             } => self.bind_select(projection, from, selection, role_id),
+            Statement::Transaction { action } => {
+                Ok(BoundStatement::Transaction { action: *action })
+            }
         }
     }
 
@@ -143,6 +153,57 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn bind_update(
+        &self,
+        table_name: &ObjectName,
+        assignments: &[Assignment],
+        selection: &Option<Expr>,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table_name)?;
+        self.require_table_privilege(role_id, table.relation_id(), Privilege::Update)?;
+
+        let mut bound_assignments = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            self.validate_expression_columns(table, &assignment.value)?;
+            bound_assignments.push(BoundAssignment {
+                column: self.resolve_column(table, assignment.column.as_str())?,
+                value: assignment.value.clone(),
+            });
+        }
+        if let Some(selection) = selection {
+            self.validate_expression_columns(table, selection)?;
+        }
+
+        Ok(BoundStatement::Update(BoundUpdate {
+            relation_id: table.relation_id(),
+            table: table_name.clone(),
+            assignments: bound_assignments,
+            selection: selection.clone(),
+            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
+        }))
+    }
+
+    fn bind_delete(
+        &self,
+        table_name: &ObjectName,
+        selection: &Option<Expr>,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table_name)?;
+        self.require_table_privilege(role_id, table.relation_id(), Privilege::Delete)?;
+        if let Some(selection) = selection {
+            self.validate_expression_columns(table, selection)?;
+        }
+
+        Ok(BoundStatement::Delete(BoundDelete {
+            relation_id: table.relation_id(),
+            table: table_name.clone(),
+            selection: selection.clone(),
+            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
+        }))
+    }
+
     fn bind_select(
         &self,
         projection: &[SelectItem],
@@ -180,19 +241,12 @@ impl<'a> Binder<'a> {
             self.validate_expression_columns(table, selection)?;
         }
 
-        let applied_row_policies = self
-            .catalog
-            .row_policies(table.relation_id())
-            .iter()
-            .map(|policy| policy.name().to_string())
-            .collect();
-
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
             table: from.clone(),
             columns,
             selection: selection.clone(),
-            applied_row_policies,
+            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
         }))
     }
 
@@ -245,6 +299,14 @@ impl<'a> Binder<'a> {
                 format!("missing {privilege:?} privilege on relation {relation_id}"),
             ))
         }
+    }
+
+    fn applied_row_policy_names(&self, relation_id: RelationId) -> Vec<String> {
+        self.catalog
+            .row_policies(relation_id)
+            .iter()
+            .map(|policy| policy.name().to_string())
+            .collect()
     }
 
     fn validate_expression_columns(&self, table: &Table, expr: &Expr) -> Result<()> {

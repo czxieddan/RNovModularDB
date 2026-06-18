@@ -139,6 +139,19 @@ impl fmt::Display for SelectItem {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Assignment {
+    pub column: Ident,
+    pub value: Expr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionAction {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     CreateTable {
         name: ObjectName,
@@ -174,10 +187,22 @@ pub enum Statement {
         columns: Vec<Ident>,
         values: Vec<Expr>,
     },
+    Update {
+        table: ObjectName,
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    },
+    Delete {
+        table: ObjectName,
+        selection: Option<Expr>,
+    },
     Select {
         projection: Vec<SelectItem>,
         from: ObjectName,
         selection: Option<Expr>,
+    },
+    Transaction {
+        action: TransactionAction,
     },
 }
 
@@ -194,6 +219,29 @@ pub struct BoundSelect {
     pub relation_id: RelationId,
     pub table: ObjectName,
     pub columns: Vec<BoundColumn>,
+    pub selection: Option<Expr>,
+    pub applied_row_policies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundAssignment {
+    pub column: BoundColumn,
+    pub value: Expr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundUpdate {
+    pub relation_id: RelationId,
+    pub table: ObjectName,
+    pub assignments: Vec<BoundAssignment>,
+    pub selection: Option<Expr>,
+    pub applied_row_policies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundDelete {
+    pub relation_id: RelationId,
+    pub table: ObjectName,
     pub selection: Option<Expr>,
     pub applied_row_policies: Vec<String>,
 }
@@ -230,5 +278,10 @@ pub enum BoundStatement {
         columns: Vec<BoundColumn>,
         values: Vec<Expr>,
     },
+    Update(BoundUpdate),
+    Delete(BoundDelete),
     Select(BoundSelect),
+    Transaction {
+        action: TransactionAction,
+    },
 }

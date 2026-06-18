@@ -3,7 +3,9 @@ use rnovdb_common::{ErrorKind, Result, RnovError};
 use rnovdb_types::SqlType;
 
 use crate::{
-    ast::{ColumnDef, Expr, Ident, ObjectName, SelectItem, Statement},
+    ast::{
+        Assignment, ColumnDef, Expr, Ident, ObjectName, SelectItem, Statement, TransactionAction,
+    },
     lexer::{Token, TokenKind, lex},
 };
 
@@ -34,7 +36,12 @@ impl Parser {
             Some(TokenKind::Create) => self.parse_create(),
             Some(TokenKind::Grant) => self.parse_grant(),
             Some(TokenKind::Insert) => self.parse_insert(),
+            Some(TokenKind::Update) => self.parse_update(),
+            Some(TokenKind::Delete) => self.parse_delete(),
             Some(TokenKind::Select) => self.parse_select(),
+            Some(TokenKind::Begin) => self.parse_transaction(TransactionAction::Begin),
+            Some(TokenKind::Commit) => self.parse_transaction(TransactionAction::Commit),
+            Some(TokenKind::Rollback) => self.parse_transaction(TransactionAction::Rollback),
             Some(kind) => Err(self.error(format!("unexpected statement token {kind:?}"))),
             None => Err(self.error("empty statement")),
         }
@@ -204,6 +211,40 @@ impl Parser {
         })
     }
 
+    fn parse_update(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Update)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::Set)?;
+        let assignments = self.parse_assignment_list()?;
+        let selection = if self.consume_if(&TokenKind::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Update {
+            table,
+            assignments,
+            selection,
+        })
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Delete)?;
+        self.expect_keyword(TokenKind::From)?;
+        let table = self.parse_object_name()?;
+        let selection = if self.consume_if(&TokenKind::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete { table, selection })
+    }
+
+    fn parse_transaction(&mut self, action: TransactionAction) -> Result<Statement> {
+        self.bump();
+        Ok(Statement::Transaction { action })
+    }
+
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
         let mut projection = Vec::new();
@@ -264,6 +305,21 @@ impl Parser {
             break;
         }
         Ok(expressions)
+    }
+
+    fn parse_assignment_list(&mut self) -> Result<Vec<Assignment>> {
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_ident()?;
+            self.expect_operator("=")?;
+            let value = self.parse_expr()?;
+            assignments.push(Assignment { column, value });
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(assignments)
     }
 
     fn parse_type_list(&mut self) -> Result<Vec<SqlType>> {
@@ -476,6 +532,9 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Insert, TokenKind::Insert)
             | (TokenKind::Into, TokenKind::Into)
             | (TokenKind::Values, TokenKind::Values)
+            | (TokenKind::Update, TokenKind::Update)
+            | (TokenKind::Delete, TokenKind::Delete)
+            | (TokenKind::Set, TokenKind::Set)
             | (TokenKind::Create, TokenKind::Create)
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
@@ -489,9 +548,10 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::To, TokenKind::To)
             | (TokenKind::Policy, TokenKind::Policy)
             | (TokenKind::Using, TokenKind::Using)
-            | (TokenKind::Update, TokenKind::Update)
-            | (TokenKind::Delete, TokenKind::Delete)
             | (TokenKind::Execute, TokenKind::Execute)
+            | (TokenKind::Begin, TokenKind::Begin)
+            | (TokenKind::Commit, TokenKind::Commit)
+            | (TokenKind::Rollback, TokenKind::Rollback)
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
