@@ -17,6 +17,7 @@ pub enum SqlType {
     Text,
     Bytes,
     HStore,
+    TextVector,
     Array(Box<SqlType>),
     Range(Box<SqlType>),
 }
@@ -30,6 +31,7 @@ pub enum SqlValue {
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
+    TextVector(TextVector),
     Array(SqlArray),
     Range(SqlRange),
 }
@@ -46,6 +48,7 @@ impl SqlValue {
     const TAG_ARRAY: u8 = 6;
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
+    const TAG_TEXT_VECTOR: u8 = 9;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -60,6 +63,7 @@ impl SqlValue {
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
+            Self::TextVector(_) => SqlType::TextVector,
             Self::Array(array) => SqlType::Array(Box::new(array.element_type().clone())),
             Self::Range(range) => SqlType::Range(Box::new(range.element_type().clone())),
         }
@@ -88,6 +92,7 @@ impl SqlValue {
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
+            Self::TextVector(value) => encode_text_vector(value, &mut encoded),
             Self::Array(array) => encode_array(array, &mut encoded),
             Self::Range(range) => encode_range(range, &mut encoded),
         }
@@ -144,6 +149,7 @@ impl SqlValue {
             Self::TAG_ARRAY => Ok(Self::Array(decode_array(payload)?)),
             Self::TAG_RANGE => Ok(Self::Range(decode_range(payload)?)),
             Self::TAG_HSTORE => Ok(Self::HStore(decode_hstore(payload)?)),
+            Self::TAG_TEXT_VECTOR => Ok(Self::TextVector(decode_text_vector(payload)?)),
             unknown => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unknown value tag {unknown}"),
@@ -160,6 +166,7 @@ impl SqlValue {
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
+            Self::TextVector(_) => Self::TAG_TEXT_VECTOR,
             Self::Array(_) => Self::TAG_ARRAY,
             Self::Range(_) => Self::TAG_RANGE,
         }
@@ -176,6 +183,7 @@ impl SqlType {
     const TAG_ARRAY: u8 = 6;
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
+    const TAG_TEXT_VECTOR: u8 = 9;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -186,6 +194,7 @@ impl SqlType {
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
+            Self::TextVector => encoded.push(Self::TAG_TEXT_VECTOR),
             Self::Array(element_type) => {
                 encoded.push(Self::TAG_ARRAY);
                 element_type.encode_into(encoded);
@@ -206,6 +215,7 @@ impl SqlType {
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
+            Self::TAG_TEXT_VECTOR => Ok(Self::TextVector),
             Self::TAG_ARRAY => Ok(Self::Array(Box::new(Self::decode_from(cursor)?))),
             Self::TAG_RANGE => Ok(Self::Range(Box::new(Self::decode_from(cursor)?))),
             unknown => Err(RnovError::new(
@@ -266,6 +276,124 @@ impl HStore {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LexemeWeight {
+    A,
+    B,
+    C,
+    D,
+}
+
+impl LexemeWeight {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+            Self::C => 2,
+            Self::D => 3,
+        }
+    }
+
+    fn from_u8(raw: u8) -> Result<Self> {
+        match raw {
+            0 => Ok(Self::A),
+            1 => Ok(Self::B),
+            2 => Ok(Self::C),
+            3 => Ok(Self::D),
+            unknown => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unknown lexeme weight {unknown}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextLexeme {
+    term: String,
+    positions: Vec<u32>,
+    weight: LexemeWeight,
+}
+
+impl TextLexeme {
+    pub fn new(
+        term: impl Into<String>,
+        mut positions: Vec<u32>,
+        weight: LexemeWeight,
+    ) -> Result<Self> {
+        let term = term.into();
+        if term.is_empty() {
+            return Err(RnovError::new(ErrorKind::InvalidInput, "empty lexeme term"));
+        }
+        if positions.iter().any(|position| *position == 0) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "lexeme position must be greater than zero",
+            ));
+        }
+
+        positions.sort_unstable();
+        positions.dedup();
+
+        Ok(Self {
+            term,
+            positions,
+            weight,
+        })
+    }
+
+    pub fn term(&self) -> &str {
+        &self.term
+    }
+
+    pub fn positions(&self) -> &[u32] {
+        &self.positions
+    }
+
+    pub fn weight(&self) -> LexemeWeight {
+        self.weight
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TextVector {
+    lexemes: BTreeMap<String, TextLexeme>,
+}
+
+impl TextVector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_lexemes(lexemes: impl IntoIterator<Item = TextLexeme>) -> Result<Self> {
+        let mut vector = Self::new();
+        for lexeme in lexemes {
+            vector.insert(lexeme)?;
+        }
+        Ok(vector)
+    }
+
+    pub fn insert(&mut self, lexeme: TextLexeme) -> Result<Option<TextLexeme>> {
+        Ok(self.lexemes.insert(lexeme.term.clone(), lexeme))
+    }
+
+    pub fn find(&self, term: &str) -> Option<&TextLexeme> {
+        self.lexemes.get(term)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TextLexeme> {
+        self.lexemes.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lexemes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lexemes.is_empty()
     }
 }
 
@@ -587,6 +715,18 @@ fn encode_hstore(hstore: &HStore, encoded: &mut Vec<u8>) {
     }
 }
 
+fn encode_text_vector(vector: &TextVector, encoded: &mut Vec<u8>) {
+    encoded.extend_from_slice(&(vector.len() as u32).to_be_bytes());
+    for lexeme in vector.iter() {
+        encode_bytes(lexeme.term().as_bytes(), encoded);
+        encoded.push(lexeme.weight().as_u8());
+        encoded.extend_from_slice(&(lexeme.positions().len() as u32).to_be_bytes());
+        for position in lexeme.positions() {
+            encoded.extend_from_slice(&position.to_be_bytes());
+        }
+    }
+}
+
 fn encode_range(range: &SqlRange, encoded: &mut Vec<u8>) {
     range.element_type().encode_into(encoded);
     encoded.push(u8::from(range.is_empty()));
@@ -659,6 +799,35 @@ fn decode_hstore(payload: &[u8]) -> Result<HStore> {
     }
 
     Ok(hstore)
+}
+
+fn decode_text_vector(payload: &[u8]) -> Result<TextVector> {
+    let mut cursor = Cursor::new(payload);
+    let lexeme_count = cursor.read_u32("text vector lexeme count")? as usize;
+    let mut lexemes = Vec::with_capacity(lexeme_count);
+
+    for _ in 0..lexeme_count {
+        let term_bytes = cursor.read_len_prefixed_bytes("text vector lexeme term")?;
+        let term = String::from_utf8(term_bytes).map_err(|_| {
+            RnovError::new(ErrorKind::InvalidInput, "text vector term is not utf-8")
+        })?;
+        let weight = LexemeWeight::from_u8(cursor.read_u8("text vector weight")?)?;
+        let position_count = cursor.read_u32("text vector position count")? as usize;
+        let mut positions = Vec::with_capacity(position_count);
+        for _ in 0..position_count {
+            positions.push(cursor.read_u32("text vector position")?);
+        }
+        lexemes.push(TextLexeme::new(term, positions, weight)?);
+    }
+
+    if !cursor.is_complete() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "text vector payload has trailing bytes",
+        ));
+    }
+
+    TextVector::from_lexemes(lexemes)
 }
 
 fn decode_range(payload: &[u8]) -> Result<SqlRange> {
