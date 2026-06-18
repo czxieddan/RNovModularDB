@@ -1,5 +1,5 @@
 use rnovdb_common::error::{ErrorKind, Result, RnovError};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Truth {
@@ -16,6 +16,7 @@ pub enum SqlType {
     UInt64,
     Text,
     Bytes,
+    HStore,
     Array(Box<SqlType>),
     Range(Box<SqlType>),
 }
@@ -28,6 +29,7 @@ pub enum SqlValue {
     UInt64(u64),
     Text(String),
     Bytes(Vec<u8>),
+    HStore(HStore),
     Array(SqlArray),
     Range(SqlRange),
 }
@@ -43,6 +45,7 @@ impl SqlValue {
     const TAG_BYTES: u8 = 5;
     const TAG_ARRAY: u8 = 6;
     const TAG_RANGE: u8 = 7;
+    const TAG_HSTORE: u8 = 8;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -56,6 +59,7 @@ impl SqlValue {
             Self::UInt64(_) => SqlType::UInt64,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
+            Self::HStore(_) => SqlType::HStore,
             Self::Array(array) => SqlType::Array(Box::new(array.element_type().clone())),
             Self::Range(range) => SqlType::Range(Box::new(range.element_type().clone())),
         }
@@ -83,6 +87,7 @@ impl SqlValue {
             Self::UInt64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
+            Self::HStore(value) => encode_hstore(value, &mut encoded),
             Self::Array(array) => encode_array(array, &mut encoded),
             Self::Range(range) => encode_range(range, &mut encoded),
         }
@@ -138,6 +143,7 @@ impl SqlValue {
             Self::TAG_BYTES => Ok(Self::Bytes(decode_bytes(payload, "bytes")?)),
             Self::TAG_ARRAY => Ok(Self::Array(decode_array(payload)?)),
             Self::TAG_RANGE => Ok(Self::Range(decode_range(payload)?)),
+            Self::TAG_HSTORE => Ok(Self::HStore(decode_hstore(payload)?)),
             unknown => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unknown value tag {unknown}"),
@@ -153,6 +159,7 @@ impl SqlValue {
             Self::UInt64(_) => Self::TAG_UINT64,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
+            Self::HStore(_) => Self::TAG_HSTORE,
             Self::Array(_) => Self::TAG_ARRAY,
             Self::Range(_) => Self::TAG_RANGE,
         }
@@ -168,6 +175,7 @@ impl SqlType {
     const TAG_BYTES: u8 = 5;
     const TAG_ARRAY: u8 = 6;
     const TAG_RANGE: u8 = 7;
+    const TAG_HSTORE: u8 = 8;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -177,6 +185,7 @@ impl SqlType {
             Self::UInt64 => encoded.push(Self::TAG_UINT64),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
+            Self::HStore => encoded.push(Self::TAG_HSTORE),
             Self::Array(element_type) => {
                 encoded.push(Self::TAG_ARRAY);
                 element_type.encode_into(encoded);
@@ -196,6 +205,7 @@ impl SqlType {
             Self::TAG_UINT64 => Ok(Self::UInt64),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
+            Self::TAG_HSTORE => Ok(Self::HStore),
             Self::TAG_ARRAY => Ok(Self::Array(Box::new(Self::decode_from(cursor)?))),
             Self::TAG_RANGE => Ok(Self::Range(Box::new(Self::decode_from(cursor)?))),
             unknown => Err(RnovError::new(
@@ -203,6 +213,59 @@ impl SqlType {
                 format!("unknown type tag {unknown}"),
             )),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HStoreValue {
+    Null,
+    Text(String),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HStore {
+    entries: BTreeMap<String, HStoreValue>,
+}
+
+impl HStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_entries(entries: impl IntoIterator<Item = (String, HStoreValue)>) -> Result<Self> {
+        let mut hstore = Self::new();
+        for (key, value) in entries {
+            hstore.insert(key, value)?;
+        }
+        Ok(hstore)
+    }
+
+    pub fn insert(&mut self, key: String, value: HStoreValue) -> Result<Option<HStoreValue>> {
+        if key.is_empty() {
+            return Err(RnovError::new(ErrorKind::InvalidInput, "hstore empty key"));
+        }
+
+        Ok(self.entries.insert(key, value))
+    }
+
+    pub fn get(&self, key: &str) -> Option<&HStoreValue> {
+        self.entries.get(key)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &HStoreValue)> {
+        self.entries.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -510,6 +573,20 @@ fn encode_array(array: &SqlArray, encoded: &mut Vec<u8>) {
     }
 }
 
+fn encode_hstore(hstore: &HStore, encoded: &mut Vec<u8>) {
+    encoded.extend_from_slice(&(hstore.len() as u32).to_be_bytes());
+    for (key, value) in hstore.iter() {
+        encode_bytes(key.as_bytes(), encoded);
+        match value {
+            HStoreValue::Null => encoded.push(0),
+            HStoreValue::Text(text) => {
+                encoded.push(1);
+                encode_bytes(text.as_bytes(), encoded);
+            }
+        }
+    }
+}
+
 fn encode_range(range: &SqlRange, encoded: &mut Vec<u8>) {
     range.element_type().encode_into(encoded);
     encoded.push(u8::from(range.is_empty()));
@@ -545,6 +622,43 @@ fn decode_array(payload: &[u8]) -> Result<SqlArray> {
     }
 
     SqlArray::new(element_type, dimensions, values)
+}
+
+fn decode_hstore(payload: &[u8]) -> Result<HStore> {
+    let mut cursor = Cursor::new(payload);
+    let entry_count = cursor.read_u32("hstore entry count")? as usize;
+    let mut hstore = HStore::new();
+
+    for _ in 0..entry_count {
+        let key_bytes = cursor.read_len_prefixed_bytes("hstore key")?;
+        let key = String::from_utf8(key_bytes)
+            .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "hstore key is not utf-8"))?;
+        let value = match cursor.read_u8("hstore value tag")? {
+            0 => HStoreValue::Null,
+            1 => {
+                let value_bytes = cursor.read_len_prefixed_bytes("hstore value")?;
+                HStoreValue::Text(String::from_utf8(value_bytes).map_err(|_| {
+                    RnovError::new(ErrorKind::InvalidInput, "hstore value is not utf-8")
+                })?)
+            }
+            unknown => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown hstore value tag {unknown}"),
+                ));
+            }
+        };
+        hstore.insert(key, value)?;
+    }
+
+    if !cursor.is_complete() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "hstore payload has trailing bytes",
+        ));
+    }
+
+    Ok(hstore)
 }
 
 fn decode_range(payload: &[u8]) -> Result<SqlRange> {
@@ -774,6 +888,11 @@ impl<'a> Cursor<'a> {
         let mut array = [0_u8; N];
         array.copy_from_slice(bytes);
         Ok(array)
+    }
+
+    fn read_len_prefixed_bytes(&mut self, name: &'static str) -> Result<Vec<u8>> {
+        let len = self.read_u32(name)? as usize;
+        Ok(self.read_exact(len, name)?.to_vec())
     }
 
     fn read_exact(&mut self, len: usize, name: &'static str) -> Result<&'a [u8]> {
