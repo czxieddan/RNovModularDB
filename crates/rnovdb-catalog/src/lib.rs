@@ -132,6 +132,14 @@ impl Catalog {
         self.database_id
     }
 
+    pub fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+
+    pub fn operators(&self) -> &[Operator] {
+        &self.operators
+    }
+
     pub fn create_schema(&mut self, name: impl Into<String>) -> Result<&Schema> {
         let name = name.into();
         validate_identifier("schema", &name)?;
@@ -570,4 +578,395 @@ fn validate_columns(columns: &[Column]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub struct CatalogCodec;
+
+impl CatalogCodec {
+    const MAGIC: [u8; 8] = *b"RNOVCAT1";
+    const VERSION: u16 = 1;
+
+    pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::MAGIC);
+        write_u16(&mut out, Self::VERSION);
+        write_u64(&mut out, catalog.database_id.get());
+        write_u64(&mut out, catalog.next_relation_id);
+        write_u64(&mut out, catalog.next_function_id);
+        write_u64(&mut out, catalog.next_operator_id);
+        write_u64(&mut out, catalog.next_role_id);
+        write_u64(&mut out, catalog.next_policy_id);
+
+        write_u32(&mut out, catalog.schemas.len() as u32);
+        for schema in catalog.schemas.values() {
+            write_string(&mut out, &schema.name)?;
+            write_u32(&mut out, schema.tables.len() as u32);
+            for table in schema.tables.values() {
+                write_u64(&mut out, table.relation_id.get());
+                write_string(&mut out, &table.schema_name)?;
+                write_string(&mut out, &table.name)?;
+                write_u64(&mut out, table.version);
+                write_u32(&mut out, table.columns.len() as u32);
+                for column in &table.columns {
+                    write_string(&mut out, &column.name)?;
+                    encode_sql_type(&mut out, &column.data_type);
+                    out.push(u8::from(column.nullable));
+                    out.push(u8::from(column.encrypted));
+                }
+            }
+        }
+
+        write_u32(&mut out, catalog.functions.len() as u32);
+        for function in &catalog.functions {
+            write_u64(&mut out, function.function_id.get());
+            write_string(&mut out, &function.name)?;
+            write_u32(&mut out, function.argument_types.len() as u32);
+            for argument_type in &function.argument_types {
+                encode_sql_type(&mut out, argument_type);
+            }
+            encode_sql_type(&mut out, &function.return_type);
+        }
+
+        write_u32(&mut out, catalog.operators.len() as u32);
+        for operator in &catalog.operators {
+            write_u64(&mut out, operator.operator_id.get());
+            write_string(&mut out, &operator.signature.symbol)?;
+            encode_sql_type(&mut out, &operator.signature.left_type);
+            encode_sql_type(&mut out, &operator.signature.right_type);
+            encode_sql_type(&mut out, &operator.signature.result_type);
+            write_u64(&mut out, operator.signature.function_id.get());
+        }
+
+        write_u32(&mut out, catalog.roles.len() as u32);
+        for role in catalog.roles.values() {
+            write_u64(&mut out, role.role_id.get());
+            write_string(&mut out, &role.name)?;
+        }
+
+        write_u32(&mut out, catalog.grants.len() as u32);
+        for grant in &catalog.grants {
+            write_u64(&mut out, grant.role_id.get());
+            write_u64(&mut out, grant.relation_id.get());
+            out.push(encode_privilege(grant.privilege));
+        }
+
+        let policy_count: usize = catalog.row_policies.values().map(Vec::len).sum();
+        write_u32(&mut out, policy_count as u32);
+        for policies in catalog.row_policies.values() {
+            for policy in policies {
+                write_u64(&mut out, policy.policy_id.get());
+                write_string(&mut out, &policy.name)?;
+                write_u64(&mut out, policy.relation_id.get());
+                write_string(&mut out, &policy.predicate)?;
+            }
+        }
+
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Catalog> {
+        let mut reader = CatalogReader::new(bytes);
+        if reader.read_exact(8, "catalog magic")? != Self::MAGIC {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "invalid catalog magic",
+            ));
+        }
+        let version = reader.read_u16("catalog version")?;
+        if version != Self::VERSION {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!("unsupported catalog version {version}"),
+            ));
+        }
+
+        let database_id = DatabaseId::new(reader.read_u64("database id")?);
+        let mut catalog = Catalog {
+            database_id,
+            next_relation_id: reader.read_u64("next relation id")?,
+            next_function_id: reader.read_u64("next function id")?,
+            next_operator_id: reader.read_u64("next operator id")?,
+            next_role_id: reader.read_u64("next role id")?,
+            next_policy_id: reader.read_u64("next policy id")?,
+            schemas: BTreeMap::new(),
+            functions: Vec::new(),
+            operators: Vec::new(),
+            roles: BTreeMap::new(),
+            grants: Vec::new(),
+            row_policies: BTreeMap::new(),
+        };
+
+        let schema_count = reader.read_u32("schema count")? as usize;
+        for _ in 0..schema_count {
+            let schema_name = reader.read_string("schema name")?;
+            let table_count = reader.read_u32("table count")? as usize;
+            let mut schema = Schema {
+                name: schema_name.clone(),
+                tables: BTreeMap::new(),
+            };
+            for _ in 0..table_count {
+                let relation_id = RelationId::new(reader.read_u64("relation id")?);
+                let table_schema = reader.read_string("table schema")?;
+                let table_name = reader.read_string("table name")?;
+                let version = reader.read_u64("table version")?;
+                let column_count = reader.read_u32("column count")? as usize;
+                let mut columns = Vec::with_capacity(column_count);
+                for _ in 0..column_count {
+                    let name = reader.read_string("column name")?;
+                    let data_type = decode_sql_type(&mut reader)?;
+                    let nullable = reader.read_bool("column nullable")?;
+                    let encrypted = reader.read_bool("column encrypted")?;
+                    columns.push(Column {
+                        name,
+                        data_type,
+                        nullable,
+                        encrypted,
+                    });
+                }
+                schema.tables.insert(
+                    table_name.clone(),
+                    Table {
+                        relation_id,
+                        schema_name: table_schema,
+                        name: table_name,
+                        columns,
+                        version,
+                    },
+                );
+            }
+            catalog.schemas.insert(schema_name, schema);
+        }
+
+        let function_count = reader.read_u32("function count")? as usize;
+        for _ in 0..function_count {
+            let function_id = FunctionId::new(reader.read_u64("function id")?);
+            let name = reader.read_string("function name")?;
+            let argument_count = reader.read_u32("function argument count")? as usize;
+            let mut argument_types = Vec::with_capacity(argument_count);
+            for _ in 0..argument_count {
+                argument_types.push(decode_sql_type(&mut reader)?);
+            }
+            let return_type = decode_sql_type(&mut reader)?;
+            catalog.functions.push(Function {
+                function_id,
+                name,
+                argument_types,
+                return_type,
+            });
+        }
+
+        let operator_count = reader.read_u32("operator count")? as usize;
+        for _ in 0..operator_count {
+            let operator_id = OperatorId::new(reader.read_u64("operator id")?);
+            let symbol = reader.read_string("operator symbol")?;
+            let left_type = decode_sql_type(&mut reader)?;
+            let right_type = decode_sql_type(&mut reader)?;
+            let result_type = decode_sql_type(&mut reader)?;
+            let function_id = FunctionId::new(reader.read_u64("operator function id")?);
+            catalog.operators.push(Operator {
+                operator_id,
+                signature: OperatorSignature {
+                    symbol,
+                    left_type,
+                    right_type,
+                    result_type,
+                    function_id,
+                },
+            });
+        }
+
+        let role_count = reader.read_u32("role count")? as usize;
+        for _ in 0..role_count {
+            let role_id = RoleId::new(reader.read_u64("role id")?);
+            let name = reader.read_string("role name")?;
+            catalog.roles.insert(name.clone(), Role { role_id, name });
+        }
+
+        let grant_count = reader.read_u32("grant count")? as usize;
+        for _ in 0..grant_count {
+            catalog.grants.push(TableGrant {
+                role_id: RoleId::new(reader.read_u64("grant role id")?),
+                relation_id: RelationId::new(reader.read_u64("grant relation id")?),
+                privilege: decode_privilege(reader.read_u8("grant privilege")?)?,
+            });
+        }
+
+        let policy_count = reader.read_u32("policy count")? as usize;
+        for _ in 0..policy_count {
+            let policy = RowPolicy {
+                policy_id: PolicyId::new(reader.read_u64("policy id")?),
+                name: reader.read_string("policy name")?,
+                relation_id: RelationId::new(reader.read_u64("policy relation id")?),
+                predicate: reader.read_string("policy predicate")?,
+            };
+            catalog
+                .row_policies
+                .entry(policy.relation_id)
+                .or_default()
+                .push(policy);
+        }
+
+        if !reader.is_complete() {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "catalog payload has trailing bytes",
+            ));
+        }
+
+        Ok(catalog)
+    }
+}
+
+fn write_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "catalog string is too large"))?;
+    write_u32(out, len);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_sql_type(out: &mut Vec<u8>, data_type: &SqlType) {
+    match data_type {
+        SqlType::Null => out.push(0),
+        SqlType::Bool => out.push(1),
+        SqlType::Int64 => out.push(2),
+        SqlType::UInt64 => out.push(3),
+        SqlType::Text => out.push(4),
+        SqlType::Bytes => out.push(5),
+        SqlType::HStore => out.push(6),
+        SqlType::TextVector => out.push(7),
+        SqlType::Array(element) => {
+            out.push(8);
+            encode_sql_type(out, element);
+        }
+        SqlType::Range(element) => {
+            out.push(9);
+            encode_sql_type(out, element);
+        }
+    }
+}
+
+fn decode_sql_type(reader: &mut CatalogReader<'_>) -> Result<SqlType> {
+    match reader.read_u8("sql type tag")? {
+        0 => Ok(SqlType::Null),
+        1 => Ok(SqlType::Bool),
+        2 => Ok(SqlType::Int64),
+        3 => Ok(SqlType::UInt64),
+        4 => Ok(SqlType::Text),
+        5 => Ok(SqlType::Bytes),
+        6 => Ok(SqlType::HStore),
+        7 => Ok(SqlType::TextVector),
+        8 => Ok(SqlType::Array(Box::new(decode_sql_type(reader)?))),
+        9 => Ok(SqlType::Range(Box::new(decode_sql_type(reader)?))),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown sql type tag {unknown}"),
+        )),
+    }
+}
+
+fn encode_privilege(privilege: Privilege) -> u8 {
+    match privilege {
+        Privilege::Select => 0,
+        Privilege::Insert => 1,
+        Privilege::Update => 2,
+        Privilege::Delete => 3,
+        Privilege::Execute => 4,
+    }
+}
+
+fn decode_privilege(raw: u8) -> Result<Privilege> {
+    match raw {
+        0 => Ok(Privilege::Select),
+        1 => Ok(Privilege::Insert),
+        2 => Ok(Privilege::Update),
+        3 => Ok(Privilege::Delete),
+        4 => Ok(Privilege::Execute),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown privilege tag {unknown}"),
+        )),
+    }
+}
+
+struct CatalogReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> CatalogReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn read_bool(&mut self, name: &'static str) -> Result<bool> {
+        match self.read_u8(name)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!("invalid boolean value {value}"),
+            )),
+        }
+    }
+
+    fn read_u8(&mut self, name: &'static str) -> Result<u8> {
+        Ok(self.read_exact(1, name)?[0])
+    }
+
+    fn read_u16(&mut self, name: &'static str) -> Result<u16> {
+        Ok(u16::from_be_bytes(self.read_fixed::<2>(name)?))
+    }
+
+    fn read_u32(&mut self, name: &'static str) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.read_fixed::<4>(name)?))
+    }
+
+    fn read_u64(&mut self, name: &'static str) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.read_fixed::<8>(name)?))
+    }
+
+    fn read_string(&mut self, name: &'static str) -> Result<String> {
+        let len = self.read_u32(name)? as usize;
+        let bytes = self.read_exact(len, name)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| {
+            RnovError::new(ErrorKind::Corruption, format!("{name} is not valid utf-8"))
+        })
+    }
+
+    fn read_fixed<const N: usize>(&mut self, name: &'static str) -> Result<[u8; N]> {
+        let bytes = self.read_exact(N, name)?;
+        let mut array = [0_u8; N];
+        array.copy_from_slice(bytes);
+        Ok(array)
+    }
+
+    fn read_exact(&mut self, len: usize, name: &'static str) -> Result<&'a [u8]> {
+        let end = self.position.checked_add(len).ok_or_else(|| {
+            RnovError::new(ErrorKind::Corruption, format!("{name} length overflow"))
+        })?;
+        let bytes = self
+            .bytes
+            .get(self.position..end)
+            .ok_or_else(|| RnovError::new(ErrorKind::Corruption, format!("truncated {name}")))?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.position == self.bytes.len()
+    }
 }
