@@ -245,7 +245,7 @@ impl PageCodec {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct PageCryptoKey([u8; 32]);
 
 impl PageCryptoKey {
@@ -456,18 +456,31 @@ impl Drop for PinnedPage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct SingleFileOptions {
     page_size: PageSize,
+    page_key: Option<PageCryptoKey>,
 }
 
 impl SingleFileOptions {
     pub fn new(page_size: PageSize) -> Self {
-        Self { page_size }
+        Self {
+            page_size,
+            page_key: None,
+        }
     }
 
     pub fn page_size(self) -> PageSize {
         self.page_size
+    }
+
+    pub fn page_key(self) -> Option<PageCryptoKey> {
+        self.page_key
+    }
+
+    pub fn with_page_key(mut self, key: PageCryptoKey) -> Self {
+        self.page_key = Some(key);
+        self
     }
 }
 
@@ -477,12 +490,23 @@ impl Default for SingleFileOptions {
     }
 }
 
-#[derive(Debug)]
 pub struct SingleFileBackend {
     path: PathBuf,
     file: File,
     page_size: PageSize,
     superblock_generation: u64,
+    page_key: Option<PageCryptoKey>,
+}
+
+impl std::fmt::Debug for SingleFileBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleFileBackend")
+            .field("path", &self.path)
+            .field("page_size", &self.page_size)
+            .field("superblock_generation", &self.superblock_generation)
+            .field("page_key_present", &self.page_key.is_some())
+            .finish()
+    }
 }
 
 impl SingleFileBackend {
@@ -490,6 +514,8 @@ impl SingleFileBackend {
     const FORMAT_VERSION: u16 = 1;
     const HEADER_LEN: usize = 8 + 2 + 2 + 8 + 8 + 8;
     const SUPERBLOCK_LEN: usize = 8 + 8 + 8 + 8;
+    const PAGE_RECORD_MAGIC: [u8; 8] = *b"RNOVPGR1";
+    const PAGE_RECORD_HEADER_LEN: usize = 8 + 4 + 4;
 
     pub fn create(path: impl AsRef<Path>, options: SingleFileOptions) -> Result<Self> {
         let path = path.as_ref();
@@ -519,11 +545,19 @@ impl SingleFileBackend {
             file,
             page_size: options.page_size(),
             superblock_generation,
+            page_key: options.page_key(),
         })
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_internal(path.as_ref(), None)
+    }
+
+    pub fn open_with_key(path: impl AsRef<Path>, key: PageCryptoKey) -> Result<Self> {
+        Self::open_internal(path.as_ref(), Some(key))
+    }
+
+    fn open_internal(path: &Path, page_key: Option<PageCryptoKey>) -> Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -541,6 +575,7 @@ impl SingleFileBackend {
             file,
             page_size,
             superblock_generation,
+            page_key,
         })
     }
 
@@ -555,21 +590,160 @@ impl SingleFileBackend {
     pub fn superblock_generation(&self) -> u64 {
         self.superblock_generation
     }
+
+    fn data_start(&self) -> u64 {
+        (Self::HEADER_LEN + Self::SUPERBLOCK_LEN * 2) as u64
+    }
+
+    fn page_record_size(&self) -> u64 {
+        (Self::PAGE_RECORD_HEADER_LEN + self.page_size.bytes() + 16) as u64
+    }
+
+    fn page_offset(&self, page_id: PageId) -> Result<u64> {
+        if page_id.get() == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "page id must be greater than zero",
+            ));
+        }
+        Ok(self.data_start() + (page_id.get() - 1) * self.page_record_size())
+    }
+
+    fn page_key(&self) -> Result<PageCryptoKey> {
+        self.page_key.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Security,
+                "single-file page encryption key is required",
+            )
+        })
+    }
 }
 
 impl StorageBackend for SingleFileBackend {
-    fn read_page(&self, _id: PageId) -> Result<Option<Page>> {
-        Err(RnovError::new(
-            ErrorKind::Storage,
-            "single-file page reads are not implemented yet",
-        ))
+    fn read_page(&self, id: PageId) -> Result<Option<Page>> {
+        let key = self.page_key()?;
+        let mut file = self.file.try_clone().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to clone database file handle: {err}"),
+            )
+        })?;
+        let offset = self.page_offset(id)?;
+        file.seek(SeekFrom::Start(offset)).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to seek encrypted page record: {err}"),
+            )
+        })?;
+
+        let mut header = [0_u8; Self::PAGE_RECORD_HEADER_LEN];
+        let read = file.read(&mut header).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to read encrypted page record header: {err}"),
+            )
+        })?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if read != header.len() {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "truncated encrypted page record header",
+            ));
+        }
+        if header[..8].iter().all(|byte| *byte == 0) {
+            return Ok(None);
+        }
+        if header[..8] != Self::PAGE_RECORD_MAGIC {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "invalid encrypted page record magic",
+            ));
+        }
+
+        let counter = u32::from_be_bytes(read_fixed::<4>(&header, 8)?);
+        let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as usize;
+        if ciphertext_len > self.page_size.bytes() + 16 {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "encrypted page record length is too large",
+            ));
+        }
+
+        let mut ciphertext = vec![0_u8; ciphertext_len];
+        file.read_exact(&mut ciphertext).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Corruption,
+                format!("failed to read encrypted page payload: {err}"),
+            )
+        })?;
+
+        PageCrypto::decrypt(
+            &key,
+            PageNonce::from_page_counter(id, counter),
+            id,
+            &ciphertext,
+        )
+        .map(Some)
     }
 
-    fn write_page(&self, _page: Page) -> Result<()> {
-        Err(RnovError::new(
-            ErrorKind::Storage,
-            "single-file page writes are not implemented yet",
-        ))
+    fn write_page(&self, page: Page) -> Result<()> {
+        if page.payload().len() != self.page_size.bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "page size mismatch: expected {} bytes, got {} bytes",
+                    self.page_size.bytes(),
+                    page.payload().len()
+                ),
+            ));
+        }
+
+        let key = self.page_key()?;
+        let mut file = self.file.try_clone().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to clone database file handle: {err}"),
+            )
+        })?;
+        let offset = self.page_offset(page.id())?;
+        let counter = read_existing_page_counter(&mut file, offset)?.unwrap_or(0) + 1;
+        let nonce = PageNonce::from_page_counter(page.id(), counter);
+        let ciphertext = PageCrypto::encrypt(&key, nonce, &page)?;
+
+        file.seek(SeekFrom::Start(offset)).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to seek encrypted page record: {err}"),
+            )
+        })?;
+        file.write_all(&Self::PAGE_RECORD_MAGIC).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to write encrypted page record magic: {err}"),
+            )
+        })?;
+        file.write_all(&counter.to_be_bytes()).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to write encrypted page counter: {err}"),
+            )
+        })?;
+        file.write_all(&(ciphertext.len() as u32).to_be_bytes())
+            .map_err(|err| {
+                RnovError::new(
+                    ErrorKind::Io,
+                    format!("failed to write encrypted page length: {err}"),
+                )
+            })?;
+        file.write_all(&ciphertext).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to write encrypted page payload: {err}"),
+            )
+        })?;
+        Ok(())
     }
 
     fn sync(&self) -> Result<SyncStatus> {
@@ -716,6 +890,39 @@ fn read_superblock(file: &mut File, offset: u64) -> Result<(u64, u64, u64)> {
         u64::from_be_bytes(read_fixed::<8>(&block, 8)?),
         u64::from_be_bytes(read_fixed::<8>(&block, 16)?),
     ))
+}
+
+fn read_existing_page_counter(file: &mut File, offset: u64) -> Result<Option<u32>> {
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek encrypted page record: {err}"),
+        )
+    })?;
+
+    let mut header = [0_u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN];
+    let read = file.read(&mut header).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to read encrypted page record counter: {err}"),
+        )
+    })?;
+    if read == 0 || header[..8].iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    if read != header.len() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "truncated encrypted page record header",
+        ));
+    }
+    if header[..8] != SingleFileBackend::PAGE_RECORD_MAGIC {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "invalid encrypted page record magic",
+        ));
+    }
+    Ok(Some(u32::from_be_bytes(read_fixed::<4>(&header, 8)?)))
 }
 
 fn read_fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
