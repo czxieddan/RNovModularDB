@@ -1,0 +1,188 @@
+use std::fmt;
+
+use rnovdb_catalog::Column;
+use rnovdb_common::ids::RelationId;
+use rnovdb_types::SqlType;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Ident(String);
+
+impl Ident {
+    pub fn new(value: impl AsRef<str>) -> Self {
+        Self(value.as_ref().to_ascii_lowercase())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Ident {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectName {
+    schema: Option<Ident>,
+    object: Ident,
+}
+
+impl ObjectName {
+    pub fn qualified(schema: impl AsRef<str>, object: impl AsRef<str>) -> Self {
+        Self {
+            schema: Some(Ident::new(schema)),
+            object: Ident::new(object),
+        }
+    }
+
+    pub fn unqualified(object: impl AsRef<str>) -> Self {
+        Self {
+            schema: None,
+            object: Ident::new(object),
+        }
+    }
+
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_ref().map(Ident::as_str)
+    }
+
+    pub fn object(&self) -> &str {
+        self.object.as_str()
+    }
+}
+
+impl fmt::Display for ObjectName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(schema) = &self.schema {
+            write!(f, "{schema}.{}", self.object)
+        } else {
+            write!(f, "{}", self.object)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnDef {
+    pub name: Ident,
+    pub data_type: SqlType,
+    pub nullable: bool,
+    pub encrypted: bool,
+}
+
+impl ColumnDef {
+    pub fn to_catalog_column(&self) -> Column {
+        let mut column = Column::new(self.name.as_str(), self.data_type.clone());
+        if !self.nullable {
+            column = column.not_null();
+        }
+        if self.encrypted {
+            column = column.encrypted();
+        }
+        column
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Expr {
+    Identifier(Ident),
+    Integer(i64),
+    String(String),
+    Null,
+    Binary {
+        left: Box<Expr>,
+        op: String,
+        right: Box<Expr>,
+    },
+    Call {
+        name: ObjectName,
+        args: Vec<Expr>,
+    },
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Identifier(ident) => write!(f, "{ident}"),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
+            Self::Null => f.write_str("NULL"),
+            Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
+            Self::Call { name, args } => {
+                write!(f, "{name}(")?;
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectItem {
+    Wildcard,
+    Expr(Expr),
+}
+
+impl fmt::Display for SelectItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wildcard => f.write_str("*"),
+            Self::Expr(expr) => write!(f, "{expr}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Statement {
+    CreateTable {
+        name: ObjectName,
+        columns: Vec<ColumnDef>,
+    },
+    Insert {
+        table: ObjectName,
+        columns: Vec<Ident>,
+        values: Vec<Expr>,
+    },
+    Select {
+        projection: Vec<SelectItem>,
+        from: ObjectName,
+        selection: Option<Expr>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundColumn {
+    pub name: String,
+    pub data_type: SqlType,
+    pub nullable: bool,
+    pub encrypted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundSelect {
+    pub relation_id: RelationId,
+    pub table: ObjectName,
+    pub columns: Vec<BoundColumn>,
+    pub selection: Option<Expr>,
+    pub applied_row_policies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundStatement {
+    CreateTable {
+        name: ObjectName,
+        columns: Vec<ColumnDef>,
+    },
+    Insert {
+        table: ObjectName,
+        columns: Vec<BoundColumn>,
+        values: Vec<Expr>,
+    },
+    Select(BoundSelect),
+}

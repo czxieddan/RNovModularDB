@@ -2,6 +2,7 @@
 members = [
     "crates/rnovdb-common",
     "crates/rnovdb-types",
+    "crates/rnovdb-sql",
     "crates/rnovdb-catalog",
     "crates/rnovdb-storage",
     "crates/rnovdb-cli",
@@ -16,5 +17,6 @@ rust-version = "1.95"
 [workspace.dependencies]
 rnovdb-common = { path = "crates/rnovdb-common" }
 rnovdb-types = { path = "crates/rnovdb-types" }
+rnovdb-sql = { path = "crates/rnovdb-sql" }
 rnovdb-catalog = { path = "crates/rnovdb-catalog" }
 rnovdb-storage = { path = "crates/rnovdb-storage" }
