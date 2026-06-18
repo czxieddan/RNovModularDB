@@ -6,9 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chacha20poly1305 = "0.11.0-rc.2"
 rnovdb-common.workspace = true
 
 [dev-dependencies]
+rand_core = { version = "0.9.3", features = ["os_rng"] }
 tempfile = "3.23.0"
 
 [lib]

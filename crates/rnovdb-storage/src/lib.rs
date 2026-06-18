@@ -6,6 +6,10 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
 use rnovdb_common::{
     error::{ErrorKind, Result, RnovError},
     ids::PageId,
@@ -239,6 +243,84 @@ impl PageCodec {
 
         Page::new_with_header(header, payload)
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct PageCryptoKey([u8; 32]);
+
+impl PageCryptoKey {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    fn to_key(self) -> Key {
+        Key::try_from(&self.0[..]).expect("PageCryptoKey is always 32 bytes")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageNonce([u8; 12]);
+
+impl PageNonce {
+    pub fn from_page_counter(page_id: PageId, counter: u32) -> Self {
+        let mut nonce = [0_u8; 12];
+        nonce[0..8].copy_from_slice(&page_id.get().to_be_bytes());
+        nonce[8..12].copy_from_slice(&counter.to_be_bytes());
+        Self(nonce)
+    }
+
+    fn to_nonce(self) -> Nonce {
+        Nonce::try_from(&self.0[..]).expect("PageNonce is always 12 bytes")
+    }
+}
+
+pub struct PageCrypto;
+
+impl PageCrypto {
+    pub fn encrypt(key: &PageCryptoKey, nonce: PageNonce, page: &Page) -> Result<Vec<u8>> {
+        let key = key.to_key();
+        let nonce = nonce.to_nonce();
+        let cipher = ChaCha20Poly1305::new(&key);
+        cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: page.payload(),
+                    aad: &page_associated_data(page.id()),
+                },
+            )
+            .map_err(|_| RnovError::new(ErrorKind::Security, "page encryption failed"))
+    }
+
+    pub fn decrypt(
+        key: &PageCryptoKey,
+        nonce: PageNonce,
+        page_id: PageId,
+        ciphertext: &[u8],
+    ) -> Result<Page> {
+        let key = key.to_key();
+        let nonce = nonce.to_nonce();
+        let cipher = ChaCha20Poly1305::new(&key);
+        let payload = cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &page_associated_data(page_id),
+                },
+            )
+            .map_err(|_| {
+                RnovError::new(
+                    ErrorKind::Security,
+                    "page authentication failed during decryption",
+                )
+            })?;
+        Page::new(page_id, payload)
+    }
+}
+
+fn page_associated_data(page_id: PageId) -> [u8; 8] {
+    page_id.get().to_be_bytes()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
