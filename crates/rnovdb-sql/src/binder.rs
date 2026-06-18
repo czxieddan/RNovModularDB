@@ -3,6 +3,7 @@ use rnovdb_common::{
     ErrorKind, Result, RnovError,
     ids::{RelationId, RoleId},
 };
+use rnovdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundSelect, BoundStatement,
@@ -81,7 +82,7 @@ impl<'a> Binder<'a> {
                 table,
                 columns,
                 values,
-            } => self.bind_insert(table, columns, values),
+            } => self.bind_insert(table, columns, values, role_id),
             Statement::Update {
                 table,
                 assignments,
@@ -102,9 +103,9 @@ impl<'a> Binder<'a> {
     fn bind_create_operator(
         &self,
         symbol: &str,
-        left_type: &rnovdb_types::SqlType,
-        right_type: &rnovdb_types::SqlType,
-        result_type: &rnovdb_types::SqlType,
+        left_type: &SqlType,
+        right_type: &SqlType,
+        result_type: &SqlType,
         function_name: &str,
     ) -> Result<BoundStatement> {
         let argument_types = [left_type.clone(), right_type.clone()];
@@ -140,11 +141,15 @@ impl<'a> Binder<'a> {
         table_name: &ObjectName,
         columns: &[crate::ast::Ident],
         values: &[Expr],
+        role_id: RoleId,
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
+        self.require_table_privilege(role_id, table.relation_id(), Privilege::Insert)?;
         let mut bound_columns = Vec::with_capacity(columns.len());
-        for ident in columns {
-            bound_columns.push(self.resolve_column(table, ident.as_str())?);
+        for (ident, value) in columns.iter().zip(values) {
+            let column = self.resolve_column(table, ident.as_str())?;
+            self.ensure_expr_assignable(table, &column, value)?;
+            bound_columns.push(column);
         }
         Ok(BoundStatement::Insert {
             table: table_name.clone(),
@@ -165,9 +170,10 @@ impl<'a> Binder<'a> {
 
         let mut bound_assignments = Vec::with_capacity(assignments.len());
         for assignment in assignments {
-            self.validate_expression_columns(table, &assignment.value)?;
+            let column = self.resolve_column(table, assignment.column.as_str())?;
+            self.ensure_expr_assignable(table, &column, &assignment.value)?;
             bound_assignments.push(BoundAssignment {
-                column: self.resolve_column(table, assignment.column.as_str())?,
+                column,
                 value: assignment.value.clone(),
             });
         }
@@ -307,6 +313,84 @@ impl<'a> Binder<'a> {
             .iter()
             .map(|policy| policy.name().to_string())
             .collect()
+    }
+
+    fn ensure_expr_assignable(
+        &self,
+        table: &Table,
+        column: &BoundColumn,
+        expr: &Expr,
+    ) -> Result<()> {
+        let Some(expr_type) = self.infer_expr_type(table, expr)? else {
+            return Ok(());
+        };
+
+        if expr_type == SqlType::Null {
+            if column.nullable {
+                return Ok(());
+            }
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "null value cannot be assigned to not-null column {}",
+                    column.name
+                ),
+            ));
+        }
+
+        if expr_type == column.data_type {
+            Ok(())
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "type mismatch for column {}: expected {:?}, got {:?}",
+                    column.name, column.data_type, expr_type
+                ),
+            ))
+        }
+    }
+
+    fn infer_expr_type(&self, table: &Table, expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Identifier(identifier) => {
+                let column = self.resolve_column(table, identifier.as_str())?;
+                Ok(Some(column.data_type))
+            }
+            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::Binary { left, right, .. } => {
+                let _ = self.infer_expr_type(table, left)?;
+                let _ = self.infer_expr_type(table, right)?;
+                Ok(Some(SqlType::Bool))
+            }
+            Expr::Call { name, args } => {
+                let mut argument_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(arg_type) = self.infer_expr_type(table, arg)? else {
+                        return Ok(None);
+                    };
+                    argument_types.push(arg_type);
+                }
+
+                let function = self
+                    .catalog
+                    .functions()
+                    .iter()
+                    .find(|function| {
+                        function.name() == name.object()
+                            && function.argument_types() == argument_types
+                    })
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::NotFound,
+                            format!("function does not exist: {name}"),
+                        )
+                    })?;
+                Ok(Some(function.return_type().clone()))
+            }
+        }
     }
 
     fn validate_expression_columns(&self, table: &Table, expr: &Expr) -> Result<()> {
