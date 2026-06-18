@@ -1,5 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
@@ -369,6 +372,277 @@ impl Drop for PinnedPage {
             entry.pin_count = entry.pin_count.saturating_sub(1);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SingleFileOptions {
+    page_size: PageSize,
+}
+
+impl SingleFileOptions {
+    pub fn new(page_size: PageSize) -> Self {
+        Self { page_size }
+    }
+
+    pub fn page_size(self) -> PageSize {
+        self.page_size
+    }
+}
+
+impl Default for SingleFileOptions {
+    fn default() -> Self {
+        Self::new(PageSize::default())
+    }
+}
+
+#[derive(Debug)]
+pub struct SingleFileBackend {
+    path: PathBuf,
+    file: File,
+    page_size: PageSize,
+    superblock_generation: u64,
+}
+
+impl SingleFileBackend {
+    const MAGIC: [u8; 8] = *b"RNOVDB01";
+    const FORMAT_VERSION: u16 = 1;
+    const HEADER_LEN: usize = 8 + 2 + 2 + 8 + 8 + 8;
+    const SUPERBLOCK_LEN: usize = 8 + 8 + 8 + 8;
+
+    pub fn create(path: impl AsRef<Path>, options: SingleFileOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                RnovError::new(
+                    ErrorKind::Io,
+                    format!("failed to create database file: {err}"),
+                )
+            })?;
+
+        let superblock_generation = 1;
+        write_single_file_header(&mut file, options.page_size(), superblock_generation)?;
+        file.sync_all().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to sync database file: {err}"),
+            )
+        })?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            page_size: options.page_size(),
+            superblock_generation,
+        })
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|err| {
+                RnovError::new(
+                    ErrorKind::Io,
+                    format!("failed to open database file: {err}"),
+                )
+            })?;
+        let (page_size, superblock_generation) = read_single_file_header(&mut file)?;
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            page_size,
+            superblock_generation,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+}
+
+impl StorageBackend for SingleFileBackend {
+    fn read_page(&self, _id: PageId) -> Result<Option<Page>> {
+        Err(RnovError::new(
+            ErrorKind::Storage,
+            "single-file page reads are not implemented yet",
+        ))
+    }
+
+    fn write_page(&self, _page: Page) -> Result<()> {
+        Err(RnovError::new(
+            ErrorKind::Storage,
+            "single-file page writes are not implemented yet",
+        ))
+    }
+
+    fn sync(&self) -> Result<SyncStatus> {
+        self.file.sync_all().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to sync database file: {err}"),
+            )
+        })?;
+        Ok(SyncStatus::new(0, 0, BackendMode::DiskOnly))
+    }
+
+    fn mode(&self) -> BackendMode {
+        BackendMode::DiskOnly
+    }
+
+    fn capabilities(&self) -> StorageCapability {
+        StorageCapability::WRITES_TO_DISK | StorageCapability::SINGLE_FILE
+    }
+}
+
+fn write_single_file_header(
+    file: &mut File,
+    page_size: PageSize,
+    superblock_generation: u64,
+) -> Result<()> {
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek database file: {err}"),
+        )
+    })?;
+
+    let mut header = Vec::with_capacity(SingleFileBackend::HEADER_LEN);
+    header.extend_from_slice(&SingleFileBackend::MAGIC);
+    header.extend_from_slice(&SingleFileBackend::FORMAT_VERSION.to_be_bytes());
+    header.extend_from_slice(&0_u16.to_be_bytes());
+    header.extend_from_slice(&(page_size.bytes() as u64).to_be_bytes());
+    header.extend_from_slice(&(SingleFileBackend::HEADER_LEN as u64).to_be_bytes());
+    header.extend_from_slice(
+        &((SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN) as u64).to_be_bytes(),
+    );
+
+    let primary = encode_superblock(superblock_generation, 0, 0);
+    let secondary = encode_superblock(0, 0, 0);
+
+    file.write_all(&header).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write database file header: {err}"),
+        )
+    })?;
+    file.write_all(&primary).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write primary superblock: {err}"),
+        )
+    })?;
+    file.write_all(&secondary).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write secondary superblock: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn read_single_file_header(file: &mut File) -> Result<(PageSize, u64)> {
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek database file: {err}"),
+        )
+    })?;
+
+    let mut header = [0_u8; SingleFileBackend::HEADER_LEN];
+    file.read_exact(&mut header).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            format!("failed to read database file header: {err}"),
+        )
+    })?;
+
+    if header[..8] != SingleFileBackend::MAGIC {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "invalid database file magic",
+        ));
+    }
+
+    let format_version = u16::from_be_bytes([header[8], header[9]]);
+    if format_version != SingleFileBackend::FORMAT_VERSION {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unsupported database format version {format_version}"),
+        ));
+    }
+
+    let page_size = PageSize::new(u64::from_be_bytes(read_fixed::<8>(&header, 12)?) as usize);
+    let primary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 20)?);
+    let secondary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 28)?);
+    let primary = read_superblock(file, primary_offset)?;
+    let secondary = read_superblock(file, secondary_offset)?;
+    let generation = primary.0.max(secondary.0);
+
+    Ok((page_size, generation))
+}
+
+fn encode_superblock(generation: u64, catalog_root: u64, free_map_root: u64) -> [u8; 32] {
+    let mut block = [0_u8; 32];
+    block[0..8].copy_from_slice(&generation.to_be_bytes());
+    block[8..16].copy_from_slice(&catalog_root.to_be_bytes());
+    block[16..24].copy_from_slice(&free_map_root.to_be_bytes());
+    let checksum = fnv1a(FNV_OFFSET, &block[0..24]);
+    block[24..32].copy_from_slice(&checksum.to_be_bytes());
+    block
+}
+
+fn read_superblock(file: &mut File, offset: u64) -> Result<(u64, u64, u64)> {
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek database superblock: {err}"),
+        )
+    })?;
+    let mut block = [0_u8; SingleFileBackend::SUPERBLOCK_LEN];
+    file.read_exact(&mut block).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            format!("failed to read database superblock: {err}"),
+        )
+    })?;
+    let checksum = u64::from_be_bytes(read_fixed::<8>(&block, 24)?);
+    let expected = fnv1a(FNV_OFFSET, &block[0..24]);
+    if checksum != expected {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "database superblock checksum mismatch",
+        ));
+    }
+
+    Ok((
+        u64::from_be_bytes(read_fixed::<8>(&block, 0)?),
+        u64::from_be_bytes(read_fixed::<8>(&block, 8)?),
+        u64::from_be_bytes(read_fixed::<8>(&block, 16)?),
+    ))
+}
+
+fn read_fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
+    let slice = bytes
+        .get(offset..offset + N)
+        .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "encoded data ended unexpectedly"))?;
+    let mut array = [0_u8; N];
+    array.copy_from_slice(slice);
+    Ok(array)
 }
 
 impl StorageBackend for MemoryBackend {
