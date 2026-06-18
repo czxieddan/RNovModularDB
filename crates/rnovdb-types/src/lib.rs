@@ -1,4 +1,5 @@
 use rnovdb_common::error::{ErrorKind, Result, RnovError};
+use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Truth {
@@ -16,6 +17,7 @@ pub enum SqlType {
     Text,
     Bytes,
     Array(Box<SqlType>),
+    Range(Box<SqlType>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,6 +29,7 @@ pub enum SqlValue {
     Text(String),
     Bytes(Vec<u8>),
     Array(SqlArray),
+    Range(SqlRange),
 }
 
 impl SqlValue {
@@ -39,6 +42,7 @@ impl SqlValue {
     const TAG_TEXT: u8 = 4;
     const TAG_BYTES: u8 = 5;
     const TAG_ARRAY: u8 = 6;
+    const TAG_RANGE: u8 = 7;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -53,6 +57,7 @@ impl SqlValue {
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::Array(array) => SqlType::Array(Box::new(array.element_type().clone())),
+            Self::Range(range) => SqlType::Range(Box::new(range.element_type().clone())),
         }
     }
 
@@ -79,6 +84,7 @@ impl SqlValue {
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::Array(array) => encode_array(array, &mut encoded),
+            Self::Range(range) => encode_range(range, &mut encoded),
         }
 
         encoded
@@ -131,6 +137,7 @@ impl SqlValue {
             }
             Self::TAG_BYTES => Ok(Self::Bytes(decode_bytes(payload, "bytes")?)),
             Self::TAG_ARRAY => Ok(Self::Array(decode_array(payload)?)),
+            Self::TAG_RANGE => Ok(Self::Range(decode_range(payload)?)),
             unknown => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unknown value tag {unknown}"),
@@ -147,6 +154,7 @@ impl SqlValue {
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::Array(_) => Self::TAG_ARRAY,
+            Self::Range(_) => Self::TAG_RANGE,
         }
     }
 }
@@ -159,6 +167,7 @@ impl SqlType {
     const TAG_TEXT: u8 = 4;
     const TAG_BYTES: u8 = 5;
     const TAG_ARRAY: u8 = 6;
+    const TAG_RANGE: u8 = 7;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -170,6 +179,10 @@ impl SqlType {
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::Array(element_type) => {
                 encoded.push(Self::TAG_ARRAY);
+                element_type.encode_into(encoded);
+            }
+            Self::Range(element_type) => {
+                encoded.push(Self::TAG_RANGE);
                 element_type.encode_into(encoded);
             }
         }
@@ -184,6 +197,7 @@ impl SqlType {
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_ARRAY => Ok(Self::Array(Box::new(Self::decode_from(cursor)?))),
+            Self::TAG_RANGE => Ok(Self::Range(Box::new(Self::decode_from(cursor)?))),
             unknown => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unknown type tag {unknown}"),
@@ -319,6 +333,160 @@ impl SqlArray {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RangeBound {
+    Unbounded,
+    Included(SqlValue),
+    Excluded(SqlValue),
+}
+
+impl RangeBound {
+    fn value(&self) -> Option<&SqlValue> {
+        match self {
+            Self::Unbounded => None,
+            Self::Included(value) | Self::Excluded(value) => Some(value),
+        }
+    }
+
+    fn is_included(&self) -> bool {
+        matches!(self, Self::Included(_))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlRange {
+    element_type: SqlType,
+    lower: Box<RangeBound>,
+    upper: Box<RangeBound>,
+    empty: bool,
+}
+
+impl SqlRange {
+    pub fn new(element_type: SqlType, lower: RangeBound, upper: RangeBound) -> Result<Self> {
+        validate_range_bound_type(&element_type, &lower)?;
+        validate_range_bound_type(&element_type, &upper)?;
+
+        let empty = bounds_are_empty(&lower, &upper)?;
+        if empty {
+            return Ok(Self::empty(element_type));
+        }
+
+        Ok(Self {
+            element_type,
+            lower: Box::new(lower),
+            upper: Box::new(upper),
+            empty: false,
+        })
+    }
+
+    pub fn empty(element_type: SqlType) -> Self {
+        Self {
+            element_type,
+            lower: Box::new(RangeBound::Unbounded),
+            upper: Box::new(RangeBound::Unbounded),
+            empty: true,
+        }
+    }
+
+    pub fn element_type(&self) -> &SqlType {
+        &self.element_type
+    }
+
+    pub fn lower(&self) -> &RangeBound {
+        self.lower.as_ref()
+    }
+
+    pub fn upper(&self) -> &RangeBound {
+        self.upper.as_ref()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    pub fn contains_value(&self, value: &SqlValue) -> Result<bool> {
+        if self.empty {
+            return Ok(false);
+        }
+        if value.is_null() || value.data_type() != self.element_type {
+            return Ok(false);
+        }
+
+        let above_lower = match self.lower() {
+            RangeBound::Unbounded => true,
+            RangeBound::Included(bound) => compare_scalar_values(value, bound)? != Ordering::Less,
+            RangeBound::Excluded(bound) => {
+                compare_scalar_values(value, bound)? == Ordering::Greater
+            }
+        };
+        let below_upper = match self.upper() {
+            RangeBound::Unbounded => true,
+            RangeBound::Included(bound) => {
+                compare_scalar_values(value, bound)? != Ordering::Greater
+            }
+            RangeBound::Excluded(bound) => compare_scalar_values(value, bound)? == Ordering::Less,
+        };
+
+        Ok(above_lower && below_upper)
+    }
+
+    pub fn overlaps(&self, other: &Self) -> Result<bool> {
+        self.ensure_same_element_type(other)?;
+        Ok(!self.intersection(other)?.is_empty())
+    }
+
+    pub fn adjacent(&self, other: &Self) -> Result<bool> {
+        self.ensure_same_element_type(other)?;
+        if self.empty || other.empty || self.overlaps(other)? {
+            return Ok(false);
+        }
+
+        Ok(bounds_touch_without_gap(self.upper(), other.lower())?
+            || bounds_touch_without_gap(other.upper(), self.lower())?)
+    }
+
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
+        self.ensure_same_element_type(other)?;
+        if self.empty || other.empty {
+            return Ok(Self::empty(self.element_type.clone()));
+        }
+
+        let lower = max_lower_bound(self.lower(), other.lower())?;
+        let upper = min_upper_bound(self.upper(), other.upper())?;
+        Self::new(self.element_type.clone(), lower, upper)
+    }
+
+    pub fn union(&self, other: &Self) -> Result<Self> {
+        self.ensure_same_element_type(other)?;
+        if self.empty {
+            return Ok(other.clone());
+        }
+        if other.empty {
+            return Ok(self.clone());
+        }
+        if !self.overlaps(other)? && !self.adjacent(other)? {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "ranges are disjoint and cannot be represented as one range",
+            ));
+        }
+
+        let lower = min_lower_bound(self.lower(), other.lower())?;
+        let upper = max_upper_bound(self.upper(), other.upper())?;
+        Self::new(self.element_type.clone(), lower, upper)
+    }
+
+    fn ensure_same_element_type(&self, other: &Self) -> Result<()> {
+        if self.element_type != other.element_type {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "range element type mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn encode_bytes(bytes: &[u8], encoded: &mut Vec<u8>) {
     let len = bytes.len() as u32;
     encoded.extend_from_slice(&len.to_be_bytes());
@@ -340,6 +508,13 @@ fn encode_array(array: &SqlArray, encoded: &mut Vec<u8>) {
         encoded.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
         encoded.extend_from_slice(&value_bytes);
     }
+}
+
+fn encode_range(range: &SqlRange, encoded: &mut Vec<u8>) {
+    range.element_type().encode_into(encoded);
+    encoded.push(u8::from(range.is_empty()));
+    encode_range_bound(range.lower(), encoded);
+    encode_range_bound(range.upper(), encoded);
 }
 
 fn decode_array(payload: &[u8]) -> Result<SqlArray> {
@@ -370,6 +545,175 @@ fn decode_array(payload: &[u8]) -> Result<SqlArray> {
     }
 
     SqlArray::new(element_type, dimensions, values)
+}
+
+fn decode_range(payload: &[u8]) -> Result<SqlRange> {
+    let mut cursor = Cursor::new(payload);
+    let element_type = SqlType::decode_from(&mut cursor)?;
+    let empty = cursor.read_u8("range empty flag")? != 0;
+    let lower = decode_range_bound(&mut cursor)?;
+    let upper = decode_range_bound(&mut cursor)?;
+    if !cursor.is_complete() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range payload has trailing bytes",
+        ));
+    }
+
+    if empty {
+        return Ok(SqlRange::empty(element_type));
+    }
+
+    SqlRange::new(element_type, lower, upper)
+}
+
+fn encode_range_bound(bound: &RangeBound, encoded: &mut Vec<u8>) {
+    match bound {
+        RangeBound::Unbounded => encoded.push(0),
+        RangeBound::Included(value) => {
+            encoded.push(1);
+            let value_bytes = value.encode();
+            encoded.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&value_bytes);
+        }
+        RangeBound::Excluded(value) => {
+            encoded.push(2);
+            let value_bytes = value.encode();
+            encoded.extend_from_slice(&(value_bytes.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&value_bytes);
+        }
+    }
+}
+
+fn decode_range_bound(cursor: &mut Cursor<'_>) -> Result<RangeBound> {
+    let tag = cursor.read_u8("range bound tag")?;
+    match tag {
+        0 => Ok(RangeBound::Unbounded),
+        1 | 2 => {
+            let len = cursor.read_u32("range bound length")? as usize;
+            let bytes = cursor.read_exact(len, "range bound payload")?;
+            let value = SqlValue::decode(bytes)?;
+            Ok(if tag == 1 {
+                RangeBound::Included(value)
+            } else {
+                RangeBound::Excluded(value)
+            })
+        }
+        unknown => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unknown range bound tag {unknown}"),
+        )),
+    }
+}
+
+fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> {
+    match (left, right) {
+        (SqlValue::Bool(a), SqlValue::Bool(b)) => Ok(a.cmp(b)),
+        (SqlValue::Int64(a), SqlValue::Int64(b)) => Ok(a.cmp(b)),
+        (SqlValue::UInt64(a), SqlValue::UInt64(b)) => Ok(a.cmp(b)),
+        (SqlValue::Text(a), SqlValue::Text(b)) => Ok(a.cmp(b)),
+        (SqlValue::Bytes(a), SqlValue::Bytes(b)) => Ok(a.cmp(b)),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range comparison only supports matching scalar types",
+        )),
+    }
+}
+
+fn validate_range_bound_type(element_type: &SqlType, bound: &RangeBound) -> Result<()> {
+    if let Some(value) = bound.value() {
+        if value.is_null() || value.data_type() != *element_type {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "range bound type does not match declared element type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn bounds_are_empty(lower: &RangeBound, upper: &RangeBound) -> Result<bool> {
+    let Some(lower_value) = lower.value() else {
+        return Ok(false);
+    };
+    let Some(upper_value) = upper.value() else {
+        return Ok(false);
+    };
+
+    match compare_scalar_values(lower_value, upper_value)? {
+        Ordering::Greater => Ok(true),
+        Ordering::Equal => Ok(!(lower.is_included() && upper.is_included())),
+        Ordering::Less => Ok(false),
+    }
+}
+
+fn min_lower_bound(left: &RangeBound, right: &RangeBound) -> Result<RangeBound> {
+    compare_lower_bounds(left, right).map(|ordering| match ordering {
+        Ordering::Less | Ordering::Equal => left.clone(),
+        Ordering::Greater => right.clone(),
+    })
+}
+
+fn max_lower_bound(left: &RangeBound, right: &RangeBound) -> Result<RangeBound> {
+    compare_lower_bounds(left, right).map(|ordering| match ordering {
+        Ordering::Greater | Ordering::Equal => left.clone(),
+        Ordering::Less => right.clone(),
+    })
+}
+
+fn min_upper_bound(left: &RangeBound, right: &RangeBound) -> Result<RangeBound> {
+    compare_upper_bounds(left, right).map(|ordering| match ordering {
+        Ordering::Less | Ordering::Equal => left.clone(),
+        Ordering::Greater => right.clone(),
+    })
+}
+
+fn max_upper_bound(left: &RangeBound, right: &RangeBound) -> Result<RangeBound> {
+    compare_upper_bounds(left, right).map(|ordering| match ordering {
+        Ordering::Greater | Ordering::Equal => left.clone(),
+        Ordering::Less => right.clone(),
+    })
+}
+
+fn compare_lower_bounds(left: &RangeBound, right: &RangeBound) -> Result<Ordering> {
+    match (left.value(), right.value()) {
+        (None, None) => Ok(Ordering::Equal),
+        (None, Some(_)) => Ok(Ordering::Less),
+        (Some(_), None) => Ok(Ordering::Greater),
+        (Some(a), Some(b)) => match compare_scalar_values(a, b)? {
+            Ordering::Equal => match (left.is_included(), right.is_included()) {
+                (true, false) => Ok(Ordering::Less),
+                (false, true) => Ok(Ordering::Greater),
+                _ => Ok(Ordering::Equal),
+            },
+            other => Ok(other),
+        },
+    }
+}
+
+fn compare_upper_bounds(left: &RangeBound, right: &RangeBound) -> Result<Ordering> {
+    match (left.value(), right.value()) {
+        (None, None) => Ok(Ordering::Equal),
+        (None, Some(_)) => Ok(Ordering::Greater),
+        (Some(_), None) => Ok(Ordering::Less),
+        (Some(a), Some(b)) => match compare_scalar_values(a, b)? {
+            Ordering::Equal => match (left.is_included(), right.is_included()) {
+                (true, false) => Ok(Ordering::Greater),
+                (false, true) => Ok(Ordering::Less),
+                _ => Ok(Ordering::Equal),
+            },
+            other => Ok(other),
+        },
+    }
+}
+
+fn bounds_touch_without_gap(left_upper: &RangeBound, right_lower: &RangeBound) -> Result<bool> {
+    match (left_upper.value(), right_lower.value()) {
+        (Some(left), Some(right)) if compare_scalar_values(left, right)? == Ordering::Equal => {
+            Ok(left_upper.is_included() || right_lower.is_included())
+        }
+        _ => Ok(false),
+    }
 }
 
 fn decode_bytes(payload: &[u8], type_name: &'static str) -> Result<Vec<u8>> {
