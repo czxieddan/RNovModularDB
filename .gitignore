@@ -1,0 +1,47 @@
+# Local agent and planning artifacts
+AGENTS.md
+plans/
+tests/
+
+# Rust build output
+target/
+debug/
+release/
+*.rlib
+*.rmeta
+*.profraw
+*.profdata
+
+# Native build artifacts and binaries
+*.a
+*.dll
+*.dylib
+*.exe
+*.lib
+*.o
+*.obj
+*.pdb
+*.so
+*.wasm
+
+# Logs and runtime diagnostics
+*.log
+logs/
+trace/
+tmp/
+temp/
+
+# Local database/runtime files
+*.db
+*.db-shm
+*.db-wal
+*.rnov
+*.rnov-backup
+*.snapshot
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
