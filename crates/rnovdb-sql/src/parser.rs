@@ -34,6 +34,8 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek_kind() {
             Some(TokenKind::Create) => self.parse_create(),
+            Some(TokenKind::Alter) => self.parse_alter(),
+            Some(TokenKind::Drop) => self.parse_drop(),
             Some(TokenKind::Grant) => self.parse_grant(),
             Some(TokenKind::Insert) => self.parse_insert(),
             Some(TokenKind::Update) => self.parse_update(),
@@ -66,32 +68,7 @@ impl Parser {
         self.expect_keyword(TokenKind::LeftParen)?;
         let mut columns = Vec::new();
         loop {
-            let name = self.parse_ident()?;
-            let data_type = self.parse_type()?;
-            let mut nullable = true;
-            let mut encrypted = false;
-
-            loop {
-                match self.peek_kind() {
-                    Some(TokenKind::Not) => {
-                        self.bump();
-                        self.expect_keyword(TokenKind::Null)?;
-                        nullable = false;
-                    }
-                    Some(TokenKind::Encrypted) => {
-                        self.bump();
-                        encrypted = true;
-                    }
-                    _ => break,
-                }
-            }
-
-            columns.push(ColumnDef {
-                name,
-                data_type,
-                nullable,
-                encrypted,
-            });
+            columns.push(self.parse_column_def()?);
 
             if self.consume_if(&TokenKind::Comma) {
                 continue;
@@ -101,6 +78,58 @@ impl Parser {
         self.expect_keyword(TokenKind::RightParen)?;
 
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Alter)?;
+        self.expect_keyword(TokenKind::Table)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::Add)?;
+        self.expect_keyword(TokenKind::Column)?;
+        let column = self.parse_column_def()?;
+        Ok(Statement::AlterTableAddColumn { table, column })
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Drop)?;
+        self.expect_keyword(TokenKind::Table)?;
+        let if_exists = if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_object_name()?;
+        Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_column_def(&mut self) -> Result<ColumnDef> {
+        let name = self.parse_ident()?;
+        let data_type = self.parse_type()?;
+        let mut nullable = true;
+        let mut encrypted = false;
+
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Not) => {
+                    self.bump();
+                    self.expect_keyword(TokenKind::Null)?;
+                    nullable = false;
+                }
+                Some(TokenKind::Encrypted) => {
+                    self.bump();
+                    encrypted = true;
+                }
+                _ => break,
+            }
+        }
+
+        Ok(ColumnDef {
+            name,
+            data_type,
+            nullable,
+            encrypted,
+        })
     }
 
     fn parse_create_function_tail(&mut self) -> Result<Statement> {
@@ -536,6 +565,12 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Delete, TokenKind::Delete)
             | (TokenKind::Set, TokenKind::Set)
             | (TokenKind::Create, TokenKind::Create)
+            | (TokenKind::Alter, TokenKind::Alter)
+            | (TokenKind::Drop, TokenKind::Drop)
+            | (TokenKind::Add, TokenKind::Add)
+            | (TokenKind::Column, TokenKind::Column)
+            | (TokenKind::If, TokenKind::If)
+            | (TokenKind::Exists, TokenKind::Exists)
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)

@@ -25,6 +25,15 @@ impl<'a> Binder<'a> {
                 name: name.clone(),
                 columns: columns.clone(),
             }),
+            Statement::AlterTableAddColumn { table, column } => {
+                let resolved = self.resolve_table(table)?;
+                Ok(BoundStatement::AlterTableAddColumn {
+                    relation_id: resolved.relation_id(),
+                    table: table.clone(),
+                    column: column.clone(),
+                })
+            }
+            Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
             Statement::CreateFunction {
                 name,
                 argument_types,
@@ -98,6 +107,20 @@ impl<'a> Binder<'a> {
                 Ok(BoundStatement::Transaction { action: *action })
             }
         }
+    }
+
+    fn bind_drop_table(&self, name: &ObjectName, if_exists: bool) -> Result<BoundStatement> {
+        let relation_id = match self.resolve_table(name) {
+            Ok(table) => Some(table.relation_id()),
+            Err(err) if if_exists && err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+
+        Ok(BoundStatement::DropTable {
+            relation_id,
+            name: name.clone(),
+            if_exists,
+        })
     }
 
     fn bind_create_operator(

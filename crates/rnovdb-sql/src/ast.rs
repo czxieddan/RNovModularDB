@@ -157,6 +157,14 @@ pub enum Statement {
         name: ObjectName,
         columns: Vec<ColumnDef>,
     },
+    AlterTableAddColumn {
+        table: ObjectName,
+        column: ColumnDef,
+    },
+    DropTable {
+        name: ObjectName,
+        if_exists: bool,
+    },
     CreateFunction {
         name: Ident,
         argument_types: Vec<SqlType>,
@@ -251,6 +259,16 @@ pub enum BoundStatement {
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDef>,
+    },
+    AlterTableAddColumn {
+        relation_id: RelationId,
+        table: ObjectName,
+        column: ColumnDef,
+    },
+    DropTable {
+        relation_id: Option<RelationId>,
+        name: ObjectName,
+        if_exists: bool,
     },
     CreateFunction {
         name: Ident,
