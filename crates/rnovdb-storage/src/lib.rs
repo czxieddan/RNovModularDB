@@ -278,7 +278,14 @@ pub trait StorageBackend: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct MemoryBackend {
     page_size: PageSize,
-    pages: Arc<RwLock<BTreeMap<PageId, Page>>>,
+    pages: Arc<RwLock<BTreeMap<PageId, MemoryPageEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryPageEntry {
+    page: Page,
+    dirty: bool,
+    pin_count: usize,
 }
 
 impl MemoryBackend {
@@ -292,14 +299,82 @@ impl MemoryBackend {
     pub fn page_size(&self) -> PageSize {
         self.page_size
     }
+
+    pub fn dirty_page_count(&self) -> Result<usize> {
+        let pages = self.read_pages()?;
+        Ok(pages.values().filter(|entry| entry.dirty).count())
+    }
+
+    pub fn pinned_page_count(&self) -> Result<usize> {
+        let pages = self.read_pages()?;
+        Ok(pages.values().filter(|entry| entry.pin_count > 0).count())
+    }
+
+    pub fn mark_clean(&self, id: PageId) -> Result<bool> {
+        let mut pages = self.write_pages()?;
+        let Some(entry) = pages.get_mut(&id) else {
+            return Ok(false);
+        };
+        entry.dirty = false;
+        Ok(true)
+    }
+
+    pub fn pin_page(&self, id: PageId) -> Result<Option<PinnedPage>> {
+        let mut pages = self.write_pages()?;
+        let Some(entry) = pages.get_mut(&id) else {
+            return Ok(None);
+        };
+        entry.pin_count += 1;
+        Ok(Some(PinnedPage {
+            backend_pages: Arc::clone(&self.pages),
+            page_id: id,
+            page: entry.page.clone(),
+        }))
+    }
+
+    fn read_pages(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, BTreeMap<PageId, MemoryPageEntry>>> {
+        self.pages.read().map_err(|_| {
+            RnovError::new(ErrorKind::Internal, "memory backend page map lock poisoned")
+        })
+    }
+
+    fn write_pages(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, BTreeMap<PageId, MemoryPageEntry>>> {
+        self.pages.write().map_err(|_| {
+            RnovError::new(ErrorKind::Internal, "memory backend page map lock poisoned")
+        })
+    }
+}
+
+pub struct PinnedPage {
+    backend_pages: Arc<RwLock<BTreeMap<PageId, MemoryPageEntry>>>,
+    page_id: PageId,
+    page: Page,
+}
+
+impl PinnedPage {
+    pub fn page(&self) -> &Page {
+        &self.page
+    }
+}
+
+impl Drop for PinnedPage {
+    fn drop(&mut self) {
+        if let Ok(mut pages) = self.backend_pages.write()
+            && let Some(entry) = pages.get_mut(&self.page_id)
+        {
+            entry.pin_count = entry.pin_count.saturating_sub(1);
+        }
+    }
 }
 
 impl StorageBackend for MemoryBackend {
     fn read_page(&self, id: PageId) -> Result<Option<Page>> {
-        let pages = self.pages.read().map_err(|_| {
-            RnovError::new(ErrorKind::Internal, "memory backend page map lock poisoned")
-        })?;
-        Ok(pages.get(&id).cloned())
+        let pages = self.read_pages()?;
+        Ok(pages.get(&id).map(|entry| entry.page.clone()))
     }
 
     fn write_page(&self, page: Page) -> Result<()> {
@@ -314,10 +389,15 @@ impl StorageBackend for MemoryBackend {
             ));
         }
 
-        let mut pages = self.pages.write().map_err(|_| {
-            RnovError::new(ErrorKind::Internal, "memory backend page map lock poisoned")
-        })?;
-        pages.insert(page.id(), page);
+        let mut pages = self.write_pages()?;
+        pages.insert(
+            page.id(),
+            MemoryPageEntry {
+                page,
+                dirty: true,
+                pin_count: 0,
+            },
+        );
         Ok(())
     }
 
