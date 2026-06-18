@@ -39,14 +39,51 @@ impl std::ops::BitOr for StorageCapability {
     }
 }
 
+fn read_header_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
+    let slice = bytes.get(offset..offset + N).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "encoded page ended while reading header",
+        )
+    })?;
+    let mut array = [0_u8; N];
+    array.copy_from_slice(slice);
+    Ok(array)
+}
+
+fn checksum_page(header: &PageHeader, payload: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET;
+    hash = fnv1a(hash, &header.page_id().get().to_be_bytes());
+    hash = fnv1a(hash, &header.lsn().to_be_bytes());
+    hash = fnv1a(hash, &(header.page_size().bytes() as u64).to_be_bytes());
+    hash = fnv1a(hash, &[header.format_version()]);
+    fnv1a(hash, payload)
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Page {
-    id: PageId,
+    header: PageHeader,
     payload: Vec<u8>,
 }
 
 impl Page {
     pub fn new(id: PageId, payload: Vec<u8>) -> Result<Self> {
+        let header = PageHeader::new(id, 0, PageSize::new(payload.len()));
+        Self::new_with_header(header, payload)
+    }
+
+    pub fn new_with_header(header: PageHeader, payload: Vec<u8>) -> Result<Self> {
         if payload.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -54,11 +91,26 @@ impl Page {
             ));
         }
 
-        Ok(Self { id, payload })
+        if payload.len() != header.page_size().bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "page size mismatch: header declares {} bytes, payload has {} bytes",
+                    header.page_size().bytes(),
+                    payload.len()
+                ),
+            ));
+        }
+
+        Ok(Self { header, payload })
     }
 
     pub fn id(&self) -> PageId {
-        self.id
+        self.header.page_id()
+    }
+
+    pub fn header(&self) -> &PageHeader {
+        &self.header
     }
 
     pub fn payload(&self) -> &[u8] {
@@ -67,6 +119,122 @@ impl Page {
 
     pub fn into_payload(self) -> Vec<u8> {
         self.payload
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageHeader {
+    page_id: PageId,
+    lsn: u64,
+    page_size: PageSize,
+    format_version: u8,
+    checksum: u64,
+}
+
+impl PageHeader {
+    pub fn new(page_id: PageId, lsn: u64, page_size: PageSize) -> Self {
+        Self {
+            page_id,
+            lsn,
+            page_size,
+            format_version: PageCodec::FORMAT_VERSION,
+            checksum: 0,
+        }
+    }
+
+    pub fn page_id(self) -> PageId {
+        self.page_id
+    }
+
+    pub fn lsn(self) -> u64 {
+        self.lsn
+    }
+
+    pub fn page_size(self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn format_version(self) -> u8 {
+        self.format_version
+    }
+
+    pub fn checksum(self) -> u64 {
+        self.checksum
+    }
+
+    fn with_checksum(mut self, checksum: u64) -> Self {
+        self.checksum = checksum;
+        self
+    }
+}
+
+pub struct PageCodec;
+
+impl PageCodec {
+    pub const FORMAT_VERSION: u8 = 1;
+    const MAGIC: [u8; 8] = *b"RNOVPAGE";
+    const HEADER_LEN: usize = 8 + 1 + 8 + 8 + 8 + 8;
+
+    pub fn encode(page: &Page) -> Result<Vec<u8>> {
+        let mut header = page.header;
+        header.format_version = Self::FORMAT_VERSION;
+        header.checksum = checksum_page(&header, page.payload());
+
+        let mut encoded = Vec::with_capacity(Self::HEADER_LEN + page.payload().len());
+        encoded.extend_from_slice(&Self::MAGIC);
+        encoded.push(header.format_version());
+        encoded.extend_from_slice(&header.page_id().get().to_be_bytes());
+        encoded.extend_from_slice(&header.lsn().to_be_bytes());
+        encoded.extend_from_slice(&(header.page_size().bytes() as u64).to_be_bytes());
+        encoded.extend_from_slice(&header.checksum().to_be_bytes());
+        encoded.extend_from_slice(page.payload());
+        Ok(encoded)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Page> {
+        if bytes.len() < Self::HEADER_LEN {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "encoded page is shorter than header",
+            ));
+        }
+
+        if bytes[..8] != Self::MAGIC {
+            return Err(RnovError::new(ErrorKind::Corruption, "invalid page magic"));
+        }
+
+        let format_version = bytes[8];
+        if format_version != Self::FORMAT_VERSION {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!("unsupported page format version {format_version}"),
+            ));
+        }
+
+        let page_id = PageId::new(u64::from_be_bytes(read_header_array::<8>(bytes, 9)?));
+        let lsn = u64::from_be_bytes(read_header_array::<8>(bytes, 17)?);
+        let page_size_bytes = u64::from_be_bytes(read_header_array::<8>(bytes, 25)?) as usize;
+        let checksum = u64::from_be_bytes(read_header_array::<8>(bytes, 33)?);
+        let payload = bytes[Self::HEADER_LEN..].to_vec();
+
+        if payload.len() != page_size_bytes {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "encoded page payload length does not match header page size",
+            ));
+        }
+
+        let header =
+            PageHeader::new(page_id, lsn, PageSize::new(page_size_bytes)).with_checksum(checksum);
+        let expected = checksum_page(&header, &payload);
+        if checksum != expected {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "page checksum mismatch",
+            ));
+        }
+
+        Page::new_with_header(header, payload)
     }
 }
 
