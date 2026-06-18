@@ -1,3 +1,4 @@
+use rnovdb_catalog::Privilege;
 use rnovdb_common::{ErrorKind, Result, RnovError};
 use rnovdb_types::SqlType;
 
@@ -30,7 +31,8 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.peek_kind() {
-            Some(TokenKind::Create) => self.parse_create_table(),
+            Some(TokenKind::Create) => self.parse_create(),
+            Some(TokenKind::Grant) => self.parse_grant(),
             Some(TokenKind::Insert) => self.parse_insert(),
             Some(TokenKind::Select) => self.parse_select(),
             Some(kind) => Err(self.error(format!("unexpected statement token {kind:?}"))),
@@ -38,8 +40,20 @@ impl Parser {
         }
     }
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Create)?;
+        match self.peek_kind() {
+            Some(TokenKind::Table) => self.parse_create_table_tail(),
+            Some(TokenKind::Function) => self.parse_create_function_tail(),
+            Some(TokenKind::OperatorKeyword) => self.parse_create_operator_tail(),
+            Some(TokenKind::Role) => self.parse_create_role_tail(),
+            Some(TokenKind::Policy) => self.parse_create_policy_tail(),
+            Some(kind) => Err(self.error(format!("unexpected CREATE target {kind:?}"))),
+            None => Err(self.error("expected CREATE target")),
+        }
+    }
+
+    fn parse_create_table_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Table)?;
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
@@ -80,6 +94,93 @@ impl Parser {
         self.expect_keyword(TokenKind::RightParen)?;
 
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_create_function_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Function)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = if self.consume_if(&TokenKind::RightParen) {
+            Vec::new()
+        } else {
+            let types = self.parse_type_list()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            types
+        };
+        self.expect_keyword(TokenKind::Returns)?;
+        let return_type = self.parse_type()?;
+        Ok(Statement::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+        })
+    }
+
+    fn parse_create_operator_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::OperatorKeyword)?;
+        let symbol = self.parse_operator_symbol()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        self.expect_option_label("leftarg")?;
+        self.expect_operator("=")?;
+        let left_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        self.expect_option_label("rightarg")?;
+        self.expect_operator("=")?;
+        let right_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        self.expect_keyword(TokenKind::Returns)?;
+        self.expect_operator("=")?;
+        let result_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        self.expect_keyword(TokenKind::Function)?;
+        self.expect_operator("=")?;
+        let function = self.parse_ident()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::CreateOperator {
+            symbol,
+            left_type,
+            right_type,
+            result_type,
+            function,
+        })
+    }
+
+    fn parse_create_role_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Role)?;
+        Ok(Statement::CreateRole {
+            name: self.parse_ident()?,
+        })
+    }
+
+    fn parse_create_policy_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Policy)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::Using)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let predicate = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::CreatePolicy {
+            name,
+            table,
+            predicate,
+        })
+    }
+
+    fn parse_grant(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Grant)?;
+        let privilege = self.parse_privilege()?;
+        self.expect_keyword(TokenKind::On)?;
+        self.expect_keyword(TokenKind::Table)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::To)?;
+        let role = self.parse_ident()?;
+        Ok(Statement::GrantTablePrivilege {
+            privilege,
+            table,
+            role,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -165,6 +266,18 @@ impl Parser {
         Ok(expressions)
     }
 
+    fn parse_type_list(&mut self) -> Result<Vec<SqlType>> {
+        let mut types = Vec::new();
+        loop {
+            types.push(self.parse_type()?);
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(types)
+    }
+
     fn parse_expr(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary_expr()?;
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
@@ -236,6 +349,70 @@ impl Parser {
         Ok(data_type)
     }
 
+    fn parse_privilege(&mut self) -> Result<Privilege> {
+        match self.peek_kind() {
+            Some(TokenKind::Select) => {
+                self.bump();
+                Ok(Privilege::Select)
+            }
+            Some(TokenKind::Insert) => {
+                self.bump();
+                Ok(Privilege::Insert)
+            }
+            Some(TokenKind::Update) => {
+                self.bump();
+                Ok(Privilege::Update)
+            }
+            Some(TokenKind::Delete) => {
+                self.bump();
+                Ok(Privilege::Delete)
+            }
+            Some(TokenKind::Execute) => {
+                self.bump();
+                Ok(Privilege::Execute)
+            }
+            Some(kind) => Err(self.error(format!("expected privilege but found {kind:?}"))),
+            None => Err(self.error("expected privilege")),
+        }
+    }
+
+    fn parse_operator_symbol(&mut self) -> Result<String> {
+        match self.peek_kind().cloned() {
+            Some(TokenKind::Operator(symbol)) => {
+                self.bump();
+                Ok(symbol)
+            }
+            Some(TokenKind::Identifier(symbol)) => {
+                self.bump();
+                Ok(symbol)
+            }
+            Some(kind) => Err(self.error(format!("expected operator symbol but found {kind:?}"))),
+            None => Err(self.error("expected operator symbol")),
+        }
+    }
+
+    fn expect_operator(&mut self, expected: &str) -> Result<()> {
+        match self.peek_kind().cloned() {
+            Some(TokenKind::Operator(op)) if op == expected => {
+                self.bump();
+                Ok(())
+            }
+            Some(kind) => {
+                Err(self.error(format!("expected operator {expected} but found {kind:?}")))
+            }
+            None => Err(self.error(format!("expected operator {expected}"))),
+        }
+    }
+
+    fn expect_option_label(&mut self, expected: &str) -> Result<()> {
+        let ident = self.parse_ident()?;
+        if ident.as_str() == expected {
+            Ok(())
+        } else {
+            Err(self.error(format!("expected option {expected}")))
+        }
+    }
+
     fn parse_ident(&mut self) -> Result<Ident> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Identifier(value)) => {
@@ -303,6 +480,18 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)
+            | (TokenKind::Function, TokenKind::Function)
+            | (TokenKind::Returns, TokenKind::Returns)
+            | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)
+            | (TokenKind::Role, TokenKind::Role)
+            | (TokenKind::Grant, TokenKind::Grant)
+            | (TokenKind::On, TokenKind::On)
+            | (TokenKind::To, TokenKind::To)
+            | (TokenKind::Policy, TokenKind::Policy)
+            | (TokenKind::Using, TokenKind::Using)
+            | (TokenKind::Update, TokenKind::Update)
+            | (TokenKind::Delete, TokenKind::Delete)
+            | (TokenKind::Execute, TokenKind::Execute)
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)

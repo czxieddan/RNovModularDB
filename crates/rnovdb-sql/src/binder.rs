@@ -1,4 +1,4 @@
-use rnovdb_catalog::{Catalog, Privilege, Table};
+use rnovdb_catalog::{Catalog, OperatorSignature, Privilege, Table};
 use rnovdb_common::{
     ErrorKind, Result, RnovError,
     ids::{RelationId, RoleId},
@@ -23,6 +23,59 @@ impl<'a> Binder<'a> {
                 name: name.clone(),
                 columns: columns.clone(),
             }),
+            Statement::CreateFunction {
+                name,
+                argument_types,
+                return_type,
+            } => Ok(BoundStatement::CreateFunction {
+                name: name.clone(),
+                argument_types: argument_types.clone(),
+                return_type: return_type.clone(),
+            }),
+            Statement::CreateOperator {
+                symbol,
+                left_type,
+                right_type,
+                result_type,
+                function,
+            } => self.bind_create_operator(
+                symbol,
+                left_type,
+                right_type,
+                result_type,
+                function.as_str(),
+            ),
+            Statement::CreateRole { name } => Ok(BoundStatement::CreateRole { name: name.clone() }),
+            Statement::CreatePolicy {
+                name,
+                table,
+                predicate,
+            } => {
+                let table = self.resolve_table(table)?;
+                Ok(BoundStatement::CreatePolicy {
+                    name: name.clone(),
+                    relation_id: table.relation_id(),
+                    predicate: predicate.to_string(),
+                })
+            }
+            Statement::GrantTablePrivilege {
+                privilege,
+                table,
+                role,
+            } => {
+                let table = self.resolve_table(table)?;
+                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("role does not exist: {}", role.as_str()),
+                    )
+                })?;
+                Ok(BoundStatement::GrantTablePrivilege {
+                    role_id: role.role_id(),
+                    relation_id: table.relation_id(),
+                    privilege: *privilege,
+                })
+            }
             Statement::Insert {
                 table,
                 columns,
@@ -34,6 +87,42 @@ impl<'a> Binder<'a> {
                 selection,
             } => self.bind_select(projection, from, selection, role_id),
         }
+    }
+
+    fn bind_create_operator(
+        &self,
+        symbol: &str,
+        left_type: &rnovdb_types::SqlType,
+        right_type: &rnovdb_types::SqlType,
+        result_type: &rnovdb_types::SqlType,
+        function_name: &str,
+    ) -> Result<BoundStatement> {
+        let argument_types = [left_type.clone(), right_type.clone()];
+        let function = self
+            .catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == function_name
+                    && function.argument_types() == argument_types
+                    && function.return_type() == result_type
+            })
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("function does not exist for operator {symbol}: {function_name}"),
+                )
+            })?;
+
+        Ok(BoundStatement::CreateOperator {
+            signature: OperatorSignature::new(
+                symbol,
+                left_type.clone(),
+                right_type.clone(),
+                result_type.clone(),
+                function.function_id(),
+            ),
+        })
     }
 
     fn bind_insert(

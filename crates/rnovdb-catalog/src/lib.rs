@@ -140,6 +140,10 @@ impl Catalog {
         &self.operators
     }
 
+    pub fn get_role(&self, name: &str) -> Option<&Role> {
+        self.roles.get(name)
+    }
+
     pub fn create_schema(&mut self, name: impl Into<String>) -> Result<&Schema> {
         let name = name.into();
         validate_identifier("schema", &name)?;
@@ -459,6 +463,22 @@ impl OperatorSignature {
 
     pub fn symbol(&self) -> &str {
         &self.symbol
+    }
+
+    pub fn left_type(&self) -> &SqlType {
+        &self.left_type
+    }
+
+    pub fn right_type(&self) -> &SqlType {
+        &self.right_type
+    }
+
+    pub fn result_type(&self) -> &SqlType {
+        &self.result_type
+    }
+
+    pub fn function_id(&self) -> FunctionId {
+        self.function_id
     }
 }
 

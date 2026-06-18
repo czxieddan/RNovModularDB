@@ -1,7 +1,7 @@
 use std::fmt;
 
-use rnovdb_catalog::Column;
-use rnovdb_common::ids::RelationId;
+use rnovdb_catalog::{Column, OperatorSignature, Privilege};
+use rnovdb_common::ids::{RelationId, RoleId};
 use rnovdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -144,6 +144,31 @@ pub enum Statement {
         name: ObjectName,
         columns: Vec<ColumnDef>,
     },
+    CreateFunction {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+    },
+    CreateOperator {
+        symbol: String,
+        left_type: SqlType,
+        right_type: SqlType,
+        result_type: SqlType,
+        function: Ident,
+    },
+    CreateRole {
+        name: Ident,
+    },
+    CreatePolicy {
+        name: Ident,
+        table: ObjectName,
+        predicate: Expr,
+    },
+    GrantTablePrivilege {
+        privilege: Privilege,
+        table: ObjectName,
+        role: Ident,
+    },
     Insert {
         table: ObjectName,
         columns: Vec<Ident>,
@@ -178,6 +203,27 @@ pub enum BoundStatement {
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDef>,
+    },
+    CreateFunction {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+    },
+    CreateOperator {
+        signature: OperatorSignature,
+    },
+    CreateRole {
+        name: Ident,
+    },
+    CreatePolicy {
+        name: Ident,
+        relation_id: RelationId,
+        predicate: String,
+    },
+    GrantTablePrivilege {
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: Privilege,
     },
     Insert {
         table: ObjectName,
