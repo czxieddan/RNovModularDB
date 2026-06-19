@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rnovdb_common::{ErrorKind, Result, RnovError, ids::PageId};
+use rnovdb_types::TextVector;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IndexKey {
@@ -83,5 +84,67 @@ impl MemoryBTreeIndex {
             unique,
             entries: BTreeMap::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InvertedTextIndex {
+    name: String,
+    terms: BTreeMap<String, BTreeSet<IndexPointer>>,
+}
+
+impl InvertedTextIndex {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            terms: BTreeMap::new(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn insert_document(&mut self, pointer: IndexPointer, vector: &TextVector) -> Result<()> {
+        if vector.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot index an empty text vector",
+            ));
+        }
+        for lexeme in vector.iter() {
+            self.terms
+                .entry(lexeme.term().to_string())
+                .or_default()
+                .insert(pointer);
+        }
+        Ok(())
+    }
+
+    pub fn lookup(&self, term: &str) -> Vec<IndexPointer> {
+        self.terms
+            .get(term)
+            .map(|pointers| pointers.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn lookup_all<'a>(&self, terms: impl IntoIterator<Item = &'a str>) -> Vec<IndexPointer> {
+        let mut terms = terms.into_iter();
+        let Some(first) = terms.next() else {
+            return Vec::new();
+        };
+
+        let mut matches = self.terms.get(first).cloned().unwrap_or_else(BTreeSet::new);
+        for term in terms {
+            let Some(next) = self.terms.get(term) else {
+                return Vec::new();
+            };
+            matches = matches.intersection(next).copied().collect();
+            if matches.is_empty() {
+                return Vec::new();
+            }
+        }
+
+        matches.into_iter().collect()
     }
 }
