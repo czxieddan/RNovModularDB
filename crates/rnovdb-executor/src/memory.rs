@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
 use rnovdb_planner::logical::LogicalPlan;
-use rnovdb_sql::ast::Expr;
+use rnovdb_sql::ast::{ColumnDef, Expr};
 use rnovdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
 };
@@ -51,6 +51,7 @@ pub struct MemoryExecutor {
 pub enum ExecutionResult {
     Batch(VectorBatch),
     RowsAffected(u64),
+    SchemaChanged,
 }
 
 impl MemoryExecutor {
@@ -97,6 +98,10 @@ impl MemoryExecutor {
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
         match plan {
+            LogicalPlan::CreateTable { table, columns } => {
+                self.create_table(table, columns)?;
+                Ok(ExecutionResult::SchemaChanged)
+            }
             LogicalPlan::Insert {
                 table,
                 columns,
@@ -131,6 +136,30 @@ impl MemoryExecutor {
             _ => self.execute(plan).map(ExecutionResult::Batch),
         }
     }
+
+    fn create_table(&mut self, name: &str, columns: &[ColumnDef]) -> Result<()> {
+        if self.tables.contains_key(name) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("table already exists: {name}"),
+            ));
+        }
+        let columns = columns.iter().map(column_schema_from_def).collect();
+        let table = MemoryTable::new(columns)?;
+        self.tables.insert(name.to_string(), table);
+        Ok(())
+    }
+}
+
+fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
+    let mut schema = ColumnSchema::new(column.name.as_str(), column.data_type.clone());
+    if !column.nullable {
+        schema = schema.not_null();
+    }
+    if column.encrypted {
+        schema = schema.encrypted();
+    }
+    schema
 }
 
 fn update_rows(
