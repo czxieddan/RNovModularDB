@@ -6,7 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rnovdb-catalog.workspace = true
 rnovdb-common.workspace = true
+rnovdb-executor.workspace = true
+rnovdb-planner.workspace = true
+rnovdb-sql.workspace = true
 rnovdb-storage.workspace = true
 rnovdb-types.workspace = true
 

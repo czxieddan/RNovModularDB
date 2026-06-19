@@ -227,7 +227,11 @@ dependencies = [
 name = "rnovdb-cli"
 version = "0.1.0"
 dependencies = [
+ "rnovdb-catalog",
  "rnovdb-common",
+ "rnovdb-executor",
+ "rnovdb-planner",
+ "rnovdb-sql",
  "rnovdb-storage",
  "rnovdb-types",
 ]
