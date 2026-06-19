@@ -594,3 +594,162 @@ fn index_key_family(key: &IndexKey) -> IndexKeyFamily {
         IndexKey::Text(_) => IndexKeyFamily::Text,
     }
 }
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CompositeIndexKey {
+    parts: Vec<IndexKey>,
+}
+
+impl CompositeIndexKey {
+    pub fn new(parts: Vec<IndexKey>) -> Result<Self> {
+        if parts.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "composite index key must have at least one part",
+            ));
+        }
+        Ok(Self { parts })
+    }
+
+    pub fn parts(&self) -> &[IndexKey] {
+        &self.parts
+    }
+
+    pub fn rank(&self) -> usize {
+        self.parts.len()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompositeKeyPattern {
+    parts: Vec<Option<IndexKey>>,
+}
+
+impl CompositeKeyPattern {
+    pub fn new(parts: Vec<Option<IndexKey>>) -> Result<Self> {
+        if parts.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "composite key pattern must have at least one part",
+            ));
+        }
+        Ok(Self { parts })
+    }
+
+    pub fn parts(&self) -> &[Option<IndexKey>] {
+        &self.parts
+    }
+
+    pub fn rank(&self) -> usize {
+        self.parts.len()
+    }
+
+    pub fn has_bound_part(&self) -> bool {
+        self.parts.iter().any(Option::is_some)
+    }
+
+    fn matches(&self, key: &CompositeIndexKey) -> bool {
+        self.parts
+            .iter()
+            .zip(key.parts.iter())
+            .all(|(pattern_part, key_part)| match pattern_part {
+                Some(pattern_key) => pattern_key == key_part,
+                None => true,
+            })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryCompositeIndex {
+    name: String,
+    unique: bool,
+    rank: Option<usize>,
+    entries: BTreeMap<CompositeIndexKey, Vec<IndexPointer>>,
+}
+
+impl MemoryCompositeIndex {
+    pub fn unique(name: impl Into<String>) -> Self {
+        Self::new(name, true)
+    }
+
+    pub fn non_unique(name: impl Into<String>) -> Self {
+        Self::new(name, false)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+
+    pub fn insert(&mut self, key: CompositeIndexKey, pointer: IndexPointer) -> Result<()> {
+        self.ensure_rank(key.rank())?;
+        let pointers = self.entries.entry(key).or_default();
+        if self.unique && !pointers.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unique composite index violation: {}", self.name),
+            ));
+        }
+        if !pointers.contains(&pointer) {
+            pointers.push(pointer);
+        }
+        Ok(())
+    }
+
+    pub fn point_lookup(&self, key: &CompositeIndexKey) -> Vec<IndexPointer> {
+        self.entries.get(key).cloned().unwrap_or_default()
+    }
+
+    pub fn skip_scan(&self, pattern: &CompositeKeyPattern) -> Result<Vec<IndexPointer>> {
+        if !pattern.has_bound_part() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "skip scan requires at least one bound key part",
+            ));
+        }
+        self.ensure_query_rank(pattern.rank())?;
+
+        Ok(self
+            .entries
+            .iter()
+            .filter(|(key, _)| pattern.matches(key))
+            .flat_map(|(_, pointers)| pointers.iter().copied())
+            .collect())
+    }
+
+    fn new(name: impl Into<String>, unique: bool) -> Self {
+        Self {
+            name: name.into(),
+            unique,
+            rank: None,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn ensure_rank(&mut self, rank: usize) -> Result<()> {
+        match self.rank {
+            Some(existing) if existing != rank => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "composite index rank mismatch",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.rank = Some(rank);
+                Ok(())
+            }
+        }
+    }
+
+    fn ensure_query_rank(&self, rank: usize) -> Result<()> {
+        match self.rank {
+            Some(existing) if existing != rank => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "composite query rank does not match index rank",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
