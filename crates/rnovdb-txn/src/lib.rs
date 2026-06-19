@@ -61,6 +61,78 @@ impl Snapshot {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionChain<T> {
+    versions: Vec<Version<T>>,
+}
+
+impl<T> Default for VersionChain<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> VersionChain<T> {
+    pub fn new() -> Self {
+        Self {
+            versions: Vec::new(),
+        }
+    }
+
+    pub fn push_insert(&mut self, created_by: TransactionId, value: T) -> Result<()> {
+        if created_by == TransactionId::new(0) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "version creator transaction cannot be zero",
+            ));
+        }
+        self.versions.push(Version {
+            created_by,
+            deleted_by: None,
+            value,
+        });
+        Ok(())
+    }
+
+    pub fn mark_deleted(&mut self, deleted_by: TransactionId) -> Result<()> {
+        let version = self.versions.last_mut().ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, "cannot delete an empty version chain")
+        })?;
+        if version.deleted_by.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "latest version is already marked deleted",
+            ));
+        }
+        version.deleted_by = Some(deleted_by);
+        Ok(())
+    }
+
+    pub fn visible(&self, snapshot: &Snapshot) -> Option<&T> {
+        self.versions
+            .iter()
+            .rev()
+            .find(|version| version.is_visible(snapshot))
+            .map(|version| &version.value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Version<T> {
+    created_by: TransactionId,
+    deleted_by: Option<TransactionId>,
+    value: T,
+}
+
+impl<T> Version<T> {
+    fn is_visible(&self, snapshot: &Snapshot) -> bool {
+        snapshot.is_committed(self.created_by)
+            && self
+                .deleted_by
+                .is_none_or(|deleted_by| !snapshot.is_committed(deleted_by))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TransactionManager {
     next_transaction_id: u64,
