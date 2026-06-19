@@ -1,6 +1,6 @@
 use rnovdb_common::ids::RelationId;
 use rnovdb_common::{ErrorKind, Result, RnovError};
-use rnovdb_sql::ast::{BoundStatement, Expr, ObjectName, TransactionAction};
+use rnovdb_sql::ast::{BoundStatement, ColumnDef, Expr, ObjectName, TransactionAction};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalPlan {
@@ -34,12 +34,12 @@ pub enum LogicalPlan {
     },
     CreateTable {
         table: String,
-        columns: Vec<String>,
+        columns: Vec<ColumnDef>,
     },
     AlterTableAddColumn {
         relation_id: RelationId,
         table: String,
-        column: String,
+        column: ColumnDef,
     },
     DropTable {
         relation_id: Option<RelationId>,
@@ -63,10 +63,7 @@ impl LogicalPlanner {
         match statement {
             BoundStatement::CreateTable { name, columns } => Ok(LogicalPlan::CreateTable {
                 table: object_name(name),
-                columns: columns
-                    .iter()
-                    .map(|column| column.name.as_str().to_string())
-                    .collect(),
+                columns: columns.clone(),
             }),
             BoundStatement::AlterTableAddColumn {
                 relation_id,
@@ -75,7 +72,7 @@ impl LogicalPlanner {
             } => Ok(LogicalPlan::AlterTableAddColumn {
                 relation_id: *relation_id,
                 table: object_name(table),
-                column: column.name.as_str().to_string(),
+                column: column.clone(),
             }),
             BoundStatement::DropTable {
                 relation_id,
