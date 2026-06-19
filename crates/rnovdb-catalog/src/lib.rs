@@ -493,6 +493,10 @@ impl Operator {
         self.operator_id
     }
 
+    pub fn signature(&self) -> &OperatorSignature {
+        &self.signature
+    }
+
     pub fn symbol(&self) -> &str {
         self.signature.symbol()
     }

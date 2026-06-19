@@ -201,7 +201,7 @@ impl<'a> Binder<'a> {
             });
         }
         if let Some(selection) = selection {
-            self.validate_expression_columns(table, selection)?;
+            self.validate_predicate(table, selection)?;
         }
 
         Ok(BoundStatement::Update(BoundUpdate {
@@ -222,7 +222,7 @@ impl<'a> Binder<'a> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Delete)?;
         if let Some(selection) = selection {
-            self.validate_expression_columns(table, selection)?;
+            self.validate_predicate(table, selection)?;
         }
 
         Ok(BoundStatement::Delete(BoundDelete {
@@ -258,16 +258,24 @@ impl<'a> Binder<'a> {
                     columns.push(self.resolve_column(table, identifier.as_str())?);
                 }
                 SelectItem::Expr(expr) => {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("select expression is not bindable yet: {expr}"),
-                    ));
+                    let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer select expression type: {expr}"),
+                        )
+                    })?;
+                    columns.push(BoundColumn {
+                        name: format!("expr{}", columns.len() + 1),
+                        data_type,
+                        nullable: true,
+                        encrypted: false,
+                    });
                 }
             }
         }
 
         if let Some(selection) = selection {
-            self.validate_expression_columns(table, selection)?;
+            self.validate_predicate(table, selection)?;
         }
 
         Ok(BoundStatement::Select(BoundSelect {
@@ -277,6 +285,17 @@ impl<'a> Binder<'a> {
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
         }))
+    }
+
+    fn validate_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
+        match self.infer_expr_type(table, expr)? {
+            Some(SqlType::Bool | SqlType::Null) => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("predicate must be bool, got {other:?}"),
+            )),
+            None => Ok(()),
+        }
     }
 
     fn resolve_table(&self, name: &ObjectName) -> Result<&Table> {
@@ -426,9 +445,13 @@ impl<'a> Binder<'a> {
                 Ok(Some(SqlType::Range(Box::new(element_type))))
             }
             Expr::Binary { left, right, .. } => {
-                let _ = self.infer_expr_type(table, left)?;
-                let _ = self.infer_expr_type(table, right)?;
-                Ok(Some(SqlType::Bool))
+                let Some(left_type) = self.infer_expr_type(table, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_expr_type(table, right)? else {
+                    return Ok(None);
+                };
+                self.infer_operator_result_type(expr, &left_type, &right_type)
             }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
@@ -458,31 +481,40 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn validate_expression_columns(&self, table: &Table, expr: &Expr) -> Result<()> {
-        match expr {
-            Expr::Identifier(identifier) => {
-                let _ = self.resolve_column(table, identifier.as_str())?;
-            }
-            Expr::Binary { left, right, .. } => {
-                self.validate_expression_columns(table, left)?;
-                self.validate_expression_columns(table, right)?;
-            }
-            Expr::Call { args, .. } => {
-                for arg in args {
-                    self.validate_expression_columns(table, arg)?;
-                }
-            }
-            Expr::Array(values) => {
-                for value in values {
-                    self.validate_expression_columns(table, value)?;
-                }
-            }
-            Expr::Range { lower, upper, .. } => {
-                self.validate_expression_columns(table, lower)?;
-                self.validate_expression_columns(table, upper)?;
-            }
-            Expr::Integer(_) | Expr::String(_) | Expr::Null | Expr::HStore(_) => {}
+    fn infer_operator_result_type(
+        &self,
+        expr: &Expr,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        let Expr::Binary { op, .. } = expr else {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "operator inference requires binary expression",
+            ));
+        };
+
+        if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+            return Ok(Some(SqlType::Bool));
         }
-        Ok(())
+
+        let operator = self
+            .catalog
+            .operators()
+            .iter()
+            .find(|operator| {
+                let signature = operator.signature();
+                signature.symbol() == op
+                    && signature.left_type() == left_type
+                    && signature.right_type() == right_type
+            })
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("operator does not exist: {left_type:?} {op} {right_type:?}"),
+                )
+            })?;
+
+        Ok(Some(operator.signature().result_type().clone()))
     }
 }
