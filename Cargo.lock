@@ -237,6 +237,16 @@ name = "rnovdb-common"
 version = "0.1.0"
 
 [[package]]
+name = "rnovdb-planner"
+version = "0.1.0"
+dependencies = [
+ "rnovdb-catalog",
+ "rnovdb-common",
+ "rnovdb-sql",
+ "rnovdb-types",
+]
+
+[[package]]
 name = "rnovdb-sql"
 version = "0.1.0"
 dependencies = [
