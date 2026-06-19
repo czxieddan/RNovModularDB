@@ -251,6 +251,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rnovdb-index"
+version = "0.1.0"
+dependencies = [
+ "rnovdb-common",
+]
+
+[[package]]
 name = "rnovdb-planner"
 version = "0.1.0"
 dependencies = [
