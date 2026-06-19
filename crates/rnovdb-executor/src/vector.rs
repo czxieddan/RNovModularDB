@@ -64,6 +64,10 @@ impl Row {
         self.values[index] = value;
     }
 
+    pub(crate) fn push_value(&mut self, value: SqlValue) {
+        self.values.push(value);
+    }
+
     fn project(&self, indexes: &[usize]) -> Self {
         Self {
             values: indexes

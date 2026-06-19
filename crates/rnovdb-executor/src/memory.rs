@@ -40,6 +40,19 @@ impl MemoryTable {
         VectorBatch::new(self.columns.clone(), self.rows.clone())
             .expect("stored rows are validated on insert")
     }
+
+    fn add_column(&mut self, column: ColumnSchema) -> Result<()> {
+        let mut columns = self.columns.clone();
+        columns.push(column);
+        let mut rows = self.rows.clone();
+        for row in &mut rows {
+            row.push_value(SqlValue::Null);
+        }
+        let _ = VectorBatch::new(columns.clone(), rows.clone())?;
+        self.columns = columns;
+        self.rows = rows;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +114,25 @@ impl MemoryExecutor {
             LogicalPlan::CreateTable { table, columns } => {
                 self.create_table(table, columns)?;
                 Ok(ExecutionResult::SchemaChanged)
+            }
+            LogicalPlan::AlterTableAddColumn { table, column, .. } => {
+                let table = self.tables.get_mut(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                table.add_column(column_schema_from_def(column))?;
+                Ok(ExecutionResult::SchemaChanged)
+            }
+            LogicalPlan::DropTable {
+                table, if_exists, ..
+            } => {
+                if self.tables.remove(table).is_some() || *if_exists {
+                    Ok(ExecutionResult::SchemaChanged)
+                } else {
+                    Err(RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("table not found: {table}"),
+                    ))
+                }
             }
             LogicalPlan::Insert {
                 table,
