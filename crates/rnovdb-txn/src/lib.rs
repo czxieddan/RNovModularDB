@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rnovdb_common::{
     ErrorKind, Result, RnovError,
-    ids::{SnapshotId, TransactionId},
+    ids::{RelationId, SnapshotId, TransactionId},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +130,110 @@ impl<T> Version<T> {
             && self
                 .deleted_by
                 .is_none_or(|deleted_by| !snapshot.is_committed(deleted_by))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LockTarget {
+    Row {
+        relation_id: RelationId,
+        row_id: u64,
+    },
+}
+
+impl LockTarget {
+    pub fn row(relation_id: RelationId, row_id: u64) -> Self {
+        Self::Row {
+            relation_id,
+            row_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockResult {
+    Acquired,
+    Waiting { blocking: TransactionId },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LockManager {
+    exclusive: BTreeMap<LockTarget, TransactionId>,
+    waits_for: BTreeMap<TransactionId, BTreeSet<TransactionId>>,
+}
+
+impl LockManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn acquire_exclusive(
+        &mut self,
+        transaction_id: TransactionId,
+        target: LockTarget,
+    ) -> Result<LockResult> {
+        match self.exclusive.get(&target).copied() {
+            None => {
+                self.exclusive.insert(target, transaction_id);
+                self.clear_wait(transaction_id);
+                Ok(LockResult::Acquired)
+            }
+            Some(holder) if holder == transaction_id => Ok(LockResult::Acquired),
+            Some(holder) => {
+                self.waits_for
+                    .entry(transaction_id)
+                    .or_default()
+                    .insert(holder);
+                if self.has_wait_path(holder, transaction_id) {
+                    self.remove_wait_edge(transaction_id, holder);
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("deadlock detected between {transaction_id} and {holder}"),
+                    ));
+                }
+                Ok(LockResult::Waiting { blocking: holder })
+            }
+        }
+    }
+
+    pub fn release_all(&mut self, transaction_id: TransactionId) {
+        self.exclusive.retain(|_, holder| *holder != transaction_id);
+        self.waits_for.remove(&transaction_id);
+        for blockers in self.waits_for.values_mut() {
+            blockers.remove(&transaction_id);
+        }
+    }
+
+    fn clear_wait(&mut self, transaction_id: TransactionId) {
+        self.waits_for.remove(&transaction_id);
+    }
+
+    fn remove_wait_edge(&mut self, waiter: TransactionId, blocker: TransactionId) {
+        if let Some(blockers) = self.waits_for.get_mut(&waiter) {
+            blockers.remove(&blocker);
+            if blockers.is_empty() {
+                self.waits_for.remove(&waiter);
+            }
+        }
+    }
+
+    fn has_wait_path(&self, start: TransactionId, target: TransactionId) -> bool {
+        let mut stack = vec![start];
+        let mut seen = BTreeSet::new();
+
+        while let Some(current) = stack.pop() {
+            if current == target {
+                return true;
+            }
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(next) = self.waits_for.get(&current) {
+                stack.extend(next.iter().copied());
+            }
+        }
+
+        false
     }
 }
 
