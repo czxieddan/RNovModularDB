@@ -9,7 +9,7 @@ pub enum LogicalPlan {
         table: String,
     },
     Filter {
-        predicate: String,
+        predicate: Expr,
         input: Box<LogicalPlan>,
     },
     Project {
@@ -91,7 +91,7 @@ impl LogicalPlanner {
                 };
                 if let Some(predicate) = &select.selection {
                     plan = LogicalPlan::Filter {
-                        predicate: predicate.to_string(),
+                        predicate: predicate.clone(),
                         input: Box::new(plan),
                     };
                 }

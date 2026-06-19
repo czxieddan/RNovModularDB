@@ -241,6 +241,8 @@ name = "rnovdb-executor"
 version = "0.1.0"
 dependencies = [
  "rnovdb-common",
+ "rnovdb-planner",
+ "rnovdb-sql",
  "rnovdb-types",
 ]
 
