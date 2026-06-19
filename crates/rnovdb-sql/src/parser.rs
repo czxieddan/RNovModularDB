@@ -4,7 +4,8 @@ use rnovdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, ColumnDef, Expr, Ident, ObjectName, SelectItem, Statement, TransactionAction,
+        Assignment, ColumnDef, Expr, Ident, ObjectName, RangeLiteralBounds, SelectItem, Statement,
+        TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -304,6 +305,10 @@ impl Parser {
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
         let first = self.parse_ident()?;
+        self.parse_object_name_from_first(first)
+    }
+
+    fn parse_object_name_from_first(&mut self, first: Ident) -> Result<ObjectName> {
         if self.consume_if(&TokenKind::Dot) {
             let second = self.parse_ident()?;
             Ok(ObjectName::qualified(first.as_str(), second.as_str()))
@@ -380,7 +385,25 @@ impl Parser {
     fn parse_primary_expr(&mut self) -> Result<Expr> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Identifier(_)) => {
-                let name = self.parse_object_name()?;
+                let first = self.parse_ident()?;
+                if first.as_str() == "array" && self.consume_if(&TokenKind::LeftBracket) {
+                    let values = if self.consume_if(&TokenKind::RightBracket) {
+                        Vec::new()
+                    } else {
+                        let values = self.parse_expr_list()?;
+                        self.expect_keyword(TokenKind::RightBracket)?;
+                        values
+                    };
+                    return Ok(Expr::Array(values));
+                }
+                if first.as_str() == "hstore" && self.consume_if(&TokenKind::LeftParen) {
+                    return self.parse_hstore_literal_tail();
+                }
+                if first.as_str() == "range" && self.consume_if(&TokenKind::LeftParen) {
+                    return self.parse_range_literal_tail();
+                }
+
+                let name = self.parse_object_name_from_first(first)?;
                 if self.consume_if(&TokenKind::LeftParen) {
                     let args = if self.consume_if(&TokenKind::RightParen) {
                         Vec::new()
@@ -413,17 +436,66 @@ impl Parser {
         }
     }
 
+    fn parse_hstore_literal_tail(&mut self) -> Result<Expr> {
+        let mut entries = Vec::new();
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(Expr::HStore(entries));
+        }
+
+        loop {
+            let key = self.parse_string_literal("hstore key")?;
+            self.expect_operator("=>")?;
+            let value = if self.consume_if(&TokenKind::Null) {
+                None
+            } else {
+                Some(self.parse_string_literal("hstore value")?)
+            };
+            entries.push((key, value));
+
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::HStore(entries))
+    }
+
+    fn parse_range_literal_tail(&mut self) -> Result<Expr> {
+        let lower = self.parse_expr()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        let upper = self.parse_expr()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        let raw_bounds = self.parse_string_literal("range bounds")?;
+        let bounds = RangeLiteralBounds::parse(&raw_bounds)
+            .ok_or_else(|| self.error("range bounds must be one of [], [), (], ()"))?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::Range {
+            lower: Box::new(lower),
+            upper: Box::new(upper),
+            bounds,
+        })
+    }
+
     fn parse_type(&mut self) -> Result<SqlType> {
         let type_name = self.parse_ident()?;
-        let mut data_type = match type_name.as_str() {
-            "bool" | "boolean" => SqlType::Bool,
-            "int64" | "bigint" | "integer" => SqlType::Int64,
-            "uint64" => SqlType::UInt64,
-            "text" | "string" | "varchar" => SqlType::Text,
-            "bytes" | "bytea" => SqlType::Bytes,
-            "hstore" => SqlType::HStore,
-            "textvector" | "tsvector" => SqlType::TextVector,
-            unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
+        let mut data_type = if type_name.as_str() == "range" {
+            self.expect_operator("<")?;
+            let element_type = self.parse_type()?;
+            self.expect_operator(">")?;
+            SqlType::Range(Box::new(element_type))
+        } else {
+            match type_name.as_str() {
+                "bool" | "boolean" => SqlType::Bool,
+                "int64" | "bigint" | "integer" => SqlType::Int64,
+                "uint64" => SqlType::UInt64,
+                "text" | "string" | "varchar" => SqlType::Text,
+                "bytes" | "bytea" => SqlType::Bytes,
+                "hstore" => SqlType::HStore,
+                "textvector" | "tsvector" => SqlType::TextVector,
+                unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
+            }
         };
 
         while self.consume_if(&TokenKind::LeftBracket) {
@@ -432,6 +504,17 @@ impl Parser {
         }
 
         Ok(data_type)
+    }
+
+    fn parse_string_literal(&mut self, name: &'static str) -> Result<String> {
+        match self.peek_kind().cloned() {
+            Some(TokenKind::String(value)) => {
+                self.bump();
+                Ok(value)
+            }
+            Some(kind) => Err(self.error(format!("expected {name} but found {kind:?}"))),
+            None => Err(self.error(format!("expected {name}"))),
+        }
     }
 
     fn parse_privilege(&mut self) -> Result<Privilege> {

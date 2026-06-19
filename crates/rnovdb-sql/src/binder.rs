@@ -383,6 +383,48 @@ impl<'a> Binder<'a> {
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::Array(values) => {
+                let mut element_type = None;
+                for value in values {
+                    let Some(value_type) = self.infer_expr_type(table, value)? else {
+                        return Ok(None);
+                    };
+                    if value_type == SqlType::Null {
+                        continue;
+                    }
+                    match &element_type {
+                        Some(existing) if *existing != value_type => {
+                            return Err(RnovError::new(
+                                ErrorKind::InvalidInput,
+                                "array literal contains mixed element types",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => element_type = Some(value_type),
+                    }
+                }
+                Ok(Some(SqlType::Array(Box::new(
+                    element_type.unwrap_or(SqlType::Null),
+                ))))
+            }
+            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
+            Expr::Range { lower, upper, .. } => {
+                let lower_type = self.infer_expr_type(table, lower)?.unwrap_or(SqlType::Null);
+                let upper_type = self.infer_expr_type(table, upper)?.unwrap_or(SqlType::Null);
+                let element_type = match (lower_type, upper_type) {
+                    (SqlType::Null, SqlType::Null) => SqlType::Null,
+                    (SqlType::Null, upper_type) => upper_type,
+                    (lower_type, SqlType::Null) => lower_type,
+                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
+                    _ => {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "range literal bounds have different types",
+                        ));
+                    }
+                };
+                Ok(Some(SqlType::Range(Box::new(element_type))))
+            }
             Expr::Binary { left, right, .. } => {
                 let _ = self.infer_expr_type(table, left)?;
                 let _ = self.infer_expr_type(table, right)?;
@@ -430,7 +472,16 @@ impl<'a> Binder<'a> {
                     self.validate_expression_columns(table, arg)?;
                 }
             }
-            Expr::Integer(_) | Expr::String(_) | Expr::Null => {}
+            Expr::Array(values) => {
+                for value in values {
+                    self.validate_expression_columns(table, value)?;
+                }
+            }
+            Expr::Range { lower, upper, .. } => {
+                self.validate_expression_columns(table, lower)?;
+                self.validate_expression_columns(table, upper)?;
+            }
+            Expr::Integer(_) | Expr::String(_) | Expr::Null | Expr::HStore(_) => {}
         }
         Ok(())
     }

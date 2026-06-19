@@ -90,6 +90,13 @@ pub enum Expr {
     Integer(i64),
     String(String),
     Null,
+    Array(Vec<Expr>),
+    HStore(Vec<(String, Option<String>)>),
+    Range {
+        lower: Box<Expr>,
+        upper: Box<Expr>,
+        bounds: RangeLiteralBounds,
+    },
     Binary {
         left: Box<Expr>,
         op: String,
@@ -101,6 +108,46 @@ pub enum Expr {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RangeLiteralBounds {
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+}
+
+impl RangeLiteralBounds {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let bytes = raw.as_bytes();
+        if bytes.len() != 2 {
+            return None;
+        }
+
+        let lower_inclusive = match bytes[0] {
+            b'[' => true,
+            b'(' => false,
+            _ => return None,
+        };
+        let upper_inclusive = match bytes[1] {
+            b']' => true,
+            b')' => false,
+            _ => return None,
+        };
+
+        Some(Self {
+            lower_inclusive,
+            upper_inclusive,
+        })
+    }
+
+    fn as_str(self) -> &'static str {
+        match (self.lower_inclusive, self.upper_inclusive) {
+            (true, true) => "[]",
+            (true, false) => "[)",
+            (false, true) => "(]",
+            (false, false) => "()",
+        }
+    }
+}
+
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -108,6 +155,36 @@ impl fmt::Display for Expr {
             Self::Integer(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
             Self::Null => f.write_str("NULL"),
+            Self::Array(values) => {
+                f.write_str("ARRAY[")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                f.write_str("]")
+            }
+            Self::HStore(entries) => {
+                f.write_str("HSTORE(")?;
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "'{}' => ", key.replace('\'', "''"))?;
+                    if let Some(value) = value {
+                        write!(f, "'{}'", value.replace('\'', "''"))?;
+                    } else {
+                        f.write_str("NULL")?;
+                    }
+                }
+                f.write_str(")")
+            }
+            Self::Range {
+                lower,
+                upper,
+                bounds,
+            } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
             Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;
