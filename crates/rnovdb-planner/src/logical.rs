@@ -21,6 +21,17 @@ pub enum LogicalPlan {
         columns: Vec<String>,
         values: Vec<Expr>,
     },
+    Update {
+        relation_id: RelationId,
+        table: String,
+        assignments: Vec<(String, Expr)>,
+        selection: Option<Expr>,
+    },
+    Delete {
+        relation_id: RelationId,
+        table: String,
+        selection: Option<Expr>,
+    },
     CreateTable {
         table: String,
         columns: Vec<String>,
@@ -84,6 +95,21 @@ impl LogicalPlanner {
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
                 values: values.clone(),
             }),
+            BoundStatement::Update(update) => Ok(LogicalPlan::Update {
+                relation_id: update.relation_id,
+                table: object_name(&update.table),
+                assignments: update
+                    .assignments
+                    .iter()
+                    .map(|assignment| (assignment.column.name.clone(), assignment.value.clone()))
+                    .collect(),
+                selection: update.selection.clone(),
+            }),
+            BoundStatement::Delete(delete) => Ok(LogicalPlan::Delete {
+                relation_id: delete.relation_id,
+                table: object_name(&delete.table),
+                selection: delete.selection.clone(),
+            }),
             BoundStatement::Select(select) => {
                 let mut plan = LogicalPlan::Scan {
                     relation_id: select.relation_id,
@@ -104,9 +130,7 @@ impl LogicalPlanner {
                     input: Box::new(plan),
                 })
             }
-            BoundStatement::Update(_)
-            | BoundStatement::Delete(_)
-            | BoundStatement::CreateFunction { .. }
+            BoundStatement::CreateFunction { .. }
             | BoundStatement::CreateOperator { .. }
             | BoundStatement::CreateRole { .. }
             | BoundStatement::CreatePolicy { .. }
