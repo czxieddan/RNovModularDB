@@ -4,7 +4,9 @@ use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
 use rnovdb_planner::logical::LogicalPlan;
 use rnovdb_sql::ast::Expr;
-use rnovdb_types::SqlValue;
+use rnovdb_types::{
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
+};
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
 
@@ -199,9 +201,103 @@ fn literal_value(expr: &Expr) -> Result<SqlValue> {
         Expr::Integer(value) => Ok(SqlValue::Int64(*value)),
         Expr::String(value) => Ok(SqlValue::Text(value.clone())),
         Expr::Null => Ok(SqlValue::Null),
+        Expr::Array(values) => array_literal_value(values),
+        Expr::HStore(entries) => hstore_literal_value(entries),
+        Expr::Range {
+            lower,
+            upper,
+            bounds,
+        } => range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
-            format!("unsupported memory filter literal: {expr}"),
+            format!("unsupported memory literal: {expr}"),
         )),
+    }
+}
+
+fn array_literal_value(values: &[Expr]) -> Result<SqlValue> {
+    let mut converted = Vec::with_capacity(values.len());
+    let mut element_type = None;
+
+    for expr in values {
+        let value = literal_value(expr)?;
+        if !value.is_null() {
+            let value_type = value.data_type();
+            match &element_type {
+                Some(existing) if *existing != value_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "array literal contains mixed element types",
+                    ));
+                }
+                Some(_) => {}
+                None => element_type = Some(value_type),
+            }
+        }
+        converted.push(value);
+    }
+
+    let dimension = ArrayDimension::new(1, converted.len())?;
+    Ok(SqlValue::Array(SqlArray::new(
+        element_type.unwrap_or(SqlType::Null),
+        vec![dimension],
+        converted,
+    )?))
+}
+
+fn hstore_literal_value(entries: &[(String, Option<String>)]) -> Result<SqlValue> {
+    let entries = entries.iter().map(|(key, value)| {
+        (
+            key.clone(),
+            value
+                .as_ref()
+                .map_or(HStoreValue::Null, |value| HStoreValue::Text(value.clone())),
+        )
+    });
+    Ok(SqlValue::HStore(HStore::from_entries(entries)?))
+}
+
+fn range_literal_value(
+    lower: &Expr,
+    upper: &Expr,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> Result<SqlValue> {
+    let lower = literal_value(lower)?;
+    let upper = literal_value(upper)?;
+    let element_type = range_element_type(&lower, &upper)?;
+    let lower_bound = range_bound(lower, lower_inclusive);
+    let upper_bound = range_bound(upper, upper_inclusive);
+
+    Ok(SqlValue::Range(SqlRange::new(
+        element_type,
+        lower_bound,
+        upper_bound,
+    )?))
+}
+
+fn range_element_type(lower: &SqlValue, upper: &SqlValue) -> Result<SqlType> {
+    match (lower, upper) {
+        (SqlValue::Null, SqlValue::Null) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range literal requires at least one typed bound",
+        )),
+        (SqlValue::Null, upper) => Ok(upper.data_type()),
+        (lower, SqlValue::Null) => Ok(lower.data_type()),
+        (lower, upper) if lower.data_type() == upper.data_type() => Ok(lower.data_type()),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range literal bounds have different types",
+        )),
+    }
+}
+
+fn range_bound(value: SqlValue, inclusive: bool) -> RangeBound {
+    if value.is_null() {
+        RangeBound::Unbounded
+    } else if inclusive {
+        RangeBound::Included(value)
+    } else {
+        RangeBound::Excluded(value)
     }
 }
