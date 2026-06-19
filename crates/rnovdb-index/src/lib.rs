@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rnovdb_common::{ErrorKind, Result, RnovError, ids::PageId};
-use rnovdb_types::TextVector;
+use rnovdb_types::{HStore, HStoreValue, SqlArray, SqlValue, TextVector};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IndexKey {
@@ -146,5 +146,100 @@ impl InvertedTextIndex {
         }
 
         matches.into_iter().collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InvertedValueIndex {
+    name: String,
+    tokens: BTreeMap<ValueToken, BTreeSet<IndexPointer>>,
+}
+
+impl InvertedValueIndex {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tokens: BTreeMap::new(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn insert_array(&mut self, pointer: IndexPointer, array: &SqlArray) -> Result<()> {
+        if array.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot index an empty array",
+            ));
+        }
+        for value in array.values() {
+            self.insert_token(ValueToken::ArrayValue(value.encode()), pointer);
+        }
+        Ok(())
+    }
+
+    pub fn insert_hstore(&mut self, pointer: IndexPointer, hstore: &HStore) -> Result<()> {
+        if hstore.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot index an empty hstore",
+            ));
+        }
+        for (key, value) in hstore.iter() {
+            self.insert_token(ValueToken::HStoreKey(key.clone()), pointer);
+            self.insert_token(
+                ValueToken::HStorePair(key.clone(), hstore_value_token(value)),
+                pointer,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn lookup_array_value(&self, value: &SqlValue) -> Vec<IndexPointer> {
+        self.lookup_token(&ValueToken::ArrayValue(value.encode()))
+    }
+
+    pub fn lookup_hstore_key(&self, key: &str) -> Vec<IndexPointer> {
+        self.lookup_token(&ValueToken::HStoreKey(key.to_string()))
+    }
+
+    pub fn lookup_hstore_pair(&self, key: &str, value: &HStoreValue) -> Vec<IndexPointer> {
+        self.lookup_token(&ValueToken::HStorePair(
+            key.to_string(),
+            hstore_value_token(value),
+        ))
+    }
+
+    fn insert_token(&mut self, token: ValueToken, pointer: IndexPointer) {
+        self.tokens.entry(token).or_default().insert(pointer);
+    }
+
+    fn lookup_token(&self, token: &ValueToken) -> Vec<IndexPointer> {
+        self.tokens
+            .get(token)
+            .map(|pointers| pointers.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ValueToken {
+    ArrayValue(Vec<u8>),
+    HStoreKey(String),
+    HStorePair(String, HStoreValueToken),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum HStoreValueToken {
+    Null,
+    Text(String),
+}
+
+fn hstore_value_token(value: &HStoreValue) -> HStoreValueToken {
+    match value {
+        HStoreValue::Null => HStoreValueToken::Null,
+        HStoreValue::Text(text) => HStoreValueToken::Text(text.clone()),
     }
 }
