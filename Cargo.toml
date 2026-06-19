@@ -7,6 +7,7 @@ members = [
     "crates/rnovdb-executor",
     "crates/rnovdb-txn",
     "crates/rnovdb-index",
+    "crates/rnovdb-fts",
     "crates/rnovdb-catalog",
     "crates/rnovdb-storage",
     "crates/rnovdb-cli",
@@ -26,5 +27,6 @@ rnovdb-planner = { path = "crates/rnovdb-planner" }
 rnovdb-executor = { path = "crates/rnovdb-executor" }
 rnovdb-txn = { path = "crates/rnovdb-txn" }
 rnovdb-index = { path = "crates/rnovdb-index" }
+rnovdb-fts = { path = "crates/rnovdb-fts" }
 rnovdb-catalog = { path = "crates/rnovdb-catalog" }
 rnovdb-storage = { path = "crates/rnovdb-storage" }

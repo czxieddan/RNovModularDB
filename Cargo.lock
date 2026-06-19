@@ -251,6 +251,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rnovdb-fts"
+version = "0.1.0"
+dependencies = [
+ "rnovdb-common",
+ "rnovdb-types",
+]
+
+[[package]]
 name = "rnovdb-index"
 version = "0.1.0"
 dependencies = [
