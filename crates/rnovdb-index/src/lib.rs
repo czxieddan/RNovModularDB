@@ -448,3 +448,149 @@ impl MemoryBoundsIndex {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRange {
+    start_page: PageId,
+    end_page: PageId,
+}
+
+impl BlockRange {
+    pub fn new(start_page: PageId, end_page: PageId) -> Result<Self> {
+        if start_page > end_page {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "page range start cannot exceed end",
+            ));
+        }
+        Ok(Self {
+            start_page,
+            end_page,
+        })
+    }
+
+    pub fn start_page(self) -> PageId {
+        self.start_page
+    }
+
+    pub fn end_page(self) -> PageId {
+        self.end_page
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockSummaryIndex {
+    name: String,
+    key_family: Option<IndexKeyFamily>,
+    summaries: Vec<BlockSummary>,
+}
+
+impl BlockSummaryIndex {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            key_family: None,
+            summaries: Vec::new(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn insert_summary(
+        &mut self,
+        pages: BlockRange,
+        min_key: IndexKey,
+        max_key: IndexKey,
+    ) -> Result<()> {
+        let family = ensure_same_key_family(&min_key, &max_key)?;
+        if min_key > max_key {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "summary lower key cannot exceed upper key",
+            ));
+        }
+        self.ensure_family(family)?;
+        self.summaries.push(BlockSummary {
+            pages,
+            min_key,
+            max_key,
+        });
+        Ok(())
+    }
+
+    pub fn range_candidates(&self, lower: &IndexKey, upper: &IndexKey) -> Result<Vec<BlockRange>> {
+        let family = ensure_same_key_family(lower, upper)?;
+        if lower > upper {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "query lower key cannot exceed upper key",
+            ));
+        }
+        self.ensure_query_family(family)?;
+
+        Ok(self
+            .summaries
+            .iter()
+            .filter(|summary| summary.max_key >= *lower && summary.min_key <= *upper)
+            .map(|summary| summary.pages)
+            .collect())
+    }
+
+    fn ensure_family(&mut self, family: IndexKeyFamily) -> Result<()> {
+        match self.key_family {
+            Some(existing) if existing != family => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "summary key family does not match index",
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.key_family = Some(family);
+                Ok(())
+            }
+        }
+    }
+
+    fn ensure_query_family(&self, family: IndexKeyFamily) -> Result<()> {
+        match self.key_family {
+            Some(existing) if existing != family => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "summary query key family does not match index",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BlockSummary {
+    pages: BlockRange,
+    min_key: IndexKey,
+    max_key: IndexKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexKeyFamily {
+    Int64,
+    Text,
+}
+
+fn ensure_same_key_family(left: &IndexKey, right: &IndexKey) -> Result<IndexKeyFamily> {
+    let left_family = index_key_family(left);
+    let right_family = index_key_family(right);
+    if left_family != right_family {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "index key family mismatch",
+        ));
+    }
+    Ok(left_family)
+}
+
+fn index_key_family(key: &IndexKey) -> IndexKeyFamily {
+    match key {
+        IndexKey::Int64(_) => IndexKeyFamily::Int64,
+        IndexKey::Text(_) => IndexKeyFamily::Text,
+    }
+}
