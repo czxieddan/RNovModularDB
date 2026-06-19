@@ -19,7 +19,7 @@ pub enum LogicalPlan {
     Insert {
         table: String,
         columns: Vec<String>,
-        values: Vec<String>,
+        values: Vec<Expr>,
     },
     CreateTable {
         table: String,
@@ -82,7 +82,7 @@ impl LogicalPlanner {
             } => Ok(LogicalPlan::Insert {
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
-                values: values.iter().map(Expr::to_string).collect(),
+                values: values.clone(),
             }),
             BoundStatement::Select(select) => {
                 let mut plan = LogicalPlan::Scan {

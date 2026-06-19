@@ -23,6 +23,10 @@ impl MemoryTable {
         })
     }
 
+    pub fn columns(&self) -> &[ColumnSchema] {
+        &self.columns
+    }
+
     pub fn insert(&mut self, row: Row) -> Result<()> {
         let batch = VectorBatch::new(self.columns.clone(), vec![row.clone()])?;
         self.rows
@@ -39,6 +43,12 @@ impl MemoryTable {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryExecutor {
     tables: BTreeMap<String, MemoryTable>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionResult {
+    Batch(VectorBatch),
+    RowsAffected(u64),
 }
 
 impl MemoryExecutor {
@@ -82,6 +92,69 @@ impl MemoryExecutor {
             )),
         }
     }
+
+    pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        match plan {
+            LogicalPlan::Insert {
+                table,
+                columns,
+                values,
+            } => {
+                let table = self.tables.get_mut(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                insert_values(table, columns, values)?;
+                Ok(ExecutionResult::RowsAffected(1))
+            }
+            _ => self.execute(plan).map(ExecutionResult::Batch),
+        }
+    }
+}
+
+fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -> Result<()> {
+    if columns.len() != values.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "insert column count {} does not match value count {}",
+                columns.len(),
+                values.len()
+            ),
+        ));
+    }
+
+    for (index, column) in columns.iter().enumerate() {
+        if columns[..index].iter().any(|existing| existing == column) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate insert column: {column}"),
+            ));
+        }
+        if !table
+            .columns()
+            .iter()
+            .any(|table_column| table_column.name() == column)
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("column not found: {column}"),
+            ));
+        }
+    }
+
+    let mut row_values = Vec::with_capacity(table.columns().len());
+    for table_column in table.columns() {
+        let value = match columns
+            .iter()
+            .position(|column| column == table_column.name())
+        {
+            Some(index) => literal_value(&values[index])?,
+            None => SqlValue::Null,
+        };
+        row_values.push(value);
+    }
+
+    table.insert(Row::new(row_values))
 }
 
 fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
