@@ -60,6 +60,10 @@ impl Row {
         &self.values
     }
 
+    pub(crate) fn set_value(&mut self, index: usize, value: SqlValue) {
+        self.values[index] = value;
+    }
+
     fn project(&self, indexes: &[usize]) -> Self {
         Self {
             values: indexes

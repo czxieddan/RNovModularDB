@@ -5,7 +5,7 @@ use rnovdb_common::{ErrorKind, RnovError};
 use rnovdb_planner::logical::LogicalPlan;
 use rnovdb_sql::ast::Expr;
 use rnovdb_types::{
-    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
 };
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
@@ -108,9 +108,90 @@ impl MemoryExecutor {
                 insert_values(table, columns, values)?;
                 Ok(ExecutionResult::RowsAffected(1))
             }
+            LogicalPlan::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => {
+                let table = self.tables.get_mut(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                update_rows(table, assignments, selection.as_ref())
+                    .map(ExecutionResult::RowsAffected)
+            }
+            LogicalPlan::Delete {
+                table, selection, ..
+            } => {
+                let table = self.tables.get_mut(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                delete_rows(table, selection.as_ref()).map(ExecutionResult::RowsAffected)
+            }
             _ => self.execute(plan).map(ExecutionResult::Batch),
         }
     }
+}
+
+fn update_rows(
+    table: &mut MemoryTable,
+    assignments: &[(String, Expr)],
+    selection: Option<&Expr>,
+) -> Result<u64> {
+    let columns = table.columns.clone();
+    let assignments = compile_assignments(&columns, assignments)?;
+    let mut affected = 0;
+
+    for row in &mut table.rows {
+        if row_matches(&columns, row, selection)? {
+            let mut updated = row.clone();
+            for (index, value) in &assignments {
+                updated.set_value(*index, value.clone());
+            }
+            VectorBatch::new(columns.clone(), vec![updated.clone()])?;
+            *row = updated;
+            affected += 1;
+        }
+    }
+
+    Ok(affected)
+}
+
+fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64> {
+    let columns = table.columns.clone();
+    let mut kept = Vec::with_capacity(table.rows.len());
+    let mut affected = 0;
+
+    for row in table.rows.drain(..) {
+        if row_matches(&columns, &row, selection)? {
+            affected += 1;
+        } else {
+            kept.push(row);
+        }
+    }
+
+    table.rows = kept;
+    Ok(affected)
+}
+
+fn compile_assignments(
+    columns: &[ColumnSchema],
+    assignments: &[(String, Expr)],
+) -> Result<Vec<(usize, SqlValue)>> {
+    let mut compiled = Vec::with_capacity(assignments.len());
+    for (index, (column, value)) in assignments.iter().enumerate() {
+        if assignments[..index]
+            .iter()
+            .any(|(existing, _)| existing == column)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate update column: {column}"),
+            ));
+        }
+        compiled.push((column_index(columns, column)?, literal_value(value)?));
+    }
+    Ok(compiled)
 }
 
 fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -> Result<()> {
@@ -132,16 +213,7 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
                 format!("duplicate insert column: {column}"),
             ));
         }
-        if !table
-            .columns()
-            .iter()
-            .any(|table_column| table_column.name() == column)
-        {
-            return Err(RnovError::new(
-                ErrorKind::NotFound,
-                format!("column not found: {column}"),
-            ));
-        }
+        let _ = column_index(table.columns(), column)?;
     }
 
     let mut row_values = Vec::with_capacity(table.columns().len());
@@ -187,6 +259,55 @@ fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
         ErrorKind::InvalidInput,
         "memory filter requires one column and one literal",
     ))
+}
+
+fn row_matches(columns: &[ColumnSchema], row: &Row, selection: Option<&Expr>) -> Result<bool> {
+    let Some(selection) = selection else {
+        return Ok(true);
+    };
+    let Expr::Binary { left, op, right } = selection else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "row predicate requires a binary expression",
+        ));
+    };
+    if op != "=" {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("row predicate does not support operator {op}"),
+        ));
+    }
+
+    if let Some(column) = column_name(left) {
+        let value = literal_value(right)?;
+        return row_value_equals(columns, row, column, &value);
+    }
+    if let Some(column) = column_name(right) {
+        let value = literal_value(left)?;
+        return row_value_equals(columns, row, column, &value);
+    }
+
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "row predicate requires one column and one literal",
+    ))
+}
+
+fn row_value_equals(
+    columns: &[ColumnSchema],
+    row: &Row,
+    column: &str,
+    expected: &SqlValue,
+) -> Result<bool> {
+    let index = column_index(columns, column)?;
+    Ok(row.values()[index].sql_eq(expected) == Truth::True)
+}
+
+fn column_index(columns: &[ColumnSchema], name: &str) -> Result<usize> {
+    columns
+        .iter()
+        .position(|column| column.name() == name)
+        .ok_or_else(|| RnovError::new(ErrorKind::NotFound, format!("column not found: {name}")))
 }
 
 fn column_name(expr: &Expr) -> Option<&str> {
