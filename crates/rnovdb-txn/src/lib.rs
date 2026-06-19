@@ -137,7 +137,7 @@ impl<T> Version<T> {
 pub struct TransactionManager {
     next_transaction_id: u64,
     next_snapshot_id: u64,
-    states: BTreeMap<TransactionId, TransactionState>,
+    transactions: BTreeMap<TransactionId, TransactionEntry>,
 }
 
 impl Default for TransactionManager {
@@ -151,14 +151,21 @@ impl TransactionManager {
         Self {
             next_transaction_id: 1,
             next_snapshot_id: 1,
-            states: BTreeMap::new(),
+            transactions: BTreeMap::new(),
         }
     }
 
     pub fn begin(&mut self, isolation_level: IsolationLevel) -> Result<Transaction> {
         let id = TransactionId::new(self.next_transaction_id);
         self.next_transaction_id += 1;
-        self.states.insert(id, TransactionState::Active);
+        self.transactions.insert(
+            id,
+            TransactionEntry {
+                state: TransactionState::Active,
+                isolation_level,
+                pinned_snapshot: None,
+            },
+        );
         Ok(Transaction {
             id,
             isolation_level,
@@ -166,7 +173,9 @@ impl TransactionManager {
     }
 
     pub fn state(&self, transaction_id: TransactionId) -> Option<TransactionState> {
-        self.states.get(&transaction_id).copied()
+        self.transactions
+            .get(&transaction_id)
+            .map(|entry| entry.state)
     }
 
     pub fn commit(&mut self, transaction_id: TransactionId) -> Result<()> {
@@ -182,14 +191,14 @@ impl TransactionManager {
         self.next_snapshot_id += 1;
 
         let committed = self
-            .states
+            .transactions
             .iter()
-            .filter_map(|(id, state)| (*state == TransactionState::Committed).then_some(*id))
+            .filter_map(|(id, entry)| (entry.state == TransactionState::Committed).then_some(*id))
             .collect();
         let active = self
-            .states
+            .transactions
             .iter()
-            .filter_map(|(id, state)| (*state == TransactionState::Active).then_some(*id))
+            .filter_map(|(id, entry)| (entry.state == TransactionState::Active).then_some(*id))
             .collect();
 
         Ok(Snapshot {
@@ -200,20 +209,64 @@ impl TransactionManager {
         })
     }
 
-    fn finish(&mut self, transaction_id: TransactionId, new_state: TransactionState) -> Result<()> {
-        let state = self.states.get_mut(&transaction_id).ok_or_else(|| {
-            RnovError::new(
-                ErrorKind::NotFound,
-                format!("transaction not found: {transaction_id}"),
+    pub fn snapshot_for(&mut self, transaction_id: TransactionId) -> Result<Snapshot> {
+        let (state, isolation_level, pinned_snapshot) = {
+            let entry = self.transactions.get(&transaction_id).ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("transaction not found: {transaction_id}"),
+                )
+            })?;
+            (
+                entry.state,
+                entry.isolation_level,
+                entry.pinned_snapshot.clone(),
             )
-        })?;
-        if *state != TransactionState::Active {
+        };
+        if state != TransactionState::Active {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("transaction is not active: {transaction_id}"),
             ));
         }
-        *state = new_state;
+
+        match isolation_level {
+            IsolationLevel::ReadCommitted => self.snapshot(isolation_level),
+            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+                if let Some(snapshot) = pinned_snapshot {
+                    return Ok(snapshot);
+                }
+                let snapshot = self.snapshot(isolation_level)?;
+                self.transactions
+                    .get_mut(&transaction_id)
+                    .expect("transaction was verified")
+                    .pinned_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+        }
+    }
+
+    fn finish(&mut self, transaction_id: TransactionId, new_state: TransactionState) -> Result<()> {
+        let entry = self.transactions.get_mut(&transaction_id).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("transaction not found: {transaction_id}"),
+            )
+        })?;
+        if entry.state != TransactionState::Active {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("transaction is not active: {transaction_id}"),
+            ));
+        }
+        entry.state = new_state;
         Ok(())
     }
+}
+
+#[derive(Clone, Debug)]
+struct TransactionEntry {
+    state: TransactionState,
+    isolation_level: IsolationLevel,
+    pinned_snapshot: Option<Snapshot>,
 }
