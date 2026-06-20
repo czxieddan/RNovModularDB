@@ -221,8 +221,8 @@ fn update_rows(
     for row in &mut table.rows {
         if row_matches(&columns, row, selection)? {
             let mut updated = row.clone();
-            for (index, value) in &assignments {
-                updated.set_value(*index, value.clone());
+            for (index, expr) in &assignments {
+                updated.set_value(*index, eval_expr(&columns, row, expr)?);
             }
             VectorBatch::new(columns.clone(), vec![updated.clone()])?;
             *row = updated;
@@ -253,9 +253,9 @@ fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64>
 fn compile_assignments(
     columns: &[ColumnSchema],
     assignments: &[(String, Expr)],
-) -> Result<Vec<(usize, SqlValue)>> {
+) -> Result<Vec<(usize, Expr)>> {
     let mut compiled = Vec::with_capacity(assignments.len());
-    for (index, (column, value)) in assignments.iter().enumerate() {
+    for (index, (column, expr)) in assignments.iter().enumerate() {
         if assignments[..index]
             .iter()
             .any(|(existing, _)| existing == column)
@@ -265,7 +265,7 @@ fn compile_assignments(
                 format!("duplicate update column: {column}"),
             ));
         }
-        compiled.push((column_index(columns, column)?, literal_value(value)?));
+        compiled.push((column_index(columns, column)?, expr.clone()));
     }
     Ok(compiled)
 }
