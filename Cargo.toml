@@ -10,6 +10,10 @@ members = [
     "crates/rnovdb-fts",
     "crates/rnovdb-catalog",
     "crates/rnovdb-storage",
+    "crates/rnovdb-udf",
+    "crates/rnovdb-security",
+    "crates/rnovdb-instance",
+    "crates/rnovdb-server",
     "crates/rnovdb-cli",
 ]
 resolver = "3"
@@ -30,3 +34,7 @@ rnovdb-index = { path = "crates/rnovdb-index" }
 rnovdb-fts = { path = "crates/rnovdb-fts" }
 rnovdb-catalog = { path = "crates/rnovdb-catalog" }
 rnovdb-storage = { path = "crates/rnovdb-storage" }
+rnovdb-udf = { path = "crates/rnovdb-udf" }
+rnovdb-security = { path = "crates/rnovdb-security" }
+rnovdb-instance = { path = "crates/rnovdb-instance" }
+rnovdb-server = { path = "crates/rnovdb-server" }
