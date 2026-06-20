@@ -98,6 +98,10 @@ impl EmbeddedRuntime {
         self.open_session_with_usage(ResourceUsage::new(0, 0, 1))
     }
 
+    pub async fn open_session_async(&self) -> Result<LocalSession> {
+        self.open_session()
+    }
+
     pub fn open_session_with_usage(&self, usage: ResourceUsage) -> Result<LocalSession> {
         if !self.config.is_memory_only() {
             return Err(RnovError::new(
@@ -107,5 +111,12 @@ impl EmbeddedRuntime {
         }
         self.config.instance().check_resource_usage(&usage)?;
         LocalSession::memory()
+    }
+
+    pub async fn open_session_with_usage_async(
+        &self,
+        usage: ResourceUsage,
+    ) -> Result<LocalSession> {
+        self.open_session_with_usage(usage)
     }
 }
