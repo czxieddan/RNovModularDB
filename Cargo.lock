@@ -272,6 +272,7 @@ version = "0.1.0"
 dependencies = [
  "rnovdb-catalog",
  "rnovdb-common",
+ "rnovdb-fts",
  "rnovdb-sql",
  "rnovdb-types",
 ]
