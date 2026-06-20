@@ -1,7 +1,13 @@
 use std::io::{self, Read};
 
-use rnovdb_cli::{CommandOutput, LocalSession, backup_storage, inspect_storage, verify_storage};
-use rnovdb_storage::{SingleFileBackupReport, SingleFileInspection, SingleFileVerificationReport};
+use rnovdb_cli::{
+    CommandOutput, LocalSession, backup_storage, inspect_storage, restore_storage_dry_run,
+    verify_storage,
+};
+use rnovdb_storage::{
+    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
+    SingleFileVerificationReport,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -33,6 +39,13 @@ fn run_command(args: &[String]) -> rnovdb_common::Result<()> {
             println!(
                 "{}",
                 format_backup_report(&backup_storage(source, destination)?)
+            );
+            Ok(())
+        }
+        [command, dry_run, backup, target] if command == "restore" && dry_run == "--dry-run" => {
+            println!(
+                "{}",
+                format_restore_dry_run(&restore_storage_dry_run(backup, target)?)
             );
             Ok(())
         }
@@ -113,6 +126,19 @@ fn format_verification(report: &SingleFileVerificationReport) -> String {
             "encryption_authenticated: {}",
             report.encryption_authenticated()
         ),
+    ]
+    .join("\n")
+}
+
+fn format_restore_dry_run(report: &SingleFileRestoreDryRun) -> String {
+    [
+        format!("backup: {}", report.backup_path().display()),
+        format!("target: {}", report.target_path().display()),
+        format!("target_exists: {}", report.target_exists()),
+        format!("backup_valid: {}", report.backup_valid()),
+        format!("bytes_to_restore: {}", report.bytes_to_restore()),
+        format!("page_record_slots: {}", report.page_record_slots()),
+        format!("present_page_records: {}", report.present_page_records()),
     ]
     .join("\n")
 }

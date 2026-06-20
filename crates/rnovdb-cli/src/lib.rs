@@ -14,8 +14,9 @@ use rnovdb_sql::{
     parser::parse_statement,
 };
 use rnovdb_storage::{
-    SingleFileBackupReport, SingleFileInspection, SingleFileVerificationReport, backup_single_file,
-    inspect_single_file, verify_single_file,
+    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
+    SingleFileVerificationReport, backup_single_file, inspect_single_file,
+    restore_single_file_dry_run, verify_single_file,
 };
 use rnovdb_types::SqlType;
 
@@ -196,4 +197,11 @@ pub fn backup_storage(
 
 pub fn verify_storage(path: impl AsRef<std::path::Path>) -> Result<SingleFileVerificationReport> {
     verify_single_file(path)
+}
+
+pub fn restore_storage_dry_run(
+    backup: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> Result<SingleFileRestoreDryRun> {
+    restore_single_file_dry_run(backup, target)
 }
