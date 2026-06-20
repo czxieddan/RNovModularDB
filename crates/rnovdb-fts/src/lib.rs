@@ -161,3 +161,291 @@ fn normalize_term(term: &str) -> String {
         .flat_map(char::to_lowercase)
         .collect()
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextQuery {
+    root: TextQueryExpr,
+}
+
+impl TextQuery {
+    pub fn parse(input: &str) -> Result<Self> {
+        let tokens = QueryLexer::new(input).tokenize()?;
+        if tokens.is_empty() {
+            return Err(RnovError::new(ErrorKind::InvalidInput, "empty text query"));
+        }
+
+        let mut parser = QueryParser::new(tokens);
+        let root = parser.parse_expr()?;
+        if !parser.is_finished() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "unexpected text query token",
+            ));
+        }
+        Ok(Self { root })
+    }
+
+    pub fn matches(&self, vector: &TextVector) -> bool {
+        self.root.matches(vector)
+    }
+
+    pub fn required_terms(&self) -> Vec<&str> {
+        let mut terms = BTreeSet::new();
+        self.root.collect_required_terms(&mut terms);
+        terms.into_iter().collect()
+    }
+
+    pub fn optional_terms(&self) -> Vec<&str> {
+        let mut terms = BTreeSet::new();
+        self.root.collect_optional_terms(&mut terms);
+        terms.into_iter().collect()
+    }
+
+    pub fn excluded_terms(&self) -> Vec<&str> {
+        let mut terms = BTreeSet::new();
+        self.root.collect_excluded_terms(&mut terms);
+        terms.into_iter().collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TextQueryExpr {
+    Term(String),
+    And(Box<TextQueryExpr>, Box<TextQueryExpr>),
+    Or(Box<TextQueryExpr>, Box<TextQueryExpr>),
+    Not(Box<TextQueryExpr>),
+}
+
+impl TextQueryExpr {
+    fn matches(&self, vector: &TextVector) -> bool {
+        match self {
+            Self::Term(term) => vector.find(term).is_some(),
+            Self::And(left, right) => left.matches(vector) && right.matches(vector),
+            Self::Or(left, right) => left.matches(vector) || right.matches(vector),
+            Self::Not(expr) => !expr.matches(vector),
+        }
+    }
+
+    fn collect_required_terms<'a>(&'a self, terms: &mut BTreeSet<&'a str>) {
+        match self {
+            Self::Term(term) => {
+                terms.insert(term.as_str());
+            }
+            Self::And(left, right) => {
+                left.collect_required_terms(terms);
+                right.collect_required_terms(terms);
+            }
+            Self::Or(_, _) | Self::Not(_) => {}
+        }
+    }
+
+    fn collect_optional_terms<'a>(&'a self, terms: &mut BTreeSet<&'a str>) {
+        match self {
+            Self::Term(_) | Self::Not(_) => {}
+            Self::And(left, right) => {
+                left.collect_optional_terms(terms);
+                right.collect_optional_terms(terms);
+            }
+            Self::Or(left, right) => {
+                left.collect_positive_terms(terms);
+                right.collect_positive_terms(terms);
+            }
+        }
+    }
+
+    fn collect_excluded_terms<'a>(&'a self, terms: &mut BTreeSet<&'a str>) {
+        match self {
+            Self::Term(_) => {}
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.collect_excluded_terms(terms);
+                right.collect_excluded_terms(terms);
+            }
+            Self::Not(expr) => expr.collect_positive_terms(terms),
+        }
+    }
+
+    fn collect_positive_terms<'a>(&'a self, terms: &mut BTreeSet<&'a str>) {
+        match self {
+            Self::Term(term) => {
+                terms.insert(term.as_str());
+            }
+            Self::And(left, right) | Self::Or(left, right) => {
+                left.collect_positive_terms(terms);
+                right.collect_positive_terms(terms);
+            }
+            Self::Not(_) => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QueryToken {
+    Term(String),
+    And,
+    Or,
+    Not,
+    LeftParen,
+    RightParen,
+}
+
+struct QueryLexer<'a> {
+    input: &'a str,
+}
+
+impl<'a> QueryLexer<'a> {
+    fn new(input: &'a str) -> Self {
+        Self { input }
+    }
+
+    fn tokenize(&self) -> Result<Vec<QueryToken>> {
+        let mut tokens = Vec::new();
+        let mut chars = self.input.chars().peekable();
+
+        while let Some(character) = chars.next() {
+            match character {
+                '&' => tokens.push(QueryToken::And),
+                '|' => tokens.push(QueryToken::Or),
+                '!' => tokens.push(QueryToken::Not),
+                '(' => tokens.push(QueryToken::LeftParen),
+                ')' => tokens.push(QueryToken::RightParen),
+                whitespace if whitespace.is_whitespace() => {}
+                term_start if term_start.is_alphanumeric() => {
+                    let mut term = String::new();
+                    term.extend(term_start.to_lowercase());
+                    while let Some(next) = chars.peek().copied() {
+                        if next.is_alphanumeric() {
+                            chars.next();
+                            term.extend(next.to_lowercase());
+                        } else {
+                            break;
+                        }
+                    }
+                    tokens.push(QueryToken::Term(term));
+                }
+                invalid => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid text query character {invalid:?}"),
+                    ));
+                }
+            }
+        }
+
+        Ok(tokens)
+    }
+}
+
+struct QueryParser {
+    tokens: Vec<QueryToken>,
+    position: usize,
+}
+
+impl QueryParser {
+    fn new(tokens: Vec<QueryToken>) -> Self {
+        Self {
+            tokens,
+            position: 0,
+        }
+    }
+
+    fn parse_expr(&mut self) -> Result<TextQueryExpr> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<TextQueryExpr> {
+        let mut expr = self.parse_and()?;
+        while self.consume_if(QueryTokenKind::Or) {
+            let right = self.parse_and()?;
+            expr = TextQueryExpr::Or(Box::new(expr), Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    fn parse_and(&mut self) -> Result<TextQueryExpr> {
+        let mut expr = self.parse_unary()?;
+        while self.consume_if(QueryTokenKind::And) {
+            let right = self.parse_unary()?;
+            expr = TextQueryExpr::And(Box::new(expr), Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    fn parse_unary(&mut self) -> Result<TextQueryExpr> {
+        if self.consume_if(QueryTokenKind::Not) {
+            return Ok(TextQueryExpr::Not(Box::new(self.parse_unary()?)));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<TextQueryExpr> {
+        let Some(token) = self.advance() else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "incomplete text query",
+            ));
+        };
+
+        match token {
+            QueryToken::Term(term) => Ok(TextQueryExpr::Term(term)),
+            QueryToken::LeftParen => {
+                let expr = self.parse_expr()?;
+                if !self.consume_if(QueryTokenKind::RightParen) {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "missing closing parenthesis in text query",
+                    ));
+                }
+                Ok(expr)
+            }
+            QueryToken::RightParen => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "unexpected closing parenthesis in text query",
+            )),
+            QueryToken::And | QueryToken::Or | QueryToken::Not => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "unexpected text query operator",
+            )),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.position == self.tokens.len()
+    }
+
+    fn advance(&mut self) -> Option<QueryToken> {
+        let token = self.tokens.get(self.position).cloned()?;
+        self.position += 1;
+        Some(token)
+    }
+
+    fn consume_if(&mut self, kind: QueryTokenKind) -> bool {
+        let Some(token) = self.tokens.get(self.position) else {
+            return false;
+        };
+        if kind.matches(token) {
+            self.position += 1;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryTokenKind {
+    And,
+    Or,
+    Not,
+    RightParen,
+}
+
+impl QueryTokenKind {
+    fn matches(self, token: &QueryToken) -> bool {
+        matches!(
+            (self, token),
+            (Self::And, QueryToken::And)
+                | (Self::Or, QueryToken::Or)
+                | (Self::Not, QueryToken::Not)
+                | (Self::RightParen, QueryToken::RightParen)
+        )
+    }
+}
