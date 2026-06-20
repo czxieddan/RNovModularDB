@@ -347,6 +347,96 @@ fn position_score(position: u32) -> u32 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextPhraseQuery {
+    terms: Vec<String>,
+    max_gap: u32,
+}
+
+impl TextPhraseQuery {
+    pub fn exact<I, S>(terms: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::within(terms, 1)
+    }
+
+    pub fn within<I, S>(terms: I, max_gap: u32) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if max_gap == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "phrase position gap must be greater than zero",
+            ));
+        }
+
+        let mut normalized_terms = Vec::new();
+        for term in terms {
+            let normalized = normalize_term(term.as_ref());
+            if normalized.is_empty() {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "phrase term cannot be empty",
+                ));
+            }
+            normalized_terms.push(normalized);
+        }
+        if normalized_terms.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "phrase query must contain at least one term",
+            ));
+        }
+
+        Ok(Self {
+            terms: normalized_terms,
+            max_gap,
+        })
+    }
+
+    pub fn terms(&self) -> &[String] {
+        &self.terms
+    }
+
+    pub fn max_gap(&self) -> u32 {
+        self.max_gap
+    }
+
+    pub fn matches(&self, vector: &TextVector) -> bool {
+        let Some(first_term) = self.terms.first() else {
+            return false;
+        };
+        let Some(first_lexeme) = vector.find(first_term) else {
+            return false;
+        };
+
+        first_lexeme
+            .positions()
+            .iter()
+            .copied()
+            .any(|position| self.matches_from(vector, 1, position))
+    }
+
+    fn matches_from(&self, vector: &TextVector, term_index: usize, previous_position: u32) -> bool {
+        if term_index == self.terms.len() {
+            return true;
+        }
+
+        let Some(lexeme) = vector.find(&self.terms[term_index]) else {
+            return false;
+        };
+        lexeme.positions().iter().copied().any(|position| {
+            position > previous_position
+                && position - previous_position <= self.max_gap
+                && self.matches_from(vector, term_index + 1, position)
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum QueryToken {
     Term(String),
     And,
