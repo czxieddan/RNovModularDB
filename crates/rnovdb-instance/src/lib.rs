@@ -219,9 +219,250 @@ impl InstanceIsolation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceSyncState {
+    MemoryOnly,
+    DiskOnly,
+    HybridSyncing,
+    HybridReady,
+    Switching,
+    Faulted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstanceSyncTarget {
+    Memory,
+    Disk,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchDataMovement {
+    MetadataOnly,
+    PreSynchronized,
+    FullDataMovement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstanceSyncStatus {
+    state: InstanceSyncState,
+    active_target: InstanceSyncTarget,
+    memory_lsn: u64,
+    disk_lsn: u64,
+    dirty_bytes: usize,
+    estimated_flush_bytes: usize,
+}
+
+impl InstanceSyncStatus {
+    pub fn new(
+        state: InstanceSyncState,
+        active_target: InstanceSyncTarget,
+        memory_lsn: u64,
+        disk_lsn: u64,
+        dirty_bytes: usize,
+        estimated_flush_bytes: usize,
+    ) -> Result<Self> {
+        if estimated_flush_bytes < dirty_bytes {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "estimated flush bytes cannot be lower than dirty bytes",
+            ));
+        }
+        if matches!(state, InstanceSyncState::HybridReady)
+            && (dirty_bytes != 0 || memory_lsn != disk_lsn)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "hybrid ready status requires equal LSNs and zero dirty bytes",
+            ));
+        }
+        if matches!(state, InstanceSyncState::MemoryOnly)
+            && !matches!(active_target, InstanceSyncTarget::Memory)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory-only status must target memory",
+            ));
+        }
+        if matches!(state, InstanceSyncState::DiskOnly)
+            && !matches!(active_target, InstanceSyncTarget::Disk)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "disk-only status must target disk",
+            ));
+        }
+
+        Ok(Self {
+            state,
+            active_target,
+            memory_lsn,
+            disk_lsn,
+            dirty_bytes,
+            estimated_flush_bytes,
+        })
+    }
+
+    pub fn state(self) -> InstanceSyncState {
+        self.state
+    }
+
+    pub fn active_target(self) -> InstanceSyncTarget {
+        self.active_target
+    }
+
+    pub fn memory_lsn(self) -> u64 {
+        self.memory_lsn
+    }
+
+    pub fn disk_lsn(self) -> u64 {
+        self.disk_lsn
+    }
+
+    pub fn dirty_bytes(self) -> usize {
+        self.dirty_bytes
+    }
+
+    pub fn estimated_flush_bytes(self) -> usize {
+        self.estimated_flush_bytes
+    }
+
+    pub fn switch_data_movement(self, target: InstanceSyncTarget) -> SwitchDataMovement {
+        if target == self.active_target {
+            return SwitchDataMovement::MetadataOnly;
+        }
+        if self.is_pre_synchronized() {
+            return SwitchDataMovement::PreSynchronized;
+        }
+        SwitchDataMovement::FullDataMovement
+    }
+
+    pub fn can_switch_in_millis(self, target: InstanceSyncTarget) -> bool {
+        !matches!(
+            self.switch_data_movement(target),
+            SwitchDataMovement::FullDataMovement
+        )
+    }
+
+    pub fn require_millisecond_switch(
+        self,
+        target: InstanceSyncTarget,
+    ) -> Result<SwitchDataMovement> {
+        let movement = self.switch_data_movement(target);
+        if matches!(movement, SwitchDataMovement::FullDataMovement) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance switch to {target:?} requires full data movement: dirty {} bytes, estimated flush {} bytes, memory LSN {}, disk LSN {}",
+                    self.dirty_bytes, self.estimated_flush_bytes, self.memory_lsn, self.disk_lsn
+                ),
+            ));
+        }
+        Ok(movement)
+    }
+
+    fn is_pre_synchronized(self) -> bool {
+        matches!(self.state, InstanceSyncState::HybridReady)
+            && self.dirty_bytes == 0
+            && self.memory_lsn == self.disk_lsn
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstanceSwitchPolicy {
+    millisecond_switch_required: bool,
+    full_data_movement_allowed: bool,
+}
+
+impl InstanceSwitchPolicy {
+    pub fn millisecond_only() -> Self {
+        Self {
+            millisecond_switch_required: true,
+            full_data_movement_allowed: false,
+        }
+    }
+
+    pub fn allow_full_data_movement() -> Self {
+        Self {
+            millisecond_switch_required: false,
+            full_data_movement_allowed: true,
+        }
+    }
+
+    pub fn millisecond_switch_required(self) -> bool {
+        self.millisecond_switch_required
+    }
+
+    pub fn full_data_movement_allowed(self) -> bool {
+        self.full_data_movement_allowed
+    }
+
+    pub fn validate_switch(
+        self,
+        status: InstanceSyncStatus,
+        target: InstanceSyncTarget,
+    ) -> Result<SwitchDataMovement> {
+        let movement = status.switch_data_movement(target);
+        if matches!(movement, SwitchDataMovement::FullDataMovement)
+            && (self.millisecond_switch_required || !self.full_data_movement_allowed)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "instance switch policy rejects full data movement",
+            ));
+        }
+        Ok(movement)
+    }
+}
+
+impl Default for InstanceSwitchPolicy {
+    fn default() -> Self {
+        Self::millisecond_only()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceSyncChannel {
+    source_instance: InstanceId,
+    target_instance: InstanceId,
+    switch_policy: InstanceSwitchPolicy,
+}
+
+impl InstanceSyncChannel {
+    pub fn new(
+        source_instance: InstanceId,
+        target_instance: InstanceId,
+        switch_policy: InstanceSwitchPolicy,
+    ) -> Result<Self> {
+        if source_instance == target_instance {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "instance sync channel requires distinct source and target instances",
+            ));
+        }
+        Ok(Self {
+            source_instance,
+            target_instance,
+            switch_policy,
+        })
+    }
+
+    pub fn source_instance(&self) -> InstanceId {
+        self.source_instance
+    }
+
+    pub fn target_instance(&self) -> InstanceId {
+        self.target_instance
+    }
+
+    pub fn switch_policy(&self) -> InstanceSwitchPolicy {
+        self.switch_policy
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct InstanceManager {
     instances: BTreeMap<InstanceId, InstanceConfig>,
+    sync_channels: BTreeMap<(InstanceId, InstanceId), InstanceSyncChannel>,
 }
 
 impl InstanceManager {
@@ -246,7 +487,54 @@ impl InstanceManager {
     }
 
     pub fn remove(&mut self, instance_id: InstanceId) -> Option<InstanceConfig> {
+        self.sync_channels
+            .retain(|(source, target), _| *source != instance_id && *target != instance_id);
         self.instances.remove(&instance_id)
+    }
+
+    pub fn register_sync_channel(&mut self, channel: InstanceSyncChannel) -> Result<()> {
+        let source = channel.source_instance();
+        let target = channel.target_instance();
+        if !self.instances.contains_key(&source) {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("sync channel source instance not registered: {source}"),
+            ));
+        }
+        if !self.instances.contains_key(&target) {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("sync channel target instance not registered: {target}"),
+            ));
+        }
+        if self.sync_channels.contains_key(&(source, target)) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("instance sync channel already exists: {source} -> {target}"),
+            ));
+        }
+        self.sync_channels.insert((source, target), channel);
+        Ok(())
+    }
+
+    pub fn sync_channel(
+        &self,
+        source: InstanceId,
+        target: InstanceId,
+    ) -> Option<&InstanceSyncChannel> {
+        self.sync_channels.get(&(source, target))
+    }
+
+    pub fn remove_sync_channel(
+        &mut self,
+        source: InstanceId,
+        target: InstanceId,
+    ) -> Option<InstanceSyncChannel> {
+        self.sync_channels.remove(&(source, target))
+    }
+
+    pub fn sync_channels(&self) -> Vec<&InstanceSyncChannel> {
+        self.sync_channels.values().collect()
     }
 
     pub fn instance_ids(&self) -> Vec<InstanceId> {
