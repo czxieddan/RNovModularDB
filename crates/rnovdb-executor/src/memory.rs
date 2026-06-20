@@ -308,33 +308,14 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
 }
 
 fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
-    let Expr::Binary { left, op, right } = predicate else {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "memory filter requires a binary predicate",
-        ));
-    };
-
-    if op != "=" {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("memory filter does not support operator {op}"),
-        ));
+    let mut rows = Vec::new();
+    for row in batch.rows() {
+        if eval_predicate(batch.columns(), row, predicate)? {
+            rows.push(row.clone());
+        }
     }
 
-    if let Some(column) = column_name(left) {
-        let expected = literal_value(right)?;
-        return batch.filter_eq(column, &expected);
-    }
-    if let Some(column) = column_name(right) {
-        let expected = literal_value(left)?;
-        return batch.filter_eq(column, &expected);
-    }
-
-    Err(RnovError::new(
-        ErrorKind::InvalidInput,
-        "memory filter requires one column and one literal",
-    ))
+    VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
 fn apply_projection(
@@ -463,6 +444,20 @@ fn eval_binary_expr(
     }
 }
 
+fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bool> {
+    match eval_expr(columns, row, expr)? {
+        SqlValue::Bool(value) => Ok(value),
+        SqlValue::Null => Ok(false),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "predicate expression must be bool, got {:?}",
+                other.data_type()
+            ),
+        )),
+    }
+}
+
 fn boolean_operator(op: &str) -> bool {
     matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@")
 }
@@ -515,42 +510,7 @@ fn row_matches(columns: &[ColumnSchema], row: &Row, selection: Option<&Expr>) ->
     let Some(selection) = selection else {
         return Ok(true);
     };
-    let Expr::Binary { left, op, right } = selection else {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "row predicate requires a binary expression",
-        ));
-    };
-    if op != "=" {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("row predicate does not support operator {op}"),
-        ));
-    }
-
-    if let Some(column) = column_name(left) {
-        let value = literal_value(right)?;
-        return row_value_equals(columns, row, column, &value);
-    }
-    if let Some(column) = column_name(right) {
-        let value = literal_value(left)?;
-        return row_value_equals(columns, row, column, &value);
-    }
-
-    Err(RnovError::new(
-        ErrorKind::InvalidInput,
-        "row predicate requires one column and one literal",
-    ))
-}
-
-fn row_value_equals(
-    columns: &[ColumnSchema],
-    row: &Row,
-    column: &str,
-    expected: &SqlValue,
-) -> Result<bool> {
-    let index = column_index(columns, column)?;
-    Ok(row.values()[index].sql_eq(expected) == Truth::True)
+    eval_predicate(columns, row, selection)
 }
 
 fn column_index(columns: &[ColumnSchema], name: &str) -> Result<usize> {
@@ -558,13 +518,6 @@ fn column_index(columns: &[ColumnSchema], name: &str) -> Result<usize> {
         .iter()
         .position(|column| column.name() == name)
         .ok_or_else(|| RnovError::new(ErrorKind::NotFound, format!("column not found: {name}")))
-}
-
-fn column_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Identifier(identifier) => Some(identifier.as_str()),
-        _ => None,
-    }
 }
 
 fn literal_value(expr: &Expr) -> Result<SqlValue> {
