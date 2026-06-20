@@ -947,7 +947,9 @@ impl StorageBackend for SingleFileBackend {
     }
 
     fn capabilities(&self) -> StorageCapability {
-        StorageCapability::WRITES_TO_DISK | StorageCapability::SINGLE_FILE
+        StorageCapability::WRITES_TO_DISK
+            | StorageCapability::SINGLE_FILE
+            | StorageCapability::ENCRYPTED
     }
 }
 
