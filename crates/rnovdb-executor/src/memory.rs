@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
+use rnovdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnovdb_planner::logical::LogicalPlan;
 use rnovdb_sql::ast::{ColumnDef, Expr};
 use rnovdb_types::{
@@ -96,6 +97,21 @@ impl MemoryExecutor {
             LogicalPlan::Filter { predicate, input } => {
                 let batch = self.execute(input)?;
                 apply_filter(batch, predicate)
+            }
+            LogicalPlan::TextSearch {
+                table,
+                column,
+                query,
+                ..
+            } => {
+                let batch = self
+                    .tables
+                    .get(table)
+                    .map(MemoryTable::scan)
+                    .ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                apply_text_search(batch, column, query)
             }
             LogicalPlan::Project { columns, input } => {
                 let batch = self.execute(input)?;
@@ -320,6 +336,50 @@ fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
         ErrorKind::InvalidInput,
         "memory filter requires one column and one literal",
     ))
+}
+
+fn apply_text_search(batch: VectorBatch, column: &str, query: &str) -> Result<VectorBatch> {
+    let index = column_index(batch.columns(), column)?;
+    match batch.columns()[index].data_type() {
+        SqlType::Text | SqlType::TextVector => {}
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("text search requires text or text vector column, got {other:?}"),
+            ));
+        }
+    }
+
+    let query = TextQuery::parse(query)?;
+    let builder = TextVectorBuilder::new(SimpleTokenizer::new());
+    let mut rows = Vec::new();
+
+    for row in batch.rows() {
+        if text_value_matches(row.values()[index].clone(), &query, &builder)? {
+            rows.push(row.clone());
+        }
+    }
+
+    VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+fn text_value_matches(
+    value: SqlValue,
+    query: &TextQuery,
+    builder: &TextVectorBuilder<SimpleTokenizer>,
+) -> Result<bool> {
+    match value {
+        SqlValue::Null => Ok(false),
+        SqlValue::Text(text) => Ok(query.matches(&builder.build(&text)?)),
+        SqlValue::TextVector(vector) => Ok(query.matches(&vector)),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "text search cannot evaluate value type {:?}",
+                other.data_type()
+            ),
+        )),
+    }
 }
 
 fn row_matches(columns: &[ColumnSchema], row: &Row, selection: Option<&Expr>) -> Result<bool> {
