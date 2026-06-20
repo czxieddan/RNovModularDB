@@ -1,4 +1,4 @@
-use rnovdb_catalog::{Catalog, Privilege};
+use rnovdb_catalog::{Catalog, OperatorSignature, Privilege};
 use rnovdb_common::{
     Result,
     ids::{DatabaseId, RelationId, RoleId},
@@ -13,6 +13,7 @@ use rnovdb_sql::{
     binder::Binder,
     parser::parse_statement,
 };
+use rnovdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
@@ -32,6 +33,7 @@ impl LocalSession {
     pub fn memory() -> Result<Self> {
         let mut catalog = Catalog::new(DatabaseId::new(1));
         catalog.create_schema("public")?;
+        register_builtin_functions(&mut catalog)?;
         let role = catalog.create_role("local")?;
         Ok(Self {
             catalog,
@@ -96,6 +98,22 @@ impl LocalSession {
         }
         Ok(())
     }
+}
+
+fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
+    let text_contains = catalog.register_function(
+        "text_contains",
+        vec![SqlType::Text, SqlType::Text],
+        SqlType::Bool,
+    )?;
+    catalog.register_operator(OperatorSignature::new(
+        "@@",
+        SqlType::Text,
+        SqlType::Text,
+        SqlType::Bool,
+        text_contains.function_id(),
+    ))?;
+    Ok(())
 }
 
 impl From<ExecutionResult> for CommandOutput {
