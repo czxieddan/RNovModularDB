@@ -735,6 +735,47 @@ pub struct SingleFileVerificationReport {
     encryption_authenticated: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileRestoreDryRun {
+    backup_path: PathBuf,
+    target_path: PathBuf,
+    target_exists: bool,
+    backup_valid: bool,
+    bytes_to_restore: u64,
+    page_record_slots: u64,
+    present_page_records: u64,
+}
+
+impl SingleFileRestoreDryRun {
+    pub fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
+    pub fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
+    pub fn target_exists(&self) -> bool {
+        self.target_exists
+    }
+
+    pub fn backup_valid(&self) -> bool {
+        self.backup_valid
+    }
+
+    pub fn bytes_to_restore(&self) -> u64 {
+        self.bytes_to_restore
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn present_page_records(&self) -> u64 {
+        self.present_page_records
+    }
+}
+
 impl SingleFileVerificationReport {
     pub fn path(&self) -> &Path {
         &self.path
@@ -1236,6 +1277,25 @@ pub fn backup_single_file(
         page_size: destination_inspection.page_size(),
         page_record_slots: destination_inspection.page_record_slots(),
         present_page_records: destination_inspection.present_page_records(),
+    })
+}
+
+pub fn restore_single_file_dry_run(
+    backup: impl AsRef<Path>,
+    target: impl AsRef<Path>,
+) -> Result<SingleFileRestoreDryRun> {
+    let backup = backup.as_ref();
+    let target = target.as_ref();
+    let verification = verify_single_file(backup)?;
+
+    Ok(SingleFileRestoreDryRun {
+        backup_path: backup.to_path_buf(),
+        target_path: target.to_path_buf(),
+        target_exists: target.exists(),
+        backup_valid: verification.is_valid(),
+        bytes_to_restore: verification.file_len_bytes(),
+        page_record_slots: verification.page_record_slots(),
+        present_page_records: verification.present_page_records(),
     })
 }
 
