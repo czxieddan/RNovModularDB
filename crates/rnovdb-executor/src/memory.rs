@@ -124,6 +124,10 @@ impl MemoryExecutor {
         }
     }
 
+    pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
+        self.execute(plan)
+    }
+
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
         match plan {
             LogicalPlan::CreateTable { table, columns } => {
@@ -182,6 +186,10 @@ impl MemoryExecutor {
             }
             _ => self.execute(plan).map(ExecutionResult::Batch),
         }
+    }
+
+    pub async fn execute_mut_async(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        self.execute_mut(plan)
     }
 
     fn create_table(&mut self, name: &str, columns: &[ColumnDef]) -> Result<()> {
