@@ -189,6 +189,40 @@ impl TextQuery {
         self.root.matches(vector)
     }
 
+    pub fn rank(&self, vector: &TextVector) -> Option<TextRank> {
+        if !self.matches(vector) {
+            return None;
+        }
+
+        let mut positive_terms = BTreeSet::new();
+        self.root.collect_positive_terms(&mut positive_terms);
+
+        let mut score = 0_u32;
+        let mut first_position: Option<u32> = None;
+        let mut matched_terms = Vec::new();
+        for term in positive_terms {
+            let Some(lexeme) = vector.find(term) else {
+                continue;
+            };
+
+            matched_terms.push(term.to_string());
+            if let Some(position) = lexeme.positions().first().copied() {
+                first_position =
+                    Some(first_position.map_or(position, |existing| existing.min(position)));
+                score = score.saturating_add(position_score(position));
+            }
+            score = score
+                .saturating_add(weight_score(lexeme.weight()))
+                .saturating_add((lexeme.positions().len() as u32).saturating_mul(2));
+        }
+
+        Some(TextRank {
+            score,
+            first_position,
+            matched_terms,
+        })
+    }
+
     pub fn required_terms(&self) -> Vec<&str> {
         let mut terms = BTreeSet::new();
         self.root.collect_required_terms(&mut terms);
@@ -205,6 +239,27 @@ impl TextQuery {
         let mut terms = BTreeSet::new();
         self.root.collect_excluded_terms(&mut terms);
         terms.into_iter().collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextRank {
+    score: u32,
+    first_position: Option<u32>,
+    matched_terms: Vec<String>,
+}
+
+impl TextRank {
+    pub fn score(&self) -> u32 {
+        self.score
+    }
+
+    pub fn first_position(&self) -> Option<u32> {
+        self.first_position
+    }
+
+    pub fn matched_terms(&self) -> &[String] {
+        &self.matched_terms
     }
 }
 
@@ -276,6 +331,19 @@ impl TextQueryExpr {
             Self::Not(_) => {}
         }
     }
+}
+
+fn weight_score(weight: LexemeWeight) -> u32 {
+    match weight {
+        LexemeWeight::A => 40,
+        LexemeWeight::B => 30,
+        LexemeWeight::C => 20,
+        LexemeWeight::D => 10,
+    }
+}
+
+fn position_score(position: u32) -> u32 {
+    16_u32.saturating_sub(position.min(16))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
