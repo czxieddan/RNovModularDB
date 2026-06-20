@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::{cmp::Ordering, collections::BTreeMap, thread};
 
 use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
@@ -42,6 +42,36 @@ impl MemoryTable {
             .expect("stored rows are validated on insert")
     }
 
+    pub fn scan_parallel(&self, config: ParallelQueryConfig) -> Result<VectorBatch> {
+        config.validate()?;
+        if self.rows.is_empty()
+            || config.worker_threads() == 1
+            || self.rows.len() < config.min_parallel_rows()
+        {
+            return Ok(self.scan());
+        }
+
+        let worker_count = config.worker_threads().min(self.rows.len());
+        let chunk_size = self.rows.len().div_ceil(worker_count);
+        let mut rows = Vec::with_capacity(self.rows.len());
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for chunk in self.rows.chunks(chunk_size) {
+                handles.push(scope.spawn(move || chunk.to_vec()));
+            }
+
+            for handle in handles {
+                let mut chunk = handle.join().map_err(|_| {
+                    RnovError::new(ErrorKind::Internal, "parallel memory scan worker panicked")
+                })?;
+                rows.append(&mut chunk);
+            }
+            Ok::<(), RnovError>(())
+        })?;
+
+        VectorBatch::new(self.columns.clone(), rows)
+    }
+
     fn add_column(&mut self, column: ColumnSchema) -> Result<()> {
         let mut columns = self.columns.clone();
         columns.push(column);
@@ -53,6 +83,48 @@ impl MemoryTable {
         self.columns = columns;
         self.rows = rows;
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParallelQueryConfig {
+    worker_threads: usize,
+    min_parallel_rows: usize,
+}
+
+impl ParallelQueryConfig {
+    pub fn new(worker_threads: usize, min_parallel_rows: usize) -> Self {
+        Self {
+            worker_threads,
+            min_parallel_rows,
+        }
+    }
+
+    pub fn worker_threads(self) -> usize {
+        self.worker_threads
+    }
+
+    pub fn min_parallel_rows(self) -> usize {
+        self.min_parallel_rows
+    }
+
+    fn validate(self) -> Result<()> {
+        if self.worker_threads == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "parallel query worker count must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ParallelQueryConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 1,
+            min_parallel_rows: 1024,
+        }
     }
 }
 
@@ -126,6 +198,58 @@ impl MemoryExecutor {
 
     pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
         self.execute(plan)
+    }
+
+    pub fn execute_parallel(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+    ) -> Result<VectorBatch> {
+        config.validate()?;
+        match plan {
+            LogicalPlan::Scan { table, .. } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .scan_parallel(config),
+            LogicalPlan::Filter { predicate, input } => {
+                let batch = self.execute_parallel(input, config)?;
+                apply_filter(batch, predicate)
+            }
+            LogicalPlan::TextSearch {
+                table,
+                column,
+                query,
+                ..
+            } => {
+                let batch = self
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?
+                    .scan_parallel(config)?;
+                apply_text_search(batch, column, query)
+            }
+            LogicalPlan::Project { items, input } => {
+                let batch = self.execute_parallel(input, config)?;
+                apply_projection(batch, items)
+            }
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory executor does not support this logical plan",
+            )),
+        }
+    }
+
+    pub async fn execute_parallel_async(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+    ) -> Result<VectorBatch> {
+        self.execute_parallel(plan, config)
     }
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
