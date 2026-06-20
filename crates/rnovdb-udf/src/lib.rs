@@ -1,6 +1,7 @@
 use std::time::Duration;
 
-use rnovdb_common::{ErrorKind, Result, RnovError};
+use rnovdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
+use rnovdb_types::SqlType;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdfBudget {
@@ -98,5 +99,128 @@ impl UdfSandboxPolicy {
 impl Default for UdfSandboxPolicy {
     fn default() -> Self {
         Self::locked_down(UdfBudget::default())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FunctionKind {
+    TrustedRust,
+    WasmSandbox,
+    SqlProcedure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UdfDefinition {
+    function_id: FunctionId,
+    name: String,
+    argument_types: Vec<SqlType>,
+    return_type: SqlType,
+    kind: FunctionKind,
+    sandbox_policy: UdfSandboxPolicy,
+}
+
+impl UdfDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+        kind: FunctionKind,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "function name cannot be empty",
+            ));
+        }
+
+        Ok(Self {
+            function_id: FunctionId::new(0),
+            name,
+            argument_types,
+            return_type,
+            kind,
+            sandbox_policy,
+        })
+    }
+
+    pub fn function_id(&self) -> FunctionId {
+        self.function_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn argument_types(&self) -> &[SqlType] {
+        &self.argument_types
+    }
+
+    pub fn return_type(&self) -> &SqlType {
+        &self.return_type
+    }
+
+    pub fn kind(&self) -> FunctionKind {
+        self.kind
+    }
+
+    pub fn sandbox_policy(&self) -> &UdfSandboxPolicy {
+        &self.sandbox_policy
+    }
+
+    fn with_function_id(mut self, function_id: FunctionId) -> Self {
+        self.function_id = function_id;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UdfRegistry {
+    next_function_id: u64,
+    functions: Vec<UdfDefinition>,
+}
+
+impl UdfRegistry {
+    pub fn new() -> Self {
+        Self {
+            next_function_id: 1,
+            functions: Vec::new(),
+        }
+    }
+
+    pub fn register(&mut self, definition: UdfDefinition) -> Result<FunctionId> {
+        if self.functions.iter().any(|function| {
+            function.name == definition.name && function.argument_types == definition.argument_types
+        }) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("function already exists: {}", definition.name),
+            ));
+        }
+
+        let function_id = FunctionId::new(self.next_function_id);
+        self.next_function_id += 1;
+        self.functions
+            .push(definition.with_function_id(function_id));
+        Ok(function_id)
+    }
+
+    pub fn resolve(&self, name: &str, argument_types: &[SqlType]) -> Option<&UdfDefinition> {
+        self.functions
+            .iter()
+            .find(|function| function.name == name && function.argument_types == argument_types)
+    }
+
+    pub fn functions(&self) -> &[UdfDefinition] {
+        &self.functions
+    }
+
+    pub fn len(&self) -> usize {
+        self.functions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
     }
 }

@@ -338,6 +338,7 @@ name = "rnovdb-udf"
 version = "0.1.0"
 dependencies = [
  "rnovdb-common",
+ "rnovdb-types",
 ]
 
 [[package]]
