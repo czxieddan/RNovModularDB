@@ -724,6 +724,52 @@ pub struct SingleFileBackupReport {
     present_page_records: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileVerificationReport {
+    path: PathBuf,
+    file_len_bytes: u64,
+    page_record_slots: u64,
+    present_page_records: u64,
+    empty_page_slots: u64,
+    authenticated_page_records: u64,
+    encryption_authenticated: bool,
+}
+
+impl SingleFileVerificationReport {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_len_bytes(&self) -> u64 {
+        self.file_len_bytes
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn present_page_records(&self) -> u64 {
+        self.present_page_records
+    }
+
+    pub fn empty_page_slots(&self) -> u64 {
+        self.empty_page_slots
+    }
+
+    pub fn authenticated_page_records(&self) -> u64 {
+        self.authenticated_page_records
+    }
+
+    pub fn encryption_authenticated(&self) -> bool {
+        self.encryption_authenticated
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.encryption_authenticated
+            || self.authenticated_page_records == self.present_page_records
+    }
+}
+
 impl SingleFileBackupReport {
     pub fn source_path(&self) -> &Path {
         &self.source_path
@@ -880,6 +926,14 @@ impl SingleFileBackend {
             )
         })?;
         backup_single_file(&self.path, destination)
+    }
+
+    pub fn verify(&self) -> Result<SingleFileVerificationReport> {
+        verify_single_file(&self.path)
+    }
+
+    pub fn verify_with_key(&self) -> Result<SingleFileVerificationReport> {
+        verify_single_file_with_key(&self.path, self.page_key()?)
     }
 
     fn open_internal(path: &Path, page_key: Option<PageCryptoKey>) -> Result<Self> {
@@ -1090,6 +1144,44 @@ impl StorageBackend for SingleFileBackend {
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED
     }
+}
+
+pub fn verify_single_file(path: impl AsRef<Path>) -> Result<SingleFileVerificationReport> {
+    let inspection = inspect_single_file(path)?;
+    Ok(SingleFileVerificationReport {
+        path: inspection.path().to_path_buf(),
+        file_len_bytes: inspection.file_len_bytes(),
+        page_record_slots: inspection.page_record_slots(),
+        present_page_records: inspection.present_page_records(),
+        empty_page_slots: inspection.empty_page_slots(),
+        authenticated_page_records: 0,
+        encryption_authenticated: false,
+    })
+}
+
+pub fn verify_single_file_with_key(
+    path: impl AsRef<Path>,
+    key: PageCryptoKey,
+) -> Result<SingleFileVerificationReport> {
+    let inspection = inspect_single_file(path.as_ref())?;
+    let backend = SingleFileBackend::open_with_key(path.as_ref(), key)?;
+    let mut authenticated_page_records = 0_u64;
+
+    for page_number in 1..=inspection.page_record_slots() {
+        if backend.read_page(PageId::new(page_number))?.is_some() {
+            authenticated_page_records += 1;
+        }
+    }
+
+    Ok(SingleFileVerificationReport {
+        path: inspection.path().to_path_buf(),
+        file_len_bytes: inspection.file_len_bytes(),
+        page_record_slots: inspection.page_record_slots(),
+        present_page_records: inspection.present_page_records(),
+        empty_page_slots: inspection.empty_page_slots(),
+        authenticated_page_records,
+        encryption_authenticated: true,
+    })
 }
 
 pub fn backup_single_file(
