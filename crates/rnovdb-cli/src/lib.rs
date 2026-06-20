@@ -4,10 +4,10 @@ use rnovdb_common::{
     ids::{DatabaseId, RelationId, RoleId},
 };
 use rnovdb_executor::{
-    memory::{ExecutionResult, MemoryExecutor},
+    memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
     vector::VectorBatch,
 };
-use rnovdb_planner::logical::LogicalPlanner;
+use rnovdb_planner::{logical::LogicalPlanner, optimizer::RuleOptimizer};
 use rnovdb_sql::{
     ast::{BoundStatement, ColumnDef, ObjectName},
     binder::Binder,
@@ -33,10 +33,20 @@ pub struct LocalSession {
     role_id: RoleId,
     executor: MemoryExecutor,
     planner: LogicalPlanner,
+    optimizer: RuleOptimizer,
+    execution: LocalExecutionConfig,
 }
 
 impl LocalSession {
     pub fn memory() -> Result<Self> {
+        Self::memory_with_execution(LocalExecutionConfig::default())
+    }
+
+    pub fn memory_parallel(worker_threads: usize) -> Result<Self> {
+        Self::memory_with_execution(LocalExecutionConfig::parallel(worker_threads)?)
+    }
+
+    pub fn memory_with_execution(execution: LocalExecutionConfig) -> Result<Self> {
         let mut catalog = Catalog::new(DatabaseId::new(1));
         catalog.create_schema("public")?;
         register_builtin_functions(&mut catalog)?;
@@ -46,6 +56,8 @@ impl LocalSession {
             role_id: role.role_id(),
             executor: MemoryExecutor::new(),
             planner: LogicalPlanner::new(),
+            optimizer: RuleOptimizer::new(),
+            execution,
         })
     }
 
@@ -106,11 +118,13 @@ impl LocalSession {
                 Ok(CommandOutput::SchemaChanged)
             }
             BoundStatement::Select(_) => {
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute(&plan).map(CommandOutput::Rows)
+                let plan = self.optimize_read_plan(self.planner.plan(&bound)?);
+                self.executor
+                    .execute_parallel(&plan, self.execution.parallel_query())
+                    .map(CommandOutput::Rows)
             }
             BoundStatement::Explain { statement } => {
-                let plan = self.planner.plan(statement)?;
+                let plan = self.optimize_read_plan(self.planner.plan(statement)?);
                 Ok(CommandOutput::Text(plan.explain()))
             }
             _ => {
@@ -155,6 +169,60 @@ impl LocalSession {
                 .grant_table_privilege(self.role_id, relation_id, privilege)?;
         }
         Ok(())
+    }
+
+    fn optimize_read_plan(
+        &self,
+        plan: rnovdb_planner::logical::LogicalPlan,
+    ) -> rnovdb_planner::logical::LogicalPlan {
+        self.optimizer
+            .optimize_parallel(plan, self.execution.worker_threads())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalExecutionConfig {
+    worker_threads: usize,
+    min_parallel_rows: usize,
+}
+
+impl LocalExecutionConfig {
+    pub fn parallel(worker_threads: usize) -> Result<Self> {
+        Self::new(worker_threads, 1024)
+    }
+
+    pub fn new(worker_threads: usize, min_parallel_rows: usize) -> Result<Self> {
+        if worker_threads == 0 {
+            return Err(rnovdb_common::RnovError::new(
+                rnovdb_common::ErrorKind::InvalidInput,
+                "local execution worker count must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            worker_threads,
+            min_parallel_rows,
+        })
+    }
+
+    pub fn worker_threads(self) -> usize {
+        self.worker_threads
+    }
+
+    pub fn min_parallel_rows(self) -> usize {
+        self.min_parallel_rows
+    }
+
+    pub fn parallel_query(self) -> ParallelQueryConfig {
+        ParallelQueryConfig::new(self.worker_threads, self.min_parallel_rows)
+    }
+}
+
+impl Default for LocalExecutionConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 1,
+            min_parallel_rows: 1024,
+        }
     }
 }
 
