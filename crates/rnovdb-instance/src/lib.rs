@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use rnovdb_common::{
     ErrorKind, Result, RnovError,
@@ -105,5 +105,48 @@ impl InstanceConfig {
 
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InstanceManager {
+    instances: BTreeMap<InstanceId, InstanceConfig>,
+}
+
+impl InstanceManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, config: InstanceConfig) -> Result<()> {
+        let instance_id = config.instance_id();
+        if self.instances.contains_key(&instance_id) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("instance already exists: {instance_id}"),
+            ));
+        }
+        self.instances.insert(instance_id, config);
+        Ok(())
+    }
+
+    pub fn get(&self, instance_id: InstanceId) -> Option<&InstanceConfig> {
+        self.instances.get(&instance_id)
+    }
+
+    pub fn remove(&mut self, instance_id: InstanceId) -> Option<InstanceConfig> {
+        self.instances.remove(&instance_id)
+    }
+
+    pub fn instance_ids(&self) -> Vec<InstanceId> {
+        self.instances.keys().copied().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
     }
 }
