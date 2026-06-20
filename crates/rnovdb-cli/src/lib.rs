@@ -13,7 +13,9 @@ use rnovdb_sql::{
     binder::Binder,
     parser::parse_statement,
 };
-use rnovdb_storage::{SingleFileInspection, inspect_single_file};
+use rnovdb_storage::{
+    SingleFileBackupReport, SingleFileInspection, backup_single_file, inspect_single_file,
+};
 use rnovdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,4 +184,11 @@ impl From<ExecutionResult> for CommandOutput {
 
 pub fn inspect_storage(path: impl AsRef<std::path::Path>) -> Result<SingleFileInspection> {
     inspect_single_file(path)
+}
+
+pub fn backup_storage(
+    source: impl AsRef<std::path::Path>,
+    destination: impl AsRef<std::path::Path>,
+) -> Result<SingleFileBackupReport> {
+    backup_single_file(source, destination)
 }

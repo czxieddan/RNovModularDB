@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 
-use rnovdb_cli::{CommandOutput, LocalSession, inspect_storage};
-use rnovdb_storage::SingleFileInspection;
+use rnovdb_cli::{CommandOutput, LocalSession, backup_storage, inspect_storage};
+use rnovdb_storage::{SingleFileBackupReport, SingleFileInspection};
 
 fn main() {
     if let Err(err) = run() {
@@ -23,6 +23,13 @@ fn run_command(args: &[String]) -> rnovdb_common::Result<()> {
     match args {
         [command, path] if command == "inspect" => {
             println!("{}", format_inspection(&inspect_storage(path)?));
+            Ok(())
+        }
+        [command, source, destination] if command == "backup" => {
+            println!(
+                "{}",
+                format_backup_report(&backup_storage(source, destination)?)
+            );
             Ok(())
         }
         [command, ..] => Err(rnovdb_common::RnovError::new(
@@ -82,6 +89,19 @@ fn format_inspection(inspection: &SingleFileInspection) -> String {
             "capabilities: {}",
             inspection.capabilities().names().join(",")
         ),
+    ]
+    .join("\n")
+}
+
+fn format_backup_report(report: &SingleFileBackupReport) -> String {
+    [
+        format!("source: {}", report.source_path().display()),
+        format!("destination: {}", report.destination_path().display()),
+        format!("bytes_copied: {}", report.bytes_copied()),
+        format!("page_size_bytes: {}", report.page_size().bytes()),
+        format!("superblock_generation: {}", report.superblock_generation()),
+        format!("page_record_slots: {}", report.page_record_slots()),
+        format!("present_page_records: {}", report.present_page_records()),
     ]
     .join("\n")
 }
