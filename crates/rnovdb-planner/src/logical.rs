@@ -60,6 +60,10 @@ pub enum LogicalPlan {
     Explain {
         input: Box<LogicalPlan>,
     },
+    Parallel {
+        hint: ParallelPlanHint,
+        input: Box<LogicalPlan>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +77,27 @@ pub struct TextSearchCostHint {
     pub required_terms: Vec<String>,
     pub optional_terms: Vec<String>,
     pub excluded_terms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParallelPlanHint {
+    pub workers: usize,
+    pub reason: String,
+}
+
+impl ParallelPlanHint {
+    pub fn new(workers: usize, reason: impl Into<String>) -> Result<Self> {
+        if workers == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "parallel plan worker count must be greater than zero",
+            ));
+        }
+        Ok(Self {
+            workers,
+            reason: reason.into(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -270,6 +295,13 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         }
         LogicalPlan::Explain { input } => {
             out.push_str(&format!("{prefix}Explain\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Parallel { hint, input } => {
+            out.push_str(&format!(
+                "{prefix}Parallel workers={} reason={}\n",
+                hint.workers, hint.reason
+            ));
             write_plan(input, indent + 1, out);
         }
     }

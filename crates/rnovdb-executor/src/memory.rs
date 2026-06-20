@@ -252,6 +252,7 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Parallel { input, .. } => self.execute_cancellable(input, cancellation),
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "memory executor does not support this logical plan",
@@ -317,6 +318,9 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Parallel { input, .. } => {
+                self.execute_parallel_cancellable(input, config, cancellation)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
