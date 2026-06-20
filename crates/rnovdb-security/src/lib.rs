@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
+
 use rnovdb_common::{
     ErrorKind, Result, RnovError,
-    ids::{InstanceId, RoleId},
+    ids::{InstanceId, RelationId, RoleId},
 };
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -16,6 +18,72 @@ pub enum AuditEventKind {
     Ddl,
     BackupRestore,
     DeniedAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ObjectPrivilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Execute,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RelationGrant {
+    role_id: RoleId,
+    relation_id: RelationId,
+    privilege: ObjectPrivilege,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AccessControl {
+    relation_grants: BTreeSet<RelationGrant>,
+}
+
+impl AccessControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn grant_relation_privilege(
+        &mut self,
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        self.relation_grants.insert(RelationGrant {
+            role_id,
+            relation_id,
+            privilege,
+        })
+    }
+
+    pub fn revoke_relation_privilege(
+        &mut self,
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        self.relation_grants.remove(&RelationGrant {
+            role_id,
+            relation_id,
+            privilege,
+        })
+    }
+
+    pub fn has_relation_privilege(
+        &self,
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        self.relation_grants.contains(&RelationGrant {
+            role_id,
+            relation_id,
+            privilege,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
