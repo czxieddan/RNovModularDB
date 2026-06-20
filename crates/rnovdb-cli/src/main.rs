@@ -1,7 +1,7 @@
 use std::io::{self, Read};
 
-use rnovdb_cli::{CommandOutput, LocalSession, backup_storage, inspect_storage};
-use rnovdb_storage::{SingleFileBackupReport, SingleFileInspection};
+use rnovdb_cli::{CommandOutput, LocalSession, backup_storage, inspect_storage, verify_storage};
+use rnovdb_storage::{SingleFileBackupReport, SingleFileInspection, SingleFileVerificationReport};
 
 fn main() {
     if let Err(err) = run() {
@@ -23,6 +23,10 @@ fn run_command(args: &[String]) -> rnovdb_common::Result<()> {
     match args {
         [command, path] if command == "inspect" => {
             println!("{}", format_inspection(&inspect_storage(path)?));
+            Ok(())
+        }
+        [command, path] if command == "verify" => {
+            println!("{}", format_verification(&verify_storage(path)?));
             Ok(())
         }
         [command, source, destination] if command == "backup" => {
@@ -88,6 +92,26 @@ fn format_inspection(inspection: &SingleFileInspection) -> String {
         format!(
             "capabilities: {}",
             inspection.capabilities().names().join(",")
+        ),
+    ]
+    .join("\n")
+}
+
+fn format_verification(report: &SingleFileVerificationReport) -> String {
+    [
+        format!("path: {}", report.path().display()),
+        format!("valid: {}", report.is_valid()),
+        format!("file_len_bytes: {}", report.file_len_bytes()),
+        format!("page_record_slots: {}", report.page_record_slots()),
+        format!("present_page_records: {}", report.present_page_records()),
+        format!("empty_page_slots: {}", report.empty_page_slots()),
+        format!(
+            "authenticated_page_records: {}",
+            report.authenticated_page_records()
+        ),
+        format!(
+            "encryption_authenticated: {}",
+            report.encryption_authenticated()
         ),
     ]
     .join("\n")
