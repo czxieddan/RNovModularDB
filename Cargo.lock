@@ -234,6 +234,7 @@ dependencies = [
  "rnovdb-sql",
  "rnovdb-storage",
  "rnovdb-types",
+ "tempfile",
 ]
 
 [[package]]
