@@ -81,6 +81,14 @@ impl SqlValue {
         }
     }
 
+    pub fn sql_cmp(&self, other: &Self) -> Result<Option<Ordering>> {
+        if self.is_null() || other.is_null() {
+            return Ok(None);
+        }
+
+        compare_scalar_values(self, other).map(Some)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut encoded = vec![Self::ENCODING_VERSION, self.tag()];
 

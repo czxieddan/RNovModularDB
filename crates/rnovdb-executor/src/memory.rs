@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
@@ -420,10 +420,29 @@ fn eval_binary_expr(
     right: &Expr,
 ) -> Result<SqlValue> {
     match op {
-        "=" => {
+        "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
-            Ok(SqlValue::Bool(left.sql_eq(&right) == Truth::True))
+            let truth = left.sql_eq(&right);
+            Ok(SqlValue::Bool(match op {
+                "=" => truth == Truth::True,
+                "<>" | "!=" => truth == Truth::False,
+                _ => unreachable!("matched equality operators"),
+            }))
+        }
+        "<" | "<=" | ">" | ">=" => {
+            let left = eval_expr(columns, row, left)?;
+            let right = eval_expr(columns, row, right)?;
+            let Some(ordering) = left.sql_cmp(&right)? else {
+                return Ok(SqlValue::Bool(false));
+            };
+            Ok(SqlValue::Bool(match op {
+                "<" => ordering == Ordering::Less,
+                "<=" => matches!(ordering, Ordering::Less | Ordering::Equal),
+                ">" => ordering == Ordering::Greater,
+                ">=" => matches!(ordering, Ordering::Greater | Ordering::Equal),
+                _ => unreachable!("matched ordering operators"),
+            }))
         }
         "@@" => {
             let left = eval_expr(columns, row, left)?;
