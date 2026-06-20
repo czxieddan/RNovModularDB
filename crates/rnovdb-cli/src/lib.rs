@@ -1,4 +1,4 @@
-use rnovdb_catalog::{Catalog, OperatorSignature, Privilege};
+use rnovdb_catalog::{Catalog, OperatorSignature, Privilege, RowPolicy};
 use rnovdb_common::{
     Result,
     ids::{DatabaseId, RelationId, RoleId},
@@ -46,19 +46,67 @@ impl LocalSession {
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
         let statement = parse_statement(sql)?;
         let bound = Binder::new(&self.catalog).bind_for_role(&statement, self.role_id)?;
-        let plan = self.planner.plan(&bound)?;
 
         match &bound {
             BoundStatement::CreateTable { name, columns } => {
                 self.apply_catalog_create_table(name, columns)?;
+                let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
             BoundStatement::AlterTableAddColumn { table, column, .. } => {
                 self.apply_catalog_add_column(table, column)?;
+                let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
-            BoundStatement::Select(_) => self.executor.execute(&plan).map(CommandOutput::Rows),
-            _ => self.executor.execute_mut(&plan).map(CommandOutput::from),
+            BoundStatement::CreateFunction {
+                name,
+                argument_types,
+                return_type,
+            } => {
+                self.catalog.register_function(
+                    name.as_str(),
+                    argument_types.clone(),
+                    return_type.clone(),
+                )?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::CreateOperator { signature } => {
+                self.catalog.register_operator(signature.clone())?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::CreateRole { name } => {
+                self.catalog.create_role(name.as_str())?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::CreatePolicy {
+                name,
+                relation_id,
+                predicate,
+            } => {
+                self.catalog.add_row_policy(RowPolicy::new(
+                    name.as_str(),
+                    *relation_id,
+                    predicate.as_str(),
+                ))?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::GrantTablePrivilege {
+                role_id,
+                relation_id,
+                privilege,
+            } => {
+                self.catalog
+                    .grant_table_privilege(*role_id, *relation_id, *privilege)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::Select(_) => {
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute(&plan).map(CommandOutput::Rows)
+            }
+            _ => {
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan).map(CommandOutput::from)
+            }
         }
     }
 
