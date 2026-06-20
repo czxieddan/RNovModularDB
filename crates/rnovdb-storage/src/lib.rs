@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write, copy},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -713,6 +713,47 @@ pub struct SingleFileInspection {
     capabilities: StorageCapability,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileBackupReport {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    bytes_copied: u64,
+    superblock_generation: u64,
+    page_size: PageSize,
+    page_record_slots: u64,
+    present_page_records: u64,
+}
+
+impl SingleFileBackupReport {
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn destination_path(&self) -> &Path {
+        &self.destination_path
+    }
+
+    pub fn bytes_copied(&self) -> u64 {
+        self.bytes_copied
+    }
+
+    pub fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn present_page_records(&self) -> u64 {
+        self.present_page_records
+    }
+}
+
 impl SingleFileInspection {
     pub fn path(&self) -> &Path {
         &self.path
@@ -829,6 +870,16 @@ impl SingleFileBackend {
 
     pub fn inspect(path: impl AsRef<Path>) -> Result<SingleFileInspection> {
         inspect_single_file(path)
+    }
+
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<SingleFileBackupReport> {
+        self.file.sync_all().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to sync source database before backup: {err}"),
+            )
+        })?;
+        backup_single_file(&self.path, destination)
     }
 
     fn open_internal(path: &Path, page_key: Option<PageCryptoKey>) -> Result<Self> {
@@ -1039,6 +1090,95 @@ impl StorageBackend for SingleFileBackend {
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED
     }
+}
+
+pub fn backup_single_file(
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<SingleFileBackupReport> {
+    let source = source.as_ref();
+    let destination = destination.as_ref();
+    if source == destination {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "backup source and destination must be different paths",
+        ));
+    }
+
+    let source_inspection = inspect_single_file(source)?;
+    let mut source_file = OpenOptions::new().read(true).open(source).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to open backup source: {err}"),
+        )
+    })?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to create backup destination: {err}"),
+            )
+        })?;
+    let bytes_copied = copy(&mut source_file, &mut destination_file).map_err(|err| {
+        RnovError::new(ErrorKind::Io, format!("failed to copy backup bytes: {err}"))
+    })?;
+    destination_file.sync_all().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to sync backup destination: {err}"),
+        )
+    })?;
+    drop(destination_file);
+
+    let destination_inspection = inspect_single_file(destination)?;
+    validate_backup_copy(&source_inspection, &destination_inspection)?;
+
+    Ok(SingleFileBackupReport {
+        source_path: source.to_path_buf(),
+        destination_path: destination.to_path_buf(),
+        bytes_copied,
+        superblock_generation: destination_inspection.superblock_generation(),
+        page_size: destination_inspection.page_size(),
+        page_record_slots: destination_inspection.page_record_slots(),
+        present_page_records: destination_inspection.present_page_records(),
+    })
+}
+
+fn validate_backup_copy(
+    source: &SingleFileInspection,
+    destination: &SingleFileInspection,
+) -> Result<()> {
+    if source.file_len_bytes() != destination.file_len_bytes() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "backup validation failed: copied file length differs from source",
+        ));
+    }
+    if source.page_size() != destination.page_size() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "backup validation failed: page size differs from source",
+        ));
+    }
+    if source.superblock_generation() != destination.superblock_generation() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "backup validation failed: superblock generation differs from source",
+        ));
+    }
+    if source.page_record_slots() != destination.page_record_slots()
+        || source.present_page_records() != destination.present_page_records()
+        || source.empty_page_slots() != destination.empty_page_slots()
+    {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "backup validation failed: page record map differs from source",
+        ));
+    }
+    Ok(())
 }
 
 pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspection> {
