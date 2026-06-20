@@ -80,6 +80,7 @@ pub struct InstanceConfig {
     instance_id: InstanceId,
     database_id: DatabaseId,
     limits: ResourceLimits,
+    isolation: InstanceIsolation,
 }
 
 impl InstanceConfig {
@@ -92,6 +93,7 @@ impl InstanceConfig {
             instance_id,
             database_id,
             limits,
+            isolation: InstanceIsolation::for_instance(instance_id),
         }
     }
 
@@ -105,6 +107,52 @@ impl InstanceConfig {
 
     pub fn limits(&self) -> &ResourceLimits {
         &self.limits
+    }
+
+    pub fn isolation(&self) -> &InstanceIsolation {
+        &self.isolation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceIsolation {
+    catalog_namespace: String,
+    key_namespace: String,
+    temp_namespace: String,
+    audit_namespace: String,
+    background_worker_group: String,
+}
+
+impl InstanceIsolation {
+    pub fn for_instance(instance_id: InstanceId) -> Self {
+        let suffix = instance_id.get();
+        Self {
+            catalog_namespace: format!("catalog:{suffix}"),
+            key_namespace: format!("keys:{suffix}"),
+            temp_namespace: format!("temp:{suffix}"),
+            audit_namespace: format!("audit:{suffix}"),
+            background_worker_group: format!("workers:{suffix}"),
+        }
+    }
+
+    pub fn catalog_namespace(&self) -> &str {
+        &self.catalog_namespace
+    }
+
+    pub fn key_namespace(&self) -> &str {
+        &self.key_namespace
+    }
+
+    pub fn temp_namespace(&self) -> &str {
+        &self.temp_namespace
+    }
+
+    pub fn audit_namespace(&self) -> &str {
+        &self.audit_namespace
+    }
+
+    pub fn background_worker_group(&self) -> &str {
+        &self.background_worker_group
     }
 }
 
