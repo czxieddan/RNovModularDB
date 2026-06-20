@@ -75,6 +75,35 @@ impl Default for ResourceLimits {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResourceUsage {
+    memory_bytes: usize,
+    temp_bytes: usize,
+    worker_threads: usize,
+}
+
+impl ResourceUsage {
+    pub fn new(memory_bytes: usize, temp_bytes: usize, worker_threads: usize) -> Self {
+        Self {
+            memory_bytes,
+            temp_bytes,
+            worker_threads,
+        }
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.memory_bytes
+    }
+
+    pub fn temp_bytes(&self) -> usize {
+        self.temp_bytes
+    }
+
+    pub fn worker_threads(&self) -> usize {
+        self.worker_threads
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceConfig {
     instance_id: InstanceId,
@@ -111,6 +140,40 @@ impl InstanceConfig {
 
     pub fn isolation(&self) -> &InstanceIsolation {
         &self.isolation
+    }
+
+    pub fn check_resource_usage(&self, usage: &ResourceUsage) -> Result<()> {
+        if usage.memory_bytes() > self.limits.max_memory_bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance memory request exceeds limit: requested {} bytes, limit {} bytes",
+                    usage.memory_bytes(),
+                    self.limits.max_memory_bytes()
+                ),
+            ));
+        }
+        if usage.temp_bytes() > self.limits.max_temp_bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance temp request exceeds limit: requested {} bytes, limit {} bytes",
+                    usage.temp_bytes(),
+                    self.limits.max_temp_bytes()
+                ),
+            ));
+        }
+        if usage.worker_threads() > self.limits.max_worker_threads() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance worker request exceeds limit: requested {}, limit {}",
+                    usage.worker_threads(),
+                    self.limits.max_worker_threads()
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
