@@ -303,9 +303,16 @@ pub struct BoundColumn {
 pub struct BoundSelect {
     pub relation_id: RelationId,
     pub table: ObjectName,
+    pub projection: Vec<BoundSelectItem>,
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,
     pub applied_row_policies: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundSelectItem {
+    pub column: BoundColumn,
+    pub expr: Expr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

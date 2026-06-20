@@ -113,10 +113,9 @@ impl MemoryExecutor {
                     })?;
                 apply_text_search(batch, column, query)
             }
-            LogicalPlan::Project { columns, input } => {
+            LogicalPlan::Project { items, input } => {
                 let batch = self.execute(input)?;
-                let names = columns.iter().map(String::as_str).collect::<Vec<_>>();
-                batch.project(&names)
+                apply_projection(batch, items)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -336,6 +335,117 @@ fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
         ErrorKind::InvalidInput,
         "memory filter requires one column and one literal",
     ))
+}
+
+fn apply_projection(
+    batch: VectorBatch,
+    items: &[rnovdb_planner::logical::ProjectionItem],
+) -> Result<VectorBatch> {
+    let columns = items
+        .iter()
+        .map(|item| {
+            projection_type(batch.columns(), &item.expr)
+                .map(|data_type| ColumnSchema::new(item.name.as_str(), data_type))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut rows = Vec::with_capacity(batch.rows().len());
+    for row in batch.rows() {
+        let values = items
+            .iter()
+            .map(|item| eval_expr(batch.columns(), row, &item.expr))
+            .collect::<Result<Vec<_>>>()?;
+        rows.push(Row::new(values));
+    }
+
+    VectorBatch::new(columns, rows)
+}
+
+fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
+    match expr {
+        Expr::Identifier(identifier) => {
+            let index = column_index(columns, identifier.as_str())?;
+            Ok(columns[index].data_type().clone())
+        }
+        Expr::Integer(_) => Ok(SqlType::Int64),
+        Expr::String(_) => Ok(SqlType::Text),
+        Expr::Null => Ok(SqlType::Null),
+        Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
+        Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
+        Expr::Range {
+            lower,
+            upper,
+            bounds,
+        } => Ok(
+            range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive)?
+                .data_type(),
+        ),
+        Expr::Binary { op, .. } if boolean_operator(op) => Ok(SqlType::Bool),
+        Expr::Binary { op, .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("memory projection does not support operator {op}"),
+        )),
+        Expr::Call { name, .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("memory projection does not support function call {name}"),
+        )),
+    }
+}
+
+fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValue> {
+    match expr {
+        Expr::Identifier(identifier) => {
+            let index = column_index(columns, identifier.as_str())?;
+            Ok(row.values()[index].clone())
+        }
+        Expr::Integer(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::Array(_)
+        | Expr::HStore(_)
+        | Expr::Range { .. } => literal_value(expr),
+        Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
+        Expr::Call { name, .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("memory projection does not support function call {name}"),
+        )),
+    }
+}
+
+fn eval_binary_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlValue> {
+    match op {
+        "=" => {
+            let left = eval_expr(columns, row, left)?;
+            let right = eval_expr(columns, row, right)?;
+            Ok(SqlValue::Bool(left.sql_eq(&right) == Truth::True))
+        }
+        "@@" => {
+            let left = eval_expr(columns, row, left)?;
+            let SqlValue::Text(query) = eval_expr(columns, row, right)? else {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "text search expression requires a text query",
+                ));
+            };
+            let query = TextQuery::parse(&query)?;
+            let builder = TextVectorBuilder::new(SimpleTokenizer::new());
+            Ok(SqlValue::Bool(text_value_matches(left, &query, &builder)?))
+        }
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("memory projection does not support operator {other}"),
+        )),
+    }
+}
+
+fn boolean_operator(op: &str) -> bool {
+    matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@")
 }
 
 fn apply_text_search(batch: VectorBatch, column: &str, query: &str) -> Result<VectorBatch> {

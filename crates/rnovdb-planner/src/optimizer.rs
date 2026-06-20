@@ -19,10 +19,10 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             let input = optimize_plan(*input);
             match input {
                 LogicalPlan::Project {
-                    columns,
+                    items,
                     input: project_input,
                 } => LogicalPlan::Project {
-                    columns,
+                    items,
                     input: Box::new(optimize_plan(LogicalPlan::Filter {
                         predicate,
                         input: project_input,
@@ -34,8 +34,8 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
                 },
             }
         }
-        LogicalPlan::Project { columns, input } => LogicalPlan::Project {
-            columns,
+        LogicalPlan::Project { items, input } => LogicalPlan::Project {
+            items,
             input: Box::new(optimize_plan(*input)),
         },
         other => other,

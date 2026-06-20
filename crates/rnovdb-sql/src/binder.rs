@@ -6,8 +6,8 @@ use rnovdb_common::{
 use rnovdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundSelect, BoundStatement,
-    BoundUpdate, Expr, ObjectName, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundSelect, BoundSelectItem,
+    BoundStatement, BoundUpdate, Expr, Ident, ObjectName, SelectItem, Statement,
 };
 
 pub struct Binder<'a> {
@@ -235,7 +235,7 @@ impl<'a> Binder<'a> {
 
     fn bind_select(
         &self,
-        projection: &[SelectItem],
+        select_items: &[SelectItem],
         from: &ObjectName,
         selection: &Option<Expr>,
         role_id: RoleId,
@@ -244,18 +244,31 @@ impl<'a> Binder<'a> {
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Select)?;
 
         let mut columns = Vec::new();
-        for item in projection {
+        let mut projection = Vec::new();
+        for item in select_items {
             match item {
                 SelectItem::Wildcard => {
-                    columns.extend(table.columns().iter().map(|column| BoundColumn {
-                        name: column.name().to_string(),
-                        data_type: column.data_type().clone(),
-                        nullable: column.nullable(),
-                        encrypted: column.is_encrypted(),
-                    }));
+                    for column in table.columns() {
+                        let bound_column = BoundColumn {
+                            name: column.name().to_string(),
+                            data_type: column.data_type().clone(),
+                            nullable: column.nullable(),
+                            encrypted: column.is_encrypted(),
+                        };
+                        projection.push(BoundSelectItem {
+                            column: bound_column.clone(),
+                            expr: Expr::Identifier(Ident::new(column.name())),
+                        });
+                        columns.push(bound_column);
+                    }
                 }
                 SelectItem::Expr(Expr::Identifier(identifier)) => {
-                    columns.push(self.resolve_column(table, identifier.as_str())?);
+                    let column = self.resolve_column(table, identifier.as_str())?;
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Identifier(identifier.clone()),
+                    });
+                    columns.push(column);
                 }
                 SelectItem::Expr(expr) => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
@@ -264,12 +277,17 @@ impl<'a> Binder<'a> {
                             format!("cannot infer select expression type: {expr}"),
                         )
                     })?;
-                    columns.push(BoundColumn {
+                    let column = BoundColumn {
                         name: format!("expr{}", columns.len() + 1),
                         data_type,
                         nullable: true,
                         encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: expr.clone(),
                     });
+                    columns.push(column);
                 }
             }
         }
@@ -281,6 +299,7 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
             table: from.clone(),
+            projection,
             columns,
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),

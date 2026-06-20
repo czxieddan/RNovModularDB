@@ -21,7 +21,7 @@ pub enum LogicalPlan {
         cost_hint: TextSearchCostHint,
     },
     Project {
-        columns: Vec<String>,
+        items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
     },
     Insert {
@@ -57,6 +57,12 @@ pub enum LogicalPlan {
     Transaction {
         action: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectionItem {
+    pub name: String,
+    pub expr: Expr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -131,10 +137,13 @@ impl LogicalPlanner {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
                 Ok(LogicalPlan::Project {
-                    columns: select
-                        .columns
+                    items: select
+                        .projection
                         .iter()
-                        .map(|column| column.name.clone())
+                        .map(|item| ProjectionItem {
+                            name: item.column.name.clone(),
+                            expr: item.expr.clone(),
+                        })
                         .collect(),
                     input: Box::new(plan),
                 })
