@@ -158,6 +158,33 @@ impl AuditRecord {
         })
     }
 
+    pub fn from_stored_parts(
+        instance_id: InstanceId,
+        role_id: Option<RoleId>,
+        sequence: u64,
+        kind: AuditEventKind,
+        message: impl Into<String>,
+        previous_digest: AuditDigest,
+        digest: AuditDigest,
+    ) -> Result<Self> {
+        let message = message.into();
+        if message.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "audit message cannot be empty",
+            ));
+        }
+        Ok(Self {
+            instance_id,
+            role_id,
+            sequence,
+            kind,
+            message,
+            previous_digest,
+            digest,
+        })
+    }
+
     pub fn verify(&self) -> bool {
         self.digest
             == audit_digest(
@@ -180,6 +207,10 @@ impl AuditRecord {
 
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
     }
 }
 
@@ -233,27 +264,161 @@ impl AuditChain {
     }
 
     pub fn verify(&self) -> bool {
-        Self::verify_records(self.instance_id, &self.records)
+        self.inspect().is_valid()
     }
 
     pub fn verify_records(instance_id: InstanceId, records: &[AuditRecord]) -> bool {
+        Self::inspect_records(instance_id, records).is_valid()
+    }
+
+    pub fn inspect(&self) -> AuditInspection {
+        Self::inspect_records(self.instance_id, &self.records)
+    }
+
+    pub fn inspect_records(instance_id: InstanceId, records: &[AuditRecord]) -> AuditInspection {
         let mut previous_digest = AuditDigest::zero();
         for (index, record) in records.iter().enumerate() {
             if record.instance_id != instance_id {
-                return false;
+                return AuditInspection::invalid(
+                    instance_id,
+                    records.len(),
+                    previous_digest,
+                    AuditInspectionFailure::InstanceMismatch {
+                        record_index: index,
+                        expected: instance_id,
+                        actual: record.instance_id,
+                    },
+                );
             }
-            if record.sequence != index as u64 + 1 {
-                return false;
+            let expected_sequence = index as u64 + 1;
+            if record.sequence != expected_sequence {
+                return AuditInspection::invalid(
+                    instance_id,
+                    records.len(),
+                    previous_digest,
+                    AuditInspectionFailure::SequenceGap {
+                        record_index: index,
+                        expected: expected_sequence,
+                        actual: record.sequence,
+                    },
+                );
             }
             if record.previous_digest != previous_digest {
-                return false;
+                return AuditInspection::invalid(
+                    instance_id,
+                    records.len(),
+                    previous_digest,
+                    AuditInspectionFailure::PreviousDigestMismatch {
+                        record_index: index,
+                        expected: previous_digest,
+                        actual: record.previous_digest,
+                    },
+                );
             }
             if !record.verify() {
-                return false;
+                return AuditInspection::invalid(
+                    instance_id,
+                    records.len(),
+                    previous_digest,
+                    AuditInspectionFailure::RecordDigestMismatch {
+                        record_index: index,
+                        sequence: record.sequence,
+                    },
+                );
             }
             previous_digest = record.digest;
         }
-        true
+        AuditInspection::valid(instance_id, records.len(), previous_digest)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditInspection {
+    instance_id: InstanceId,
+    record_count: usize,
+    valid: bool,
+    last_valid_digest: AuditDigest,
+    failure: Option<AuditInspectionFailure>,
+}
+
+impl AuditInspection {
+    fn valid(instance_id: InstanceId, record_count: usize, last_valid_digest: AuditDigest) -> Self {
+        Self {
+            instance_id,
+            record_count,
+            valid: true,
+            last_valid_digest,
+            failure: None,
+        }
+    }
+
+    fn invalid(
+        instance_id: InstanceId,
+        record_count: usize,
+        last_valid_digest: AuditDigest,
+        failure: AuditInspectionFailure,
+    ) -> Self {
+        Self {
+            instance_id,
+            record_count,
+            valid: false,
+            last_valid_digest,
+            failure: Some(failure),
+        }
+    }
+
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    pub fn last_valid_digest(&self) -> AuditDigest {
+        self.last_valid_digest
+    }
+
+    pub fn failure(&self) -> Option<&AuditInspectionFailure> {
+        self.failure.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuditInspectionFailure {
+    InstanceMismatch {
+        record_index: usize,
+        expected: InstanceId,
+        actual: InstanceId,
+    },
+    SequenceGap {
+        record_index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    PreviousDigestMismatch {
+        record_index: usize,
+        expected: AuditDigest,
+        actual: AuditDigest,
+    },
+    RecordDigestMismatch {
+        record_index: usize,
+        sequence: u64,
+    },
+}
+
+impl AuditInspectionFailure {
+    pub fn record_index(&self) -> usize {
+        match self {
+            Self::InstanceMismatch { record_index, .. }
+            | Self::SequenceGap { record_index, .. }
+            | Self::PreviousDigestMismatch { record_index, .. }
+            | Self::RecordDigestMismatch { record_index, .. } => *record_index,
+        }
     }
 }
 
