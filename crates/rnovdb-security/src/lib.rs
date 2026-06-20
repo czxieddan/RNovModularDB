@@ -4,9 +4,7 @@ use rnovdb_common::{
     ErrorKind, Result, RnovError,
     ids::{InstanceId, RelationId, RoleId},
 };
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuditEventKind {
@@ -93,8 +91,35 @@ pub struct AuditRecord {
     sequence: u64,
     kind: AuditEventKind,
     message: String,
-    previous_digest: u64,
-    digest: u64,
+    previous_digest: AuditDigest,
+    digest: AuditDigest,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AuditDigest([u8; 32]);
+
+impl AuditDigest {
+    pub const fn zero() -> Self {
+        Self([0_u8; 32])
+    }
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(64);
+        for byte in self.0 {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
 }
 
 impl AuditRecord {
@@ -104,7 +129,7 @@ impl AuditRecord {
         sequence: u64,
         kind: AuditEventKind,
         message: impl Into<String>,
-        previous_digest: u64,
+        previous_digest: AuditDigest,
     ) -> Result<Self> {
         let message = message.into();
         if message.is_empty() {
@@ -145,11 +170,11 @@ impl AuditRecord {
             )
     }
 
-    pub fn digest(&self) -> u64 {
+    pub fn digest(&self) -> AuditDigest {
         self.digest
     }
 
-    pub fn previous_digest(&self) -> u64 {
+    pub fn previous_digest(&self) -> AuditDigest {
         self.previous_digest
     }
 
@@ -179,7 +204,10 @@ impl AuditChain {
         message: impl Into<String>,
     ) -> Result<AuditRecord> {
         let sequence = self.records.len() as u64 + 1;
-        let previous_digest = self.records.last().map_or(0, AuditRecord::digest);
+        let previous_digest = self
+            .records
+            .last()
+            .map_or(AuditDigest::zero(), AuditRecord::digest);
         let record = AuditRecord::new(
             self.instance_id,
             role_id,
@@ -209,7 +237,7 @@ impl AuditChain {
     }
 
     pub fn verify_records(instance_id: InstanceId, records: &[AuditRecord]) -> bool {
-        let mut previous_digest = 0;
+        let mut previous_digest = AuditDigest::zero();
         for (index, record) in records.iter().enumerate() {
             if record.instance_id != instance_id {
                 return false;
@@ -235,15 +263,18 @@ fn audit_digest(
     sequence: u64,
     kind: &AuditEventKind,
     message: &[u8],
-    previous_digest: u64,
-) -> u64 {
-    let mut hash = FNV_OFFSET;
-    hash = fnv1a(hash, &instance_id.get().to_be_bytes());
-    hash = fnv1a(hash, &role_id.map_or(0, RoleId::get).to_be_bytes());
-    hash = fnv1a(hash, &sequence.to_be_bytes());
-    hash = fnv1a(hash, &[audit_kind_tag(kind)]);
-    hash = fnv1a(hash, message);
-    fnv1a(hash, &previous_digest.to_be_bytes())
+    previous_digest: AuditDigest,
+) -> AuditDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(b"RNOVDB-AUDIT-V1");
+    hasher.update(instance_id.get().to_be_bytes());
+    hasher.update(role_id.map_or(0, RoleId::get).to_be_bytes());
+    hasher.update(sequence.to_be_bytes());
+    hasher.update([audit_kind_tag(kind)]);
+    hasher.update((message.len() as u64).to_be_bytes());
+    hasher.update(message);
+    hasher.update(previous_digest.as_bytes());
+    AuditDigest::from_bytes(hasher.finalize().into())
 }
 
 fn audit_kind_tag(kind: &AuditEventKind) -> u8 {
@@ -257,12 +288,4 @@ fn audit_kind_tag(kind: &AuditEventKind) -> u8 {
         AuditEventKind::BackupRestore => 6,
         AuditEventKind::DeniedAccess => 7,
     }
-}
-
-fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
 }
