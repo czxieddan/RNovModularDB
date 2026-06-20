@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -453,6 +453,192 @@ impl Drop for PinnedPage {
         {
             entry.pin_count = entry.pin_count.saturating_sub(1);
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HybridState {
+    MemoryOnly,
+    DiskOnly,
+    HybridSyncing,
+    HybridReady,
+    Switching,
+    Faulted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridSyncStatus {
+    state: HybridState,
+    dirty_pages: usize,
+    mirrored_pages: usize,
+    estimated_flush_bytes: usize,
+}
+
+impl HybridSyncStatus {
+    pub const fn new(
+        state: HybridState,
+        dirty_pages: usize,
+        mirrored_pages: usize,
+        estimated_flush_bytes: usize,
+    ) -> Self {
+        Self {
+            state,
+            dirty_pages,
+            mirrored_pages,
+            estimated_flush_bytes,
+        }
+    }
+
+    pub const fn state(self) -> HybridState {
+        self.state
+    }
+
+    pub const fn dirty_pages(self) -> usize {
+        self.dirty_pages
+    }
+
+    pub const fn mirrored_pages(self) -> usize {
+        self.mirrored_pages
+    }
+
+    pub const fn estimated_flush_bytes(self) -> usize {
+        self.estimated_flush_bytes
+    }
+
+    pub const fn can_switch_to_disk_in_millis(self) -> bool {
+        matches!(self.state, HybridState::HybridReady) && self.dirty_pages == 0
+    }
+}
+
+#[derive(Clone)]
+pub struct HybridBackend {
+    memory: MemoryBackend,
+    disk: Arc<dyn StorageBackend>,
+    dirty_pages: Arc<RwLock<BTreeSet<PageId>>>,
+    mirrored_pages: Arc<RwLock<BTreeSet<PageId>>>,
+}
+
+impl HybridBackend {
+    pub fn new(memory: MemoryBackend, disk: Arc<dyn StorageBackend>) -> Result<Self> {
+        if !disk
+            .capabilities()
+            .contains(StorageCapability::WRITES_TO_DISK)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "hybrid backend disk mirror target must write to disk",
+            ));
+        }
+
+        Ok(Self {
+            memory,
+            disk,
+            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
+            mirrored_pages: Arc::new(RwLock::new(BTreeSet::new())),
+        })
+    }
+
+    pub fn sync_status(&self) -> Result<HybridSyncStatus> {
+        let dirty_pages = self.read_dirty_pages()?.len();
+        let mirrored_pages = self.read_mirrored_pages()?.len();
+        let state = if dirty_pages == 0 {
+            HybridState::HybridReady
+        } else {
+            HybridState::HybridSyncing
+        };
+        Ok(HybridSyncStatus::new(
+            state,
+            dirty_pages,
+            mirrored_pages,
+            dirty_pages.saturating_mul(self.memory.page_size().bytes()),
+        ))
+    }
+
+    fn read_dirty_pages(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeSet<PageId>>> {
+        self.dirty_pages.read().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend dirty page set lock poisoned",
+            )
+        })
+    }
+
+    fn write_dirty_pages(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeSet<PageId>>> {
+        self.dirty_pages.write().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend dirty page set lock poisoned",
+            )
+        })
+    }
+
+    fn read_mirrored_pages(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeSet<PageId>>> {
+        self.mirrored_pages.read().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend mirrored page set lock poisoned",
+            )
+        })
+    }
+
+    fn write_mirrored_pages(&self) -> Result<std::sync::RwLockWriteGuard<'_, BTreeSet<PageId>>> {
+        self.mirrored_pages.write().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend mirrored page set lock poisoned",
+            )
+        })
+    }
+}
+
+impl StorageBackend for HybridBackend {
+    fn read_page(&self, id: PageId) -> Result<Option<Page>> {
+        if let Some(page) = self.memory.read_page(id)? {
+            return Ok(Some(page));
+        }
+        self.disk.read_page(id)
+    }
+
+    fn write_page(&self, page: Page) -> Result<()> {
+        let page_id = page.id();
+        self.memory.write_page(page)?;
+        self.write_dirty_pages()?.insert(page_id);
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<SyncStatus> {
+        let pending = self.read_dirty_pages()?.iter().copied().collect::<Vec<_>>();
+
+        for page_id in &pending {
+            if let Some(page) = self.memory.read_page(*page_id)? {
+                self.disk.write_page(page)?;
+            }
+        }
+        self.disk.sync()?;
+
+        {
+            let mut dirty_pages = self.write_dirty_pages()?;
+            let mut mirrored_pages = self.write_mirrored_pages()?;
+            for page_id in &pending {
+                dirty_pages.remove(page_id);
+                mirrored_pages.insert(*page_id);
+                self.memory.mark_clean(*page_id)?;
+            }
+        }
+
+        Ok(SyncStatus::new(
+            pending.len(),
+            self.read_mirrored_pages()?.len(),
+            BackendMode::Hybrid,
+        ))
+    }
+
+    fn mode(&self) -> BackendMode {
+        BackendMode::Hybrid
+    }
+
+    fn capabilities(&self) -> StorageCapability {
+        StorageCapability::VOLATILE | self.disk.capabilities()
     }
 }
 
