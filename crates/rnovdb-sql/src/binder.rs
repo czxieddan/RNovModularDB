@@ -6,9 +6,10 @@ use rnovdb_common::{
 use rnovdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundSelect, BoundSelectItem,
-    BoundStatement, BoundUpdate, Expr, Ident, ObjectName, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundRowPolicy, BoundSelect,
+    BoundSelectItem, BoundStatement, BoundUpdate, Expr, Ident, ObjectName, SelectItem, Statement,
 };
+use crate::parser::parse_expr;
 
 pub struct Binder<'a> {
     catalog: &'a Catalog,
@@ -210,6 +211,7 @@ impl<'a> Binder<'a> {
             assignments: bound_assignments,
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(table)?,
         }))
     }
 
@@ -230,6 +232,7 @@ impl<'a> Binder<'a> {
             table: table_name.clone(),
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(table)?,
         }))
     }
 
@@ -303,6 +306,7 @@ impl<'a> Binder<'a> {
             columns,
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(table)?,
         }))
     }
 
@@ -374,6 +378,118 @@ impl<'a> Binder<'a> {
             .iter()
             .map(|policy| policy.name().to_string())
             .collect()
+    }
+
+    fn bind_row_policies(&self, table: &Table) -> Result<Vec<BoundRowPolicy>> {
+        self.catalog
+            .row_policies(table.relation_id())
+            .iter()
+            .map(|policy| {
+                let predicate = parse_expr(policy.predicate())?;
+                self.validate_policy_predicate(table, &predicate)?;
+                Ok(BoundRowPolicy {
+                    name: policy.name().to_string(),
+                    predicate,
+                })
+            })
+            .collect()
+    }
+
+    fn validate_policy_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
+        match self.infer_policy_expr_type(table, expr)? {
+            Some(SqlType::Bool | SqlType::Null) | None => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("row policy predicate must be bool, got {other:?}"),
+            )),
+        }
+    }
+
+    fn infer_policy_expr_type(&self, table: &Table, expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Identifier(identifier) => {
+                let column = self.resolve_column(table, identifier.as_str())?;
+                Ok(Some(column.data_type))
+            }
+            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::Array(values) => {
+                let mut element_type = None;
+                for value in values {
+                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
+                        return Ok(None);
+                    };
+                    if value_type == SqlType::Null {
+                        continue;
+                    }
+                    match &element_type {
+                        Some(existing) if *existing != value_type => {
+                            return Err(RnovError::new(
+                                ErrorKind::InvalidInput,
+                                "array literal contains mixed element types",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => element_type = Some(value_type),
+                    }
+                }
+                Ok(Some(SqlType::Array(Box::new(
+                    element_type.unwrap_or(SqlType::Null),
+                ))))
+            }
+            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
+            Expr::Range { lower, upper, .. } => {
+                let Some(lower_type) = self.infer_policy_expr_type(table, lower)? else {
+                    return Ok(None);
+                };
+                let Some(upper_type) = self.infer_policy_expr_type(table, upper)? else {
+                    return Ok(None);
+                };
+                let element_type = match (lower_type, upper_type) {
+                    (SqlType::Null, SqlType::Null) => SqlType::Null,
+                    (SqlType::Null, upper_type) => upper_type,
+                    (lower_type, SqlType::Null) => lower_type,
+                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
+                    _ => {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "range literal bounds have different types",
+                        ));
+                    }
+                };
+                Ok(Some(SqlType::Range(Box::new(element_type))))
+            }
+            Expr::Binary { left, right, .. } => {
+                let left_type = self.infer_policy_expr_type(table, left)?;
+                let right_type = self.infer_policy_expr_type(table, right)?;
+                match (left_type, right_type) {
+                    (Some(left_type), Some(right_type)) => {
+                        self.infer_operator_result_type(expr, &left_type, &right_type)
+                    }
+                    _ => Ok(policy_unknown_side_operator_type(expr)),
+                }
+            }
+            Expr::Call { name, args } => {
+                let mut argument_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(arg_type) = self.infer_policy_expr_type(table, arg)? else {
+                        return Ok(None);
+                    };
+                    argument_types.push(arg_type);
+                }
+
+                Ok(self
+                    .catalog
+                    .functions()
+                    .iter()
+                    .find(|function| {
+                        function.name() == name.object()
+                            && function.argument_types() == argument_types
+                    })
+                    .map(|function| function.return_type().clone()))
+            }
+        }
     }
 
     fn ensure_expr_assignable(
@@ -535,5 +651,17 @@ impl<'a> Binder<'a> {
             })?;
 
         Ok(Some(operator.signature().result_type().clone()))
+    }
+}
+
+fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
+    let Expr::Binary { op, .. } = expr else {
+        return None;
+    };
+
+    if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        Some(SqlType::Bool)
+    } else {
+        None
     }
 }

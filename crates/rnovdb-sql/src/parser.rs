@@ -19,6 +19,14 @@ pub fn parse_statement(input: &str) -> Result<Statement> {
     Ok(statement)
 }
 
+pub fn parse_expr(input: &str) -> Result<Expr> {
+    let tokens = lex(input)?;
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr()?;
+    parser.expect_end()?;
+    Ok(expr)
+}
+
 struct Parser {
     tokens: Vec<Token>,
     position: usize,

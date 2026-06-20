@@ -307,6 +307,7 @@ pub struct BoundSelect {
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,
     pub applied_row_policies: Vec<String>,
+    pub row_policy_predicates: Vec<BoundRowPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -322,12 +323,19 @@ pub struct BoundAssignment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundRowPolicy {
+    pub name: String,
+    pub predicate: Expr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundUpdate {
     pub relation_id: RelationId,
     pub table: ObjectName,
     pub assignments: Vec<BoundAssignment>,
     pub selection: Option<Expr>,
     pub applied_row_policies: Vec<String>,
+    pub row_policy_predicates: Vec<BoundRowPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -336,6 +344,7 @@ pub struct BoundDelete {
     pub table: ObjectName,
     pub selection: Option<Expr>,
     pub applied_row_policies: Vec<String>,
+    pub row_policy_predicates: Vec<BoundRowPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

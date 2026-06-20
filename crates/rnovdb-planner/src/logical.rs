@@ -133,6 +133,10 @@ impl LogicalPlanner {
                     relation_id: select.relation_id,
                     table: object_name(&select.table),
                 };
+                for policy in &select.row_policy_predicates {
+                    plan =
+                        plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
+                }
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
