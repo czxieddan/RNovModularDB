@@ -57,6 +57,9 @@ pub enum LogicalPlan {
     Transaction {
         action: String,
     },
+    Explain {
+        input: Box<LogicalPlan>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +166,111 @@ impl LogicalPlanner {
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
             }),
+            BoundStatement::Explain { statement } => Ok(LogicalPlan::Explain {
+                input: Box::new(self.plan(statement)?),
+            }),
+        }
+    }
+}
+
+impl LogicalPlan {
+    pub fn explain(&self) -> String {
+        let mut out = String::new();
+        write_plan(self, 0, &mut out);
+        out
+    }
+}
+
+fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
+    let prefix = "  ".repeat(indent);
+    match plan {
+        LogicalPlan::Scan { table, .. } => {
+            out.push_str(&format!("{prefix}Scan table={table}\n"));
+        }
+        LogicalPlan::Filter { predicate, input } => {
+            out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::TextSearch {
+            table,
+            column,
+            query,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}TextSearch table={table} column={column} query='{query}'\n"
+            ));
+        }
+        LogicalPlan::Project { items, input } => {
+            let columns = items
+                .iter()
+                .map(|item| format!("{} := {}", item.name, item.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Insert { table, columns, .. } => {
+            out.push_str(&format!(
+                "{prefix}Insert table={table} columns={}\n",
+                columns.join(", ")
+            ));
+        }
+        LogicalPlan::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => {
+            let assignments = assignments
+                .iter()
+                .map(|(column, expr)| format!("{column} = {expr}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("{prefix}Update table={table} set={assignments}"));
+            if let Some(selection) = selection {
+                out.push_str(&format!(" where={selection}"));
+            }
+            out.push('\n');
+        }
+        LogicalPlan::Delete {
+            table, selection, ..
+        } => {
+            out.push_str(&format!("{prefix}Delete table={table}"));
+            if let Some(selection) = selection {
+                out.push_str(&format!(" where={selection}"));
+            }
+            out.push('\n');
+        }
+        LogicalPlan::CreateTable { table, columns } => {
+            out.push_str(&format!(
+                "{prefix}CreateTable table={table} columns={}\n",
+                columns
+                    .iter()
+                    .map(|column| column.name.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        LogicalPlan::AlterTableAddColumn { table, column, .. } => {
+            out.push_str(&format!(
+                "{prefix}AlterTableAddColumn table={table} column={}\n",
+                column.name
+            ));
+        }
+        LogicalPlan::DropTable {
+            table, if_exists, ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropTable table={table} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::Transaction { action } => {
+            out.push_str(&format!("{prefix}Transaction action={action}\n"));
+        }
+        LogicalPlan::Explain { input } => {
+            out.push_str(&format!("{prefix}Explain\n"));
+            write_plan(input, indent + 1, out);
         }
     }
 }

@@ -53,9 +53,20 @@ impl Parser {
             Some(TokenKind::Begin) => self.parse_transaction(TransactionAction::Begin),
             Some(TokenKind::Commit) => self.parse_transaction(TransactionAction::Commit),
             Some(TokenKind::Rollback) => self.parse_transaction(TransactionAction::Rollback),
+            Some(TokenKind::Explain) => self.parse_explain(),
             Some(kind) => Err(self.error(format!("unexpected statement token {kind:?}"))),
             None => Err(self.error("empty statement")),
         }
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Explain)?;
+        if matches!(self.peek_kind(), Some(TokenKind::Explain)) {
+            return Err(self.error("nested EXPLAIN is not supported"));
+        }
+        Ok(Statement::Explain {
+            statement: Box::new(self.parse_statement()?),
+        })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -681,6 +692,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
+            | (TokenKind::Explain, TokenKind::Explain)
             | (TokenKind::Comma, TokenKind::Comma)
             | (TokenKind::Dot, TokenKind::Dot)
             | (TokenKind::Semicolon, TokenKind::Semicolon)

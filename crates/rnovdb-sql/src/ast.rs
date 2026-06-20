@@ -289,6 +289,9 @@ pub enum Statement {
     Transaction {
         action: TransactionAction,
     },
+    Explain {
+        statement: Box<Statement>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -394,5 +397,8 @@ pub enum BoundStatement {
     Select(BoundSelect),
     Transaction {
         action: TransactionAction,
+    },
+    Explain {
+        statement: Box<BoundStatement>,
     },
 }

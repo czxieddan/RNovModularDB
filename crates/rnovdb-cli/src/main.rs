@@ -36,5 +36,6 @@ fn format_output(output: CommandOutput) -> String {
         CommandOutput::Rows(batch) => format!("{:?}", batch.rows()),
         CommandOutput::RowsAffected(rows) => format!("{rows} rows affected"),
         CommandOutput::SchemaChanged => "schema changed".to_string(),
+        CommandOutput::Text(text) => text,
     }
 }

@@ -20,6 +20,7 @@ pub enum CommandOutput {
     Rows(VectorBatch),
     RowsAffected(u64),
     SchemaChanged,
+    Text(String),
 }
 
 pub struct LocalSession {
@@ -102,6 +103,10 @@ impl LocalSession {
             BoundStatement::Select(_) => {
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute(&plan).map(CommandOutput::Rows)
+            }
+            BoundStatement::Explain { statement } => {
+                let plan = self.planner.plan(statement)?;
+                Ok(CommandOutput::Text(plan.explain()))
             }
             _ => {
                 let plan = self.planner.plan(&bound)?;
