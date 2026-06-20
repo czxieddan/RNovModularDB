@@ -296,8 +296,10 @@ dependencies = [
 name = "rnovdb-server"
 version = "0.1.0"
 dependencies = [
+ "rnovdb-cli",
  "rnovdb-common",
  "rnovdb-instance",
+ "rnovdb-types",
 ]
 
 [[package]]

@@ -6,8 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rnovdb-cli.workspace = true
 rnovdb-common.workspace = true
 rnovdb-instance.workspace = true
+
+[dev-dependencies]
+rnovdb-types.workspace = true
 
 [lib]
 path = "src/lib.rs"

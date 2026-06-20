@@ -38,3 +38,4 @@ rnovdb-udf = { path = "crates/rnovdb-udf" }
 rnovdb-security = { path = "crates/rnovdb-security" }
 rnovdb-instance = { path = "crates/rnovdb-instance" }
 rnovdb-server = { path = "crates/rnovdb-server" }
+rnovdb-cli = { path = "crates/rnovdb-cli" }
