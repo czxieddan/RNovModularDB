@@ -84,6 +84,81 @@ impl AuditRecord {
     pub fn previous_digest(&self) -> u64 {
         self.previous_digest
     }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditChain {
+    instance_id: InstanceId,
+    records: Vec<AuditRecord>,
+}
+
+impl AuditChain {
+    pub fn new(instance_id: InstanceId) -> Self {
+        Self {
+            instance_id,
+            records: Vec::new(),
+        }
+    }
+
+    pub fn append(
+        &mut self,
+        role_id: Option<RoleId>,
+        kind: AuditEventKind,
+        message: impl Into<String>,
+    ) -> Result<AuditRecord> {
+        let sequence = self.records.len() as u64 + 1;
+        let previous_digest = self.records.last().map_or(0, AuditRecord::digest);
+        let record = AuditRecord::new(
+            self.instance_id,
+            role_id,
+            sequence,
+            kind,
+            message,
+            previous_digest,
+        )?;
+        self.records.push(record.clone());
+        Ok(record)
+    }
+
+    pub fn records(&self) -> &[AuditRecord] {
+        &self.records
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn verify(&self) -> bool {
+        Self::verify_records(self.instance_id, &self.records)
+    }
+
+    pub fn verify_records(instance_id: InstanceId, records: &[AuditRecord]) -> bool {
+        let mut previous_digest = 0;
+        for (index, record) in records.iter().enumerate() {
+            if record.instance_id != instance_id {
+                return false;
+            }
+            if record.sequence != index as u64 + 1 {
+                return false;
+            }
+            if record.previous_digest != previous_digest {
+                return false;
+            }
+            if !record.verify() {
+                return false;
+            }
+            previous_digest = record.digest;
+        }
+        true
+    }
 }
 
 fn audit_digest(
