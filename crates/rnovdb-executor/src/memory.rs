@@ -1,4 +1,12 @@
-use std::{cmp::Ordering, collections::BTreeMap, thread};
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
+    thread,
+};
 
 use rnovdb_common::Result;
 use rnovdb_common::{ErrorKind, RnovError};
@@ -43,11 +51,21 @@ impl MemoryTable {
     }
 
     pub fn scan_parallel(&self, config: ParallelQueryConfig) -> Result<VectorBatch> {
+        self.scan_parallel_cancellable(config, &CancellationToken::default())
+    }
+
+    pub fn scan_parallel_cancellable(
+        &self,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         config.validate()?;
+        cancellation.check()?;
         if self.rows.is_empty()
             || config.worker_threads() == 1
             || self.rows.len() < config.min_parallel_rows()
         {
+            cancellation.check()?;
             return Ok(self.scan());
         }
 
@@ -57,18 +75,25 @@ impl MemoryTable {
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for chunk in self.rows.chunks(chunk_size) {
-                handles.push(scope.spawn(move || chunk.to_vec()));
+                let cancellation = cancellation.clone();
+                handles.push(scope.spawn(move || {
+                    cancellation.check()?;
+                    let rows = chunk.to_vec();
+                    cancellation.check()?;
+                    Ok::<Vec<Row>, RnovError>(rows)
+                }));
             }
 
             for handle in handles {
                 let mut chunk = handle.join().map_err(|_| {
                     RnovError::new(ErrorKind::Internal, "parallel memory scan worker panicked")
-                })?;
+                })??;
                 rows.append(&mut chunk);
             }
             Ok::<(), RnovError>(())
         })?;
 
+        cancellation.check()?;
         VectorBatch::new(self.columns.clone(), rows)
     }
 
@@ -82,6 +107,35 @@ impl MemoryTable {
         let _ = VectorBatch::new(columns.clone(), rows.clone())?;
         self.columns = columns;
         self.rows = rows;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    canceled: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.canceled.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.canceled.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.is_canceled() {
+            return Err(RnovError::new(
+                ErrorKind::Canceled,
+                "query execution canceled",
+            ));
+        }
         Ok(())
     }
 }
@@ -158,6 +212,15 @@ impl MemoryExecutor {
     }
 
     pub fn execute(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
+        self.execute_cancellable(plan, &CancellationToken::default())
+    }
+
+    pub fn execute_cancellable(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        cancellation.check()?;
         match plan {
             LogicalPlan::Scan { table, .. } => self
                 .tables
@@ -167,8 +230,8 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 }),
             LogicalPlan::Filter { predicate, input } => {
-                let batch = self.execute(input)?;
-                apply_filter(batch, predicate)
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_filter_cancellable(batch, predicate, cancellation)
             }
             LogicalPlan::TextSearch {
                 table,
@@ -183,11 +246,11 @@ impl MemoryExecutor {
                     .ok_or_else(|| {
                         RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                     })?;
-                apply_text_search(batch, column, query)
+                apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::Project { items, input } => {
-                let batch = self.execute(input)?;
-                apply_projection(batch, items)
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_projection_cancellable(batch, items, cancellation)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -200,12 +263,30 @@ impl MemoryExecutor {
         self.execute(plan)
     }
 
+    pub async fn execute_cancellable_async(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        self.execute_cancellable(plan, cancellation)
+    }
+
     pub fn execute_parallel(
         &self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
     ) -> Result<VectorBatch> {
+        self.execute_parallel_cancellable(plan, config, &CancellationToken::default())
+    }
+
+    pub fn execute_parallel_cancellable(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         config.validate()?;
+        cancellation.check()?;
         match plan {
             LogicalPlan::Scan { table, .. } => self
                 .tables
@@ -213,10 +294,10 @@ impl MemoryExecutor {
                 .ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
-                .scan_parallel(config),
+                .scan_parallel_cancellable(config, cancellation),
             LogicalPlan::Filter { predicate, input } => {
-                let batch = self.execute_parallel(input, config)?;
-                apply_filter(batch, predicate)
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_filter_cancellable(batch, predicate, cancellation)
             }
             LogicalPlan::TextSearch {
                 table,
@@ -230,12 +311,12 @@ impl MemoryExecutor {
                     .ok_or_else(|| {
                         RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                     })?
-                    .scan_parallel(config)?;
-                apply_text_search(batch, column, query)
+                    .scan_parallel_cancellable(config, cancellation)?;
+                apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::Project { items, input } => {
-                let batch = self.execute_parallel(input, config)?;
-                apply_projection(batch, items)
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_projection_cancellable(batch, items, cancellation)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -250,6 +331,15 @@ impl MemoryExecutor {
         config: ParallelQueryConfig,
     ) -> Result<VectorBatch> {
         self.execute_parallel(plan, config)
+    }
+
+    pub async fn execute_parallel_cancellable_async(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        self.execute_parallel_cancellable(plan, config, cancellation)
     }
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
@@ -439,20 +529,27 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
     table.insert(Row::new(row_values))
 }
 
-fn apply_filter(batch: VectorBatch, predicate: &Expr) -> Result<VectorBatch> {
+fn apply_filter_cancellable(
+    batch: VectorBatch,
+    predicate: &Expr,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
     let mut rows = Vec::new();
     for row in batch.rows() {
+        cancellation.check()?;
         if eval_predicate(batch.columns(), row, predicate)? {
             rows.push(row.clone());
         }
     }
 
+    cancellation.check()?;
     VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
-fn apply_projection(
+fn apply_projection_cancellable(
     batch: VectorBatch,
     items: &[rnovdb_planner::logical::ProjectionItem],
+    cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let columns = items
         .iter()
@@ -464,6 +561,7 @@ fn apply_projection(
 
     let mut rows = Vec::with_capacity(batch.rows().len());
     for row in batch.rows() {
+        cancellation.check()?;
         let values = items
             .iter()
             .map(|item| eval_expr(batch.columns(), row, &item.expr))
@@ -471,6 +569,7 @@ fn apply_projection(
         rows.push(Row::new(values));
     }
 
+    cancellation.check()?;
     VectorBatch::new(columns, rows)
 }
 
@@ -594,7 +693,12 @@ fn boolean_operator(op: &str) -> bool {
     matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@")
 }
 
-fn apply_text_search(batch: VectorBatch, column: &str, query: &str) -> Result<VectorBatch> {
+fn apply_text_search_cancellable(
+    batch: VectorBatch,
+    column: &str,
+    query: &str,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
     let index = column_index(batch.columns(), column)?;
     match batch.columns()[index].data_type() {
         SqlType::Text | SqlType::TextVector => {}
@@ -611,11 +715,13 @@ fn apply_text_search(batch: VectorBatch, column: &str, query: &str) -> Result<Ve
     let mut rows = Vec::new();
 
     for row in batch.rows() {
+        cancellation.check()?;
         if text_value_matches(row.values()[index].clone(), &query, &builder)? {
             rows.push(row.clone());
         }
     }
 
+    cancellation.check()?;
     VectorBatch::new(batch.columns().to_vec(), rows)
 }
 

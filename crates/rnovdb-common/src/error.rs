@@ -4,6 +4,7 @@ pub type Result<T> = std::result::Result<T, RnovError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ErrorKind {
+    Canceled,
     Config,
     Corruption,
     Internal,
