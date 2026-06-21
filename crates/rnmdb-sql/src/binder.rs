@@ -103,7 +103,8 @@ impl<'a> Binder<'a> {
                 projection,
                 from,
                 selection,
-            } => self.bind_select(projection, from, selection, role_id),
+                limit,
+            } => self.bind_select(projection, from, selection, *limit, role_id),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -245,6 +246,7 @@ impl<'a> Binder<'a> {
         select_items: &[SelectItem],
         from: &ObjectName,
         selection: &Option<Expr>,
+        limit: Option<usize>,
         role_id: RoleId,
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(from)?;
@@ -309,6 +311,7 @@ impl<'a> Binder<'a> {
             projection,
             columns,
             selection: selection.clone(),
+            limit,
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
             row_policy_predicates: self.bind_row_policies(table)?,
         }))

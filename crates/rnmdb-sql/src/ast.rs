@@ -285,6 +285,7 @@ pub enum Statement {
         projection: Vec<SelectItem>,
         from: ObjectName,
         selection: Option<Expr>,
+        limit: Option<usize>,
     },
     Transaction {
         action: TransactionAction,
@@ -310,6 +311,7 @@ pub struct BoundSelect {
     pub projection: Vec<BoundSelectItem>,
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,
+    pub limit: Option<usize>,
     pub applied_row_policies: Vec<String>,
     pub row_policy_predicates: Vec<BoundRowPolicy>,
 }

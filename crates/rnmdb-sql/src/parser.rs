@@ -317,10 +317,16 @@ impl Parser {
         } else {
             None
         };
+        let limit = if self.consume_if(&TokenKind::Limit) {
+            Some(self.parse_limit_value()?)
+        } else {
+            None
+        };
         Ok(Statement::Select {
             projection,
             from,
             selection,
+            limit,
         })
     }
 
@@ -538,6 +544,18 @@ impl Parser {
         }
     }
 
+    fn parse_limit_value(&mut self) -> Result<usize> {
+        match self.peek_kind().cloned() {
+            Some(TokenKind::Integer(value)) => {
+                self.bump();
+                usize::try_from(value)
+                    .map_err(|_| self.error("LIMIT must be a non-negative integer"))
+            }
+            Some(kind) => Err(self.error(format!("expected LIMIT value but found {kind:?}"))),
+            None => Err(self.error("expected LIMIT value")),
+        }
+    }
+
     fn parse_privilege(&mut self) -> Result<Privilege> {
         match self.peek_kind() {
             Some(TokenKind::Select) => {
@@ -678,6 +696,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)
+            | (TokenKind::Limit, TokenKind::Limit)
             | (TokenKind::Function, TokenKind::Function)
             | (TokenKind::Returns, TokenKind::Returns)
             | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)

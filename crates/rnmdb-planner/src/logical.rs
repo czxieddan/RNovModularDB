@@ -24,6 +24,10 @@ pub enum LogicalPlan {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
     },
+    Limit {
+        count: usize,
+        input: Box<LogicalPlan>,
+    },
     Insert {
         table: String,
         columns: Vec<String>,
@@ -169,7 +173,7 @@ impl LogicalPlanner {
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
-                Ok(LogicalPlan::Project {
+                let plan = LogicalPlan::Project {
                     items: select
                         .projection
                         .iter()
@@ -179,7 +183,15 @@ impl LogicalPlanner {
                         })
                         .collect(),
                     input: Box::new(plan),
-                })
+                };
+                if let Some(count) = select.limit {
+                    Ok(LogicalPlan::Limit {
+                        count,
+                        input: Box::new(plan),
+                    })
+                } else {
+                    Ok(plan)
+                }
             }
             BoundStatement::CreateFunction { .. }
             | BoundStatement::CreateOperator { .. }
@@ -235,6 +247,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Limit { count, input } => {
+            out.push_str(&format!("{prefix}Limit count={count}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Insert { table, columns, .. } => {

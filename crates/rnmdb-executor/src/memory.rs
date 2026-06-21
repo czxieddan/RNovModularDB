@@ -252,6 +252,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Limit { count, input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_limit_cancellable(batch, *count, cancellation)
+            }
             LogicalPlan::Parallel { input, .. } => self.execute_cancellable(input, cancellation),
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -318,6 +322,10 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Limit { count, input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_limit_cancellable(batch, *count, cancellation)
             }
             LogicalPlan::Parallel { input, .. } => {
                 self.execute_parallel_cancellable(input, config, cancellation)
@@ -575,6 +583,17 @@ fn apply_projection_cancellable(
 
     cancellation.check()?;
     VectorBatch::new(columns, rows)
+}
+
+fn apply_limit_cancellable(
+    batch: VectorBatch,
+    count: usize,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    let rows = batch.rows().iter().take(count).cloned().collect();
+    cancellation.check()?;
+    VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
 fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {

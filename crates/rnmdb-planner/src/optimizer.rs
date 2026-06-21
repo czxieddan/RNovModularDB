@@ -45,6 +45,10 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             items,
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::Limit { count, input } => LogicalPlan::Limit {
+            count,
+            input: Box::new(optimize_plan(*input)),
+        },
         LogicalPlan::Parallel { hint, input } => LogicalPlan::Parallel {
             hint,
             input: Box::new(optimize_plan(*input)),
@@ -66,6 +70,10 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
         },
         LogicalPlan::Project { items, input } => LogicalPlan::Project {
             items,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::Limit { count, input } => LogicalPlan::Limit {
+            count,
             input: Box::new(annotate_parallel(*input, workers)),
         },
         LogicalPlan::Explain { analyze, input } => LogicalPlan::Explain {
