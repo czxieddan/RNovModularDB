@@ -98,9 +98,10 @@ pub struct AggregateItem {
     pub function: AggregateFunction,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateFunction {
     CountStar,
+    Count(Expr),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,11 +206,11 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                let mut plan = if is_count_star_select(select) {
+                let mut plan = if let Some(function) = select_aggregate_function(select) {
                     LogicalPlan::Aggregate {
                         items: vec![AggregateItem {
                             name: select.projection[0].column.name.clone(),
-                            function: AggregateFunction::CountStar,
+                            function,
                         }],
                         input: Box::new(plan),
                     }
@@ -311,7 +312,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     format!(
                         "{} := {}",
                         item.name,
-                        aggregate_function_name(item.function)
+                        aggregate_function_name(&item.function)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -473,19 +474,21 @@ fn object_name(name: &ObjectName) -> String {
     name.to_string()
 }
 
-fn is_count_star_select(select: &rnmdb_sql::ast::BoundSelect) -> bool {
-    matches!(
-        select.projection.as_slice(),
-        [rnmdb_sql::ast::BoundSelectItem {
-            expr: Expr::CountStar,
-            ..
-        }]
-    )
+fn select_aggregate_function(select: &rnmdb_sql::ast::BoundSelect) -> Option<AggregateFunction> {
+    let [item] = select.projection.as_slice() else {
+        return None;
+    };
+    match &item.expr {
+        Expr::CountStar => Some(AggregateFunction::CountStar),
+        Expr::Count(expr) => Some(AggregateFunction::Count((**expr).clone())),
+        _ => None,
+    }
 }
 
-fn aggregate_function_name(function: AggregateFunction) -> &'static str {
+fn aggregate_function_name(function: &AggregateFunction) -> String {
     match function {
-        AggregateFunction::CountStar => "count(*)",
+        AggregateFunction::CountStar => "count(*)".to_string(),
+        AggregateFunction::Count(expr) => format!("count({expr})"),
     }
 }
 

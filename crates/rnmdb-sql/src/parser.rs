@@ -461,6 +461,13 @@ impl Parser {
                         self.expect_keyword(TokenKind::RightParen)?;
                         args
                     };
+                    if name.schema().is_none() && name.object() == "count" {
+                        let mut args = args;
+                        if args.len() != 1 {
+                            return Err(self.error("count() requires exactly one expression"));
+                        }
+                        return Ok(Expr::Count(Box::new(args.remove(0))));
+                    }
                     Ok(Expr::Call { name, args })
                 } else if name.schema().is_none() {
                     Ok(Expr::Identifier(Ident::new(name.object())))

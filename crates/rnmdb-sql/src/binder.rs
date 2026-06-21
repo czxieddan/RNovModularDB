@@ -300,6 +300,25 @@ impl<'a> Binder<'a> {
                     });
                     columns.push(column);
                 }
+                SelectItem::Expr(Expr::Count(expr)) => {
+                    let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer COUNT expression type: {expr}"),
+                        )
+                    })?;
+                    let column = BoundColumn {
+                        name: "count".to_string(),
+                        data_type: SqlType::Int64,
+                        nullable: false,
+                        encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Count(expr.clone()),
+                    });
+                    columns.push(column);
+                }
                 SelectItem::Expr(expr) => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
@@ -321,17 +340,17 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        let has_count_star = projection.iter().any(|item| item.expr == Expr::CountStar);
-        if has_count_star && projection.len() != 1 {
+        let has_aggregate = projection.iter().any(|item| is_aggregate_expr(&item.expr));
+        if has_aggregate && projection.len() != 1 {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "COUNT(*) cannot be mixed with other select items yet",
+                "aggregate expressions cannot be mixed with other select items yet",
             ));
         }
-        if has_count_star && !order_by.is_empty() {
+        if has_aggregate && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "ORDER BY with COUNT(*) is not supported yet",
+                "ORDER BY with aggregate expressions is not supported yet",
             ));
         }
 
@@ -483,6 +502,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
             )),
+            Expr::Count(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(expr) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -609,6 +632,10 @@ impl<'a> Binder<'a> {
             Expr::CountStar => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
+            )),
+            Expr::Count(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(expr) is only supported as a SELECT projection",
             )),
             Expr::Array(values) => {
                 let mut element_type = None;
@@ -737,4 +764,8 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
     } else {
         None
     }
+}
+
+fn is_aggregate_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::CountStar | Expr::Count(_))
 }

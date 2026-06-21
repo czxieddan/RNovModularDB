@@ -629,25 +629,37 @@ fn apply_aggregate_cancellable(
         .collect::<Vec<_>>();
     let values = items
         .iter()
-        .map(|item| aggregate_value(&batch, item.function))
+        .map(|item| aggregate_value(&batch, &item.function))
         .collect::<Result<Vec<_>>>()?;
     cancellation.check()?;
     VectorBatch::new(columns, vec![Row::new(values)])
 }
 
 fn aggregate_column_schema(item: &AggregateItem) -> ColumnSchema {
-    match item.function {
+    match &item.function {
         AggregateFunction::CountStar => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
+        AggregateFunction::Count(_) => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
     }
     .not_null()
 }
 
-fn aggregate_value(batch: &VectorBatch, function: AggregateFunction) -> Result<SqlValue> {
+fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<SqlValue> {
     match function {
         AggregateFunction::CountStar => {
             Ok(SqlValue::Int64(i64::try_from(batch.rows().len()).map_err(
                 |_| RnovError::new(ErrorKind::InvalidInput, "COUNT(*) result exceeds int64"),
             )?))
+        }
+        AggregateFunction::Count(expr) => {
+            let mut count = 0_i64;
+            for row in batch.rows() {
+                if !eval_expr(batch.columns(), row, expr)?.is_null() {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        RnovError::new(ErrorKind::InvalidInput, "COUNT(expr) result exceeds int64")
+                    })?;
+                }
+            }
+            Ok(SqlValue::Int64(count))
         }
     }
 }
@@ -798,6 +810,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "COUNT(*) requires aggregate execution",
         )),
+        Expr::Count(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COUNT(expr) requires aggregate execution",
+        )),
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
         Expr::Range {
@@ -842,6 +858,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::CountStar => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "COUNT(*) requires aggregate execution",
+        )),
+        Expr::Count(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COUNT(expr) requires aggregate execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Call { name, .. } => Err(RnovError::new(

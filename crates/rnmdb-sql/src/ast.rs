@@ -91,6 +91,7 @@ pub enum Expr {
     String(String),
     Null,
     CountStar,
+    Count(Box<Expr>),
     Array(Vec<Expr>),
     HStore(Vec<(String, Option<String>)>),
     Range {
@@ -157,6 +158,7 @@ impl fmt::Display for Expr {
             Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
             Self::Null => f.write_str("NULL"),
             Self::CountStar => f.write_str("count(*)"),
+            Self::Count(expr) => write!(f, "count({expr})"),
             Self::Array(values) => {
                 f.write_str("ARRAY[")?;
                 for (index, value) in values.iter().enumerate() {
