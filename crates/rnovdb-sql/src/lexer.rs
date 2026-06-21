@@ -65,6 +65,7 @@ pub enum TokenKind {
     Null,
     Encrypted,
     Explain,
+    Analyze,
     Identifier(String),
     Integer(i64),
     String(String),
@@ -177,6 +178,7 @@ impl<'a> Lexer<'a> {
             "null" => TokenKind::Null,
             "encrypted" => TokenKind::Encrypted,
             "explain" => TokenKind::Explain,
+            "analyze" => TokenKind::Analyze,
             _ => TokenKind::Identifier(normalized),
         };
         Token::new(kind, start, self.position)

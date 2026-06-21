@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use rnovdb_catalog::{Catalog, OperatorSignature, Privilege, RowPolicy};
 use rnovdb_common::{
     Result,
@@ -123,9 +125,23 @@ impl LocalSession {
                     .execute_parallel(&plan, self.execution.parallel_query())
                     .map(CommandOutput::Rows)
             }
-            BoundStatement::Explain { statement } => {
+            BoundStatement::Explain { analyze, statement } => {
                 let plan = self.optimize_read_plan(self.planner.plan(statement)?);
-                Ok(CommandOutput::Text(plan.explain()))
+                if *analyze {
+                    let started = Instant::now();
+                    let batch = self
+                        .executor
+                        .execute_parallel(&plan, self.execution.parallel_query())?;
+                    let elapsed = started.elapsed();
+                    Ok(CommandOutput::Text(format!(
+                        "{}Analyze rows={} elapsed_us={}\n",
+                        plan.explain(),
+                        batch.rows().len(),
+                        elapsed.as_micros()
+                    )))
+                } else {
+                    Ok(CommandOutput::Text(plan.explain()))
+                }
             }
             _ => {
                 let plan = self.planner.plan(&bound)?;

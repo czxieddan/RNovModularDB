@@ -58,6 +58,7 @@ pub enum LogicalPlan {
         action: String,
     },
     Explain {
+        analyze: bool,
         input: Box<LogicalPlan>,
     },
     Parallel {
@@ -191,7 +192,8 @@ impl LogicalPlanner {
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
             }),
-            BoundStatement::Explain { statement } => Ok(LogicalPlan::Explain {
+            BoundStatement::Explain { analyze, statement } => Ok(LogicalPlan::Explain {
+                analyze: *analyze,
                 input: Box::new(self.plan(statement)?),
             }),
         }
@@ -293,8 +295,8 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::Transaction { action } => {
             out.push_str(&format!("{prefix}Transaction action={action}\n"));
         }
-        LogicalPlan::Explain { input } => {
-            out.push_str(&format!("{prefix}Explain\n"));
+        LogicalPlan::Explain { analyze, input } => {
+            out.push_str(&format!("{prefix}Explain analyze={analyze}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Parallel { hint, input } => {

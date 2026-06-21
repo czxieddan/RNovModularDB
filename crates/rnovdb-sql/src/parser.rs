@@ -61,10 +61,12 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Explain)?;
+        let analyze = self.consume_if(&TokenKind::Analyze);
         if matches!(self.peek_kind(), Some(TokenKind::Explain)) {
             return Err(self.error("nested EXPLAIN is not supported"));
         }
         Ok(Statement::Explain {
+            analyze,
             statement: Box::new(self.parse_statement()?),
         })
     }
@@ -693,6 +695,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)
+            | (TokenKind::Analyze, TokenKind::Analyze)
             | (TokenKind::Comma, TokenKind::Comma)
             | (TokenKind::Dot, TokenKind::Dot)
             | (TokenKind::Semicolon, TokenKind::Semicolon)

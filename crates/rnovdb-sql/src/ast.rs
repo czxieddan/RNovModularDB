@@ -290,6 +290,7 @@ pub enum Statement {
         action: TransactionAction,
     },
     Explain {
+        analyze: bool,
         statement: Box<Statement>,
     },
 }
@@ -399,6 +400,7 @@ pub enum BoundStatement {
         action: TransactionAction,
     },
     Explain {
+        analyze: bool,
         statement: Box<BoundStatement>,
     },
 }

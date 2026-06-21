@@ -107,7 +107,8 @@ impl<'a> Binder<'a> {
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
-            Statement::Explain { statement } => Ok(BoundStatement::Explain {
+            Statement::Explain { analyze, statement } => Ok(BoundStatement::Explain {
+                analyze: *analyze,
                 statement: Box::new(self.bind_for_role(statement, role_id)?),
             }),
         }

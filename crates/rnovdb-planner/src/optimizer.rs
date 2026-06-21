@@ -68,7 +68,8 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             items,
             input: Box::new(annotate_parallel(*input, workers)),
         },
-        LogicalPlan::Explain { input } => LogicalPlan::Explain {
+        LogicalPlan::Explain { analyze, input } => LogicalPlan::Explain {
+            analyze,
             input: Box::new(annotate_parallel(*input, workers)),
         },
         LogicalPlan::Parallel { hint, input } => LogicalPlan::Parallel {
