@@ -105,12 +105,13 @@ impl<'a> Binder<'a> {
                 from,
                 selection,
                 group_by,
+                having,
                 order_by,
                 limit,
                 offset,
             } => self.bind_select(
-                *distinct, projection, from, selection, group_by, order_by, *limit, *offset,
-                role_id,
+                *distinct, projection, from, selection, group_by, having, order_by, *limit,
+                *offset, role_id,
             ),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
@@ -255,6 +256,7 @@ impl<'a> Binder<'a> {
         from: &ObjectName,
         selection: &Option<Expr>,
         group_by: &[Expr],
+        having: &Option<Expr>,
         order_by: &[crate::ast::OrderByExpr],
         limit: Option<usize>,
         offset: Option<usize>,
@@ -402,6 +404,15 @@ impl<'a> Binder<'a> {
                 "DISTINCT with GROUP BY is not supported yet",
             ));
         }
+        if let Some(having) = having {
+            if group_by.is_empty() {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "HAVING requires GROUP BY in this SQL slice",
+                ));
+            }
+            self.validate_grouped_having_expr(&projection, having)?;
+        }
         if aggregate_count > 0 && group_by.is_empty() && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -428,6 +439,7 @@ impl<'a> Binder<'a> {
             columns,
             selection: selection.clone(),
             group_by: group_by.to_vec(),
+            having: having.clone(),
             order_by: order_by.to_vec(),
             limit,
             offset,
@@ -527,6 +539,114 @@ impl<'a> Binder<'a> {
             other => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("ORDER BY expression type is not sortable: {other:?}"),
+            )),
+        }
+    }
+
+    fn validate_grouped_having_expr(
+        &self,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<()> {
+        match self.infer_grouped_output_expr_type(projection, expr)? {
+            Some(SqlType::Bool | SqlType::Null) => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("HAVING predicate must be bool, got {other:?}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn infer_grouped_output_expr_type(
+        &self,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Identifier(identifier) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| Some(item.column.data_type.clone()))
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "HAVING must reference a projected column: {}",
+                            identifier.as_str()
+                        ),
+                    )
+                }),
+            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "HAVING only supports projected aggregate output columns yet",
+                ))
+            }
+            Expr::Array(values) => {
+                let mut element_type = None;
+                for value in values {
+                    let Some(value_type) =
+                        self.infer_grouped_output_expr_type(projection, value)?
+                    else {
+                        return Ok(None);
+                    };
+                    if value_type == SqlType::Null {
+                        continue;
+                    }
+                    match &element_type {
+                        Some(existing) if *existing != value_type => {
+                            return Err(RnovError::new(
+                                ErrorKind::InvalidInput,
+                                "array literal contains mixed element types",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => element_type = Some(value_type),
+                    }
+                }
+                Ok(Some(SqlType::Array(Box::new(
+                    element_type.unwrap_or(SqlType::Null),
+                ))))
+            }
+            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
+            Expr::Range { lower, upper, .. } => {
+                let lower_type = self
+                    .infer_grouped_output_expr_type(projection, lower)?
+                    .unwrap_or(SqlType::Null);
+                let upper_type = self
+                    .infer_grouped_output_expr_type(projection, upper)?
+                    .unwrap_or(SqlType::Null);
+                let element_type = match (lower_type, upper_type) {
+                    (SqlType::Null, SqlType::Null) => SqlType::Null,
+                    (SqlType::Null, upper_type) => upper_type,
+                    (lower_type, SqlType::Null) => lower_type,
+                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
+                    _ => {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "range literal bounds have different types",
+                        ));
+                    }
+                };
+                Ok(Some(SqlType::Range(Box::new(element_type))))
+            }
+            Expr::Binary { left, right, .. } => {
+                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
+                else {
+                    return Ok(None);
+                };
+                self.infer_operator_result_type(expr, &left_type, &right_type)
+            }
+            Expr::Call { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support function calls yet",
             )),
         }
     }

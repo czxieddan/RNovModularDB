@@ -266,6 +266,12 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     }
                 };
+                if let Some(predicate) = &select.having {
+                    plan = LogicalPlan::Filter {
+                        predicate: predicate.clone(),
+                        input: Box::new(plan),
+                    };
+                }
                 if grouped && !select.order_by.is_empty() {
                     plan = LogicalPlan::Sort {
                         keys: select.order_by.clone(),
