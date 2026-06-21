@@ -386,6 +386,22 @@ impl AuditInspection {
     pub fn failure(&self) -> Option<&AuditInspectionFailure> {
         self.failure.as_ref()
     }
+
+    pub fn to_text_report(&self) -> String {
+        let mut lines = vec![
+            format!("instance: {}", self.instance_id),
+            format!("valid: {}", self.valid),
+            format!("record_count: {}", self.record_count),
+            format!("last_valid_digest: {}", self.last_valid_digest.to_hex()),
+        ];
+
+        match &self.failure {
+            Some(failure) => failure.push_report_lines(&mut lines),
+            None => lines.push("failure: none".to_string()),
+        }
+
+        lines.join("\n")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,12 +428,50 @@ pub enum AuditInspectionFailure {
 }
 
 impl AuditInspectionFailure {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InstanceMismatch { .. } => "instance_mismatch",
+            Self::SequenceGap { .. } => "sequence_gap",
+            Self::PreviousDigestMismatch { .. } => "previous_digest_mismatch",
+            Self::RecordDigestMismatch { .. } => "record_digest_mismatch",
+        }
+    }
+
     pub fn record_index(&self) -> usize {
         match self {
             Self::InstanceMismatch { record_index, .. }
             | Self::SequenceGap { record_index, .. }
             | Self::PreviousDigestMismatch { record_index, .. }
             | Self::RecordDigestMismatch { record_index, .. } => *record_index,
+        }
+    }
+
+    fn push_report_lines(&self, lines: &mut Vec<String>) {
+        lines.push(format!("failure: {}", self.kind()));
+        lines.push(format!("failure_record_index: {}", self.record_index()));
+
+        match self {
+            Self::InstanceMismatch {
+                expected, actual, ..
+            } => {
+                lines.push(format!("expected_instance: {expected}"));
+                lines.push(format!("actual_instance: {actual}"));
+            }
+            Self::SequenceGap {
+                expected, actual, ..
+            } => {
+                lines.push(format!("expected_sequence: {expected}"));
+                lines.push(format!("actual_sequence: {actual}"));
+            }
+            Self::PreviousDigestMismatch {
+                expected, actual, ..
+            } => {
+                lines.push(format!("expected_previous_digest: {}", expected.to_hex()));
+                lines.push(format!("actual_previous_digest: {}", actual.to_hex()));
+            }
+            Self::RecordDigestMismatch { sequence, .. } => {
+                lines.push(format!("sequence: {sequence}"));
+            }
         }
     }
 }
