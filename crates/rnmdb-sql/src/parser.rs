@@ -318,7 +318,12 @@ impl Parser {
             None
         };
         let limit = if self.consume_if(&TokenKind::Limit) {
-            Some(self.parse_limit_value()?)
+            Some(self.parse_row_count("LIMIT")?)
+        } else {
+            None
+        };
+        let offset = if self.consume_if(&TokenKind::Offset) {
+            Some(self.parse_row_count("OFFSET")?)
         } else {
             None
         };
@@ -327,6 +332,7 @@ impl Parser {
             from,
             selection,
             limit,
+            offset,
         })
     }
 
@@ -544,15 +550,15 @@ impl Parser {
         }
     }
 
-    fn parse_limit_value(&mut self) -> Result<usize> {
+    fn parse_row_count(&mut self, clause: &'static str) -> Result<usize> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Integer(value)) => {
                 self.bump();
                 usize::try_from(value)
-                    .map_err(|_| self.error("LIMIT must be a non-negative integer"))
+                    .map_err(|_| self.error(format!("{clause} must be a non-negative integer")))
             }
-            Some(kind) => Err(self.error(format!("expected LIMIT value but found {kind:?}"))),
-            None => Err(self.error("expected LIMIT value")),
+            Some(kind) => Err(self.error(format!("expected {clause} value but found {kind:?}"))),
+            None => Err(self.error(format!("expected {clause} value"))),
         }
     }
 
@@ -697,6 +703,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)
             | (TokenKind::Limit, TokenKind::Limit)
+            | (TokenKind::Offset, TokenKind::Offset)
             | (TokenKind::Function, TokenKind::Function)
             | (TokenKind::Returns, TokenKind::Returns)
             | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)

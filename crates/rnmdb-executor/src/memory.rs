@@ -256,6 +256,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_limit_cancellable(batch, *count, cancellation)
             }
+            LogicalPlan::Offset { count, input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_offset_cancellable(batch, *count, cancellation)
+            }
             LogicalPlan::Parallel { input, .. } => self.execute_cancellable(input, cancellation),
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -326,6 +330,10 @@ impl MemoryExecutor {
             LogicalPlan::Limit { count, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_limit_cancellable(batch, *count, cancellation)
+            }
+            LogicalPlan::Offset { count, input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_offset_cancellable(batch, *count, cancellation)
             }
             LogicalPlan::Parallel { input, .. } => {
                 self.execute_parallel_cancellable(input, config, cancellation)
@@ -592,6 +600,17 @@ fn apply_limit_cancellable(
 ) -> Result<VectorBatch> {
     cancellation.check()?;
     let rows = batch.rows().iter().take(count).cloned().collect();
+    cancellation.check()?;
+    VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+fn apply_offset_cancellable(
+    batch: VectorBatch,
+    count: usize,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    let rows = batch.rows().iter().skip(count).cloned().collect();
     cancellation.check()?;
     VectorBatch::new(batch.columns().to_vec(), rows)
 }

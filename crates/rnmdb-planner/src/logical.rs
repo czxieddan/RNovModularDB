@@ -28,6 +28,10 @@ pub enum LogicalPlan {
         count: usize,
         input: Box<LogicalPlan>,
     },
+    Offset {
+        count: usize,
+        input: Box<LogicalPlan>,
+    },
     Insert {
         table: String,
         columns: Vec<String>,
@@ -184,6 +188,14 @@ impl LogicalPlanner {
                         .collect(),
                     input: Box::new(plan),
                 };
+                let plan = if let Some(count) = select.offset {
+                    LogicalPlan::Offset {
+                        count,
+                        input: Box::new(plan),
+                    }
+                } else {
+                    plan
+                };
                 if let Some(count) = select.limit {
                     Ok(LogicalPlan::Limit {
                         count,
@@ -251,6 +263,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         }
         LogicalPlan::Limit { count, input } => {
             out.push_str(&format!("{prefix}Limit count={count}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Offset { count, input } => {
+            out.push_str(&format!("{prefix}Offset count={count}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Insert { table, columns, .. } => {
