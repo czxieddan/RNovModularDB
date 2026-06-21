@@ -463,10 +463,15 @@ impl Parser {
                     };
                     if name.schema().is_none() && name.object() == "count" {
                         let mut args = args;
-                        if args.len() != 1 {
-                            return Err(self.error("count() requires exactly one expression"));
-                        }
-                        return Ok(Expr::Count(Box::new(args.remove(0))));
+                        return Ok(Expr::Count(Box::new(
+                            self.single_function_arg("count", &mut args)?,
+                        )));
+                    }
+                    if name.schema().is_none() && name.object() == "sum" {
+                        let mut args = args;
+                        return Ok(Expr::Sum(Box::new(
+                            self.single_function_arg("sum", &mut args)?,
+                        )));
                     }
                     Ok(Expr::Call { name, args })
                 } else if name.schema().is_none() {
@@ -629,6 +634,13 @@ impl Parser {
             Some(kind) => Err(self.error(format!("expected privilege but found {kind:?}"))),
             None => Err(self.error("expected privilege")),
         }
+    }
+
+    fn single_function_arg(&self, name: &'static str, args: &mut Vec<Expr>) -> Result<Expr> {
+        if args.len() != 1 {
+            return Err(self.error(format!("{name}() requires exactly one expression")));
+        }
+        Ok(args.remove(0))
     }
 
     fn parse_operator_symbol(&mut self) -> Result<String> {

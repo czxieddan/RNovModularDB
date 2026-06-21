@@ -102,6 +102,7 @@ pub struct AggregateItem {
 pub enum AggregateFunction {
     CountStar,
     Count(Expr),
+    Sum(Expr),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -481,6 +482,7 @@ fn select_aggregate_function(select: &rnmdb_sql::ast::BoundSelect) -> Option<Agg
     match &item.expr {
         Expr::CountStar => Some(AggregateFunction::CountStar),
         Expr::Count(expr) => Some(AggregateFunction::Count((**expr).clone())),
+        Expr::Sum(expr) => Some(AggregateFunction::Sum((**expr).clone())),
         _ => None,
     }
 }
@@ -489,6 +491,7 @@ fn aggregate_function_name(function: &AggregateFunction) -> String {
     match function {
         AggregateFunction::CountStar => "count(*)".to_string(),
         AggregateFunction::Count(expr) => format!("count({expr})"),
+        AggregateFunction::Sum(expr) => format!("sum({expr})"),
     }
 }
 

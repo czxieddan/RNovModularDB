@@ -319,6 +319,31 @@ impl<'a> Binder<'a> {
                     });
                     columns.push(column);
                 }
+                SelectItem::Expr(Expr::Sum(expr)) => {
+                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer SUM expression type: {expr}"),
+                        )
+                    })?;
+                    if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("SUM expression must be INT64, got {expr_type:?}"),
+                        ));
+                    }
+                    let column = BoundColumn {
+                        name: "sum".to_string(),
+                        data_type: SqlType::Int64,
+                        nullable: true,
+                        encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Sum(expr.clone()),
+                    });
+                    columns.push(column);
+                }
                 SelectItem::Expr(expr) => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
@@ -506,6 +531,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "COUNT(expr) is only supported as a SELECT projection",
             )),
+            Expr::Sum(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "SUM(expr) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -637,6 +666,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "COUNT(expr) is only supported as a SELECT projection",
             )),
+            Expr::Sum(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "SUM(expr) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -767,5 +800,5 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::CountStar | Expr::Count(_))
+    matches!(expr, Expr::CountStar | Expr::Count(_) | Expr::Sum(_))
 }

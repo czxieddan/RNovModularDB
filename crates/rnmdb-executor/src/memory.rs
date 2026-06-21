@@ -637,10 +637,11 @@ fn apply_aggregate_cancellable(
 
 fn aggregate_column_schema(item: &AggregateItem) -> ColumnSchema {
     match &item.function {
-        AggregateFunction::CountStar => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
-        AggregateFunction::Count(_) => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
+        AggregateFunction::CountStar | AggregateFunction::Count(_) => {
+            ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null()
+        }
+        AggregateFunction::Sum(_) => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
     }
-    .not_null()
 }
 
 fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<SqlValue> {
@@ -660,6 +661,35 @@ fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<
                 }
             }
             Ok(SqlValue::Int64(count))
+        }
+        AggregateFunction::Sum(expr) => {
+            let mut sum: Option<i64> = None;
+            for row in batch.rows() {
+                match eval_expr(batch.columns(), row, expr)? {
+                    SqlValue::Null => {}
+                    SqlValue::Int64(value) => {
+                        sum = Some(match sum {
+                            Some(current) => current.checked_add(value).ok_or_else(|| {
+                                RnovError::new(
+                                    ErrorKind::InvalidInput,
+                                    "SUM(expr) result exceeds int64",
+                                )
+                            })?,
+                            None => value,
+                        });
+                    }
+                    other => {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "SUM(expr) requires INT64 values, got {:?}",
+                                other.data_type()
+                            ),
+                        ));
+                    }
+                }
+            }
+            Ok(sum.map_or(SqlValue::Null, SqlValue::Int64))
         }
     }
 }
@@ -814,6 +844,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "COUNT(expr) requires aggregate execution",
         )),
+        Expr::Sum(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "SUM(expr) requires aggregate execution",
+        )),
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
         Expr::Range {
@@ -862,6 +896,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Count(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "COUNT(expr) requires aggregate execution",
+        )),
+        Expr::Sum(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "SUM(expr) requires aggregate execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Call { name, .. } => Err(RnovError::new(
