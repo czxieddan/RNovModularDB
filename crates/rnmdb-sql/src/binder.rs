@@ -404,15 +404,19 @@ impl<'a> Binder<'a> {
                 "DISTINCT with GROUP BY is not supported yet",
             ));
         }
-        if let Some(having) = having {
+        let having = if let Some(having) = having {
             if group_by.is_empty() {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "HAVING requires GROUP BY in this SQL slice",
                 ));
             }
-            self.validate_grouped_having_expr(&projection, having)?;
-        }
+            let having = self.rewrite_grouped_having_expr(&projection, having)?;
+            self.validate_grouped_having_expr(&projection, &having)?;
+            Some(having)
+        } else {
+            None
+        };
         if aggregate_count > 0 && group_by.is_empty() && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -439,7 +443,7 @@ impl<'a> Binder<'a> {
             columns,
             selection: selection.clone(),
             group_by: group_by.to_vec(),
-            having: having.clone(),
+            having,
             order_by: order_by.to_vec(),
             limit,
             offset,
@@ -555,6 +559,61 @@ impl<'a> Binder<'a> {
                 format!("HAVING predicate must be bool, got {other:?}"),
             )),
             None => Ok(()),
+        }
+    }
+
+    fn rewrite_grouped_having_expr(
+        &self,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<Expr> {
+        match expr {
+            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
+                projection
+                    .iter()
+                    .find(|item| &item.expr == expr)
+                    .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "HAVING aggregate expression must appear in SELECT projection: {expr}"
+                            ),
+                        )
+                    })
+            }
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
+                op: op.clone(),
+                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+            }),
+            Expr::Array(values) => values
+                .iter()
+                .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                .collect::<Result<Vec<_>>>()
+                .map(Expr::Array),
+            Expr::Range {
+                lower,
+                upper,
+                bounds,
+            } => Ok(Expr::Range {
+                lower: Box::new(self.rewrite_grouped_having_expr(projection, lower)?),
+                upper: Box::new(self.rewrite_grouped_having_expr(projection, upper)?),
+                bounds: *bounds,
+            }),
+            Expr::Call { name, args } => args
+                .iter()
+                .map(|arg| self.rewrite_grouped_having_expr(projection, arg))
+                .collect::<Result<Vec<_>>>()
+                .map(|args| Expr::Call {
+                    name: name.clone(),
+                    args,
+                }),
+            Expr::Identifier(_)
+            | Expr::Integer(_)
+            | Expr::String(_)
+            | Expr::Null
+            | Expr::HStore(_) => Ok(expr.clone()),
         }
     }
 
