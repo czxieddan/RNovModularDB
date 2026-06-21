@@ -93,6 +93,8 @@ pub enum Expr {
     CountStar,
     Count(Box<Expr>),
     Sum(Box<Expr>),
+    Min(Box<Expr>),
+    Max(Box<Expr>),
     Array(Vec<Expr>),
     HStore(Vec<(String, Option<String>)>),
     Range {
@@ -161,6 +163,8 @@ impl fmt::Display for Expr {
             Self::CountStar => f.write_str("count(*)"),
             Self::Count(expr) => write!(f, "count({expr})"),
             Self::Sum(expr) => write!(f, "sum({expr})"),
+            Self::Min(expr) => write!(f, "min({expr})"),
+            Self::Max(expr) => write!(f, "max({expr})"),
             Self::Array(values) => {
                 f.write_str("ARRAY[")?;
                 for (index, value) in values.iter().enumerate() {

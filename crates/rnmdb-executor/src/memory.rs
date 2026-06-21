@@ -625,8 +625,8 @@ fn apply_aggregate_cancellable(
     cancellation.check()?;
     let columns = items
         .iter()
-        .map(|item| aggregate_column_schema(item))
-        .collect::<Vec<_>>();
+        .map(|item| aggregate_column_schema(&batch, item))
+        .collect::<Result<Vec<_>>>()?;
     let values = items
         .iter()
         .map(|item| aggregate_value(&batch, &item.function))
@@ -635,12 +635,16 @@ fn apply_aggregate_cancellable(
     VectorBatch::new(columns, vec![Row::new(values)])
 }
 
-fn aggregate_column_schema(item: &AggregateItem) -> ColumnSchema {
+fn aggregate_column_schema(batch: &VectorBatch, item: &AggregateItem) -> Result<ColumnSchema> {
     match &item.function {
         AggregateFunction::CountStar | AggregateFunction::Count(_) => {
-            ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null()
+            Ok(ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null())
         }
-        AggregateFunction::Sum(_) => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
+        AggregateFunction::Sum(_) => Ok(ColumnSchema::new(item.name.as_str(), SqlType::Int64)),
+        AggregateFunction::Min(expr) | AggregateFunction::Max(expr) => Ok(ColumnSchema::new(
+            item.name.as_str(),
+            projection_type(batch.columns(), expr)?,
+        )),
     }
 }
 
@@ -691,7 +695,54 @@ fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<
             }
             Ok(sum.map_or(SqlValue::Null, SqlValue::Int64))
         }
+        AggregateFunction::Min(expr) => aggregate_ordered_value(batch, expr, OrderedAggregate::Min),
+        AggregateFunction::Max(expr) => aggregate_ordered_value(batch, expr, OrderedAggregate::Max),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderedAggregate {
+    Min,
+    Max,
+}
+
+fn aggregate_ordered_value(
+    batch: &VectorBatch,
+    expr: &Expr,
+    aggregate: OrderedAggregate,
+) -> Result<SqlValue> {
+    let mut selected: Option<SqlValue> = None;
+    for row in batch.rows() {
+        let value = eval_expr(batch.columns(), row, expr)?;
+        if value.is_null() {
+            continue;
+        }
+        let data_type = value.data_type();
+        if !sortable_type(&data_type) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ordered aggregate expression type is not sortable: {data_type:?}"),
+            ));
+        }
+        if let Some(current) = &selected {
+            let ordering = value.sql_cmp(current)?.ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "ordered aggregate comparison produced unknown result",
+                )
+            })?;
+            let replace = match aggregate {
+                OrderedAggregate::Min => ordering == Ordering::Less,
+                OrderedAggregate::Max => ordering == Ordering::Greater,
+            };
+            if replace {
+                selected = Some(value);
+            }
+        } else {
+            selected = Some(value);
+        }
+    }
+    Ok(selected.unwrap_or(SqlValue::Null))
 }
 
 fn apply_distinct_cancellable(
@@ -848,6 +899,14 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "SUM(expr) requires aggregate execution",
         )),
+        Expr::Min(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "MIN(expr) requires aggregate execution",
+        )),
+        Expr::Max(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "MAX(expr) requires aggregate execution",
+        )),
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
         Expr::Range {
@@ -900,6 +959,14 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Sum(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "SUM(expr) requires aggregate execution",
+        )),
+        Expr::Min(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "MIN(expr) requires aggregate execution",
+        )),
+        Expr::Max(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "MAX(expr) requires aggregate execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Call { name, .. } => Err(RnovError::new(

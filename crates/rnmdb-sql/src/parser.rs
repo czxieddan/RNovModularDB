@@ -473,6 +473,18 @@ impl Parser {
                             self.single_function_arg("sum", &mut args)?,
                         )));
                     }
+                    if name.schema().is_none() && name.object() == "min" {
+                        let mut args = args;
+                        return Ok(Expr::Min(Box::new(
+                            self.single_function_arg("min", &mut args)?,
+                        )));
+                    }
+                    if name.schema().is_none() && name.object() == "max" {
+                        let mut args = args;
+                        return Ok(Expr::Max(Box::new(
+                            self.single_function_arg("max", &mut args)?,
+                        )));
+                    }
                     Ok(Expr::Call { name, args })
                 } else if name.schema().is_none() {
                     Ok(Expr::Identifier(Ident::new(name.object())))

@@ -344,6 +344,46 @@ impl<'a> Binder<'a> {
                     });
                     columns.push(column);
                 }
+                SelectItem::Expr(Expr::Min(expr)) => {
+                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer MIN expression type: {expr}"),
+                        )
+                    })?;
+                    self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
+                    let column = BoundColumn {
+                        name: "min".to_string(),
+                        data_type: expr_type,
+                        nullable: true,
+                        encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Min(expr.clone()),
+                    });
+                    columns.push(column);
+                }
+                SelectItem::Expr(Expr::Max(expr)) => {
+                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer MAX expression type: {expr}"),
+                        )
+                    })?;
+                    self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
+                    let column = BoundColumn {
+                        name: "max".to_string(),
+                        data_type: expr_type,
+                        nullable: true,
+                        encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Max(expr.clone()),
+                    });
+                    columns.push(column);
+                }
                 SelectItem::Expr(expr) => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
@@ -427,6 +467,21 @@ impl<'a> Binder<'a> {
                 format!("ORDER BY expression type is not sortable: {other:?}"),
             )),
             None => Ok(()),
+        }
+    }
+
+    fn ensure_ordered_aggregate_type(&self, function: &str, data_type: &SqlType) -> Result<()> {
+        match data_type {
+            SqlType::Null
+            | SqlType::Bool
+            | SqlType::Int64
+            | SqlType::UInt64
+            | SqlType::Text
+            | SqlType::Bytes => Ok(()),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{function} expression type is not orderable: {other:?}"),
+            )),
         }
     }
 
@@ -534,6 +589,14 @@ impl<'a> Binder<'a> {
             Expr::Sum(_) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "SUM(expr) is only supported as a SELECT projection",
+            )),
+            Expr::Min(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "MIN(expr) is only supported as a SELECT projection",
+            )),
+            Expr::Max(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "MAX(expr) is only supported as a SELECT projection",
             )),
             Expr::Array(values) => {
                 let mut element_type = None;
@@ -670,6 +733,14 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "SUM(expr) is only supported as a SELECT projection",
             )),
+            Expr::Min(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "MIN(expr) is only supported as a SELECT projection",
+            )),
+            Expr::Max(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "MAX(expr) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -800,5 +871,8 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::CountStar | Expr::Count(_) | Expr::Sum(_))
+    matches!(
+        expr,
+        Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_)
+    )
 }
