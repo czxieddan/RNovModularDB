@@ -28,6 +28,11 @@ pub enum LogicalPlan {
         items: Vec<AggregateItem>,
         input: Box<LogicalPlan>,
     },
+    GroupedAggregate {
+        group_by: Vec<Expr>,
+        items: Vec<GroupedAggregateItem>,
+        input: Box<LogicalPlan>,
+    },
     Distinct {
         input: Box<LogicalPlan>,
     },
@@ -105,6 +110,18 @@ pub enum AggregateFunction {
     Sum(Expr),
     Min(Expr),
     Max(Expr),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupedAggregateItem {
+    pub name: String,
+    pub kind: GroupedAggregateItemKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GroupedAggregateItemKind {
+    GroupKey(Expr),
+    Aggregate(AggregateFunction),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -209,7 +226,20 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                let mut plan = if let Some(functions) = select_aggregate_functions(select) {
+                let mut plan = if !select.group_by.is_empty() {
+                    LogicalPlan::GroupedAggregate {
+                        group_by: select.group_by.clone(),
+                        items: select
+                            .projection
+                            .iter()
+                            .map(|item| GroupedAggregateItem {
+                                name: item.column.name.clone(),
+                                kind: grouped_aggregate_item_kind(&item.expr),
+                            })
+                            .collect(),
+                        input: Box::new(plan),
+                    }
+                } else if let Some(functions) = select_aggregate_functions(select) {
                     LogicalPlan::Aggregate {
                         items: select
                             .projection
@@ -326,6 +356,33 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Aggregate {aggregates}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::GroupedAggregate {
+            group_by,
+            items,
+            input,
+        } => {
+            let group_by = group_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let items = items
+                .iter()
+                .map(|item| match &item.kind {
+                    GroupedAggregateItemKind::GroupKey(expr) => {
+                        format!("{} := {}", item.name, expr)
+                    }
+                    GroupedAggregateItemKind::Aggregate(function) => {
+                        format!("{} := {}", item.name, aggregate_function_name(function))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{prefix}GroupedAggregate group_by={group_by} {items}\n"
+            ));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Distinct { input } => {
@@ -490,17 +547,27 @@ fn select_aggregate_functions(
     }
     let mut functions = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        let function = match &item.expr {
-            Expr::CountStar => AggregateFunction::CountStar,
-            Expr::Count(expr) => AggregateFunction::Count((**expr).clone()),
-            Expr::Sum(expr) => AggregateFunction::Sum((**expr).clone()),
-            Expr::Min(expr) => AggregateFunction::Min((**expr).clone()),
-            Expr::Max(expr) => AggregateFunction::Max((**expr).clone()),
-            _ => return None,
-        };
-        functions.push(function);
+        functions.push(aggregate_function(&item.expr)?);
     }
     Some(functions)
+}
+
+fn grouped_aggregate_item_kind(expr: &Expr) -> GroupedAggregateItemKind {
+    match aggregate_function(expr) {
+        Some(function) => GroupedAggregateItemKind::Aggregate(function),
+        None => GroupedAggregateItemKind::GroupKey(expr.clone()),
+    }
+}
+
+fn aggregate_function(expr: &Expr) -> Option<AggregateFunction> {
+    match expr {
+        Expr::CountStar => Some(AggregateFunction::CountStar),
+        Expr::Count(expr) => Some(AggregateFunction::Count((**expr).clone())),
+        Expr::Sum(expr) => Some(AggregateFunction::Sum((**expr).clone())),
+        Expr::Min(expr) => Some(AggregateFunction::Min((**expr).clone())),
+        Expr::Max(expr) => Some(AggregateFunction::Max((**expr).clone())),
+        _ => None,
+    }
 }
 
 fn aggregate_function_name(function: &AggregateFunction) -> String {

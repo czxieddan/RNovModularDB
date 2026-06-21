@@ -11,7 +11,9 @@ use std::{
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
-use rnmdb_planner::logical::{AggregateFunction, AggregateItem, LogicalPlan};
+use rnmdb_planner::logical::{
+    AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind, LogicalPlan,
+};
 use rnmdb_sql::ast::{ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
@@ -256,6 +258,14 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_aggregate_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::GroupedAggregate {
+                group_by,
+                items,
+                input,
+            } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+            }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
@@ -342,6 +352,14 @@ impl MemoryExecutor {
             LogicalPlan::Aggregate { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_aggregate_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::GroupedAggregate {
+                group_by,
+                items,
+                input,
+            } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
             }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -633,6 +651,85 @@ fn apply_aggregate_cancellable(
         .collect::<Result<Vec<_>>>()?;
     cancellation.check()?;
     VectorBatch::new(columns, vec![Row::new(values)])
+}
+
+fn apply_grouped_aggregate_cancellable(
+    batch: VectorBatch,
+    group_by: &[Expr],
+    items: &[GroupedAggregateItem],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    let columns = items
+        .iter()
+        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .collect::<Result<Vec<_>>>()?;
+    let mut groups: Vec<GroupState> = Vec::new();
+    for row in batch.rows() {
+        cancellation.check()?;
+        let key = group_by
+            .iter()
+            .map(|expr| eval_expr(batch.columns(), row, expr))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.rows.push(row.clone());
+        } else {
+            groups.push(GroupState {
+                key,
+                rows: vec![row.clone()],
+            });
+        }
+    }
+
+    let mut rows = Vec::with_capacity(groups.len());
+    for group in groups {
+        cancellation.check()?;
+        let group_batch = VectorBatch::new(batch.columns().to_vec(), group.rows)?;
+        let values = items
+            .iter()
+            .map(|item| grouped_aggregate_value(&group_batch, item))
+            .collect::<Result<Vec<_>>>()?;
+        rows.push(Row::new(values));
+    }
+    cancellation.check()?;
+    VectorBatch::new(columns, rows)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GroupState {
+    key: Vec<SqlValue>,
+    rows: Vec<Row>,
+}
+
+fn grouped_aggregate_column_schema(
+    batch: &VectorBatch,
+    item: &GroupedAggregateItem,
+) -> Result<ColumnSchema> {
+    match &item.kind {
+        GroupedAggregateItemKind::GroupKey(expr) => Ok(ColumnSchema::new(
+            item.name.as_str(),
+            projection_type(batch.columns(), expr)?,
+        )),
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_column_schema(
+            batch,
+            &AggregateItem {
+                name: item.name.clone(),
+                function: function.clone(),
+            },
+        ),
+    }
+}
+
+fn grouped_aggregate_value(batch: &VectorBatch, item: &GroupedAggregateItem) -> Result<SqlValue> {
+    match &item.kind {
+        GroupedAggregateItemKind::GroupKey(expr) => {
+            let Some(row) = batch.rows().first() else {
+                return Ok(SqlValue::Null);
+            };
+            eval_expr(batch.columns(), row, expr)
+        }
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function),
+    }
 }
 
 fn aggregate_column_schema(batch: &VectorBatch, item: &AggregateItem) -> Result<ColumnSchema> {

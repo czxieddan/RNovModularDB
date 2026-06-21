@@ -104,11 +104,13 @@ impl<'a> Binder<'a> {
                 projection,
                 from,
                 selection,
+                group_by,
                 order_by,
                 limit,
                 offset,
             } => self.bind_select(
-                *distinct, projection, from, selection, order_by, *limit, *offset, role_id,
+                *distinct, projection, from, selection, group_by, order_by, *limit, *offset,
+                role_id,
             ),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
@@ -252,6 +254,7 @@ impl<'a> Binder<'a> {
         select_items: &[SelectItem],
         from: &ObjectName,
         selection: &Option<Expr>,
+        group_by: &[Expr],
         order_by: &[crate::ast::OrderByExpr],
         limit: Option<usize>,
         offset: Option<usize>,
@@ -384,16 +387,25 @@ impl<'a> Binder<'a> {
             .iter()
             .filter(|item| is_aggregate_expr(&item.expr))
             .count();
+        if !group_by.is_empty() {
+            self.validate_group_by_exprs(table, group_by)?;
+        }
         if aggregate_count > 0 && aggregate_count != projection.len() {
+            self.validate_grouped_projection(&projection, group_by)?;
+        }
+        if aggregate_count == 0 && !group_by.is_empty() {
+            self.validate_grouped_projection(&projection, group_by)?;
+        }
+        if aggregate_count > 0 && !group_by.is_empty() && distinct {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "aggregate expressions cannot be mixed with other select items yet",
+                "DISTINCT with GROUP BY is not supported yet",
             ));
         }
-        if aggregate_count > 0 && !order_by.is_empty() {
+        if (aggregate_count > 0 || !group_by.is_empty()) && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "ORDER BY with aggregate expressions is not supported yet",
+                "ORDER BY with grouped or aggregate queries is not supported yet",
             ));
         }
 
@@ -411,6 +423,7 @@ impl<'a> Binder<'a> {
             projection,
             columns,
             selection: selection.clone(),
+            group_by: group_by.to_vec(),
             order_by: order_by.to_vec(),
             limit,
             offset,
@@ -446,6 +459,60 @@ impl<'a> Binder<'a> {
             )),
             None => Ok(()),
         }
+    }
+
+    fn validate_group_by_exprs(&self, table: &Table, group_by: &[Expr]) -> Result<()> {
+        for expr in group_by {
+            if !matches!(expr, Expr::Identifier(_)) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "GROUP BY only supports column identifiers yet",
+                ));
+            }
+            match self.infer_expr_type(table, expr)? {
+                Some(
+                    SqlType::Null
+                    | SqlType::Bool
+                    | SqlType::Int64
+                    | SqlType::UInt64
+                    | SqlType::Text
+                    | SqlType::Bytes,
+                ) => {}
+                Some(other) => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("GROUP BY expression type is not groupable: {other:?}"),
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_grouped_projection(
+        &self,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+    ) -> Result<()> {
+        if group_by.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "aggregate expressions cannot be mixed with other select items yet",
+            ));
+        }
+        for item in projection {
+            if is_aggregate_expr(&item.expr) {
+                continue;
+            }
+            if !group_by.iter().any(|expr| expr == &item.expr) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "non-aggregate select items must appear in GROUP BY",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_ordered_aggregate_type(&self, function: &str, data_type: &SqlType) -> Result<()> {

@@ -318,6 +318,12 @@ impl Parser {
         } else {
             None
         };
+        let group_by = if self.consume_if(&TokenKind::Group) {
+            self.expect_keyword(TokenKind::By)?;
+            self.parse_expr_list()?
+        } else {
+            Vec::new()
+        };
         let order_by = if self.consume_if(&TokenKind::Order) {
             self.expect_keyword(TokenKind::By)?;
             self.parse_order_by_list()?
@@ -339,6 +345,7 @@ impl Parser {
             projection,
             from,
             selection,
+            group_by,
             order_by,
             limit,
             offset,
@@ -769,6 +776,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)
+            | (TokenKind::Group, TokenKind::Group)
             | (TokenKind::Order, TokenKind::Order)
             | (TokenKind::By, TokenKind::By)
             | (TokenKind::Asc, TokenKind::Asc)
