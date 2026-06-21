@@ -402,10 +402,10 @@ impl<'a> Binder<'a> {
                 "DISTINCT with GROUP BY is not supported yet",
             ));
         }
-        if (aggregate_count > 0 || !group_by.is_empty()) && !order_by.is_empty() {
+        if aggregate_count > 0 && group_by.is_empty() && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "ORDER BY with grouped or aggregate queries is not supported yet",
+                "ORDER BY with aggregate expressions is not supported yet",
             ));
         }
 
@@ -413,7 +413,11 @@ impl<'a> Binder<'a> {
             self.validate_predicate(table, selection)?;
         }
         for order_by in order_by {
-            self.validate_sort_expr(table, &order_by.expr)?;
+            if group_by.is_empty() {
+                self.validate_sort_expr(table, &order_by.expr)?;
+            } else {
+                self.validate_grouped_sort_expr(&projection, &order_by.expr)?;
+            }
         }
 
         Ok(BoundStatement::Select(BoundSelect {
@@ -488,6 +492,43 @@ impl<'a> Binder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn validate_grouped_sort_expr(
+        &self,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<()> {
+        let Expr::Identifier(identifier) = expr else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "ORDER BY for grouped queries only supports projected column identifiers yet",
+            ));
+        };
+        let column = projection
+            .iter()
+            .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "ORDER BY for grouped queries must reference a projected column: {}",
+                        identifier.as_str()
+                    ),
+                )
+            })?;
+        match &column.column.data_type {
+            SqlType::Null
+            | SqlType::Bool
+            | SqlType::Int64
+            | SqlType::UInt64
+            | SqlType::Text
+            | SqlType::Bytes => Ok(()),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ORDER BY expression type is not sortable: {other:?}"),
+            )),
+        }
     }
 
     fn validate_grouped_projection(

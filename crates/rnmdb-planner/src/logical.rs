@@ -220,13 +220,14 @@ impl LogicalPlanner {
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
-                if !select.order_by.is_empty() {
+                let grouped = !select.group_by.is_empty();
+                if !grouped && !select.order_by.is_empty() {
                     plan = LogicalPlan::Sort {
                         keys: select.order_by.clone(),
                         input: Box::new(plan),
                     };
                 }
-                let mut plan = if !select.group_by.is_empty() {
+                let mut plan = if grouped {
                     LogicalPlan::GroupedAggregate {
                         group_by: select.group_by.clone(),
                         items: select
@@ -265,6 +266,12 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     }
                 };
+                if grouped && !select.order_by.is_empty() {
+                    plan = LogicalPlan::Sort {
+                        keys: select.order_by.clone(),
+                        input: Box::new(plan),
+                    };
+                }
                 if select.distinct {
                     plan = LogicalPlan::Distinct {
                         input: Box::new(plan),
