@@ -1,7 +1,7 @@
 use rnmdb_common::ids::RelationId;
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
-use rnmdb_sql::ast::{BoundStatement, ColumnDef, Expr, ObjectName, TransactionAction};
+use rnmdb_sql::ast::{BoundStatement, ColumnDef, Expr, ObjectName, OrderByExpr, TransactionAction};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalPlan {
@@ -22,6 +22,10 @@ pub enum LogicalPlan {
     },
     Project {
         items: Vec<ProjectionItem>,
+        input: Box<LogicalPlan>,
+    },
+    Sort {
+        keys: Vec<OrderByExpr>,
         input: Box<LogicalPlan>,
     },
     Limit {
@@ -177,6 +181,12 @@ impl LogicalPlanner {
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
+                if !select.order_by.is_empty() {
+                    plan = LogicalPlan::Sort {
+                        keys: select.order_by.clone(),
+                        input: Box::new(plan),
+                    };
+                }
                 let plan = LogicalPlan::Project {
                     items: select
                         .projection
@@ -259,6 +269,15 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Sort { keys, input } => {
+            let keys = keys
+                .iter()
+                .map(|key| format!("{} {}", key.expr, sort_direction_name(key.direction)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("{prefix}Sort {keys}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Limit { count, input } => {
@@ -407,5 +426,12 @@ fn transaction_action_name(action: TransactionAction) -> &'static str {
         TransactionAction::Begin => "begin",
         TransactionAction::Commit => "commit",
         TransactionAction::Rollback => "rollback",
+    }
+}
+
+fn sort_direction_name(direction: rnmdb_sql::ast::SortDirection) -> &'static str {
+    match direction {
+        rnmdb_sql::ast::SortDirection::Asc => "ASC",
+        rnmdb_sql::ast::SortDirection::Desc => "DESC",
     }
 }

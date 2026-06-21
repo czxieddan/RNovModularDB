@@ -215,6 +215,18 @@ impl fmt::Display for SelectItem {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderByExpr {
+    pub expr: Expr,
+    pub direction: SortDirection,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Assignment {
     pub column: Ident,
@@ -285,6 +297,7 @@ pub enum Statement {
         projection: Vec<SelectItem>,
         from: ObjectName,
         selection: Option<Expr>,
+        order_by: Vec<OrderByExpr>,
         limit: Option<usize>,
         offset: Option<usize>,
     },
@@ -312,6 +325,7 @@ pub struct BoundSelect {
     pub projection: Vec<BoundSelectItem>,
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,
+    pub order_by: Vec<OrderByExpr>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub applied_row_policies: Vec<String>,

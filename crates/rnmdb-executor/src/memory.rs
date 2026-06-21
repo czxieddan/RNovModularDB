@@ -12,7 +12,7 @@ use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_planner::logical::LogicalPlan;
-use rnmdb_sql::ast::{ColumnDef, Expr};
+use rnmdb_sql::ast::{ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
 };
@@ -252,6 +252,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Sort { keys, input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_sort_cancellable(batch, keys, cancellation)
+            }
             LogicalPlan::Limit { count, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_limit_cancellable(batch, *count, cancellation)
@@ -326,6 +330,10 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Sort { keys, input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_sort_cancellable(batch, keys, cancellation)
             }
             LogicalPlan::Limit { count, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -593,6 +601,102 @@ fn apply_projection_cancellable(
     VectorBatch::new(columns, rows)
 }
 
+#[derive(Clone, Debug)]
+struct SortRow {
+    keys: Vec<SqlValue>,
+    original_index: usize,
+    row: Row,
+}
+
+fn apply_sort_cancellable(
+    batch: VectorBatch,
+    keys: &[OrderByExpr],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    if keys.is_empty() {
+        return Ok(batch);
+    }
+
+    let mut rows = Vec::with_capacity(batch.rows().len());
+    for (original_index, row) in batch.rows().iter().enumerate() {
+        cancellation.check()?;
+        let sort_keys = keys
+            .iter()
+            .map(|key| eval_expr(batch.columns(), row, &key.expr))
+            .collect::<Result<Vec<_>>>()?;
+        rows.push(SortRow {
+            keys: sort_keys,
+            original_index,
+            row: row.clone(),
+        });
+    }
+    validate_sort_key_types(&rows, keys.len())?;
+
+    rows.sort_by(|left, right| compare_sort_rows(left, right, keys));
+    cancellation.check()?;
+    VectorBatch::new(
+        batch.columns().to_vec(),
+        rows.into_iter().map(|row| row.row).collect(),
+    )
+}
+
+fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
+    let mut key_types = vec![None; key_count];
+    for row in rows {
+        for (index, value) in row.keys.iter().enumerate() {
+            if value.is_null() {
+                continue;
+            }
+            let data_type = value.data_type();
+            if !sortable_type(&data_type) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("ORDER BY expression type is not sortable: {data_type:?}"),
+                ));
+            }
+            match &key_types[index] {
+                Some(existing) if *existing != data_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "ORDER BY expression produced mixed value types",
+                    ));
+                }
+                Some(_) => {}
+                None => key_types[index] = Some(data_type),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compare_sort_rows(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
+    for (index, key) in keys.iter().enumerate() {
+        let ordering = compare_sort_values(&left.keys[index], &right.keys[index]);
+        let ordering = match key.direction {
+            SortDirection::Asc => ordering,
+            SortDirection::Desc => ordering.reverse(),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.original_index.cmp(&right.original_index)
+}
+
+fn compare_sort_values(left: &SqlValue, right: &SqlValue) -> Ordering {
+    match (left, right) {
+        (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+        (SqlValue::Null, _) => Ordering::Greater,
+        (_, SqlValue::Null) => Ordering::Less,
+        (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
+        (SqlValue::Int64(left), SqlValue::Int64(right)) => left.cmp(right),
+        (SqlValue::UInt64(left), SqlValue::UInt64(right)) => left.cmp(right),
+        (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
+        (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
+        _ => Ordering::Equal,
+    }
+}
+
 fn apply_limit_cancellable(
     batch: VectorBatch,
     count: usize,
@@ -644,6 +748,13 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             format!("memory projection does not support function call {name}"),
         )),
     }
+}
+
+fn sortable_type(data_type: &SqlType) -> bool {
+    matches!(
+        data_type,
+        SqlType::Bool | SqlType::Int64 | SqlType::UInt64 | SqlType::Text | SqlType::Bytes
+    )
 }
 
 fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValue> {

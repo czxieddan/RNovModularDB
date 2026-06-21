@@ -4,8 +4,8 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, ColumnDef, Expr, Ident, ObjectName, RangeLiteralBounds, SelectItem, Statement,
-        TransactionAction,
+        Assignment, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, RangeLiteralBounds,
+        SelectItem, SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -317,6 +317,12 @@ impl Parser {
         } else {
             None
         };
+        let order_by = if self.consume_if(&TokenKind::Order) {
+            self.expect_keyword(TokenKind::By)?;
+            self.parse_order_by_list()?
+        } else {
+            Vec::new()
+        };
         let limit = if self.consume_if(&TokenKind::Limit) {
             Some(self.parse_row_count("LIMIT")?)
         } else {
@@ -331,6 +337,7 @@ impl Parser {
             projection,
             from,
             selection,
+            order_by,
             limit,
             offset,
         })
@@ -550,6 +557,25 @@ impl Parser {
         }
     }
 
+    fn parse_order_by_list(&mut self) -> Result<Vec<OrderByExpr>> {
+        let mut expressions = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            let direction = if self.consume_if(&TokenKind::Desc) {
+                SortDirection::Desc
+            } else {
+                let _ = self.consume_if(&TokenKind::Asc);
+                SortDirection::Asc
+            };
+            expressions.push(OrderByExpr { expr, direction });
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(expressions)
+    }
+
     fn parse_row_count(&mut self, clause: &'static str) -> Result<usize> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Integer(value)) => {
@@ -702,6 +728,10 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
             | (TokenKind::Where, TokenKind::Where)
+            | (TokenKind::Order, TokenKind::Order)
+            | (TokenKind::By, TokenKind::By)
+            | (TokenKind::Asc, TokenKind::Asc)
+            | (TokenKind::Desc, TokenKind::Desc)
             | (TokenKind::Limit, TokenKind::Limit)
             | (TokenKind::Offset, TokenKind::Offset)
             | (TokenKind::Function, TokenKind::Function)

@@ -103,9 +103,12 @@ impl<'a> Binder<'a> {
                 projection,
                 from,
                 selection,
+                order_by,
                 limit,
                 offset,
-            } => self.bind_select(projection, from, selection, *limit, *offset, role_id),
+            } => self.bind_select(
+                projection, from, selection, order_by, *limit, *offset, role_id,
+            ),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -247,6 +250,7 @@ impl<'a> Binder<'a> {
         select_items: &[SelectItem],
         from: &ObjectName,
         selection: &Option<Expr>,
+        order_by: &[crate::ast::OrderByExpr],
         limit: Option<usize>,
         offset: Option<usize>,
         role_id: RoleId,
@@ -306,6 +310,9 @@ impl<'a> Binder<'a> {
         if let Some(selection) = selection {
             self.validate_predicate(table, selection)?;
         }
+        for order_by in order_by {
+            self.validate_sort_expr(table, &order_by.expr)?;
+        }
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
@@ -313,6 +320,7 @@ impl<'a> Binder<'a> {
             projection,
             columns,
             selection: selection.clone(),
+            order_by: order_by.to_vec(),
             limit,
             offset,
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
@@ -326,6 +334,24 @@ impl<'a> Binder<'a> {
             Some(other) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("predicate must be bool, got {other:?}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_sort_expr(&self, table: &Table, expr: &Expr) -> Result<()> {
+        match self.infer_expr_type(table, expr)? {
+            Some(
+                SqlType::Null
+                | SqlType::Bool
+                | SqlType::Int64
+                | SqlType::UInt64
+                | SqlType::Text
+                | SqlType::Bytes,
+            ) => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ORDER BY expression type is not sortable: {other:?}"),
             )),
             None => Ok(()),
         }
