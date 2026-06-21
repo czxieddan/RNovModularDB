@@ -24,6 +24,9 @@ pub enum LogicalPlan {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
     },
+    Distinct {
+        input: Box<LogicalPlan>,
+    },
     Sort {
         keys: Vec<OrderByExpr>,
         input: Box<LogicalPlan>,
@@ -187,7 +190,7 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                let plan = LogicalPlan::Project {
+                let mut plan = LogicalPlan::Project {
                     items: select
                         .projection
                         .iter()
@@ -198,6 +201,11 @@ impl LogicalPlanner {
                         .collect(),
                     input: Box::new(plan),
                 };
+                if select.distinct {
+                    plan = LogicalPlan::Distinct {
+                        input: Box::new(plan),
+                    };
+                }
                 let plan = if let Some(count) = select.offset {
                     LogicalPlan::Offset {
                         count,
@@ -269,6 +277,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Distinct { input } => {
+            out.push_str(&format!("{prefix}Distinct\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Sort { keys, input } => {

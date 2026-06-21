@@ -252,6 +252,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Distinct { input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_distinct_cancellable(batch, cancellation)
+            }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -330,6 +334,10 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Distinct { input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_distinct_cancellable(batch, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -599,6 +607,21 @@ fn apply_projection_cancellable(
 
     cancellation.check()?;
     VectorBatch::new(columns, rows)
+}
+
+fn apply_distinct_cancellable(
+    batch: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut rows = Vec::new();
+    for row in batch.rows() {
+        cancellation.check()?;
+        if !rows.contains(row) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
 #[derive(Clone, Debug)]

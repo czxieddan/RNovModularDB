@@ -32,6 +32,7 @@ impl Token {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
     Select,
+    Distinct,
     Insert,
     Into,
     Values,
@@ -151,6 +152,7 @@ impl<'a> Lexer<'a> {
         let normalized = raw.to_ascii_lowercase();
         let kind = match normalized.as_str() {
             "select" => TokenKind::Select,
+            "distinct" => TokenKind::Distinct,
             "insert" => TokenKind::Insert,
             "into" => TokenKind::Into,
             "values" => TokenKind::Values,

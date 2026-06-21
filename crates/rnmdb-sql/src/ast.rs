@@ -294,6 +294,7 @@ pub enum Statement {
         selection: Option<Expr>,
     },
     Select {
+        distinct: bool,
         projection: Vec<SelectItem>,
         from: ObjectName,
         selection: Option<Expr>,
@@ -322,6 +323,7 @@ pub struct BoundColumn {
 pub struct BoundSelect {
     pub relation_id: RelationId,
     pub table: ObjectName,
+    pub distinct: bool,
     pub projection: Vec<BoundSelectItem>,
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,

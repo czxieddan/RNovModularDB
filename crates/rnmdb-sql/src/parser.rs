@@ -298,6 +298,7 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
+        let distinct = self.consume_if(&TokenKind::Distinct);
         let mut projection = Vec::new();
         loop {
             if self.consume_if(&TokenKind::Star) {
@@ -334,6 +335,7 @@ impl Parser {
             None
         };
         Ok(Statement::Select {
+            distinct,
             projection,
             from,
             selection,
@@ -712,6 +714,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
     matches!(
         (left, right),
         (TokenKind::Select, TokenKind::Select)
+            | (TokenKind::Distinct, TokenKind::Distinct)
             | (TokenKind::Insert, TokenKind::Insert)
             | (TokenKind::Into, TokenKind::Into)
             | (TokenKind::Values, TokenKind::Values)

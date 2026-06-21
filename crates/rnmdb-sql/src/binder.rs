@@ -100,6 +100,7 @@ impl<'a> Binder<'a> {
             } => self.bind_update(table, assignments, selection, role_id),
             Statement::Delete { table, selection } => self.bind_delete(table, selection, role_id),
             Statement::Select {
+                distinct,
                 projection,
                 from,
                 selection,
@@ -107,7 +108,7 @@ impl<'a> Binder<'a> {
                 limit,
                 offset,
             } => self.bind_select(
-                projection, from, selection, order_by, *limit, *offset, role_id,
+                *distinct, projection, from, selection, order_by, *limit, *offset, role_id,
             ),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
@@ -247,6 +248,7 @@ impl<'a> Binder<'a> {
 
     fn bind_select(
         &self,
+        distinct: bool,
         select_items: &[SelectItem],
         from: &ObjectName,
         selection: &Option<Expr>,
@@ -317,6 +319,7 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
             table: from.clone(),
+            distinct,
             projection,
             columns,
             selection: selection.clone(),
