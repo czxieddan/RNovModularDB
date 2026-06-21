@@ -209,12 +209,17 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                let mut plan = if let Some(function) = select_aggregate_function(select) {
+                let mut plan = if let Some(functions) = select_aggregate_functions(select) {
                     LogicalPlan::Aggregate {
-                        items: vec![AggregateItem {
-                            name: select.projection[0].column.name.clone(),
-                            function,
-                        }],
+                        items: select
+                            .projection
+                            .iter()
+                            .zip(functions)
+                            .map(|(item, function)| AggregateItem {
+                                name: item.column.name.clone(),
+                                function,
+                            })
+                            .collect(),
                         input: Box::new(plan),
                     }
                 } else {
@@ -477,18 +482,25 @@ fn object_name(name: &ObjectName) -> String {
     name.to_string()
 }
 
-fn select_aggregate_function(select: &rnmdb_sql::ast::BoundSelect) -> Option<AggregateFunction> {
-    let [item] = select.projection.as_slice() else {
+fn select_aggregate_functions(
+    select: &rnmdb_sql::ast::BoundSelect,
+) -> Option<Vec<AggregateFunction>> {
+    if select.projection.is_empty() {
         return None;
-    };
-    match &item.expr {
-        Expr::CountStar => Some(AggregateFunction::CountStar),
-        Expr::Count(expr) => Some(AggregateFunction::Count((**expr).clone())),
-        Expr::Sum(expr) => Some(AggregateFunction::Sum((**expr).clone())),
-        Expr::Min(expr) => Some(AggregateFunction::Min((**expr).clone())),
-        Expr::Max(expr) => Some(AggregateFunction::Max((**expr).clone())),
-        _ => None,
     }
+    let mut functions = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let function = match &item.expr {
+            Expr::CountStar => AggregateFunction::CountStar,
+            Expr::Count(expr) => AggregateFunction::Count((**expr).clone()),
+            Expr::Sum(expr) => AggregateFunction::Sum((**expr).clone()),
+            Expr::Min(expr) => AggregateFunction::Min((**expr).clone()),
+            Expr::Max(expr) => AggregateFunction::Max((**expr).clone()),
+            _ => return None,
+        };
+        functions.push(function);
+    }
+    Some(functions)
 }
 
 fn aggregate_function_name(function: &AggregateFunction) -> String {

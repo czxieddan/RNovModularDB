@@ -288,12 +288,7 @@ impl<'a> Binder<'a> {
                     columns.push(column);
                 }
                 SelectItem::Expr(Expr::CountStar) => {
-                    let column = BoundColumn {
-                        name: "count".to_string(),
-                        data_type: SqlType::Int64,
-                        nullable: false,
-                        encrypted: false,
-                    };
+                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::CountStar,
@@ -307,12 +302,7 @@ impl<'a> Binder<'a> {
                             format!("cannot infer COUNT expression type: {expr}"),
                         )
                     })?;
-                    let column = BoundColumn {
-                        name: "count".to_string(),
-                        data_type: SqlType::Int64,
-                        nullable: false,
-                        encrypted: false,
-                    };
+                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Count(expr.clone()),
@@ -332,12 +322,7 @@ impl<'a> Binder<'a> {
                             format!("SUM expression must be INT64, got {expr_type:?}"),
                         ));
                     }
-                    let column = BoundColumn {
-                        name: "sum".to_string(),
-                        data_type: SqlType::Int64,
-                        nullable: true,
-                        encrypted: false,
-                    };
+                    let column = aggregate_bound_column(&columns, "sum", SqlType::Int64, true);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Sum(expr.clone()),
@@ -352,12 +337,7 @@ impl<'a> Binder<'a> {
                         )
                     })?;
                     self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
-                    let column = BoundColumn {
-                        name: "min".to_string(),
-                        data_type: expr_type,
-                        nullable: true,
-                        encrypted: false,
-                    };
+                    let column = aggregate_bound_column(&columns, "min", expr_type, true);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Min(expr.clone()),
@@ -372,12 +352,7 @@ impl<'a> Binder<'a> {
                         )
                     })?;
                     self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
-                    let column = BoundColumn {
-                        name: "max".to_string(),
-                        data_type: expr_type,
-                        nullable: true,
-                        encrypted: false,
-                    };
+                    let column = aggregate_bound_column(&columns, "max", expr_type, true);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Max(expr.clone()),
@@ -405,14 +380,17 @@ impl<'a> Binder<'a> {
                 }
             }
         }
-        let has_aggregate = projection.iter().any(|item| is_aggregate_expr(&item.expr));
-        if has_aggregate && projection.len() != 1 {
+        let aggregate_count = projection
+            .iter()
+            .filter(|item| is_aggregate_expr(&item.expr))
+            .count();
+        if aggregate_count > 0 && aggregate_count != projection.len() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "aggregate expressions cannot be mixed with other select items yet",
             ));
         }
-        if has_aggregate && !order_by.is_empty() {
+        if aggregate_count > 0 && !order_by.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "ORDER BY with aggregate expressions is not supported yet",
@@ -875,4 +853,38 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
         expr,
         Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_)
     )
+}
+
+fn aggregate_bound_column(
+    existing_columns: &[BoundColumn],
+    base_name: &str,
+    data_type: SqlType,
+    nullable: bool,
+) -> BoundColumn {
+    BoundColumn {
+        name: unique_column_name(existing_columns, base_name),
+        data_type,
+        nullable,
+        encrypted: false,
+    }
+}
+
+fn unique_column_name(existing_columns: &[BoundColumn], base_name: &str) -> String {
+    if !existing_columns
+        .iter()
+        .any(|column| column.name == base_name)
+    {
+        return base_name.to_string();
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{base_name}{suffix}");
+        if !existing_columns
+            .iter()
+            .any(|column| column.name == candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search must find a unique aggregate column name")
 }
