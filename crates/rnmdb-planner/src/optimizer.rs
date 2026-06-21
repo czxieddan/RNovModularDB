@@ -45,6 +45,10 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             items,
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::Aggregate { items, input } => LogicalPlan::Aggregate {
+            items,
+            input: Box::new(optimize_plan(*input)),
+        },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(optimize_plan(*input)),
         },
@@ -80,6 +84,10 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             input: Box::new(annotate_parallel(*input, workers)),
         },
         LogicalPlan::Project { items, input } => LogicalPlan::Project {
+            items,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::Aggregate { items, input } => LogicalPlan::Aggregate {
             items,
             input: Box::new(annotate_parallel(*input, workers)),
         },

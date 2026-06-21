@@ -24,6 +24,10 @@ pub enum LogicalPlan {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
     },
+    Aggregate {
+        items: Vec<AggregateItem>,
+        input: Box<LogicalPlan>,
+    },
     Distinct {
         input: Box<LogicalPlan>,
     },
@@ -86,6 +90,17 @@ pub enum LogicalPlan {
 pub struct ProjectionItem {
     pub name: String,
     pub expr: Expr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateItem {
+    pub name: String,
+    pub function: AggregateFunction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AggregateFunction {
+    CountStar,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,16 +205,26 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                let mut plan = LogicalPlan::Project {
-                    items: select
-                        .projection
-                        .iter()
-                        .map(|item| ProjectionItem {
-                            name: item.column.name.clone(),
-                            expr: item.expr.clone(),
-                        })
-                        .collect(),
-                    input: Box::new(plan),
+                let mut plan = if is_count_star_select(select) {
+                    LogicalPlan::Aggregate {
+                        items: vec![AggregateItem {
+                            name: select.projection[0].column.name.clone(),
+                            function: AggregateFunction::CountStar,
+                        }],
+                        input: Box::new(plan),
+                    }
+                } else {
+                    LogicalPlan::Project {
+                        items: select
+                            .projection
+                            .iter()
+                            .map(|item| ProjectionItem {
+                                name: item.column.name.clone(),
+                                expr: item.expr.clone(),
+                            })
+                            .collect(),
+                        input: Box::new(plan),
+                    }
                 };
                 if select.distinct {
                     plan = LogicalPlan::Distinct {
@@ -277,6 +302,21 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Aggregate { items, input } => {
+            let aggregates = items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} := {}",
+                        item.name,
+                        aggregate_function_name(item.function)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("{prefix}Aggregate {aggregates}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Distinct { input } => {
@@ -431,6 +471,22 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn is_count_star_select(select: &rnmdb_sql::ast::BoundSelect) -> bool {
+    matches!(
+        select.projection.as_slice(),
+        [rnmdb_sql::ast::BoundSelectItem {
+            expr: Expr::CountStar,
+            ..
+        }]
+    )
+}
+
+fn aggregate_function_name(function: AggregateFunction) -> &'static str {
+    match function {
+        AggregateFunction::CountStar => "count(*)",
+    }
 }
 
 fn transaction_action_name(action: TransactionAction) -> &'static str {

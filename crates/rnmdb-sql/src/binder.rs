@@ -287,6 +287,19 @@ impl<'a> Binder<'a> {
                     });
                     columns.push(column);
                 }
+                SelectItem::Expr(Expr::CountStar) => {
+                    let column = BoundColumn {
+                        name: "count".to_string(),
+                        data_type: SqlType::Int64,
+                        nullable: false,
+                        encrypted: false,
+                    };
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::CountStar,
+                    });
+                    columns.push(column);
+                }
                 SelectItem::Expr(expr) => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
@@ -307,6 +320,19 @@ impl<'a> Binder<'a> {
                     columns.push(column);
                 }
             }
+        }
+        let has_count_star = projection.iter().any(|item| item.expr == Expr::CountStar);
+        if has_count_star && projection.len() != 1 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(*) cannot be mixed with other select items yet",
+            ));
+        }
+        if has_count_star && !order_by.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "ORDER BY with COUNT(*) is not supported yet",
+            ));
         }
 
         if let Some(selection) = selection {
@@ -453,6 +479,10 @@ impl<'a> Binder<'a> {
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::CountStar => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(*) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -576,6 +606,10 @@ impl<'a> Binder<'a> {
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::CountStar => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(*) is only supported as a SELECT projection",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {

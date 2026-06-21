@@ -11,7 +11,7 @@ use std::{
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
-use rnmdb_planner::logical::LogicalPlan;
+use rnmdb_planner::logical::{AggregateFunction, AggregateItem, LogicalPlan};
 use rnmdb_sql::ast::{ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
@@ -252,6 +252,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Aggregate { items, input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_aggregate_cancellable(batch, items, cancellation)
+            }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
@@ -334,6 +338,10 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Aggregate { items, input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_aggregate_cancellable(batch, items, cancellation)
             }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -609,6 +617,41 @@ fn apply_projection_cancellable(
     VectorBatch::new(columns, rows)
 }
 
+fn apply_aggregate_cancellable(
+    batch: VectorBatch,
+    items: &[AggregateItem],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    let columns = items
+        .iter()
+        .map(|item| aggregate_column_schema(item))
+        .collect::<Vec<_>>();
+    let values = items
+        .iter()
+        .map(|item| aggregate_value(&batch, item.function))
+        .collect::<Result<Vec<_>>>()?;
+    cancellation.check()?;
+    VectorBatch::new(columns, vec![Row::new(values)])
+}
+
+fn aggregate_column_schema(item: &AggregateItem) -> ColumnSchema {
+    match item.function {
+        AggregateFunction::CountStar => ColumnSchema::new(item.name.as_str(), SqlType::Int64),
+    }
+    .not_null()
+}
+
+fn aggregate_value(batch: &VectorBatch, function: AggregateFunction) -> Result<SqlValue> {
+    match function {
+        AggregateFunction::CountStar => {
+            Ok(SqlValue::Int64(i64::try_from(batch.rows().len()).map_err(
+                |_| RnovError::new(ErrorKind::InvalidInput, "COUNT(*) result exceeds int64"),
+            )?))
+        }
+    }
+}
+
 fn apply_distinct_cancellable(
     batch: VectorBatch,
     cancellation: &CancellationToken,
@@ -751,6 +794,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Integer(_) => Ok(SqlType::Int64),
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Null => Ok(SqlType::Null),
+        Expr::CountStar => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COUNT(*) requires aggregate execution",
+        )),
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
         Expr::Range {
@@ -792,6 +839,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         | Expr::Array(_)
         | Expr::HStore(_)
         | Expr::Range { .. } => literal_value(expr),
+        Expr::CountStar => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COUNT(*) requires aggregate execution",
+        )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,

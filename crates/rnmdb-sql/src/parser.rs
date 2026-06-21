@@ -447,6 +447,13 @@ impl Parser {
 
                 let name = self.parse_object_name_from_first(first)?;
                 if self.consume_if(&TokenKind::LeftParen) {
+                    if name.schema().is_none()
+                        && name.object() == "count"
+                        && self.consume_if(&TokenKind::Star)
+                    {
+                        self.expect_keyword(TokenKind::RightParen)?;
+                        return Ok(Expr::CountStar);
+                    }
                     let args = if self.consume_if(&TokenKind::RightParen) {
                         Vec::new()
                     } else {
