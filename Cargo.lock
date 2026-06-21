@@ -233,133 +233,133 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
-name = "rnovdb-catalog"
+name = "rnmdb-catalog"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
- "rnovdb-types",
+ "rnmdb-common",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-cli"
+name = "rnmdb-cli"
 version = "0.1.0"
 dependencies = [
- "rnovdb-catalog",
- "rnovdb-common",
- "rnovdb-executor",
- "rnovdb-planner",
- "rnovdb-sql",
- "rnovdb-storage",
- "rnovdb-types",
+ "rnmdb-catalog",
+ "rnmdb-common",
+ "rnmdb-executor",
+ "rnmdb-planner",
+ "rnmdb-sql",
+ "rnmdb-storage",
+ "rnmdb-types",
  "tempfile",
 ]
 
 [[package]]
-name = "rnovdb-common"
+name = "rnmdb-common"
 version = "0.1.0"
 
 [[package]]
-name = "rnovdb-executor"
+name = "rnmdb-executor"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
- "rnovdb-fts",
- "rnovdb-planner",
- "rnovdb-sql",
- "rnovdb-types",
+ "rnmdb-common",
+ "rnmdb-fts",
+ "rnmdb-planner",
+ "rnmdb-sql",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-fts"
+name = "rnmdb-fts"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
- "rnovdb-types",
+ "rnmdb-common",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-index"
+name = "rnmdb-index"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
- "rnovdb-types",
+ "rnmdb-common",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-instance"
+name = "rnmdb-instance"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
+ "rnmdb-common",
 ]
 
 [[package]]
-name = "rnovdb-planner"
+name = "rnmdb-planner"
 version = "0.1.0"
 dependencies = [
- "rnovdb-catalog",
- "rnovdb-common",
- "rnovdb-fts",
- "rnovdb-sql",
- "rnovdb-types",
+ "rnmdb-catalog",
+ "rnmdb-common",
+ "rnmdb-fts",
+ "rnmdb-sql",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-security"
+name = "rnmdb-security"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
+ "rnmdb-common",
  "sha2",
 ]
 
 [[package]]
-name = "rnovdb-server"
+name = "rnmdb-server"
 version = "0.1.0"
 dependencies = [
- "rnovdb-cli",
- "rnovdb-common",
- "rnovdb-instance",
- "rnovdb-types",
+ "rnmdb-cli",
+ "rnmdb-common",
+ "rnmdb-instance",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-sql"
+name = "rnmdb-sql"
 version = "0.1.0"
 dependencies = [
- "rnovdb-catalog",
- "rnovdb-common",
- "rnovdb-types",
+ "rnmdb-catalog",
+ "rnmdb-common",
+ "rnmdb-types",
 ]
 
 [[package]]
-name = "rnovdb-storage"
+name = "rnmdb-storage"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "rand_core 0.9.5",
- "rnovdb-common",
+ "rnmdb-common",
  "tempfile",
 ]
 
 [[package]]
-name = "rnovdb-txn"
+name = "rnmdb-txn"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
+ "rnmdb-common",
 ]
 
 [[package]]
-name = "rnovdb-types"
+name = "rnmdb-types"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
+ "rnmdb-common",
 ]
 
 [[package]]
-name = "rnovdb-udf"
+name = "rnmdb-udf"
 version = "0.1.0"
 dependencies = [
- "rnovdb-common",
- "rnovdb-types",
+ "rnmdb-common",
+ "rnmdb-types",
 ]
 
 [[package]]

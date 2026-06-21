@@ -1,20 +1,20 @@
 [workspace]
 members = [
-    "crates/rnovdb-common",
-    "crates/rnovdb-types",
-    "crates/rnovdb-sql",
-    "crates/rnovdb-planner",
-    "crates/rnovdb-executor",
-    "crates/rnovdb-txn",
-    "crates/rnovdb-index",
-    "crates/rnovdb-fts",
-    "crates/rnovdb-catalog",
-    "crates/rnovdb-storage",
-    "crates/rnovdb-udf",
-    "crates/rnovdb-security",
-    "crates/rnovdb-instance",
-    "crates/rnovdb-server",
-    "crates/rnovdb-cli",
+    "crates/rnmdb-common",
+    "crates/rnmdb-types",
+    "crates/rnmdb-sql",
+    "crates/rnmdb-planner",
+    "crates/rnmdb-executor",
+    "crates/rnmdb-txn",
+    "crates/rnmdb-index",
+    "crates/rnmdb-fts",
+    "crates/rnmdb-catalog",
+    "crates/rnmdb-storage",
+    "crates/rnmdb-udf",
+    "crates/rnmdb-security",
+    "crates/rnmdb-instance",
+    "crates/rnmdb-server",
+    "crates/rnmdb-cli",
 ]
 resolver = "3"
 
@@ -24,18 +24,18 @@ license = "AGPL-3.0-only"
 rust-version = "1.95"
 
 [workspace.dependencies]
-rnovdb-common = { path = "crates/rnovdb-common" }
-rnovdb-types = { path = "crates/rnovdb-types" }
-rnovdb-sql = { path = "crates/rnovdb-sql" }
-rnovdb-planner = { path = "crates/rnovdb-planner" }
-rnovdb-executor = { path = "crates/rnovdb-executor" }
-rnovdb-txn = { path = "crates/rnovdb-txn" }
-rnovdb-index = { path = "crates/rnovdb-index" }
-rnovdb-fts = { path = "crates/rnovdb-fts" }
-rnovdb-catalog = { path = "crates/rnovdb-catalog" }
-rnovdb-storage = { path = "crates/rnovdb-storage" }
-rnovdb-udf = { path = "crates/rnovdb-udf" }
-rnovdb-security = { path = "crates/rnovdb-security" }
-rnovdb-instance = { path = "crates/rnovdb-instance" }
-rnovdb-server = { path = "crates/rnovdb-server" }
-rnovdb-cli = { path = "crates/rnovdb-cli" }
+rnmdb-common = { path = "crates/rnmdb-common" }
+rnmdb-types = { path = "crates/rnmdb-types" }
+rnmdb-sql = { path = "crates/rnmdb-sql" }
+rnmdb-planner = { path = "crates/rnmdb-planner" }
+rnmdb-executor = { path = "crates/rnmdb-executor" }
+rnmdb-txn = { path = "crates/rnmdb-txn" }
+rnmdb-index = { path = "crates/rnmdb-index" }
+rnmdb-fts = { path = "crates/rnmdb-fts" }
+rnmdb-catalog = { path = "crates/rnmdb-catalog" }
+rnmdb-storage = { path = "crates/rnmdb-storage" }
+rnmdb-udf = { path = "crates/rnmdb-udf" }
+rnmdb-security = { path = "crates/rnmdb-security" }
+rnmdb-instance = { path = "crates/rnmdb-instance" }
+rnmdb-server = { path = "crates/rnmdb-server" }
+rnmdb-cli = { path = "crates/rnmdb-cli" }
