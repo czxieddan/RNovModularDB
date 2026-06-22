@@ -221,7 +221,8 @@ impl LogicalPlanner {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
                 let grouped = !select.group_by.is_empty();
-                if !grouped && !select.order_by.is_empty() {
+                let aggregate_functions = select_aggregate_functions(select);
+                if !grouped && aggregate_functions.is_none() && !select.order_by.is_empty() {
                     plan = LogicalPlan::Sort {
                         keys: select.order_by.clone(),
                         input: Box::new(plan),
@@ -269,6 +270,12 @@ impl LogicalPlanner {
                 if let Some(predicate) = &select.having {
                     plan = LogicalPlan::Filter {
                         predicate: predicate.clone(),
+                        input: Box::new(plan),
+                    };
+                }
+                if !grouped && aggregate_functions.is_some() && !select.order_by.is_empty() {
+                    plan = LogicalPlan::Sort {
+                        keys: select.order_by.clone(),
                         input: Box::new(plan),
                     };
                 }

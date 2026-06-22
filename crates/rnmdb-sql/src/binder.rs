@@ -437,20 +437,17 @@ impl<'a> Binder<'a> {
         } else {
             None
         };
-        if aggregate_count > 0 && group_by.is_empty() && !order_by.is_empty() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "ORDER BY with aggregate expressions is not supported yet",
-            ));
-        }
-
         if let Some(selection) = selection {
             self.validate_predicate(table, selection)?;
         }
         let mut bound_order_by = Vec::with_capacity(order_by.len());
         for order_by in order_by {
             if group_by.is_empty() {
-                bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
+                if aggregate_count > 0 {
+                    bound_order_by.push(self.bind_grouped_sort_expr(&projection, order_by)?);
+                } else {
+                    bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
+                }
             } else {
                 bound_order_by.push(self.bind_grouped_sort_expr(&projection, order_by)?);
             }
