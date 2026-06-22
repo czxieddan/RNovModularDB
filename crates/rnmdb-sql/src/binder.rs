@@ -7,7 +7,8 @@ use rnmdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundRowPolicy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundUpdate, Expr, Ident, ObjectName, SelectItem, Statement,
+    BoundSelectItem, BoundStatement, BoundUpdate, Expr, Ident, ObjectName, OrderByExpr, SelectItem,
+    Statement,
 };
 use crate::parser::parse_expr;
 
@@ -452,11 +453,13 @@ impl<'a> Binder<'a> {
         if let Some(selection) = selection {
             self.validate_predicate(table, selection)?;
         }
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
         for order_by in order_by {
             if group_by.is_empty() {
-                self.validate_sort_expr(table, &order_by.expr)?;
+                bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
             } else {
                 self.validate_grouped_sort_expr(&projection, &order_by.expr)?;
+                bound_order_by.push(order_by.clone());
             }
         }
 
@@ -469,7 +472,7 @@ impl<'a> Binder<'a> {
             selection: selection.clone(),
             group_by: group_by.to_vec(),
             having,
-            order_by: order_by.to_vec(),
+            order_by: bound_order_by,
             limit,
             offset,
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
@@ -504,6 +507,27 @@ impl<'a> Binder<'a> {
             )),
             None => Ok(()),
         }
+    }
+
+    fn bind_plain_sort_expr(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        order_by: &OrderByExpr,
+    ) -> Result<OrderByExpr> {
+        let expr = match &order_by.expr {
+            Expr::Identifier(identifier) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| item.expr.clone())
+                .unwrap_or_else(|| order_by.expr.clone()),
+            _ => order_by.expr.clone(),
+        };
+        self.validate_sort_expr(table, &expr)?;
+        Ok(OrderByExpr {
+            expr,
+            direction: order_by.direction,
+        })
     }
 
     fn validate_group_by_exprs(&self, table: &Table, group_by: &[Expr]) -> Result<()> {
