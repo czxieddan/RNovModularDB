@@ -424,12 +424,6 @@ impl<'a> Binder<'a> {
         if aggregate_count == 0 && !group_by.is_empty() {
             self.validate_grouped_projection(&projection, group_by)?;
         }
-        if aggregate_count > 0 && !group_by.is_empty() && distinct {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "DISTINCT with GROUP BY is not supported yet",
-            ));
-        }
         let having = if let Some(having) = having {
             if group_by.is_empty() {
                 return Err(RnovError::new(
@@ -458,8 +452,7 @@ impl<'a> Binder<'a> {
             if group_by.is_empty() {
                 bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
             } else {
-                self.validate_grouped_sort_expr(&projection, &order_by.expr)?;
-                bound_order_by.push(order_by.clone());
+                bound_order_by.push(self.bind_grouped_sort_expr(&projection, order_by)?);
             }
         }
 
@@ -516,6 +509,10 @@ impl<'a> Binder<'a> {
         order_by: &OrderByExpr,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
+            Expr::Integer(value) => self
+                .projection_ordinal_item(projection, *value)?
+                .expr
+                .clone(),
             Expr::Identifier(identifier) => projection
                 .iter()
                 .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
@@ -528,6 +525,54 @@ impl<'a> Binder<'a> {
             expr,
             direction: order_by.direction,
         })
+    }
+
+    fn bind_grouped_sort_expr(
+        &self,
+        projection: &[BoundSelectItem],
+        order_by: &OrderByExpr,
+    ) -> Result<OrderByExpr> {
+        let expr = match &order_by.expr {
+            Expr::Integer(value) => Expr::Identifier(Ident::new(
+                self.projection_ordinal_item(projection, *value)?
+                    .column
+                    .name
+                    .as_str(),
+            )),
+            _ => projection
+                .iter()
+                .find(|item| item.expr == order_by.expr)
+                .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
+                .unwrap_or_else(|| order_by.expr.clone()),
+        };
+        self.validate_grouped_sort_expr(projection, &expr)?;
+        Ok(OrderByExpr {
+            expr,
+            direction: order_by.direction,
+        })
+    }
+
+    fn projection_ordinal_item<'b>(
+        &self,
+        projection: &'b [BoundSelectItem],
+        value: i64,
+    ) -> Result<&'b BoundSelectItem> {
+        let ordinal = usize::try_from(value).map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ORDER BY position must be positive: {value}"),
+            )
+        })?;
+        if ordinal == 0 || ordinal > projection.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "ORDER BY position {ordinal} is out of range for {} select items",
+                    projection.len()
+                ),
+            ));
+        }
+        Ok(&projection[ordinal - 1])
     }
 
     fn validate_group_by_exprs(&self, table: &Table, group_by: &[Expr]) -> Result<()> {
