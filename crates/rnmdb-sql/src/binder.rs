@@ -284,23 +284,34 @@ impl<'a> Binder<'a> {
                         columns.push(bound_column);
                     }
                 }
-                SelectItem::Expr(Expr::Identifier(identifier)) => {
+                SelectItem::Expr {
+                    expr: Expr::Identifier(identifier),
+                    alias,
+                } => {
                     let column = self.resolve_column(table, identifier.as_str())?;
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Identifier(identifier.clone()),
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(Expr::CountStar) => {
+                SelectItem::Expr {
+                    expr: Expr::CountStar,
+                    alias,
+                } => {
                     let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::CountStar,
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(Expr::Count(expr)) => {
+                SelectItem::Expr {
+                    expr: Expr::Count(expr),
+                    alias,
+                } => {
                     let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -308,13 +319,17 @@ impl<'a> Binder<'a> {
                         )
                     })?;
                     let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Count(expr.clone()),
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(Expr::Sum(expr)) => {
+                SelectItem::Expr {
+                    expr: Expr::Sum(expr),
+                    alias,
+                } => {
                     let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -328,13 +343,17 @@ impl<'a> Binder<'a> {
                         ));
                     }
                     let column = aggregate_bound_column(&columns, "sum", SqlType::Int64, true);
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Sum(expr.clone()),
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(Expr::Min(expr)) => {
+                SelectItem::Expr {
+                    expr: Expr::Min(expr),
+                    alias,
+                } => {
                     let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -343,13 +362,17 @@ impl<'a> Binder<'a> {
                     })?;
                     self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
                     let column = aggregate_bound_column(&columns, "min", expr_type, true);
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Min(expr.clone()),
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(Expr::Max(expr)) => {
+                SelectItem::Expr {
+                    expr: Expr::Max(expr),
+                    alias,
+                } => {
                     let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -358,13 +381,14 @@ impl<'a> Binder<'a> {
                     })?;
                     self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
                     let column = aggregate_bound_column(&columns, "max", expr_type, true);
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: Expr::Max(expr.clone()),
                     });
                     columns.push(column);
                 }
-                SelectItem::Expr(expr) => {
+                SelectItem::Expr { expr, alias } => {
                     let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -377,6 +401,7 @@ impl<'a> Binder<'a> {
                         nullable: true,
                         encrypted: false,
                     };
+                    let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
                         expr: expr.clone(),
@@ -1154,6 +1179,13 @@ fn aggregate_bound_column(
         nullable,
         encrypted: false,
     }
+}
+
+fn aliased_bound_column(mut column: BoundColumn, alias: &Option<Ident>) -> BoundColumn {
+    if let Some(alias) = alias {
+        column.name = alias.as_str().to_string();
+    }
+    column
 }
 
 fn unique_column_name(existing_columns: &[BoundColumn], base_name: &str) -> String {

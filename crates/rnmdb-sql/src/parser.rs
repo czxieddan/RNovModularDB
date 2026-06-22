@@ -304,7 +304,13 @@ impl Parser {
             if self.consume_if(&TokenKind::Star) {
                 projection.push(SelectItem::Wildcard);
             } else {
-                projection.push(SelectItem::Expr(self.parse_expr()?));
+                let expr = self.parse_expr()?;
+                let alias = if self.consume_if(&TokenKind::As) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                projection.push(SelectItem::Expr { expr, alias });
             }
             if self.consume_if(&TokenKind::Comma) {
                 continue;
@@ -766,6 +772,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
         (left, right),
         (TokenKind::Select, TokenKind::Select)
             | (TokenKind::Distinct, TokenKind::Distinct)
+            | (TokenKind::As, TokenKind::As)
             | (TokenKind::Insert, TokenKind::Insert)
             | (TokenKind::Into, TokenKind::Into)
             | (TokenKind::Values, TokenKind::Values)

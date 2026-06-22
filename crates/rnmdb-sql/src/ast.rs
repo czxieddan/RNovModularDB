@@ -213,14 +213,20 @@ impl fmt::Display for Expr {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectItem {
     Wildcard,
-    Expr(Expr),
+    Expr { expr: Expr, alias: Option<Ident> },
 }
 
 impl fmt::Display for SelectItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Wildcard => f.write_str("*"),
-            Self::Expr(expr) => write!(f, "{expr}"),
+            Self::Expr { expr, alias } => {
+                write!(f, "{expr}")?;
+                if let Some(alias) = alias {
+                    write!(f, " AS {alias}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
