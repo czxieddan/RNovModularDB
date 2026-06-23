@@ -426,10 +426,10 @@ impl<'a> Binder<'a> {
             self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
         let having = if let Some(having) = having {
-            if bound_group_by.is_empty() {
+            if bound_group_by.is_empty() && aggregate_count == 0 {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
-                    "HAVING requires GROUP BY in this SQL slice",
+                    "HAVING requires GROUP BY or aggregate projection in this SQL slice",
                 ));
             }
             let having = self.rewrite_grouped_having_expr(&projection, having)?;
