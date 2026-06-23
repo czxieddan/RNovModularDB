@@ -415,17 +415,18 @@ impl<'a> Binder<'a> {
             .iter()
             .filter(|item| is_aggregate_expr(&item.expr))
             .count();
-        if !group_by.is_empty() {
-            self.validate_group_by_exprs(table, group_by)?;
+        let bound_group_by = self.bind_group_by_exprs(&projection, group_by)?;
+        if !bound_group_by.is_empty() {
+            self.validate_group_by_exprs(table, &bound_group_by)?;
         }
         if aggregate_count > 0 && aggregate_count != projection.len() {
-            self.validate_grouped_projection(&projection, group_by)?;
+            self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
-        if aggregate_count == 0 && !group_by.is_empty() {
-            self.validate_grouped_projection(&projection, group_by)?;
+        if aggregate_count == 0 && !bound_group_by.is_empty() {
+            self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
         let having = if let Some(having) = having {
-            if group_by.is_empty() {
+            if bound_group_by.is_empty() {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "HAVING requires GROUP BY in this SQL slice",
@@ -460,7 +461,7 @@ impl<'a> Binder<'a> {
             projection,
             columns,
             selection: selection.clone(),
-            group_by: group_by.to_vec(),
+            group_by: bound_group_by,
             having,
             order_by: bound_order_by,
             limit,
@@ -507,7 +508,7 @@ impl<'a> Binder<'a> {
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => self
-                .projection_ordinal_item(projection, *value)?
+                .projection_ordinal_item(projection, *value, "ORDER BY")?
                 .expr
                 .clone(),
             Expr::Identifier(identifier) => projection
@@ -531,7 +532,7 @@ impl<'a> Binder<'a> {
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => Expr::Identifier(Ident::new(
-                self.projection_ordinal_item(projection, *value)?
+                self.projection_ordinal_item(projection, *value, "ORDER BY")?
                     .column
                     .name
                     .as_str(),
@@ -553,23 +554,46 @@ impl<'a> Binder<'a> {
         &self,
         projection: &'b [BoundSelectItem],
         value: i64,
+        clause_name: &str,
     ) -> Result<&'b BoundSelectItem> {
         let ordinal = usize::try_from(value).map_err(|_| {
             RnovError::new(
                 ErrorKind::InvalidInput,
-                format!("ORDER BY position must be positive: {value}"),
+                format!("{clause_name} position must be positive: {value}"),
             )
         })?;
         if ordinal == 0 || ordinal > projection.len() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!(
-                    "ORDER BY position {ordinal} is out of range for {} select items",
+                    "{clause_name} position {ordinal} is out of range for {} select items",
                     projection.len()
                 ),
             ));
         }
         Ok(&projection[ordinal - 1])
+    }
+
+    fn bind_group_by_exprs(
+        &self,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+    ) -> Result<Vec<Expr>> {
+        group_by
+            .iter()
+            .map(|expr| match expr {
+                Expr::Integer(value) => Ok(self
+                    .projection_ordinal_item(projection, *value, "GROUP BY")?
+                    .expr
+                    .clone()),
+                Expr::Identifier(identifier) => Ok(projection
+                    .iter()
+                    .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                    .map(|item| item.expr.clone())
+                    .unwrap_or_else(|| expr.clone())),
+                _ => Ok(expr.clone()),
+            })
+            .collect()
     }
 
     fn validate_group_by_exprs(&self, table: &Table, group_by: &[Expr]) -> Result<()> {
