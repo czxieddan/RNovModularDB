@@ -108,6 +108,10 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Not(Box<Expr>),
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -198,6 +202,13 @@ impl fmt::Display for Expr {
             } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
             Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
             Self::Not(expr) => write!(f, "NOT {expr}"),
+            Self::IsNull { expr, negated } => {
+                if *negated {
+                    write!(f, "{expr} IS NOT NULL")
+                } else {
+                    write!(f, "{expr} IS NULL")
+                }
+            }
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;
                 for (index, arg) in args.iter().enumerate() {

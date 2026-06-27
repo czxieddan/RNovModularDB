@@ -648,6 +648,7 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(right)
             }
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
+            Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -741,6 +742,10 @@ impl<'a> Binder<'a> {
             Expr::Not(expr) => Ok(Expr::Not(Box::new(
                 self.rewrite_grouped_having_expr(projection, expr)?,
             ))),
+            Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                negated: *negated,
+            }),
             Expr::Array(values) => values
                 .iter()
                 .map(|value| self.rewrite_grouped_having_expr(projection, value))
@@ -862,6 +867,10 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_not_result_type(&data_type)
+            }
+            Expr::IsNull { expr, .. } => {
+                let _ = self.infer_grouped_output_expr_type(projection, expr)?;
+                Ok(Some(SqlType::Bool))
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1085,6 +1094,10 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_not_result_type(&data_type)
             }
+            Expr::IsNull { expr, .. } => {
+                let _ = self.infer_policy_expr_type(table, expr)?;
+                Ok(Some(SqlType::Bool))
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1228,6 +1241,10 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_not_result_type(&data_type)
+            }
+            Expr::IsNull { expr, .. } => {
+                let _ = self.infer_expr_type(table, expr)?;
+                Ok(Some(SqlType::Bool))
             }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());

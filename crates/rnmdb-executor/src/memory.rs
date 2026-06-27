@@ -1020,6 +1020,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             format!("memory projection does not support operator {op}"),
         )),
         Expr::Not(_) => Ok(SqlType::Bool),
+        Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1068,6 +1069,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),
+        Expr::IsNull { expr, negated } => eval_is_null_expr(columns, row, expr, *negated),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1133,6 +1135,16 @@ fn eval_not_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<Sql
         Truth::False => SqlValue::Bool(true),
         Truth::Unknown => SqlValue::Null,
     })
+}
+
+fn eval_is_null_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    negated: bool,
+) -> Result<SqlValue> {
+    let is_null = matches!(eval_expr(columns, row, expr)?, SqlValue::Null);
+    Ok(SqlValue::Bool(if negated { !is_null } else { is_null }))
 }
 
 fn eval_boolean_connector(

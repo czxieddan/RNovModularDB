@@ -468,6 +468,14 @@ impl Parser {
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary_expr()?;
+        if self.consume_if(&TokenKind::Is) {
+            let negated = self.consume_if(&TokenKind::Not);
+            self.expect_keyword(TokenKind::Null)?;
+            return Ok(Expr::IsNull {
+                expr: Box::new(expr),
+                negated,
+            });
+        }
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
             let right = self.parse_primary_expr()?;
@@ -856,6 +864,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::And, TokenKind::And)
             | (TokenKind::Or, TokenKind::Or)
             | (TokenKind::Not, TokenKind::Not)
+            | (TokenKind::Is, TokenKind::Is)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)
