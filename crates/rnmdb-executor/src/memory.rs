@@ -1025,6 +1025,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
         Expr::Like { .. } => Ok(SqlType::Bool),
+        Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1090,6 +1091,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             pattern,
             negated,
         } => eval_like_expr(columns, row, expr, pattern, *negated),
+        Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1292,6 +1294,47 @@ fn like_pattern_matches(value: &str, pattern: &str) -> bool {
     }
 
     matched[value.len()][pattern.len()]
+}
+
+fn eval_cast_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    data_type: &SqlType,
+) -> Result<SqlValue> {
+    let value = eval_expr(columns, row, expr)?;
+    if value.is_null() {
+        return Ok(SqlValue::Null);
+    }
+    let value_type = value.data_type();
+    if &value_type == data_type {
+        return Ok(value);
+    }
+    match (value, data_type) {
+        (SqlValue::Int64(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+        (SqlValue::Text(value), SqlType::Int64) => {
+            let parsed = value.parse::<i64>().map_err(|_| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot cast TEXT value '{value}' to INT64"),
+                )
+            })?;
+            Ok(SqlValue::Int64(parsed))
+        }
+        (SqlValue::Bool(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+        (SqlValue::Text(value), SqlType::Bool) => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok(SqlValue::Bool(true)),
+            "false" => Ok(SqlValue::Bool(false)),
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot cast TEXT value '{value}' to BOOL"),
+            )),
+        },
+        (value, target_type) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot cast {:?} to {target_type:?}", value.data_type()),
+        )),
+    }
 }
 
 fn eval_boolean_connector(

@@ -678,6 +678,7 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(expr)?;
                 self.validate_group_by_expr_shape(pattern)
             }
+            Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -806,6 +807,10 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 pattern: Box::new(self.rewrite_grouped_having_expr(projection, pattern)?),
                 negated: *negated,
+            }),
+            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                data_type: data_type.clone(),
             }),
             Expr::Array(values) => values
                 .iter()
@@ -972,6 +977,13 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
+            }
+            Expr::Cast { expr, data_type } => {
+                let Some(source_type) = self.infer_grouped_output_expr_type(projection, expr)?
+                else {
+                    return Ok(None);
+                };
+                self.infer_cast_result_type(&source_type, data_type)
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1235,6 +1247,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
+            Expr::Cast { expr, data_type } => {
+                let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(data_type.clone()));
+                };
+                self.infer_cast_result_type(&source_type, data_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1419,6 +1437,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
+            Expr::Cast { expr, data_type } => {
+                let Some(source_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_cast_result_type(&source_type, data_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1600,6 +1624,30 @@ impl<'a> Binder<'a> {
                 format!(
                     "LIKE requires TEXT expression and pattern, got {expr_type:?} and {pattern_type:?}"
                 ),
+            ))
+        }
+    }
+
+    fn infer_cast_result_type(
+        &self,
+        source_type: &SqlType,
+        target_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if source_type == target_type
+            || matches!(source_type, SqlType::Null)
+            || matches!(
+                (source_type, target_type),
+                (SqlType::Int64, SqlType::Text)
+                    | (SqlType::Text, SqlType::Int64)
+                    | (SqlType::Bool, SqlType::Text)
+                    | (SqlType::Text, SqlType::Bool)
+            )
+        {
+            Ok(Some(target_type.clone()))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot cast {source_type:?} to {target_type:?}"),
             ))
         }
     }

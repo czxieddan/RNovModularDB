@@ -598,6 +598,9 @@ impl Parser {
                 if first.as_str() == "range" && self.consume_if(&TokenKind::LeftParen) {
                     return self.parse_range_literal_tail();
                 }
+                if first.as_str() == "cast" && self.consume_if(&TokenKind::LeftParen) {
+                    return self.parse_cast_expr_tail();
+                }
 
                 let name = self.parse_object_name_from_first(first)?;
                 if self.consume_if(&TokenKind::LeftParen) {
@@ -708,6 +711,17 @@ impl Parser {
             lower: Box::new(lower),
             upper: Box::new(upper),
             bounds,
+        })
+    }
+
+    fn parse_cast_expr_tail(&mut self) -> Result<Expr> {
+        let expr = self.parse_expr()?;
+        self.expect_keyword(TokenKind::As)?;
+        let data_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::Cast {
+            expr: Box::new(expr),
+            data_type,
         })
     }
 

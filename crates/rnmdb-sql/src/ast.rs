@@ -128,6 +128,10 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    Cast {
+        expr: Box<Expr>,
+        data_type: SqlType,
+    },
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -266,6 +270,9 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} LIKE {pattern}")
                 }
             }
+            Self::Cast { expr, data_type } => {
+                write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
+            }
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;
                 for (index, arg) in args.iter().enumerate() {
@@ -298,6 +305,21 @@ impl fmt::Display for SelectItem {
                 Ok(())
             }
         }
+    }
+}
+
+fn format_sql_type(data_type: &SqlType) -> String {
+    match data_type {
+        SqlType::Null => "NULL".to_string(),
+        SqlType::Bool => "BOOL".to_string(),
+        SqlType::Int64 => "INT64".to_string(),
+        SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Text => "TEXT".to_string(),
+        SqlType::Bytes => "BYTES".to_string(),
+        SqlType::HStore => "HSTORE".to_string(),
+        SqlType::TextVector => "TEXTVECTOR".to_string(),
+        SqlType::Array(element_type) => format!("{}[]", format_sql_type(element_type)),
+        SqlType::Range(element_type) => format!("RANGE<{}>", format_sql_type(element_type)),
     }
 }
 
