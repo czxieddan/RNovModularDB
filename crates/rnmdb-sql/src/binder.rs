@@ -662,6 +662,10 @@ impl<'a> Binder<'a> {
                     .iter()
                     .try_for_each(|value| self.validate_group_by_expr_shape(value))
             }
+            Expr::Like { expr, pattern, .. } => {
+                self.validate_group_by_expr_shape(expr)?;
+                self.validate_group_by_expr_shape(pattern)
+            }
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -780,6 +784,15 @@ impl<'a> Binder<'a> {
                     .iter()
                     .map(|value| self.rewrite_grouped_having_expr(projection, value))
                     .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            }),
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Expr::Like {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                pattern: Box::new(self.rewrite_grouped_having_expr(projection, pattern)?),
                 negated: *negated,
             }),
             Expr::Array(values) => values
@@ -936,6 +949,17 @@ impl<'a> Binder<'a> {
                     value_types.push(value_type);
                 }
                 self.infer_in_list_result_type(&expr_type, &value_types)
+            }
+            Expr::Like { expr, pattern, .. } => {
+                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                let Some(pattern_type) =
+                    self.infer_grouped_output_expr_type(projection, pattern)?
+                else {
+                    return Ok(None);
+                };
+                self.infer_like_result_type(&expr_type, &pattern_type)
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1190,6 +1214,15 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
+            Expr::Like { expr, pattern, .. } => {
+                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                let Some(pattern_type) = self.infer_policy_expr_type(table, pattern)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_like_result_type(&expr_type, &pattern_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1365,6 +1398,15 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
+            Expr::Like { expr, pattern, .. } => {
+                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                let Some(pattern_type) = self.infer_expr_type(table, pattern)? else {
+                    return Ok(None);
+                };
+                self.infer_like_result_type(&expr_type, &pattern_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1508,6 +1550,25 @@ impl<'a> Binder<'a> {
             }
         }
         Ok(Some(SqlType::Bool))
+    }
+
+    fn infer_like_result_type(
+        &self,
+        expr_type: &SqlType,
+        pattern_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(expr_type, SqlType::Text | SqlType::Null)
+            && matches!(pattern_type, SqlType::Text | SqlType::Null)
+        {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "LIKE requires TEXT expression and pattern, got {expr_type:?} and {pattern_type:?}"
+                ),
+            ))
+        }
     }
 }
 

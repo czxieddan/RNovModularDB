@@ -1023,6 +1023,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
+        Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1083,6 +1084,11 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             values,
             negated,
         } => eval_in_list_expr(columns, row, expr, values, *negated),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => eval_like_expr(columns, row, expr, pattern, *negated),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1199,6 +1205,56 @@ fn eval_in_list_expr(
     } else {
         Ok(SqlValue::Bool(negated))
     }
+}
+
+fn eval_like_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    pattern: &Expr,
+    negated: bool,
+) -> Result<SqlValue> {
+    let value = eval_expr(columns, row, expr)?;
+    let pattern = eval_expr(columns, row, pattern)?;
+    match (value, pattern) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Text(value), SqlValue::Text(pattern)) => {
+            let matched = like_pattern_matches(&value, &pattern);
+            Ok(SqlValue::Bool(if negated { !matched } else { matched }))
+        }
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "LIKE requires TEXT expression and pattern",
+        )),
+    }
+}
+
+fn like_pattern_matches(value: &str, pattern: &str) -> bool {
+    let value: Vec<char> = value.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut matched = vec![vec![false; pattern.len() + 1]; value.len() + 1];
+    matched[0][0] = true;
+
+    for pattern_index in 0..pattern.len() {
+        if pattern[pattern_index] == '%' {
+            matched[0][pattern_index + 1] = matched[0][pattern_index];
+        }
+    }
+
+    for value_index in 0..value.len() {
+        for pattern_index in 0..pattern.len() {
+            matched[value_index + 1][pattern_index + 1] = match pattern[pattern_index] {
+                '%' => {
+                    matched[value_index + 1][pattern_index]
+                        || matched[value_index][pattern_index + 1]
+                }
+                '_' => matched[value_index][pattern_index],
+                literal => matched[value_index][pattern_index] && value[value_index] == literal,
+            };
+        }
+    }
+
+    matched[value.len()][pattern.len()]
 }
 
 fn eval_boolean_connector(

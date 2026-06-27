@@ -123,6 +123,11 @@ pub enum Expr {
         values: Vec<Expr>,
         negated: bool,
     },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -249,6 +254,17 @@ impl fmt::Display for Expr {
                     write!(f, "{value}")?;
                 }
                 f.write_str(")")
+            }
+            Self::Like {
+                expr,
+                pattern,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "{expr} NOT LIKE {pattern}")
+                } else {
+                    write!(f, "{expr} LIKE {pattern}")
+                }
             }
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;
