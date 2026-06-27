@@ -635,7 +635,10 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(upper)
             }
             Expr::Binary { left, op, right } => {
-                if !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@") {
+                if !matches!(
+                    op.as_str(),
+                    "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@"
+                ) {
                     return Err(RnovError::new(
                         ErrorKind::InvalidInput,
                         format!("GROUP BY does not support operator {op} yet"),
