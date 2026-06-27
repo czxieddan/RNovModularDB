@@ -1015,6 +1015,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
                 .data_type(),
         ),
         Expr::Binary { op, .. } if boolean_operator(op) => Ok(SqlType::Bool),
+        Expr::Binary { op, .. } if arithmetic_operator(op) => Ok(SqlType::Int64),
         Expr::Binary { op, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {op}"),
@@ -1105,6 +1106,7 @@ fn eval_binary_expr(
 ) -> Result<SqlValue> {
     match op {
         "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
+        "+" | "-" | "*" | "/" => eval_arithmetic_expr(columns, row, left, op, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
@@ -1146,6 +1148,41 @@ fn eval_binary_expr(
             format!("memory projection does not support operator {other}"),
         )),
     }
+}
+
+fn eval_arithmetic_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    let (left, right) = match (left, right) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => return Ok(SqlValue::Null),
+        (SqlValue::Int64(left), SqlValue::Int64(right)) => (left, right),
+        _ => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("arithmetic operator {op} requires INT64 operands"),
+            ));
+        }
+    };
+    let value = match op {
+        "+" => left.checked_add(right),
+        "-" => left.checked_sub(right),
+        "*" => left.checked_mul(right),
+        "/" => {
+            if right == 0 {
+                return Err(RnovError::new(ErrorKind::InvalidInput, "division by zero"));
+            }
+            left.checked_div(right)
+        }
+        _ => unreachable!("matched arithmetic operator"),
+    }
+    .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow"))?;
+    Ok(SqlValue::Int64(value))
 }
 
 fn eval_not_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValue> {
@@ -1320,6 +1357,10 @@ fn boolean_operator(op: &str) -> bool {
         op,
         "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "AND" | "OR"
     )
+}
+
+fn arithmetic_operator(op: &str) -> bool {
+    matches!(op, "+" | "-" | "*" | "/")
 }
 
 fn apply_text_search_cancellable(

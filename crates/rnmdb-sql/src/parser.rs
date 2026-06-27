@@ -467,7 +467,7 @@ impl Parser {
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_primary_expr()?;
+        let mut expr = self.parse_additive_expr()?;
         if self.consume_if(&TokenKind::Is) {
             let negated = self.consume_if(&TokenKind::Not);
             self.expect_keyword(TokenKind::Null)?;
@@ -497,7 +497,7 @@ impl Parser {
         }
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
-            let right = self.parse_primary_expr()?;
+            let right = self.parse_additive_expr()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 op,
@@ -508,9 +508,9 @@ impl Parser {
     }
 
     fn parse_between_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
-        let low = self.parse_primary_expr()?;
+        let low = self.parse_additive_expr()?;
         self.expect_keyword(TokenKind::And)?;
-        let high = self.parse_primary_expr()?;
+        let high = self.parse_additive_expr()?;
         Ok(Expr::Between {
             expr: Box::new(expr),
             low: Box::new(low),
@@ -540,6 +540,42 @@ impl Parser {
             pattern: Box::new(pattern),
             negated,
         })
+    }
+
+    fn parse_additive_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_multiplicative_expr()?;
+        while let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
+            if !matches!(op.as_str(), "+" | "-") {
+                break;
+            }
+            self.bump();
+            let right = self.parse_multiplicative_expr()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_multiplicative_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_primary_expr()?;
+        loop {
+            let op = match self.peek_kind().cloned() {
+                Some(TokenKind::Star) => "*".to_string(),
+                Some(TokenKind::Operator(op)) if op == "/" => op,
+                _ => break,
+            };
+            self.bump();
+            let right = self.parse_primary_expr()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {

@@ -637,7 +637,19 @@ impl<'a> Binder<'a> {
             Expr::Binary { left, op, right } => {
                 if !matches!(
                     op.as_str(),
-                    "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "AND" | "OR"
+                    "=" | "<>"
+                        | "!="
+                        | "<"
+                        | "<="
+                        | ">"
+                        | ">="
+                        | "@@"
+                        | "AND"
+                        | "OR"
+                        | "+"
+                        | "-"
+                        | "*"
+                        | "/"
                 ) {
                     return Err(RnovError::new(
                         ErrorKind::InvalidInput,
@@ -1451,6 +1463,9 @@ impl<'a> Binder<'a> {
         if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
             return Ok(Some(SqlType::Bool));
         }
+        if is_arithmetic_operator(op) {
+            return self.infer_arithmetic_result_type(op, left_type, right_type);
+        }
         if is_boolean_connector(op) {
             if matches!(left_type, SqlType::Bool | SqlType::Null)
                 && matches!(right_type, SqlType::Bool | SqlType::Null)
@@ -1490,6 +1505,24 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("NOT requires BOOL operand, got {data_type:?}"),
+            ))
+        }
+    }
+
+    fn infer_arithmetic_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Int64 | SqlType::Null)
+            && matches!(right_type, SqlType::Int64 | SqlType::Null)
+        {
+            Ok(Some(SqlType::Int64))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("arithmetic operator {op} requires INT64 operands"),
             ))
         }
     }
@@ -1582,6 +1615,8 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
         "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "AND" | "OR"
     ) {
         Some(SqlType::Bool)
+    } else if is_arithmetic_operator(op) {
+        Some(SqlType::Int64)
     } else {
         None
     }
@@ -1589,6 +1624,10 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
 
 fn is_boolean_connector(op: &str) -> bool {
     matches!(op, "AND" | "OR")
+}
+
+fn is_arithmetic_operator(op: &str) -> bool {
+    matches!(op, "+" | "-" | "*" | "/")
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
