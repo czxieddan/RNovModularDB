@@ -625,6 +625,7 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_)
             | Expr::Integer(_)
             | Expr::String(_)
+            | Expr::Bool(_)
             | Expr::Null
             | Expr::HStore(_) => Ok(()),
             Expr::Array(values) => values
@@ -837,6 +838,7 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_)
             | Expr::Integer(_)
             | Expr::String(_)
+            | Expr::Bool(_)
             | Expr::Null
             | Expr::HStore(_) => Ok(expr.clone()),
         }
@@ -863,6 +865,7 @@ impl<'a> Binder<'a> {
                 }),
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
@@ -1124,6 +1127,7 @@ impl<'a> Binder<'a> {
             }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
             Expr::CountStar => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1319,6 +1323,7 @@ impl<'a> Binder<'a> {
             }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
             Expr::CountStar => Err(RnovError::new(
                 ErrorKind::InvalidInput,

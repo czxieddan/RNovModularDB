@@ -983,6 +983,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         }
         Expr::Integer(_) => Ok(SqlType::Int64),
         Expr::String(_) => Ok(SqlType::Text),
+        Expr::Bool(_) => Ok(SqlType::Bool),
         Expr::Null => Ok(SqlType::Null),
         Expr::CountStar => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1048,6 +1049,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         }
         Expr::Integer(_)
         | Expr::String(_)
+        | Expr::Bool(_)
         | Expr::Null
         | Expr::Array(_)
         | Expr::HStore(_)
@@ -1475,6 +1477,7 @@ fn literal_value(expr: &Expr) -> Result<SqlValue> {
     match expr {
         Expr::Integer(value) => Ok(SqlValue::Int64(*value)),
         Expr::String(value) => Ok(SqlValue::Text(value.clone())),
+        Expr::Bool(value) => Ok(SqlValue::Bool(*value)),
         Expr::Null => Ok(SqlValue::Null),
         Expr::Array(values) => array_literal_value(values),
         Expr::HStore(entries) => hstore_literal_value(entries),

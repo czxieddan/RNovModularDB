@@ -657,6 +657,14 @@ impl Parser {
                 self.bump();
                 Ok(Expr::String(value))
             }
+            Some(TokenKind::True) => {
+                self.bump();
+                Ok(Expr::Bool(true))
+            }
+            Some(TokenKind::False) => {
+                self.bump();
+                Ok(Expr::Bool(false))
+            }
             Some(TokenKind::Null) => {
                 self.bump();
                 Ok(Expr::Null)
@@ -973,6 +981,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::In, TokenKind::In)
             | (TokenKind::Like, TokenKind::Like)
             | (TokenKind::Null, TokenKind::Null)
+            | (TokenKind::True, TokenKind::True)
+            | (TokenKind::False, TokenKind::False)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)
             | (TokenKind::Analyze, TokenKind::Analyze)
