@@ -134,6 +134,10 @@ pub enum Expr {
         negated: bool,
     },
     Coalesce(Vec<Expr>),
+    NullIf {
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Cast {
         expr: Box<Expr>,
         data_type: SqlType,
@@ -289,6 +293,7 @@ impl fmt::Display for Expr {
                 }
                 f.write_str(")")
             }
+            Self::NullIf { left, right } => write!(f, "nullif({left}, {right})"),
             Self::Cast { expr, data_type } => {
                 write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
             }

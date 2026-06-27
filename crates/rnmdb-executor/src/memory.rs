@@ -1032,6 +1032,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::InList { .. } => Ok(SqlType::Bool),
         Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Coalesce(values) => projection_coalesce_type(columns, values),
+        Expr::NullIf { left, right } => projection_nullif_type(columns, left, right),
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1072,6 +1073,26 @@ fn coalesce_result_type(value_types: &[SqlType]) -> Result<SqlType> {
         }
     }
     Ok(result_type.unwrap_or(SqlType::Null))
+}
+
+fn projection_nullif_type(columns: &[ColumnSchema], left: &Expr, right: &Expr) -> Result<SqlType> {
+    let left_type = projection_type(columns, left)?;
+    let right_type = projection_type(columns, right)?;
+    nullif_result_type(&left_type, &right_type)
+}
+
+fn nullif_result_type(left_type: &SqlType, right_type: &SqlType) -> Result<SqlType> {
+    if matches!(left_type, SqlType::Null)
+        || matches!(right_type, SqlType::Null)
+        || left_type == right_type
+    {
+        Ok(left_type.clone())
+    } else {
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "NULLIF arguments must have matching types",
+        ))
+    }
 }
 
 fn sortable_type(data_type: &SqlType) -> bool {
@@ -1135,6 +1156,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             negated,
         } => eval_like_expr(columns, row, expr, pattern, *negated),
         Expr::Coalesce(values) => eval_coalesce_expr(columns, row, values),
+        Expr::NullIf { left, right } => eval_nullif_expr(columns, row, left, right),
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1383,6 +1405,21 @@ fn eval_coalesce_expr(columns: &[ColumnSchema], row: &Row, values: &[Expr]) -> R
         }
     }
     Ok(SqlValue::Null)
+}
+
+fn eval_nullif_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    if left.sql_eq(&right) == Truth::True {
+        Ok(SqlValue::Null)
+    } else {
+        Ok(left)
+    }
 }
 
 fn eval_cast_expr(

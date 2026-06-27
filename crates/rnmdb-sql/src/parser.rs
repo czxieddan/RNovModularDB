@@ -661,6 +661,18 @@ impl Parser {
                         }
                         return Ok(Expr::Coalesce(args));
                     }
+                    if name.schema().is_none() && name.object() == "nullif" {
+                        if args.len() != 2 {
+                            return Err(self.error("NULLIF requires exactly two expressions"));
+                        }
+                        let mut args = args.into_iter();
+                        let left = args.next().expect("NULLIF argument length checked");
+                        let right = args.next().expect("NULLIF argument length checked");
+                        return Ok(Expr::NullIf {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        });
+                    }
                     Ok(Expr::Call { name, args })
                 } else if name.schema().is_none() {
                     Ok(Expr::Identifier(Ident::new(name.object())))

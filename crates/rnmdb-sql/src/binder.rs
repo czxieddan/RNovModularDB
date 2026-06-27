@@ -691,6 +691,10 @@ impl<'a> Binder<'a> {
             Expr::Coalesce(values) => values
                 .iter()
                 .try_for_each(|value| self.validate_group_by_expr_shape(value)),
+            Expr::NullIf { left, right } => {
+                self.validate_group_by_expr_shape(left)?;
+                self.validate_group_by_expr_shape(right)
+            }
             Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
@@ -830,6 +834,10 @@ impl<'a> Binder<'a> {
                 .map(|value| self.rewrite_grouped_having_expr(projection, value))
                 .collect::<Result<Vec<_>>>()
                 .map(Expr::Coalesce),
+            Expr::NullIf { left, right } => Ok(Expr::NullIf {
+                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
+                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+            }),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 data_type: data_type.clone(),
@@ -1019,6 +1027,16 @@ impl<'a> Binder<'a> {
                     value_types.push(value_type);
                 }
                 self.infer_coalesce_result_type(&value_types)
+            }
+            Expr::NullIf { left, right } => {
+                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
+                else {
+                    return Ok(None);
+                };
+                self.infer_nullif_result_type(&left_type, &right_type)
             }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_grouped_output_expr_type(projection, expr)?
@@ -1306,6 +1324,15 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_coalesce_result_type(&value_types)
             }
+            Expr::NullIf { left, right } => {
+                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
+                    return Ok(None);
+                };
+                self.infer_nullif_result_type(&left_type, &right_type)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(data_type.clone()));
@@ -1513,6 +1540,15 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_coalesce_result_type(&value_types)
             }
+            Expr::NullIf { left, right } => {
+                let Some(left_type) = self.infer_expr_type(table, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_expr_type(table, right)? else {
+                    return Ok(None);
+                };
+                self.infer_nullif_result_type(&left_type, &right_type)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -1666,6 +1702,24 @@ impl<'a> Binder<'a> {
             }
         }
         Ok(Some(result_type.unwrap_or(SqlType::Null)))
+    }
+
+    fn infer_nullif_result_type(
+        &self,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Null)
+            || matches!(right_type, SqlType::Null)
+            || left_type == right_type
+        {
+            Ok(Some(left_type.clone()))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "NULLIF arguments must have matching types",
+            ))
+        }
     }
 
     fn infer_between_result_type(
