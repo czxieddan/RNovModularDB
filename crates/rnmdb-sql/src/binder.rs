@@ -598,12 +598,7 @@ impl<'a> Binder<'a> {
 
     fn validate_group_by_exprs(&self, table: &Table, group_by: &[Expr]) -> Result<()> {
         for expr in group_by {
-            if !matches!(expr, Expr::Identifier(_)) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "GROUP BY only supports column identifiers yet",
-                ));
-            }
+            self.validate_group_by_expr_shape(expr)?;
             match self.infer_expr_type(table, expr)? {
                 Some(
                     SqlType::Null
@@ -623,6 +618,43 @@ impl<'a> Binder<'a> {
             }
         }
         Ok(())
+    }
+
+    fn validate_group_by_expr_shape(&self, expr: &Expr) -> Result<()> {
+        match expr {
+            Expr::Identifier(_)
+            | Expr::Integer(_)
+            | Expr::String(_)
+            | Expr::Null
+            | Expr::HStore(_) => Ok(()),
+            Expr::Array(values) => values
+                .iter()
+                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
+            Expr::Range { lower, upper, .. } => {
+                self.validate_group_by_expr_shape(lower)?;
+                self.validate_group_by_expr_shape(upper)
+            }
+            Expr::Binary { left, op, right } => {
+                if !matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@") {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("GROUP BY does not support operator {op} yet"),
+                    ));
+                }
+                self.validate_group_by_expr_shape(left)?;
+                self.validate_group_by_expr_shape(right)
+            }
+            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "GROUP BY does not support aggregate expressions",
+                ))
+            }
+            Expr::Call { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support function calls yet",
+            )),
+        }
     }
 
     fn validate_grouped_sort_expr(
