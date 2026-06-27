@@ -655,6 +655,12 @@ impl Parser {
                             self.single_function_arg("max", &mut args)?,
                         )));
                     }
+                    if name.schema().is_none() && name.object() == "coalesce" {
+                        if args.is_empty() {
+                            return Err(self.error("COALESCE requires at least one expression"));
+                        }
+                        return Ok(Expr::Coalesce(args));
+                    }
                     Ok(Expr::Call { name, args })
                 } else if name.schema().is_none() {
                     Ok(Expr::Identifier(Ident::new(name.object())))

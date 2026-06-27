@@ -1031,12 +1031,47 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
         Expr::Like { .. } => Ok(SqlType::Bool),
+        Expr::Coalesce(values) => projection_coalesce_type(columns, values),
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
         )),
     }
+}
+
+fn projection_coalesce_type(columns: &[ColumnSchema], values: &[Expr]) -> Result<SqlType> {
+    if values.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COALESCE requires at least one expression",
+        ));
+    }
+    let value_types = values
+        .iter()
+        .map(|value| projection_type(columns, value))
+        .collect::<Result<Vec<_>>>()?;
+    coalesce_result_type(&value_types)
+}
+
+fn coalesce_result_type(value_types: &[SqlType]) -> Result<SqlType> {
+    let mut result_type = None;
+    for value_type in value_types {
+        if value_type == &SqlType::Null {
+            continue;
+        }
+        match &result_type {
+            Some(existing) if existing != value_type => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "COALESCE arguments must have matching types",
+                ));
+            }
+            Some(_) => {}
+            None => result_type = Some(value_type.clone()),
+        }
+    }
+    Ok(result_type.unwrap_or(SqlType::Null))
 }
 
 fn sortable_type(data_type: &SqlType) -> bool {
@@ -1099,6 +1134,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             pattern,
             negated,
         } => eval_like_expr(columns, row, expr, pattern, *negated),
+        Expr::Coalesce(values) => eval_coalesce_expr(columns, row, values),
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1331,6 +1367,22 @@ fn like_pattern_matches(value: &str, pattern: &str) -> bool {
     }
 
     matched[value.len()][pattern.len()]
+}
+
+fn eval_coalesce_expr(columns: &[ColumnSchema], row: &Row, values: &[Expr]) -> Result<SqlValue> {
+    if values.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "COALESCE requires at least one expression",
+        ));
+    }
+    for expr in values {
+        let value = eval_expr(columns, row, expr)?;
+        if !value.is_null() {
+            return Ok(value);
+        }
+    }
+    Ok(SqlValue::Null)
 }
 
 fn eval_cast_expr(

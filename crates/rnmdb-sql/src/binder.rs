@@ -688,6 +688,9 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(expr)?;
                 self.validate_group_by_expr_shape(pattern)
             }
+            Expr::Coalesce(values) => values
+                .iter()
+                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
             Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
@@ -822,6 +825,11 @@ impl<'a> Binder<'a> {
                 pattern: Box::new(self.rewrite_grouped_having_expr(projection, pattern)?),
                 negated: *negated,
             }),
+            Expr::Coalesce(values) => values
+                .iter()
+                .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                .collect::<Result<Vec<_>>>()
+                .map(Expr::Coalesce),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 data_type: data_type.clone(),
@@ -999,6 +1007,18 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
+            }
+            Expr::Coalesce(values) => {
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) =
+                        self.infer_grouped_output_expr_type(projection, value)?
+                    else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_coalesce_result_type(&value_types)
             }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_grouped_output_expr_type(projection, expr)?
@@ -1276,6 +1296,16 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
+            Expr::Coalesce(values) => {
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_coalesce_result_type(&value_types)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(data_type.clone()));
@@ -1473,6 +1503,16 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
+            Expr::Coalesce(values) => {
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) = self.infer_expr_type(table, value)? else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_coalesce_result_type(&value_types)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -1606,6 +1646,26 @@ impl<'a> Binder<'a> {
                 format!("unary operator {op} requires INT64 operand"),
             ))
         }
+    }
+
+    fn infer_coalesce_result_type(&self, value_types: &[SqlType]) -> Result<Option<SqlType>> {
+        let mut result_type = None;
+        for value_type in value_types {
+            if value_type == &SqlType::Null {
+                continue;
+            }
+            match &result_type {
+                Some(existing) if existing != value_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "COALESCE arguments must have matching types",
+                    ));
+                }
+                Some(_) => {}
+                None => result_type = Some(value_type.clone()),
+            }
+        }
+        Ok(Some(result_type.unwrap_or(SqlType::Null)))
     }
 
     fn infer_between_result_type(

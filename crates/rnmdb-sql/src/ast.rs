@@ -133,6 +133,7 @@ pub enum Expr {
         pattern: Box<Expr>,
         negated: bool,
     },
+    Coalesce(Vec<Expr>),
     Cast {
         expr: Box<Expr>,
         data_type: SqlType,
@@ -277,6 +278,16 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "{expr} LIKE {pattern}")
                 }
+            }
+            Self::Coalesce(values) => {
+                f.write_str("coalesce(")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                f.write_str(")")
             }
             Self::Cast { expr, data_type } => {
                 write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
