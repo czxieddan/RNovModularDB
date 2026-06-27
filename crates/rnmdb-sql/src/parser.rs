@@ -538,7 +538,7 @@ impl Parser {
                 } else if name.schema().is_none() {
                     Ok(Expr::Identifier(Ident::new(name.object())))
                 } else {
-                    Err(self.error("qualified identifiers are not supported in expressions yet"))
+                    Ok(Expr::Identifier(Ident::new(name.object())))
                 }
             }
             Some(TokenKind::Integer(value)) => {
