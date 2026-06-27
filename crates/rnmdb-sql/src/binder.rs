@@ -660,6 +660,15 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(left)?;
                 self.validate_group_by_expr_shape(right)
             }
+            Expr::Unary { op, expr } => {
+                if !matches!(op.as_str(), "+" | "-") {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("GROUP BY does not support unary operator {op} yet"),
+                    ));
+                }
+                self.validate_group_by_expr_shape(expr)
+            }
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::Between {
@@ -769,6 +778,10 @@ impl<'a> Binder<'a> {
                 left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
                 op: op.clone(),
                 right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
             }),
             Expr::Not(expr) => Ok(Expr::Not(Box::new(
                 self.rewrite_grouped_having_expr(projection, expr)?,
@@ -930,6 +943,12 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_operator_result_type(expr, &left_type, &right_type)
+            }
+            Expr::Unary { op, expr } => {
+                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_unary_arithmetic_result_type(op, &data_type)
             }
             Expr::Not(expr) => {
                 let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
@@ -1205,6 +1224,12 @@ impl<'a> Binder<'a> {
                     _ => Ok(policy_unknown_side_operator_type(expr)),
                 }
             }
+            Expr::Unary { op, expr } => {
+                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Int64));
+                };
+                self.infer_unary_arithmetic_result_type(op, &data_type)
+            }
             Expr::Not(expr) => {
                 let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(SqlType::Bool));
@@ -1396,6 +1421,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_operator_result_type(expr, &left_type, &right_type)
             }
+            Expr::Unary { op, expr } => {
+                let Some(data_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_unary_arithmetic_result_type(op, &data_type)
+            }
             Expr::Not(expr) => {
                 let Some(data_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -1552,6 +1583,27 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("arithmetic operator {op} requires INT64 operands"),
+            ))
+        }
+    }
+
+    fn infer_unary_arithmetic_result_type(
+        &self,
+        op: &str,
+        data_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if !matches!(op, "+" | "-") {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported unary operator {op}"),
+            ));
+        }
+        if matches!(data_type, SqlType::Int64 | SqlType::Null) {
+            Ok(Some(SqlType::Int64))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unary operator {op} requires INT64 operand"),
             ))
         }
     }

@@ -1021,6 +1021,11 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {op}"),
         )),
+        Expr::Unary { op, .. } if unary_arithmetic_operator(op) => Ok(SqlType::Int64),
+        Expr::Unary { op, .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("memory projection does not support unary operator {op}"),
+        )),
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::Between { .. } => Ok(SqlType::Bool),
@@ -1075,6 +1080,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             "MAX(expr) requires aggregate execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
+        Expr::Unary { op, expr } => eval_unary_arithmetic_expr(columns, row, op, expr),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),
         Expr::IsNull { expr, negated } => eval_is_null_expr(columns, row, expr, *negated),
         Expr::Between {
@@ -1187,6 +1193,35 @@ fn eval_arithmetic_expr(
     }
     .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow"))?;
     Ok(SqlValue::Int64(value))
+}
+
+fn eval_unary_arithmetic_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    op: &str,
+    expr: &Expr,
+) -> Result<SqlValue> {
+    let value = eval_expr(columns, row, expr)?;
+    let SqlValue::Int64(value) = value else {
+        if value.is_null() {
+            return Ok(SqlValue::Null);
+        }
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unary operator {op} requires INT64 operand"),
+        ));
+    };
+    match op {
+        "+" => Ok(SqlValue::Int64(value)),
+        "-" => value
+            .checked_neg()
+            .map(SqlValue::Int64)
+            .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow")),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported unary operator {op}"),
+        )),
+    }
 }
 
 fn eval_not_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValue> {
@@ -1406,6 +1441,10 @@ fn boolean_operator(op: &str) -> bool {
 
 fn arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/")
+}
+
+fn unary_arithmetic_operator(op: &str) -> bool {
+    matches!(op, "+" | "-")
 }
 
 fn apply_text_search_cancellable(

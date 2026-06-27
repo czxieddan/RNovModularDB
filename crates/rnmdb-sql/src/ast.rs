@@ -108,6 +108,10 @@ pub enum Expr {
         op: String,
         right: Box<Expr>,
     },
+    Unary {
+        op: String,
+        expr: Box<Expr>,
+    },
     Not(Box<Expr>),
     IsNull {
         expr: Box<Expr>,
@@ -224,6 +228,7 @@ impl fmt::Display for Expr {
                 bounds,
             } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
             Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
+            Self::Unary { op, expr } => write!(f, "{op}{expr}"),
             Self::Not(expr) => write!(f, "NOT {expr}"),
             Self::IsNull { expr, negated } => {
                 if *negated {

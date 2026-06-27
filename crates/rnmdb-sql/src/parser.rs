@@ -560,7 +560,7 @@ impl Parser {
     }
 
     fn parse_multiplicative_expr(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_primary_expr()?;
+        let mut expr = self.parse_unary_arithmetic_expr()?;
         loop {
             let op = match self.peek_kind().cloned() {
                 Some(TokenKind::Star) => "*".to_string(),
@@ -568,7 +568,7 @@ impl Parser {
                 _ => break,
             };
             self.bump();
-            let right = self.parse_primary_expr()?;
+            let right = self.parse_unary_arithmetic_expr()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 op,
@@ -576,6 +576,19 @@ impl Parser {
             };
         }
         Ok(expr)
+    }
+
+    fn parse_unary_arithmetic_expr(&mut self) -> Result<Expr> {
+        if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
+            if matches!(op.as_str(), "+" | "-") {
+                self.bump();
+                return Ok(Expr::Unary {
+                    op,
+                    expr: Box::new(self.parse_unary_arithmetic_expr()?),
+                });
+            }
+        }
+        self.parse_primary_expr()
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {
