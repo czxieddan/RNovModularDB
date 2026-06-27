@@ -430,6 +430,36 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr> {
+        self.parse_or_expr()
+    }
+
+    fn parse_or_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_and_expr()?;
+        while self.consume_if(&TokenKind::Or) {
+            let right = self.parse_and_expr()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: "OR".to_string(),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_and_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_comparison_expr()?;
+        while self.consume_if(&TokenKind::And) {
+            let right = self.parse_comparison_expr()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op: "AND".to_string(),
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
+    }
+
+    fn parse_comparison_expr(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary_expr()?;
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
@@ -810,6 +840,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Begin, TokenKind::Begin)
             | (TokenKind::Commit, TokenKind::Commit)
             | (TokenKind::Rollback, TokenKind::Rollback)
+            | (TokenKind::And, TokenKind::And)
+            | (TokenKind::Or, TokenKind::Or)
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)

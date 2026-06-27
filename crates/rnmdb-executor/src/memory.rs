@@ -1081,6 +1081,7 @@ fn eval_binary_expr(
     right: &Expr,
 ) -> Result<SqlValue> {
     match op {
+        "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
@@ -1124,6 +1125,50 @@ fn eval_binary_expr(
     }
 }
 
+fn eval_boolean_connector(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = bool_truth(eval_expr(columns, row, left)?)?;
+    let right = bool_truth(eval_expr(columns, row, right)?)?;
+    let truth = match op {
+        "AND" => match (left, right) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            (Truth::True, Truth::True) => Truth::True,
+        },
+        "OR" => match (left, right) {
+            (Truth::True, _) | (_, Truth::True) => Truth::True,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            (Truth::False, Truth::False) => Truth::False,
+        },
+        _ => unreachable!("matched boolean connectors"),
+    };
+    Ok(match truth {
+        Truth::True => SqlValue::Bool(true),
+        Truth::False => SqlValue::Bool(false),
+        Truth::Unknown => SqlValue::Null,
+    })
+}
+
+fn bool_truth(value: SqlValue) -> Result<Truth> {
+    match value {
+        SqlValue::Bool(true) => Ok(Truth::True),
+        SqlValue::Bool(false) => Ok(Truth::False),
+        SqlValue::Null => Ok(Truth::Unknown),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "boolean expression requires BOOL, got {:?}",
+                other.data_type()
+            ),
+        )),
+    }
+}
+
 fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bool> {
     match eval_expr(columns, row, expr)? {
         SqlValue::Bool(value) => Ok(value),
@@ -1139,7 +1184,10 @@ fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bo
 }
 
 fn boolean_operator(op: &str) -> bool {
-    matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@")
+    matches!(
+        op,
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "AND" | "OR"
+    )
 }
 
 fn apply_text_search_cancellable(

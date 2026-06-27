@@ -637,7 +637,7 @@ impl<'a> Binder<'a> {
             Expr::Binary { left, op, right } => {
                 if !matches!(
                     op.as_str(),
-                    "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@"
+                    "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "AND" | "OR"
                 ) {
                     return Err(RnovError::new(
                         ErrorKind::InvalidInput,
@@ -1251,6 +1251,17 @@ impl<'a> Binder<'a> {
         if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
             return Ok(Some(SqlType::Bool));
         }
+        if is_boolean_connector(op) {
+            if matches!(left_type, SqlType::Bool | SqlType::Null)
+                && matches!(right_type, SqlType::Bool | SqlType::Null)
+            {
+                return Ok(Some(SqlType::Bool));
+            }
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("boolean operator {op} requires BOOL operands"),
+            ));
+        }
 
         let operator = self
             .catalog
@@ -1278,11 +1289,18 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
         return None;
     };
 
-    if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+    if matches!(
+        op.as_str(),
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "AND" | "OR"
+    ) {
         Some(SqlType::Bool)
     } else {
         None
     }
+}
+
+fn is_boolean_connector(op: &str) -> bool {
+    matches!(op, "AND" | "OR")
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
