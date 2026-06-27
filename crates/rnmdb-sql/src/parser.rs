@@ -553,6 +553,12 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Null)
             }
+            Some(TokenKind::LeftParen) => {
+                self.bump();
+                let expr = self.parse_expr()?;
+                self.expect_keyword(TokenKind::RightParen)?;
+                Ok(expr)
+            }
             Some(kind) => Err(self.error(format!("unexpected expression token {kind:?}"))),
             None => Err(self.error("expected expression")),
         }
