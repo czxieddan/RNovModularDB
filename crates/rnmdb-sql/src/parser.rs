@@ -476,6 +476,13 @@ impl Parser {
                 negated,
             });
         }
+        if self.consume_if(&TokenKind::Between) {
+            return self.parse_between_tail(expr, false);
+        }
+        if self.consume_if(&TokenKind::Not) {
+            self.expect_keyword(TokenKind::Between)?;
+            return self.parse_between_tail(expr, true);
+        }
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
             let right = self.parse_primary_expr()?;
@@ -486,6 +493,18 @@ impl Parser {
             };
         }
         Ok(expr)
+    }
+
+    fn parse_between_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        let low = self.parse_primary_expr()?;
+        self.expect_keyword(TokenKind::And)?;
+        let high = self.parse_primary_expr()?;
+        Ok(Expr::Between {
+            expr: Box::new(expr),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+        })
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {
@@ -865,6 +884,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Or, TokenKind::Or)
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Is, TokenKind::Is)
+            | (TokenKind::Between, TokenKind::Between)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)

@@ -1021,6 +1021,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         )),
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
+        Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1070,6 +1071,12 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),
         Expr::IsNull { expr, negated } => eval_is_null_expr(columns, row, expr, *negated),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => eval_between_expr(columns, row, expr, low, high, *negated),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1145,6 +1152,24 @@ fn eval_is_null_expr(
 ) -> Result<SqlValue> {
     let is_null = matches!(eval_expr(columns, row, expr)?, SqlValue::Null);
     Ok(SqlValue::Bool(if negated { !is_null } else { is_null }))
+}
+
+fn eval_between_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    negated: bool,
+) -> Result<SqlValue> {
+    let value = eval_expr(columns, row, expr)?;
+    let low = eval_expr(columns, row, low)?;
+    let high = eval_expr(columns, row, high)?;
+    let (Some(low_order), Some(high_order)) = (value.sql_cmp(&low)?, value.sql_cmp(&high)?) else {
+        return Ok(SqlValue::Null);
+    };
+    let contains = !matches!(low_order, Ordering::Less) && !matches!(high_order, Ordering::Greater);
+    Ok(SqlValue::Bool(if negated { !contains } else { contains }))
 }
 
 fn eval_boolean_connector(

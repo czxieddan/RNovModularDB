@@ -112,6 +112,12 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -207,6 +213,18 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IS NOT NULL")
                 } else {
                     write!(f, "{expr} IS NULL")
+                }
+            }
+            Self::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "{expr} NOT BETWEEN {low} AND {high}")
+                } else {
+                    write!(f, "{expr} BETWEEN {low} AND {high}")
                 }
             }
             Self::Call { name, args } => {

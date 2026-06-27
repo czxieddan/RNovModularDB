@@ -649,6 +649,13 @@ impl<'a> Binder<'a> {
             }
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.validate_group_by_expr_shape(expr)?;
+                self.validate_group_by_expr_shape(low)?;
+                self.validate_group_by_expr_shape(high)
+            }
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -744,6 +751,17 @@ impl<'a> Binder<'a> {
             ))),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                negated: *negated,
+            }),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                low: Box::new(self.rewrite_grouped_having_expr(projection, low)?),
+                high: Box::new(self.rewrite_grouped_having_expr(projection, high)?),
                 negated: *negated,
             }),
             Expr::Array(values) => values
@@ -871,6 +889,20 @@ impl<'a> Binder<'a> {
             Expr::IsNull { expr, .. } => {
                 let _ = self.infer_grouped_output_expr_type(projection, expr)?;
                 Ok(Some(SqlType::Bool))
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                let Some(low_type) = self.infer_grouped_output_expr_type(projection, low)? else {
+                    return Ok(None);
+                };
+                let Some(high_type) = self.infer_grouped_output_expr_type(projection, high)? else {
+                    return Ok(None);
+                };
+                self.infer_between_result_type(&expr_type, &low_type, &high_type)
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1098,6 +1130,20 @@ impl<'a> Binder<'a> {
                 let _ = self.infer_policy_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
             }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                let Some(low_type) = self.infer_policy_expr_type(table, low)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                let Some(high_type) = self.infer_policy_expr_type(table, high)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_between_result_type(&expr_type, &low_type, &high_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1246,6 +1292,20 @@ impl<'a> Binder<'a> {
                 let _ = self.infer_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
             }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                let Some(low_type) = self.infer_expr_type(table, low)? else {
+                    return Ok(None);
+                };
+                let Some(high_type) = self.infer_expr_type(table, high)? else {
+                    return Ok(None);
+                };
+                self.infer_between_result_type(&expr_type, &low_type, &high_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1331,6 +1391,34 @@ impl<'a> Binder<'a> {
                 format!("NOT requires BOOL operand, got {data_type:?}"),
             ))
         }
+    }
+
+    fn infer_between_result_type(
+        &self,
+        expr_type: &SqlType,
+        low_type: &SqlType,
+        high_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        let mut expected: Option<&SqlType> = None;
+        for data_type in [expr_type, low_type, high_type] {
+            if matches!(data_type, SqlType::Null) {
+                continue;
+            }
+            self.ensure_ordered_aggregate_type("BETWEEN", data_type)?;
+            match &expected {
+                Some(expected) if *expected != data_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "BETWEEN requires matching expression and bound types, got {expr_type:?}, {low_type:?}, {high_type:?}"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => expected = Some(data_type),
+            }
+        }
+        Ok(Some(SqlType::Bool))
     }
 }
 
