@@ -1,7 +1,8 @@
-use rnmdb_common::ids::RelationId;
+use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{BoundStatement, ColumnDef, Expr, ObjectName, OrderByExpr, TransactionAction};
+use rnmdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalPlan {
@@ -77,6 +78,31 @@ pub enum LogicalPlan {
         relation_id: Option<RelationId>,
         table: String,
         if_exists: bool,
+    },
+    CreateFunction {
+        name: String,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+    },
+    CreateOperator {
+        symbol: String,
+        left_type: SqlType,
+        right_type: SqlType,
+        result_type: SqlType,
+        function_id: FunctionId,
+    },
+    CreateRole {
+        name: String,
+    },
+    CreatePolicy {
+        name: String,
+        relation_id: RelationId,
+        predicate: String,
+    },
+    GrantTablePrivilege {
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: String,
     },
     Transaction {
         action: String,
@@ -307,14 +333,43 @@ impl LogicalPlanner {
                     Ok(plan)
                 }
             }
-            BoundStatement::CreateFunction { .. }
-            | BoundStatement::CreateOperator { .. }
-            | BoundStatement::CreateRole { .. }
-            | BoundStatement::CreatePolicy { .. }
-            | BoundStatement::GrantTablePrivilege { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "logical planning for this statement is not implemented yet",
-            )),
+            BoundStatement::CreateFunction {
+                name,
+                argument_types,
+                return_type,
+            } => Ok(LogicalPlan::CreateFunction {
+                name: name.as_str().to_string(),
+                argument_types: argument_types.clone(),
+                return_type: return_type.clone(),
+            }),
+            BoundStatement::CreateOperator { signature } => Ok(LogicalPlan::CreateOperator {
+                symbol: signature.symbol().to_string(),
+                left_type: signature.left_type().clone(),
+                right_type: signature.right_type().clone(),
+                result_type: signature.result_type().clone(),
+                function_id: signature.function_id(),
+            }),
+            BoundStatement::CreateRole { name } => Ok(LogicalPlan::CreateRole {
+                name: name.as_str().to_string(),
+            }),
+            BoundStatement::CreatePolicy {
+                name,
+                relation_id,
+                predicate,
+            } => Ok(LogicalPlan::CreatePolicy {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
+                predicate: predicate.clone(),
+            }),
+            BoundStatement::GrantTablePrivilege {
+                role_id,
+                relation_id,
+                privilege,
+            } => Ok(LogicalPlan::GrantTablePrivilege {
+                role_id: *role_id,
+                relation_id: *relation_id,
+                privilege: format!("{privilege:?}"),
+            }),
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
             }),
@@ -481,6 +536,48 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}DropTable table={table} if_exists={if_exists}\n"
             ));
         }
+        LogicalPlan::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+        } => {
+            out.push_str(&format!(
+                "{prefix}CreateFunction name={name} args={} returns={return_type:?}\n",
+                sql_type_list(argument_types)
+            ));
+        }
+        LogicalPlan::CreateOperator {
+            symbol,
+            left_type,
+            right_type,
+            result_type,
+            function_id,
+        } => {
+            out.push_str(&format!(
+                "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}\n"
+            ));
+        }
+        LogicalPlan::CreateRole { name } => {
+            out.push_str(&format!("{prefix}CreateRole name={name}\n"));
+        }
+        LogicalPlan::CreatePolicy {
+            name,
+            relation_id,
+            predicate,
+        } => {
+            out.push_str(&format!(
+                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}\n"
+            ));
+        }
+        LogicalPlan::GrantTablePrivilege {
+            role_id,
+            relation_id,
+            privilege,
+        } => {
+            out.push_str(&format!(
+                "{prefix}GrantTablePrivilege role={role_id} relation={relation_id} privilege={privilege}\n"
+            ));
+        }
         LogicalPlan::Transaction { action } => {
             out.push_str(&format!("{prefix}Transaction action={action}\n"));
         }
@@ -557,6 +654,14 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn sql_type_list(types: &[SqlType]) -> String {
+    types
+        .iter()
+        .map(|data_type| format!("{data_type:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn select_aggregate_functions(
