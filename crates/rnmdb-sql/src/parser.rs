@@ -479,9 +479,15 @@ impl Parser {
         if self.consume_if(&TokenKind::Between) {
             return self.parse_between_tail(expr, false);
         }
+        if self.consume_if(&TokenKind::In) {
+            return self.parse_in_list_tail(expr, false);
+        }
         if self.consume_if(&TokenKind::Not) {
-            self.expect_keyword(TokenKind::Between)?;
-            return self.parse_between_tail(expr, true);
+            if self.consume_if(&TokenKind::Between) {
+                return self.parse_between_tail(expr, true);
+            }
+            self.expect_keyword(TokenKind::In)?;
+            return self.parse_in_list_tail(expr, true);
         }
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
@@ -503,6 +509,20 @@ impl Parser {
             expr: Box::new(expr),
             low: Box::new(low),
             high: Box::new(high),
+            negated,
+        })
+    }
+
+    fn parse_in_list_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        if self.consume_if(&TokenKind::RightParen) {
+            return Err(self.error("IN requires at least one expression"));
+        }
+        let values = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::InList {
+            expr: Box::new(expr),
+            values,
             negated,
         })
     }
@@ -885,6 +905,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Not, TokenKind::Not)
             | (TokenKind::Is, TokenKind::Is)
             | (TokenKind::Between, TokenKind::Between)
+            | (TokenKind::In, TokenKind::In)
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)

@@ -118,6 +118,11 @@ pub enum Expr {
         high: Box<Expr>,
         negated: bool,
     },
+    InList {
+        expr: Box<Expr>,
+        values: Vec<Expr>,
+        negated: bool,
+    },
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -226,6 +231,24 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "{expr} BETWEEN {low} AND {high}")
                 }
+            }
+            Self::InList {
+                expr,
+                values,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "{expr} NOT IN (")?;
+                } else {
+                    write!(f, "{expr} IN (")?;
+                }
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                f.write_str(")")
             }
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;

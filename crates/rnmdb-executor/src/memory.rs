@@ -1022,6 +1022,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::Between { .. } => Ok(SqlType::Bool),
+        Expr::InList { .. } => Ok(SqlType::Bool),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1077,6 +1078,11 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             high,
             negated,
         } => eval_between_expr(columns, row, expr, low, high, *negated),
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => eval_in_list_expr(columns, row, expr, values, *negated),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1170,6 +1176,29 @@ fn eval_between_expr(
     };
     let contains = !matches!(low_order, Ordering::Less) && !matches!(high_order, Ordering::Greater);
     Ok(SqlValue::Bool(if negated { !contains } else { contains }))
+}
+
+fn eval_in_list_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    values: &[Expr],
+    negated: bool,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, expr)?;
+    let mut saw_unknown = false;
+    for value in values {
+        match left.sql_eq(&eval_expr(columns, row, value)?) {
+            Truth::True => return Ok(SqlValue::Bool(!negated)),
+            Truth::False => {}
+            Truth::Unknown => saw_unknown = true,
+        }
+    }
+    if saw_unknown {
+        Ok(SqlValue::Null)
+    } else {
+        Ok(SqlValue::Bool(negated))
+    }
 }
 
 fn eval_boolean_connector(

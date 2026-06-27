@@ -656,6 +656,12 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(low)?;
                 self.validate_group_by_expr_shape(high)
             }
+            Expr::InList { expr, values, .. } => {
+                self.validate_group_by_expr_shape(expr)?;
+                values
+                    .iter()
+                    .try_for_each(|value| self.validate_group_by_expr_shape(value))
+            }
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -762,6 +768,18 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 low: Box::new(self.rewrite_grouped_having_expr(projection, low)?),
                 high: Box::new(self.rewrite_grouped_having_expr(projection, high)?),
+                negated: *negated,
+            }),
+            Expr::InList {
+                expr,
+                values,
+                negated,
+            } => Ok(Expr::InList {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                values: values
+                    .iter()
+                    .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                    .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
             }),
             Expr::Array(values) => values
@@ -903,6 +921,21 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_between_result_type(&expr_type, &low_type, &high_type)
+            }
+            Expr::InList { expr, values, .. } => {
+                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) =
+                        self.infer_grouped_output_expr_type(projection, value)?
+                    else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_in_list_result_type(&expr_type, &value_types)
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1144,6 +1177,19 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_between_result_type(&expr_type, &low_type, &high_type)
             }
+            Expr::InList { expr, values, .. } => {
+                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
+                        return Ok(Some(SqlType::Bool));
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_in_list_result_type(&expr_type, &value_types)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1306,6 +1352,19 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_between_result_type(&expr_type, &low_type, &high_type)
             }
+            Expr::InList { expr, values, .. } => {
+                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) = self.infer_expr_type(table, value)? else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_in_list_result_type(&expr_type, &value_types)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1416,6 +1475,36 @@ impl<'a> Binder<'a> {
                 }
                 Some(_) => {}
                 None => expected = Some(data_type),
+            }
+        }
+        Ok(Some(SqlType::Bool))
+    }
+
+    fn infer_in_list_result_type(
+        &self,
+        expr_type: &SqlType,
+        value_types: &[SqlType],
+    ) -> Result<Option<SqlType>> {
+        let mut expected = if matches!(expr_type, SqlType::Null) {
+            None
+        } else {
+            Some(expr_type)
+        };
+        for value_type in value_types {
+            if matches!(value_type, SqlType::Null) {
+                continue;
+            }
+            match expected {
+                Some(expected) if expected != value_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "IN requires matching expression and list value types, got {expr_type:?} and {value_type:?}"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => expected = Some(value_type),
             }
         }
         Ok(Some(SqlType::Bool))
