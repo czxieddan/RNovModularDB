@@ -1019,6 +1019,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {op}"),
         )),
+        Expr::Not(_) => Ok(SqlType::Bool),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1066,6 +1067,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             "MAX(expr) requires aggregate execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
+        Expr::Not(expr) => eval_not_expr(columns, row, expr),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {name}"),
@@ -1123,6 +1125,14 @@ fn eval_binary_expr(
             format!("memory projection does not support operator {other}"),
         )),
     }
+}
+
+fn eval_not_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValue> {
+    Ok(match bool_truth(eval_expr(columns, row, expr)?)? {
+        Truth::True => SqlValue::Bool(false),
+        Truth::False => SqlValue::Bool(true),
+        Truth::Unknown => SqlValue::Null,
+    })
 }
 
 fn eval_boolean_connector(

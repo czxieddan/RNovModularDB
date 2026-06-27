@@ -647,6 +647,7 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(left)?;
                 self.validate_group_by_expr_shape(right)
             }
+            Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -737,6 +738,9 @@ impl<'a> Binder<'a> {
                 op: op.clone(),
                 right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
             }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.rewrite_grouped_having_expr(projection, expr)?,
+            ))),
             Expr::Array(values) => values
                 .iter()
                 .map(|value| self.rewrite_grouped_having_expr(projection, value))
@@ -852,6 +856,12 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_operator_result_type(expr, &left_type, &right_type)
+            }
+            Expr::Not(expr) => {
+                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_not_result_type(&data_type)
             }
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -1069,6 +1079,12 @@ impl<'a> Binder<'a> {
                     _ => Ok(policy_unknown_side_operator_type(expr)),
                 }
             }
+            Expr::Not(expr) => {
+                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_not_result_type(&data_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1207,6 +1223,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_operator_result_type(expr, &left_type, &right_type)
             }
+            Expr::Not(expr) => {
+                let Some(data_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_not_result_type(&data_type)
+            }
             Expr::Call { name, args } => {
                 let mut argument_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -1281,6 +1303,17 @@ impl<'a> Binder<'a> {
             })?;
 
         Ok(Some(operator.signature().result_type().clone()))
+    }
+
+    fn infer_not_result_type(&self, data_type: &SqlType) -> Result<Option<SqlType>> {
+        if matches!(data_type, SqlType::Bool | SqlType::Null) {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("NOT requires BOOL operand, got {data_type:?}"),
+            ))
+        }
     }
 }
 

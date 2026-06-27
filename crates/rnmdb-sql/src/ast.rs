@@ -107,6 +107,7 @@ pub enum Expr {
         op: String,
         right: Box<Expr>,
     },
+    Not(Box<Expr>),
     Call {
         name: ObjectName,
         args: Vec<Expr>,
@@ -196,6 +197,7 @@ impl fmt::Display for Expr {
                 bounds,
             } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
             Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
+            Self::Not(expr) => write!(f, "NOT {expr}"),
             Self::Call { name, args } => {
                 write!(f, "{name}(")?;
                 for (index, arg) in args.iter().enumerate() {
