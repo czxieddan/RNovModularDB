@@ -1028,6 +1028,9 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         )),
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            projection_null_safe_comparison_type(columns, left, right)
+        }
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
         Expr::Like { .. } => Ok(SqlType::Bool),
@@ -1095,6 +1098,26 @@ fn nullif_result_type(left_type: &SqlType, right_type: &SqlType) -> Result<SqlTy
     }
 }
 
+fn projection_null_safe_comparison_type(
+    columns: &[ColumnSchema],
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlType> {
+    let left_type = projection_type(columns, left)?;
+    let right_type = projection_type(columns, right)?;
+    if matches!(left_type, SqlType::Null)
+        || matches!(right_type, SqlType::Null)
+        || left_type == right_type
+    {
+        Ok(SqlType::Bool)
+    } else {
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "IS DISTINCT FROM requires matching operand types",
+        ))
+    }
+}
+
 fn sortable_type(data_type: &SqlType) -> bool {
     matches!(
         data_type,
@@ -1139,6 +1162,11 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Unary { op, expr } => eval_unary_arithmetic_expr(columns, row, op, expr),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),
         Expr::IsNull { expr, negated } => eval_is_null_expr(columns, row, expr, *negated),
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => eval_is_distinct_from_expr(columns, row, left, right, *negated),
         Expr::Between {
             expr,
             low,
@@ -1298,6 +1326,31 @@ fn eval_is_null_expr(
 ) -> Result<SqlValue> {
     let is_null = matches!(eval_expr(columns, row, expr)?, SqlValue::Null);
     Ok(SqlValue::Bool(if negated { !is_null } else { is_null }))
+}
+
+fn eval_is_distinct_from_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+    negated: bool,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    let distinct = match (left.is_null(), right.is_null()) {
+        (true, true) => false,
+        (true, false) | (false, true) => true,
+        (false, false) => {
+            if left.data_type() != right.data_type() {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "IS DISTINCT FROM requires matching operand types",
+                ));
+            }
+            left.sql_eq(&right) == Truth::False
+        }
+    };
+    Ok(SqlValue::Bool(if negated { !distinct } else { distinct }))
 }
 
 fn eval_between_expr(

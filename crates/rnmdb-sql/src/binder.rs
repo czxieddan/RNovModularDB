@@ -671,6 +671,10 @@ impl<'a> Binder<'a> {
             }
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::IsDistinctFrom { left, right, .. } => {
+                self.validate_group_by_expr_shape(left)?;
+                self.validate_group_by_expr_shape(right)
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -795,6 +799,15 @@ impl<'a> Binder<'a> {
             ))),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                negated: *negated,
+            }),
+            Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => Ok(Expr::IsDistinctFrom {
+                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
+                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
                 negated: *negated,
             }),
             Expr::Between {
@@ -975,6 +988,20 @@ impl<'a> Binder<'a> {
             Expr::IsNull { expr, .. } => {
                 let _ = self.infer_grouped_output_expr_type(projection, expr)?;
                 Ok(Some(SqlType::Bool))
+            }
+            Expr::IsDistinctFrom { left, right, .. } => {
+                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
+                else {
+                    return Ok(None);
+                };
+                self.infer_null_safe_comparison_result_type(
+                    "IS DISTINCT FROM",
+                    &left_type,
+                    &right_type,
+                )
             }
             Expr::Between {
                 expr, low, high, ..
@@ -1278,6 +1305,19 @@ impl<'a> Binder<'a> {
                 let _ = self.infer_policy_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
             }
+            Expr::IsDistinctFrom { left, right, .. } => {
+                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_null_safe_comparison_result_type(
+                    "IS DISTINCT FROM",
+                    &left_type,
+                    &right_type,
+                )
+            }
             Expr::Between {
                 expr, low, high, ..
             } => {
@@ -1493,6 +1533,19 @@ impl<'a> Binder<'a> {
             Expr::IsNull { expr, .. } => {
                 let _ = self.infer_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
+            }
+            Expr::IsDistinctFrom { left, right, .. } => {
+                let Some(left_type) = self.infer_expr_type(table, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_expr_type(table, right)? else {
+                    return Ok(None);
+                };
+                self.infer_null_safe_comparison_result_type(
+                    "IS DISTINCT FROM",
+                    &left_type,
+                    &right_type,
+                )
             }
             Expr::Between {
                 expr, low, high, ..
@@ -1718,6 +1771,25 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "NULLIF arguments must have matching types",
+            ))
+        }
+    }
+
+    fn infer_null_safe_comparison_result_type(
+        &self,
+        name: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Null)
+            || matches!(right_type, SqlType::Null)
+            || left_type == right_type
+        {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{name} requires matching operand types"),
             ))
         }
     }

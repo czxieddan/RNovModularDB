@@ -117,6 +117,11 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        negated: bool,
+    },
     Between {
         expr: Box<Expr>,
         low: Box<Expr>,
@@ -240,6 +245,17 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IS NOT NULL")
                 } else {
                     write!(f, "{expr} IS NULL")
+                }
+            }
+            Self::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => {
+                if *negated {
+                    write!(f, "{left} IS NOT DISTINCT FROM {right}")
+                } else {
+                    write!(f, "{left} IS DISTINCT FROM {right}")
                 }
             }
             Self::Between {

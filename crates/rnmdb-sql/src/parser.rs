@@ -470,6 +470,15 @@ impl Parser {
         let mut expr = self.parse_additive_expr()?;
         if self.consume_if(&TokenKind::Is) {
             let negated = self.consume_if(&TokenKind::Not);
+            if self.consume_if(&TokenKind::Distinct) {
+                self.expect_keyword(TokenKind::From)?;
+                let right = self.parse_additive_expr()?;
+                return Ok(Expr::IsDistinctFrom {
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                    negated,
+                });
+            }
             self.expect_keyword(TokenKind::Null)?;
             return Ok(Expr::IsNull {
                 expr: Box::new(expr),
