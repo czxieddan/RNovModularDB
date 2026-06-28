@@ -46,6 +46,10 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
+    Except {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
     Sort {
         keys: Vec<OrderByExpr>,
         input: Box<LogicalPlan>,
@@ -352,6 +356,10 @@ impl LogicalPlanner {
                 left: Box::new(self.plan(&intersect.left)?),
                 right: Box::new(self.plan(&intersect.right)?),
             }),
+            BoundStatement::Except(except) => Ok(LogicalPlan::Except {
+                left: Box::new(self.plan(&except.left)?),
+                right: Box::new(self.plan(&except.right)?),
+            }),
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -491,6 +499,11 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         }
         LogicalPlan::Intersect { left, right } => {
             out.push_str(&format!("{prefix}Intersect DISTINCT\n"));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
+        }
+        LogicalPlan::Except { left, right } => {
+            out.push_str(&format!("{prefix}Except DISTINCT\n"));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }

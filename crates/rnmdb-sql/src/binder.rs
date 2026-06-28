@@ -6,9 +6,9 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundIntersect, BoundRowPolicy,
-    BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, Expr, Ident,
-    ObjectName, OrderByExpr, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIntersect,
+    BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
+    CaseWhen, Expr, Ident, ObjectName, OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -116,6 +116,7 @@ impl<'a> Binder<'a> {
             ),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
             Statement::Intersect { left, right } => self.bind_intersect(left, right, role_id),
+            Statement::Except { left, right } => self.bind_except(left, right, role_id),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -228,6 +229,22 @@ impl<'a> Binder<'a> {
             selection: selection.clone(),
             applied_row_policies: self.applied_row_policy_names(table.relation_id()),
             row_policy_predicates: self.bind_row_policies(table)?,
+        }))
+    }
+
+    fn bind_except(
+        &self,
+        left: &Statement,
+        right: &Statement,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        let left = self.bind_for_role(left, role_id)?;
+        let right = self.bind_for_role(right, role_id)?;
+        let columns = validate_set_operation_columns("EXCEPT", &left, &right)?;
+        Ok(BoundStatement::Except(BoundExcept {
+            columns,
+            left: Box::new(left),
+            right: Box::new(right),
         }))
     }
 
@@ -2312,6 +2329,7 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
         BoundStatement::Select(select) => Ok(&select.columns),
         BoundStatement::Union(union) => Ok(&union.columns),
         BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
+        BoundStatement::Except(except) => Ok(&except.columns),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "set operation operands must be SELECT queries",

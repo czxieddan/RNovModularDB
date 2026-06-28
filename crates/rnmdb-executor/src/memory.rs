@@ -280,6 +280,11 @@ impl MemoryExecutor {
                 let right = self.execute_cancellable(right, cancellation)?;
                 apply_intersect_cancellable(left, right, cancellation)
             }
+            LogicalPlan::Except { left, right } => {
+                let left = self.execute_cancellable(left, cancellation)?;
+                let right = self.execute_cancellable(right, cancellation)?;
+                apply_except_cancellable(left, right, cancellation)
+            }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -384,6 +389,11 @@ impl MemoryExecutor {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
                 apply_intersect_cancellable(left, right, cancellation)
+            }
+            LogicalPlan::Except { left, right } => {
+                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                apply_except_cancellable(left, right, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -931,6 +941,23 @@ fn apply_intersect_cancellable(
     for row in left.rows() {
         cancellation.check()?;
         if right.rows().contains(row) && !rows.contains(row) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn apply_except_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_set_operation_columns("EXCEPT", &left, &right)?;
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if !right.rows().contains(row) && !rows.contains(row) {
             rows.push(row.clone());
         }
     }

@@ -392,6 +392,15 @@ impl Parser {
                     left: Box::new(statement),
                     right: Box::new(right),
                 };
+            } else if self.consume_if(&TokenKind::Except) {
+                if self.consume_if(&TokenKind::All) {
+                    return Err(self.error("EXCEPT ALL is not supported yet"));
+                }
+                let right = self.parse_select()?;
+                statement = Statement::Except {
+                    left: Box::new(statement),
+                    right: Box::new(right),
+                };
             } else {
                 break;
             }
@@ -1139,6 +1148,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
         (TokenKind::Select, TokenKind::Select)
             | (TokenKind::Union, TokenKind::Union)
             | (TokenKind::Intersect, TokenKind::Intersect)
+            | (TokenKind::Except, TokenKind::Except)
             | (TokenKind::Distinct, TokenKind::Distinct)
             | (TokenKind::All, TokenKind::All)
             | (TokenKind::As, TokenKind::As)
