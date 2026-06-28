@@ -647,6 +647,7 @@ impl<'a> Binder<'a> {
                         | "@@"
                         | "AND"
                         | "OR"
+                        | "||"
                         | "+"
                         | "-"
                         | "*"
@@ -1804,6 +1805,9 @@ impl<'a> Binder<'a> {
         if is_arithmetic_operator(op) {
             return self.infer_arithmetic_result_type(op, left_type, right_type);
         }
+        if is_text_concat_operator(op) {
+            return self.infer_text_concat_result_type(op, left_type, right_type);
+        }
         if is_boolean_connector(op) {
             if matches!(left_type, SqlType::Bool | SqlType::Null)
                 && matches!(right_type, SqlType::Bool | SqlType::Null)
@@ -1861,6 +1865,24 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("arithmetic operator {op} requires INT64 operands"),
+            ))
+        }
+    }
+
+    fn infer_text_concat_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Text | SqlType::Null)
+            && matches!(right_type, SqlType::Text | SqlType::Null)
+        {
+            Ok(Some(SqlType::Text))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("text operator {op} requires TEXT operands"),
             ))
         }
     }
@@ -2120,6 +2142,8 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
         Some(SqlType::Bool)
     } else if is_arithmetic_operator(op) {
         Some(SqlType::Int64)
+    } else if is_text_concat_operator(op) {
+        Some(SqlType::Text)
     } else {
         None
     }
@@ -2131,6 +2155,10 @@ fn is_boolean_connector(op: &str) -> bool {
 
 fn is_arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/")
+}
+
+fn is_text_concat_operator(op: &str) -> bool {
+    op == "||"
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {

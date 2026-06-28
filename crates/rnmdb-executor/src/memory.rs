@@ -1017,6 +1017,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         ),
         Expr::Binary { op, .. } if boolean_operator(op) => Ok(SqlType::Bool),
         Expr::Binary { op, .. } if arithmetic_operator(op) => Ok(SqlType::Int64),
+        Expr::Binary { op, .. } if text_concat_operator(op) => Ok(SqlType::Text),
         Expr::Binary { op, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {op}"),
@@ -1296,6 +1297,7 @@ fn eval_binary_expr(
     match op {
         "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
         "+" | "-" | "*" | "/" => eval_arithmetic_expr(columns, row, left, op, right),
+        "||" => eval_text_concat_expr(columns, row, left, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
@@ -1372,6 +1374,31 @@ fn eval_arithmetic_expr(
     }
     .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow"))?;
     Ok(SqlValue::Int64(value))
+}
+
+fn eval_text_concat_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    match (left, right) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Null),
+        (SqlValue::Text(mut left), SqlValue::Text(right)) => {
+            left.push_str(&right);
+            Ok(SqlValue::Text(left))
+        }
+        (left, right) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "text operator || requires TEXT operands, got {:?} and {:?}",
+                left.data_type(),
+                right.data_type()
+            ),
+        )),
+    }
 }
 
 fn eval_unary_arithmetic_expr(
@@ -1722,6 +1749,10 @@ fn boolean_operator(op: &str) -> bool {
 
 fn arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/")
+}
+
+fn text_concat_operator(op: &str) -> bool {
+    op == "||"
 }
 
 fn unary_arithmetic_operator(op: &str) -> bool {

@@ -467,7 +467,7 @@ impl Parser {
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_additive_expr()?;
+        let mut expr = self.parse_concat_expr()?;
         if self.consume_if(&TokenKind::Is) {
             let negated = self.consume_if(&TokenKind::Not);
             if self.consume_if(&TokenKind::Distinct) {
@@ -506,7 +506,7 @@ impl Parser {
         }
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
-            let right = self.parse_additive_expr()?;
+            let right = self.parse_concat_expr()?;
             expr = Expr::Binary {
                 left: Box::new(expr),
                 op,
@@ -517,9 +517,9 @@ impl Parser {
     }
 
     fn parse_between_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
-        let low = self.parse_additive_expr()?;
+        let low = self.parse_concat_expr()?;
         self.expect_keyword(TokenKind::And)?;
-        let high = self.parse_additive_expr()?;
+        let high = self.parse_concat_expr()?;
         Ok(Expr::Between {
             expr: Box::new(expr),
             low: Box::new(low),
@@ -543,12 +543,29 @@ impl Parser {
     }
 
     fn parse_like_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
-        let pattern = self.parse_primary_expr()?;
+        let pattern = self.parse_concat_expr()?;
         Ok(Expr::Like {
             expr: Box::new(expr),
             pattern: Box::new(pattern),
             negated,
         })
+    }
+
+    fn parse_concat_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_additive_expr()?;
+        while let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
+            if op != "||" {
+                break;
+            }
+            self.bump();
+            let right = self.parse_additive_expr()?;
+            expr = Expr::Binary {
+                left: Box::new(expr),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_additive_expr(&mut self) -> Result<Expr> {
