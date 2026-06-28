@@ -8,6 +8,7 @@ const DEFAULT_SCAN_ROWS: f64 = 1_000.0;
 const DEFAULT_ROW_WIDTH_BYTES: f64 = 64.0;
 const DEFAULT_FILTER_SELECTIVITY: f64 = 0.1;
 const DEFAULT_TEXT_SEARCH_SELECTIVITY: f64 = 0.05;
+const DEFAULT_INDEX_SELECTIVITY: f64 = 0.01;
 const DEFAULT_DISTINCT_SELECTIVITY: f64 = 0.5;
 const DEFAULT_GROUP_SELECTIVITY: f64 = 0.1;
 
@@ -307,6 +308,24 @@ impl CostModel {
                 0.0,
             ),
         }
+    }
+
+    pub fn estimate_index_scan(&self, relation_id: RelationId, unique: bool) -> PlanCost {
+        let stats = self.statistics.table(relation_id);
+        let rows = if unique {
+            stats.row_count().min(1.0)
+        } else {
+            (stats.row_count() * DEFAULT_INDEX_SELECTIVITY)
+                .max(1.0)
+                .min(stats.row_count())
+        };
+        let descent_cost = stats.row_count().max(2.0).log2() * self.parameters.cpu_operator_cost;
+        PlanCost::new(
+            rows,
+            stats.row_width_bytes(),
+            descent_cost + rows * self.parameters.cpu_tuple_cost,
+            rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.1,
+        )
     }
 }
 

@@ -13,7 +13,7 @@ use rnmdb_planner::{
     cost::{CostModel, StatisticsCatalog},
     logical::{LogicalPlan, LogicalPlanner},
     optimizer::RuleOptimizer,
-    physical::PhysicalPlanner,
+    physical::{IndexAccessPath, IndexCatalog, PhysicalPlanner},
 };
 use rnmdb_sql::{
     ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName},
@@ -443,8 +443,24 @@ impl LocalSession {
         match format {
             ExplainFormat::Logical => plan.explain(),
             ExplainFormat::Costs => plan.explain_with_costs(&cost_model),
-            ExplainFormat::Physical => PhysicalPlanner::new(cost_model).plan(plan).explain(),
+            ExplainFormat::Physical => PhysicalPlanner::new(cost_model)
+                .with_indexes(self.index_catalog())
+                .plan(plan)
+                .explain(),
         }
+    }
+
+    fn index_catalog(&self) -> IndexCatalog {
+        let mut catalog = IndexCatalog::new();
+        for index in self.catalog.indexes() {
+            catalog.add_index(IndexAccessPath::new(
+                format!("{}.{}", index.schema_name(), index.name()),
+                index.relation_id(),
+                index.columns().to_vec(),
+                index.unique(),
+            ));
+        }
+        catalog
     }
 
     fn cost_model_for_plan(&self, plan: &LogicalPlan) -> CostModel {

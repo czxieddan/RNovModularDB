@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::{
     cost::{CostModel, PlanCost},
     logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
@@ -10,6 +12,14 @@ pub enum PhysicalPlan {
     SeqScan {
         relation_id: RelationId,
         table: String,
+        cost: PlanCost,
+    },
+    IndexScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        value: Expr,
         cost: PlanCost,
     },
     TextSearchScan {
@@ -106,14 +116,74 @@ pub enum MutationKind {
     Delete,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexCatalog {
+    indexes: BTreeMap<RelationId, Vec<IndexAccessPath>>,
+}
+
+impl IndexCatalog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_index(&mut self, index: IndexAccessPath) {
+        self.indexes
+            .entry(index.relation_id)
+            .or_default()
+            .push(index);
+    }
+
+    fn best_for_column(&self, relation_id: RelationId, column: &str) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index
+                .columns
+                .first()
+                .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexAccessPath {
+    name: String,
+    relation_id: RelationId,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+impl IndexAccessPath {
+    pub fn new(
+        name: impl Into<String>,
+        relation_id: RelationId,
+        columns: Vec<String>,
+        unique: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            relation_id,
+            columns,
+            unique,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PhysicalPlanner {
     cost_model: CostModel,
+    indexes: IndexCatalog,
 }
 
 impl PhysicalPlanner {
     pub fn new(cost_model: CostModel) -> Self {
-        Self { cost_model }
+        Self {
+            cost_model,
+            indexes: IndexCatalog::new(),
+        }
+    }
+
+    pub fn with_indexes(mut self, indexes: IndexCatalog) -> Self {
+        self.indexes = indexes;
+        self
     }
 
     pub fn plan(&self, logical: &LogicalPlan) -> PhysicalPlan {
@@ -137,11 +207,16 @@ impl PhysicalPlanner {
                 query: query.clone(),
                 cost,
             },
-            LogicalPlan::Filter { predicate, input } => PhysicalPlan::Filter {
-                predicate: predicate.clone(),
-                input: Box::new(self.plan(input)),
-                cost,
-            },
+            LogicalPlan::Filter { predicate, input } => {
+                if let Some(scan) = self.index_scan(predicate, input, cost) {
+                    return scan;
+                }
+                PhysicalPlan::Filter {
+                    predicate: predicate.clone(),
+                    input: Box::new(self.plan(input)),
+                    cost,
+                }
+            }
             LogicalPlan::Project { items, input } => PhysicalPlan::Projection {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
@@ -248,6 +323,7 @@ impl PhysicalPlan {
     pub fn cost(&self) -> PlanCost {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
+            | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
@@ -279,6 +355,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         PhysicalPlan::SeqScan { table, cost, .. } => {
             out.push_str(&format!(
                 "{prefix}SeqScan table={table}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::IndexScan {
+            table,
+            index,
+            column,
+            value,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}IndexScan table={table} index={index} column={column} value={value}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -422,6 +511,66 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             write_physical_plan(input, indent + 1, out);
         }
     }
+}
+
+impl PhysicalPlanner {
+    fn index_scan(
+        &self,
+        predicate: &Expr,
+        input: &LogicalPlan,
+        sequential_cost: PlanCost,
+    ) -> Option<PhysicalPlan> {
+        let LogicalPlan::Scan { relation_id, table } = input else {
+            return None;
+        };
+        let (column, value) = indexable_equality(predicate)?;
+        let index = self.indexes.best_for_column(*relation_id, column)?;
+        let cost = self
+            .cost_model
+            .estimate_index_scan(*relation_id, index.unique);
+        if cost.total() > sequential_cost.total() {
+            return None;
+        }
+        Some(PhysicalPlan::IndexScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.name.clone(),
+            column: column.to_string(),
+            value: value.clone(),
+            cost,
+        })
+    }
+}
+
+fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), value) if is_index_literal(value) => {
+            Some((column.as_str(), value))
+        }
+        (value, Expr::Identifier(column)) if is_index_literal(value) => {
+            Some((column.as_str(), value))
+        }
+        _ => None,
+    }
+}
+
+fn is_index_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Null
+            | Expr::Bool(_)
+            | Expr::Integer(_)
+            | Expr::String(_)
+            | Expr::Array(_)
+            | Expr::Range { .. }
+            | Expr::HStore(_)
+    )
 }
 
 fn cost_suffix(cost: PlanCost) -> String {
