@@ -179,23 +179,95 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Drop)?;
-        let drop_index = if self.consume_if(&TokenKind::Index) {
-            true
-        } else {
-            self.expect_keyword(TokenKind::Table)?;
-            false
-        };
-        let if_exists = if self.consume_if(&TokenKind::If) {
-            self.expect_keyword(TokenKind::Exists)?;
-            true
-        } else {
-            false
-        };
+        match self.peek_kind() {
+            Some(TokenKind::Index) => self.parse_drop_index_tail(),
+            Some(TokenKind::Table) => self.parse_drop_table_tail(),
+            Some(TokenKind::Function) => self.parse_drop_function_tail(),
+            Some(TokenKind::OperatorKeyword) => self.parse_drop_operator_tail(),
+            Some(TokenKind::Role) => self.parse_drop_role_tail(),
+            Some(TokenKind::Policy) => self.parse_drop_policy_tail(),
+            _ => Err(self.error("expected object type after DROP")),
+        }
+    }
+
+    fn parse_drop_index_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Index)?;
+        let if_exists = self.parse_if_exists()?;
         let name = self.parse_object_name()?;
-        if drop_index {
-            Ok(Statement::DropIndex { name, if_exists })
+        Ok(Statement::DropIndex { name, if_exists })
+    }
+
+    fn parse_drop_table_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Table)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_object_name()?;
+        Ok(Statement::DropTable { name, if_exists })
+    }
+
+    fn parse_drop_function_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Function)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = if self.consume_if(&TokenKind::RightParen) {
+            Vec::new()
         } else {
-            Ok(Statement::DropTable { name, if_exists })
+            let types = self.parse_type_list()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            types
+        };
+        Ok(Statement::DropFunction {
+            name,
+            argument_types,
+            if_exists,
+        })
+    }
+
+    fn parse_drop_operator_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::OperatorKeyword)?;
+        let if_exists = self.parse_if_exists()?;
+        let symbol = self.parse_operator_symbol()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let left_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        let right_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::DropOperator {
+            symbol,
+            left_type,
+            right_type,
+            if_exists,
+        })
+    }
+
+    fn parse_drop_role_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Role)?;
+        let if_exists = self.parse_if_exists()?;
+        Ok(Statement::DropRole {
+            name: self.parse_ident()?,
+            if_exists,
+        })
+    }
+
+    fn parse_drop_policy_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Policy)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        Ok(Statement::DropPolicy {
+            name,
+            table,
+            if_exists,
+        })
+    }
+
+    fn parse_if_exists(&mut self) -> Result<bool> {
+        if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 

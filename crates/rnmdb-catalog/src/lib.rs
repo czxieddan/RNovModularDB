@@ -144,8 +144,63 @@ impl Catalog {
             .find(|function| function.name == name && function.argument_types == argument_types)
     }
 
+    pub fn drop_function(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+    ) -> Result<Option<Function>> {
+        validate_identifier("function", name)?;
+        let Some(position) = self.functions.iter().position(|function| {
+            function.name == name && function.argument_types == argument_types
+        }) else {
+            return Ok(None);
+        };
+        let function_id = self.functions[position].function_id;
+        if self
+            .operators
+            .iter()
+            .any(|operator| operator.signature.function_id == function_id)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("function is still used by operator: {name}"),
+            ));
+        }
+        Ok(Some(self.functions.remove(position)))
+    }
+
     pub fn operators(&self) -> &[Operator] {
         &self.operators
+    }
+
+    pub fn get_operator(
+        &self,
+        symbol: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Option<&Operator> {
+        self.operators.iter().find(|operator| {
+            operator.signature.symbol == symbol
+                && operator.signature.left_type == *left_type
+                && operator.signature.right_type == *right_type
+        })
+    }
+
+    pub fn drop_operator(
+        &mut self,
+        symbol: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<Operator>> {
+        validate_identifier("operator", symbol)?;
+        let Some(position) = self.operators.iter().position(|operator| {
+            operator.signature.symbol == symbol
+                && operator.signature.left_type == *left_type
+                && operator.signature.right_type == *right_type
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(self.operators.remove(position)))
     }
 
     pub fn indexes(&self) -> &[Index] {
@@ -178,6 +233,15 @@ impl Catalog {
 
     pub fn get_role(&self, name: &str) -> Option<&Role> {
         self.roles.get(name)
+    }
+
+    pub fn drop_role(&mut self, name: &str) -> Result<Option<Role>> {
+        validate_identifier("role", name)?;
+        let Some(role) = self.roles.remove(name) else {
+            return Ok(None);
+        };
+        self.grants.retain(|grant| grant.role_id != role.role_id);
+        Ok(Some(role))
     }
 
     pub fn create_schema(&mut self, name: impl Into<String>) -> Result<&Schema> {
@@ -493,6 +557,26 @@ impl Catalog {
         self.row_policies(relation_id)
             .iter()
             .find(|policy| policy.name == name)
+    }
+
+    pub fn drop_row_policy(
+        &mut self,
+        relation_id: RelationId,
+        name: &str,
+    ) -> Result<Option<RowPolicy>> {
+        self.ensure_relation_exists(relation_id)?;
+        validate_identifier("row policy", name)?;
+        let Some(policies) = self.row_policies.get_mut(&relation_id) else {
+            return Ok(None);
+        };
+        let Some(position) = policies.iter().position(|policy| policy.name == name) else {
+            return Ok(None);
+        };
+        let policy = policies.remove(position);
+        if policies.is_empty() {
+            self.row_policies.remove(&relation_id);
+        }
+        Ok(Some(policy))
     }
 
     fn ensure_role_exists(&self, role_id: RoleId) -> Result<()> {

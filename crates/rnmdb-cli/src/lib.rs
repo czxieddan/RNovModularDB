@@ -98,6 +98,35 @@ impl LocalSession {
                 self.apply_catalog_drop_index(name, *if_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::DropFunction {
+                name,
+                argument_types,
+                if_exists,
+            } => {
+                self.apply_catalog_drop_function(name.as_str(), argument_types, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::DropOperator {
+                symbol,
+                left_type,
+                right_type,
+                if_exists,
+            } => {
+                self.apply_catalog_drop_operator(symbol, left_type, right_type, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::DropRole { name, if_exists } => {
+                self.apply_catalog_drop_role(name.as_str(), *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::DropPolicy {
+                name,
+                relation_id,
+                if_exists,
+            } => {
+                self.apply_catalog_drop_policy(name.as_str(), *relation_id, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             BoundStatement::AlterTableAddColumn {
                 table,
                 column,
@@ -244,6 +273,66 @@ impl LocalSession {
             None => Err(rnmdb_common::RnovError::new(
                 rnmdb_common::ErrorKind::NotFound,
                 format!("index does not exist: {schema}.{}", name.object()),
+            )),
+        }
+    }
+
+    fn apply_catalog_drop_function(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_function(name, argument_types)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("function does not exist: {name}"),
+            )),
+        }
+    }
+
+    fn apply_catalog_drop_operator(
+        &mut self,
+        symbol: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_operator(symbol, left_type, right_type)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("operator does not exist: {symbol}"),
+            )),
+        }
+    }
+
+    fn apply_catalog_drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        match self.catalog.drop_role(name)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("role does not exist: {name}"),
+            )),
+        }
+    }
+
+    fn apply_catalog_drop_policy(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_row_policy(relation_id, name)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("row policy does not exist: {name}"),
             )),
         }
     }

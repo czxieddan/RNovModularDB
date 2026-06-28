@@ -477,6 +477,26 @@ pub enum Statement {
         name: ObjectName,
         if_exists: bool,
     },
+    DropFunction {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
+    DropOperator {
+        symbol: String,
+        left_type: SqlType,
+        right_type: SqlType,
+        if_exists: bool,
+    },
+    DropRole {
+        name: Ident,
+        if_exists: bool,
+    },
+    DropPolicy {
+        name: Ident,
+        table: ObjectName,
+        if_exists: bool,
+    },
     CreateFunction {
         name: Ident,
         argument_types: Vec<SqlType>,
@@ -685,6 +705,26 @@ pub enum BoundStatement {
     },
     DropIndex {
         name: ObjectName,
+        if_exists: bool,
+    },
+    DropFunction {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
+    DropOperator {
+        symbol: String,
+        left_type: SqlType,
+        right_type: SqlType,
+        if_exists: bool,
+    },
+    DropRole {
+        name: Ident,
+        if_exists: bool,
+    },
+    DropPolicy {
+        name: Ident,
+        relation_id: RelationId,
         if_exists: bool,
     },
     CreateFunction {

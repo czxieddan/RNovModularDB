@@ -110,6 +110,26 @@ pub enum LogicalPlan {
         name: String,
         if_exists: bool,
     },
+    DropFunction {
+        name: String,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
+    DropOperator {
+        symbol: String,
+        left_type: SqlType,
+        right_type: SqlType,
+        if_exists: bool,
+    },
+    DropRole {
+        name: String,
+        if_exists: bool,
+    },
+    DropPolicy {
+        name: String,
+        relation_id: RelationId,
+        if_exists: bool,
+    },
     CreateFunction {
         name: String,
         argument_types: Vec<SqlType>,
@@ -269,6 +289,39 @@ impl LogicalPlanner {
             }),
             BoundStatement::DropIndex { name, if_exists } => Ok(LogicalPlan::DropIndex {
                 name: object_name(name),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropFunction {
+                name,
+                argument_types,
+                if_exists,
+            } => Ok(LogicalPlan::DropFunction {
+                name: name.as_str().to_string(),
+                argument_types: argument_types.clone(),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropOperator {
+                symbol,
+                left_type,
+                right_type,
+                if_exists,
+            } => Ok(LogicalPlan::DropOperator {
+                symbol: symbol.clone(),
+                left_type: left_type.clone(),
+                right_type: right_type.clone(),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropRole { name, if_exists } => Ok(LogicalPlan::DropRole {
+                name: name.as_str().to_string(),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropPolicy {
+                name,
+                relation_id,
+                if_exists,
+            } => Ok(LogicalPlan::DropPolicy {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
                 if_exists: *if_exists,
             }),
             BoundStatement::Insert {
@@ -712,6 +765,40 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::DropIndex { name, if_exists } => {
             out.push_str(&format!(
                 "{prefix}DropIndex name={name} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropFunction {
+            name,
+            argument_types,
+            if_exists,
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropFunction name={name} args={} if_exists={if_exists}\n",
+                sql_type_list(argument_types)
+            ));
+        }
+        LogicalPlan::DropOperator {
+            symbol,
+            left_type,
+            right_type,
+            if_exists,
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropOperator symbol={symbol} left={left_type:?} right={right_type:?} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropRole { name, if_exists } => {
+            out.push_str(&format!(
+                "{prefix}DropRole name={name} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropPolicy {
+            name,
+            relation_id,
+            if_exists,
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropPolicy name={name} relation={relation_id} if_exists={if_exists}\n"
             ));
         }
         LogicalPlan::CreateFunction {

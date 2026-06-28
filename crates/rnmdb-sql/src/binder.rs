@@ -65,6 +65,23 @@ impl<'a> Binder<'a> {
             }
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
             Statement::DropIndex { name, if_exists } => self.bind_drop_index(name, *if_exists),
+            Statement::DropFunction {
+                name,
+                argument_types,
+                if_exists,
+            } => self.bind_drop_function(name, argument_types, *if_exists),
+            Statement::DropOperator {
+                symbol,
+                left_type,
+                right_type,
+                if_exists,
+            } => self.bind_drop_operator(symbol, left_type, right_type, *if_exists),
+            Statement::DropRole { name, if_exists } => self.bind_drop_role(name, *if_exists),
+            Statement::DropPolicy {
+                name,
+                table,
+                if_exists,
+            } => self.bind_drop_policy(name, table, *if_exists),
             Statement::CreateFunction {
                 name,
                 argument_types,
@@ -231,6 +248,94 @@ impl<'a> Binder<'a> {
 
         Ok(BoundStatement::DropIndex {
             name: ObjectName::qualified(schema, name.object()),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_function(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        if self
+            .catalog
+            .get_function(name.as_str(), argument_types)
+            .is_none()
+            && !if_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("function does not exist: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::DropFunction {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_operator(
+        &self,
+        symbol: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        if self
+            .catalog
+            .get_operator(symbol, left_type, right_type)
+            .is_none()
+            && !if_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("operator does not exist: {symbol}"),
+            ));
+        }
+        Ok(BoundStatement::DropOperator {
+            symbol: symbol.to_string(),
+            left_type: left_type.clone(),
+            right_type: right_type.clone(),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_role(&self, name: &Ident, if_exists: bool) -> Result<BoundStatement> {
+        if self.catalog.get_role(name.as_str()).is_none() && !if_exists {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("role does not exist: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::DropRole {
+            name: name.clone(),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_policy(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table)?;
+        if self
+            .catalog
+            .get_row_policy(table.relation_id(), name.as_str())
+            .is_none()
+            && !if_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("row policy does not exist: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::DropPolicy {
+            name: name.clone(),
+            relation_id: table.relation_id(),
             if_exists,
         })
     }
