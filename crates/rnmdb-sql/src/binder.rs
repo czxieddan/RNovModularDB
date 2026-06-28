@@ -32,7 +32,8 @@ impl<'a> Binder<'a> {
                 table,
                 columns,
                 unique,
-            } => self.bind_create_index(name, table, columns, *unique),
+                if_not_exists,
+            } => self.bind_create_index(name, table, columns, *unique, *if_not_exists),
             Statement::AlterTableAddColumn { table, column } => {
                 let resolved = self.resolve_table(table)?;
                 Ok(BoundStatement::AlterTableAddColumn {
@@ -177,6 +178,7 @@ impl<'a> Binder<'a> {
         table: &ObjectName,
         columns: &[Ident],
         unique: bool,
+        if_not_exists: bool,
     ) -> Result<BoundStatement> {
         let table_schema = table.schema().unwrap_or("public");
         let index_schema = name.schema().unwrap_or(table_schema);
@@ -184,6 +186,7 @@ impl<'a> Binder<'a> {
             .catalog
             .get_index(index_schema, name.object())
             .is_some()
+            && !if_not_exists
         {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -201,6 +204,7 @@ impl<'a> Binder<'a> {
             table: table.clone(),
             columns: bound_columns,
             unique,
+            if_not_exists,
         })
     }
 

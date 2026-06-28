@@ -461,6 +461,7 @@ pub enum Statement {
         table: ObjectName,
         columns: Vec<Ident>,
         unique: bool,
+        if_not_exists: bool,
     },
     AlterTableAddColumn {
         table: ObjectName,
@@ -663,6 +664,7 @@ pub enum BoundStatement {
         table: ObjectName,
         columns: Vec<BoundColumn>,
         unique: bool,
+        if_not_exists: bool,
     },
     AlterTableAddColumn {
         relation_id: RelationId,

@@ -122,6 +122,13 @@ impl Parser {
 
     fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Index)?;
+        let if_not_exists = if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Not)?;
+            self.expect_keyword(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_object_name()?;
@@ -134,6 +141,7 @@ impl Parser {
             table,
             columns,
             unique,
+            if_not_exists,
         })
     }
 

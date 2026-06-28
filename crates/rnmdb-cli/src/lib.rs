@@ -78,9 +78,16 @@ impl LocalSession {
                 relation_id,
                 columns,
                 unique,
+                if_not_exists,
                 ..
             } => {
-                self.apply_catalog_create_index(name, *relation_id, columns, *unique)?;
+                self.apply_catalog_create_index(
+                    name,
+                    *relation_id,
+                    columns,
+                    *unique,
+                    *if_not_exists,
+                )?;
                 Ok(CommandOutput::SchemaChanged)
             }
             BoundStatement::DropIndex { name, if_exists } => {
@@ -187,8 +194,12 @@ impl LocalSession {
         relation_id: RelationId,
         columns: &[rnmdb_sql::ast::BoundColumn],
         unique: bool,
+        if_not_exists: bool,
     ) -> Result<()> {
         let schema = name.schema().unwrap_or("public");
+        if self.catalog.get_index(schema, name.object()).is_some() && if_not_exists {
+            return Ok(());
+        }
         let columns = columns
             .iter()
             .map(|column| column.name.clone())

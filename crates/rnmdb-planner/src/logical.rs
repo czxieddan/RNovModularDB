@@ -92,6 +92,7 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<String>,
         unique: bool,
+        if_not_exists: bool,
     },
     AlterTableAddColumn {
         relation_id: RelationId,
@@ -227,12 +228,14 @@ impl LogicalPlanner {
                 table,
                 columns,
                 unique,
+                if_not_exists,
             } => Ok(LogicalPlan::CreateIndex {
                 name: object_name(name),
                 relation_id: *relation_id,
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
                 unique: *unique,
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::AlterTableAddColumn {
                 relation_id,
@@ -638,12 +641,19 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             table,
             columns,
             unique,
+            if_not_exists,
             ..
         } => {
             let mode = if *unique { "unique " } else { "" };
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{prefix}CreateIndex {mode}name={name} table={table} columns={}\n",
-                columns.join(", ")
+                "{prefix}CreateIndex {mode}name={name} table={table} columns={}{}\n",
+                columns.join(", "),
+                exists
             ));
         }
         LogicalPlan::AlterTableAddColumn { table, column, .. } => {
