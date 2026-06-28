@@ -470,6 +470,10 @@ pub enum Statement {
         name: ObjectName,
         if_exists: bool,
     },
+    DropIndex {
+        name: ObjectName,
+        if_exists: bool,
+    },
     CreateFunction {
         name: Ident,
         argument_types: Vec<SqlType>,
@@ -667,6 +671,10 @@ pub enum BoundStatement {
     },
     DropTable {
         relation_id: Option<RelationId>,
+        name: ObjectName,
+        if_exists: bool,
+    },
+    DropIndex {
         name: ObjectName,
         if_exists: bool,
     },

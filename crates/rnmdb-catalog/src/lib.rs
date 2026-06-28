@@ -152,6 +152,24 @@ impl Catalog {
             .find(|index| index.schema_name == schema_name && index.name == index_name)
     }
 
+    pub fn drop_index(&mut self, schema_name: &str, index_name: &str) -> Result<Option<Index>> {
+        validate_identifier("index", index_name)?;
+        if !self.schemas.contains_key(schema_name) {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("schema does not exist: {schema_name}"),
+            ));
+        }
+        let Some(position) = self
+            .indexes
+            .iter()
+            .position(|index| index.schema_name == schema_name && index.name == index_name)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.indexes.remove(position)))
+    }
+
     pub fn get_role(&self, name: &str) -> Option<&Role> {
         self.roles.get(name)
     }

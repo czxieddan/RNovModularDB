@@ -149,7 +149,12 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Drop)?;
-        self.expect_keyword(TokenKind::Table)?;
+        let drop_index = if self.consume_if(&TokenKind::Index) {
+            true
+        } else {
+            self.expect_keyword(TokenKind::Table)?;
+            false
+        };
         let if_exists = if self.consume_if(&TokenKind::If) {
             self.expect_keyword(TokenKind::Exists)?;
             true
@@ -157,7 +162,11 @@ impl Parser {
             false
         };
         let name = self.parse_object_name()?;
-        Ok(Statement::DropTable { name, if_exists })
+        if drop_index {
+            Ok(Statement::DropIndex { name, if_exists })
+        } else {
+            Ok(Statement::DropTable { name, if_exists })
+        }
     }
 
     fn parse_column_def(&mut self) -> Result<ColumnDef> {

@@ -83,6 +83,10 @@ impl LocalSession {
                 self.apply_catalog_create_index(name, *relation_id, columns, *unique)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::DropIndex { name, if_exists } => {
+                self.apply_catalog_drop_index(name, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             BoundStatement::AlterTableAddColumn { table, column, .. } => {
                 self.apply_catalog_add_column(table, column)?;
                 let plan = self.planner.plan(&bound)?;
@@ -192,6 +196,18 @@ impl LocalSession {
         self.catalog
             .create_index(schema, name.object(), relation_id, columns, unique)?;
         Ok(())
+    }
+
+    fn apply_catalog_drop_index(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {
+        let schema = name.schema().unwrap_or("public");
+        match self.catalog.drop_index(schema, name.object())? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("index does not exist: {schema}.{}", name.object()),
+            )),
+        }
     }
 
     fn apply_catalog_add_column(&mut self, table: &ObjectName, column: &ColumnDef) -> Result<()> {

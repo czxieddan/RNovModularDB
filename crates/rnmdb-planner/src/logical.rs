@@ -103,6 +103,10 @@ pub enum LogicalPlan {
         table: String,
         if_exists: bool,
     },
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
     CreateFunction {
         name: String,
         argument_types: Vec<SqlType>,
@@ -246,6 +250,10 @@ impl LogicalPlanner {
             } => Ok(LogicalPlan::DropTable {
                 relation_id: *relation_id,
                 table: object_name(name),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropIndex { name, if_exists } => Ok(LogicalPlan::DropIndex {
+                name: object_name(name),
                 if_exists: *if_exists,
             }),
             BoundStatement::Insert {
@@ -649,6 +657,11 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}DropTable table={table} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropIndex { name, if_exists } => {
+            out.push_str(&format!(
+                "{prefix}DropIndex name={name} if_exists={if_exists}\n"
             ));
         }
         LogicalPlan::CreateFunction {

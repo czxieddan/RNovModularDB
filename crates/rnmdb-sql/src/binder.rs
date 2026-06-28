@@ -42,6 +42,7 @@ impl<'a> Binder<'a> {
                 })
             }
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
+            Statement::DropIndex { name, if_exists } => self.bind_drop_index(name, *if_exists),
             Statement::CreateFunction {
                 name,
                 argument_types,
@@ -151,6 +152,21 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::DropTable {
             relation_id,
             name: name.clone(),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_index(&self, name: &ObjectName, if_exists: bool) -> Result<BoundStatement> {
+        let schema = name.schema().unwrap_or("public");
+        if self.catalog.get_index(schema, name.object()).is_none() && !if_exists {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("index does not exist: {schema}.{}", name.object()),
+            ));
+        }
+
+        Ok(BoundStatement::DropIndex {
+            name: ObjectName::qualified(schema, name.object()),
             if_exists,
         })
     }
