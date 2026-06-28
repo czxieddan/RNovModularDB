@@ -6,6 +6,8 @@ use rnmdb_sql::ast::{
 };
 use rnmdb_types::SqlType;
 
+use crate::cost::{CostModel, PlanCost};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalPlan {
     Scan {
@@ -555,6 +557,12 @@ impl LogicalPlan {
         write_plan(self, 0, &mut out);
         out
     }
+
+    pub fn explain_with_costs(&self, cost_model: &CostModel) -> String {
+        let mut out = String::new();
+        write_plan_with_costs(self, 0, cost_model, &mut out);
+        out
+    }
 }
 
 fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
@@ -879,6 +887,57 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(input, indent + 1, out);
         }
     }
+}
+
+fn write_plan_with_costs(
+    plan: &LogicalPlan,
+    indent: usize,
+    cost_model: &CostModel,
+    out: &mut String,
+) {
+    let before = out.len();
+    write_plan(plan, indent, out);
+    let Some(line_end) = out[before..].find('\n').map(|offset| before + offset) else {
+        return;
+    };
+    let cost = cost_model.estimate(plan);
+    out.insert_str(line_end, &format_plan_cost(cost));
+    match plan {
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::GroupedAggregate { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Parallel { input, .. } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(input, indent + 1, cost_model, out);
+        }
+        LogicalPlan::Union { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(left, indent + 1, cost_model, out);
+            write_plan_with_costs(right, indent + 1, cost_model, out);
+        }
+        _ => {}
+    }
+}
+
+fn truncate_child_lines(out: &mut String, keep_len: usize) {
+    out.truncate(keep_len);
+}
+
+fn format_plan_cost(cost: PlanCost) -> String {
+    format!(
+        " rows={:.0} width={:.0} cost={:.2}",
+        cost.rows,
+        cost.row_width_bytes,
+        cost.total()
+    )
 }
 
 fn plan_selection(
