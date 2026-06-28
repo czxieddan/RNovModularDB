@@ -522,12 +522,22 @@ impl<'a> Binder<'a> {
         for order_by in order_by {
             if group_by.is_empty() {
                 if aggregate_count > 0 {
-                    bound_order_by.push(self.bind_grouped_sort_expr(&projection, order_by)?);
+                    bound_order_by.push(self.bind_grouped_sort_expr(
+                        table,
+                        &projection,
+                        &bound_group_by,
+                        order_by,
+                    )?);
                 } else {
                     bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
                 }
             } else {
-                bound_order_by.push(self.bind_grouped_sort_expr(&projection, order_by)?);
+                bound_order_by.push(self.bind_grouped_sort_expr(
+                    table,
+                    &projection,
+                    &bound_group_by,
+                    order_by,
+                )?);
             }
         }
 
@@ -604,7 +614,9 @@ impl<'a> Binder<'a> {
 
     fn bind_grouped_sort_expr(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
+        group_by: &[Expr],
         order_by: &OrderByExpr,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
@@ -620,7 +632,7 @@ impl<'a> Binder<'a> {
                 .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
                 .unwrap_or_else(|| order_by.expr.clone()),
         };
-        self.validate_grouped_sort_expr(projection, &expr)?;
+        self.validate_grouped_sort_expr(table, projection, group_by, &expr)?;
         Ok(OrderByExpr {
             expr,
             direction: order_by.direction,
@@ -816,28 +828,39 @@ impl<'a> Binder<'a> {
 
     fn validate_grouped_sort_expr(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
+        group_by: &[Expr],
         expr: &Expr,
     ) -> Result<()> {
-        let Expr::Identifier(identifier) = expr else {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "ORDER BY for grouped queries only supports projected column identifiers yet",
-            ));
-        };
-        let column = projection
-            .iter()
-            .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
-            .ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "ORDER BY for grouped queries must reference a projected column: {}",
-                        identifier.as_str()
-                    ),
-                )
-            })?;
-        match &column.column.data_type {
+        if let Expr::Identifier(identifier) = expr {
+            if let Some(column) = projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+            {
+                return self.ensure_sortable_type(&column.column.data_type);
+            }
+        }
+        if group_by.iter().any(|group| group == expr) {
+            return match self.infer_expr_type(table, expr)? {
+                Some(data_type) => self.ensure_sortable_type(&data_type),
+                None => Ok(()),
+            };
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            match expr {
+                Expr::Identifier(identifier) => format!(
+                    "ORDER BY for grouped queries must reference a projected column or GROUP BY expression: {}",
+                    identifier.as_str()
+                ),
+                _ => "ORDER BY for grouped queries must reference a projected column or GROUP BY expression".to_string(),
+            },
+        ))
+    }
+
+    fn ensure_sortable_type(&self, data_type: &SqlType) -> Result<()> {
+        match data_type {
             SqlType::Null
             | SqlType::Bool
             | SqlType::Int64

@@ -1,7 +1,9 @@
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
-use rnmdb_sql::ast::{BoundStatement, ColumnDef, Expr, ObjectName, OrderByExpr, TransactionAction};
+use rnmdb_sql::ast::{
+    BoundStatement, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, TransactionAction,
+};
 use rnmdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,23 +266,28 @@ impl LogicalPlanner {
                 }
                 let grouped = !select.group_by.is_empty();
                 let aggregate_functions = select_aggregate_functions(select);
-                if !grouped && aggregate_functions.is_none() && !select.order_by.is_empty() {
+                let mut order_by = select.order_by.clone();
+                if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
                     plan = LogicalPlan::Sort {
-                        keys: select.order_by.clone(),
+                        keys: order_by.clone(),
                         input: Box::new(plan),
                     };
                 }
+                let mut project_grouped_sort_keys = false;
                 let mut plan = if grouped {
+                    let mut items = select
+                        .projection
+                        .iter()
+                        .map(|item| GroupedAggregateItem {
+                            name: item.column.name.clone(),
+                            kind: grouped_aggregate_item_kind(&item.expr),
+                        })
+                        .collect::<Vec<_>>();
+                    project_grouped_sort_keys =
+                        add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
                     LogicalPlan::GroupedAggregate {
                         group_by: select.group_by.clone(),
-                        items: select
-                            .projection
-                            .iter()
-                            .map(|item| GroupedAggregateItem {
-                                name: item.column.name.clone(),
-                                kind: grouped_aggregate_item_kind(&item.expr),
-                            })
-                            .collect(),
+                        items,
                         input: Box::new(plan),
                     }
                 } else if let Some(functions) = select_aggregate_functions(select) {
@@ -315,15 +322,28 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                if !grouped && aggregate_functions.is_some() && !select.order_by.is_empty() {
+                if !grouped && aggregate_functions.is_some() && !order_by.is_empty() {
                     plan = LogicalPlan::Sort {
-                        keys: select.order_by.clone(),
+                        keys: order_by.clone(),
                         input: Box::new(plan),
                     };
                 }
-                if grouped && !select.order_by.is_empty() {
+                if grouped && !order_by.is_empty() {
                     plan = LogicalPlan::Sort {
-                        keys: select.order_by.clone(),
+                        keys: order_by.clone(),
+                        input: Box::new(plan),
+                    };
+                }
+                if project_grouped_sort_keys {
+                    plan = LogicalPlan::Project {
+                        items: select
+                            .projection
+                            .iter()
+                            .map(|item| ProjectionItem {
+                                name: item.column.name.clone(),
+                                expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
+                            })
+                            .collect(),
                         input: Box::new(plan),
                     };
                 }
@@ -730,6 +750,73 @@ fn grouped_aggregate_item_kind(expr: &Expr) -> GroupedAggregateItemKind {
     match aggregate_function(expr) {
         Some(function) => GroupedAggregateItemKind::Aggregate(function),
         None => GroupedAggregateItemKind::GroupKey(expr.clone()),
+    }
+}
+
+fn add_grouped_sort_keys(
+    items: &mut Vec<GroupedAggregateItem>,
+    order_by: &mut [OrderByExpr],
+    group_by: &[Expr],
+) -> bool {
+    let mut added = false;
+    for (index, key) in order_by.iter_mut().enumerate() {
+        if let Some(name) = grouped_output_column_name(items, &key.expr) {
+            key.expr = Expr::Identifier(Ident::new(name.as_str()));
+            continue;
+        }
+        if let Some(expr) = group_by.iter().find(|expr| *expr == &key.expr) {
+            let name = grouped_sort_key_name(items, expr, index);
+            items.push(GroupedAggregateItem {
+                name: name.clone(),
+                kind: GroupedAggregateItemKind::GroupKey(expr.clone()),
+            });
+            key.expr = Expr::Identifier(Ident::new(name.as_str()));
+            added = true;
+        }
+    }
+    added
+}
+
+fn grouped_output_column_name(items: &[GroupedAggregateItem], expr: &Expr) -> Option<String> {
+    if let Expr::Identifier(identifier) = expr {
+        if let Some(item) = items
+            .iter()
+            .find(|item| item.name.eq_ignore_ascii_case(identifier.as_str()))
+        {
+            return Some(item.name.clone());
+        }
+    }
+    items.iter().find_map(|item| match &item.kind {
+        GroupedAggregateItemKind::GroupKey(group_expr) if group_expr == expr => {
+            Some(item.name.clone())
+        }
+        _ => None,
+    })
+}
+
+fn grouped_sort_key_name(items: &[GroupedAggregateItem], expr: &Expr, index: usize) -> String {
+    if let Expr::Identifier(identifier) = expr {
+        if items
+            .iter()
+            .all(|item| !item.name.eq_ignore_ascii_case(identifier.as_str()))
+        {
+            return identifier.as_str().to_string();
+        }
+    }
+    unique_grouped_sort_key_name(items, index + 1)
+}
+
+fn unique_grouped_sort_key_name(items: &[GroupedAggregateItem], index: usize) -> String {
+    let mut suffix = index;
+    loop {
+        let name = format!("__group_sort{suffix}");
+        if items
+            .iter()
+            .all(|item| !item.name.eq_ignore_ascii_case(name.as_str()))
+        {
+            return name;
+        }
+        suffix += 1;
     }
 }
 
