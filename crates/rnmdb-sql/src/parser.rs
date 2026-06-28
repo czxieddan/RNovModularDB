@@ -350,7 +350,7 @@ impl Parser {
             None
         };
         let offset = if self.consume_if(&TokenKind::Offset) {
-            Some(self.parse_row_count("OFFSET")?)
+            Some(self.parse_offset_count()?)
         } else {
             None
         };
@@ -944,6 +944,14 @@ impl Parser {
         }
         self.expect_keyword(TokenKind::Only)?;
         Ok(Some(count))
+    }
+
+    fn parse_offset_count(&mut self) -> Result<usize> {
+        let count = self.parse_row_count("OFFSET")?;
+        if !self.consume_if(&TokenKind::Row) {
+            let _ = self.consume_if(&TokenKind::Rows);
+        }
+        Ok(count)
     }
 
     fn parse_row_count(&mut self, clause: &'static str) -> Result<usize> {
