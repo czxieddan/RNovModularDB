@@ -384,20 +384,18 @@ impl Parser {
                     right: Box::new(right),
                 };
             } else if self.consume_if(&TokenKind::Intersect) {
-                if self.consume_if(&TokenKind::All) {
-                    return Err(self.error("INTERSECT ALL is not supported yet"));
-                }
+                let all = self.consume_if(&TokenKind::All);
                 let right = self.parse_select()?;
                 statement = Statement::Intersect {
+                    all,
                     left: Box::new(statement),
                     right: Box::new(right),
                 };
             } else if self.consume_if(&TokenKind::Except) {
-                if self.consume_if(&TokenKind::All) {
-                    return Err(self.error("EXCEPT ALL is not supported yet"));
-                }
+                let all = self.consume_if(&TokenKind::All);
                 let right = self.parse_select()?;
                 statement = Statement::Except {
+                    all,
                     left: Box::new(statement),
                     right: Box::new(right),
                 };

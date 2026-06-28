@@ -275,15 +275,15 @@ impl MemoryExecutor {
                 let right = self.execute_cancellable(right, cancellation)?;
                 apply_union_cancellable(left, right, *all, cancellation)
             }
-            LogicalPlan::Intersect { left, right } => {
+            LogicalPlan::Intersect { all, left, right } => {
                 let left = self.execute_cancellable(left, cancellation)?;
                 let right = self.execute_cancellable(right, cancellation)?;
-                apply_intersect_cancellable(left, right, cancellation)
+                apply_intersect_cancellable(left, right, *all, cancellation)
             }
-            LogicalPlan::Except { left, right } => {
+            LogicalPlan::Except { all, left, right } => {
                 let left = self.execute_cancellable(left, cancellation)?;
                 let right = self.execute_cancellable(right, cancellation)?;
-                apply_except_cancellable(left, right, cancellation)
+                apply_except_cancellable(left, right, *all, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
@@ -385,15 +385,15 @@ impl MemoryExecutor {
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
                 apply_union_cancellable(left, right, *all, cancellation)
             }
-            LogicalPlan::Intersect { left, right } => {
+            LogicalPlan::Intersect { all, left, right } => {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_intersect_cancellable(left, right, cancellation)
+                apply_intersect_cancellable(left, right, *all, cancellation)
             }
-            LogicalPlan::Except { left, right } => {
+            LogicalPlan::Except { all, left, right } => {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_except_cancellable(left, right, cancellation)
+                apply_except_cancellable(left, right, *all, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -934,9 +934,13 @@ fn apply_union_cancellable(
 fn apply_intersect_cancellable(
     left: VectorBatch,
     right: VectorBatch,
+    all: bool,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     validate_set_operation_columns("INTERSECT", &left, &right)?;
+    if all {
+        return apply_intersect_all_cancellable(left, right, cancellation);
+    }
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
@@ -951,13 +955,54 @@ fn apply_intersect_cancellable(
 fn apply_except_cancellable(
     left: VectorBatch,
     right: VectorBatch,
+    all: bool,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     validate_set_operation_columns("EXCEPT", &left, &right)?;
+    if all {
+        return apply_except_all_cancellable(left, right, cancellation);
+    }
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
         if !right.rows().contains(row) && !rows.contains(row) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn apply_intersect_all_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut right_rows = right.rows().to_vec();
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
+            rows.push(row.clone());
+            right_rows.remove(index);
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn apply_except_all_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut right_rows = right.rows().to_vec();
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
+            right_rows.remove(index);
+        } else {
             rows.push(row.clone());
         }
     }

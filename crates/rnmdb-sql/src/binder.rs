@@ -115,8 +115,10 @@ impl<'a> Binder<'a> {
                 *offset, role_id,
             ),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
-            Statement::Intersect { left, right } => self.bind_intersect(left, right, role_id),
-            Statement::Except { left, right } => self.bind_except(left, right, role_id),
+            Statement::Intersect { all, left, right } => {
+                self.bind_intersect(*all, left, right, role_id)
+            }
+            Statement::Except { all, left, right } => self.bind_except(*all, left, right, role_id),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -234,6 +236,7 @@ impl<'a> Binder<'a> {
 
     fn bind_except(
         &self,
+        all: bool,
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
@@ -242,6 +245,7 @@ impl<'a> Binder<'a> {
         let right = self.bind_for_role(right, role_id)?;
         let columns = validate_set_operation_columns("EXCEPT", &left, &right)?;
         Ok(BoundStatement::Except(BoundExcept {
+            all,
             columns,
             left: Box::new(left),
             right: Box::new(right),
@@ -289,6 +293,7 @@ impl<'a> Binder<'a> {
 
     fn bind_intersect(
         &self,
+        all: bool,
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
@@ -297,6 +302,7 @@ impl<'a> Binder<'a> {
         let right = self.bind_for_role(right, role_id)?;
         let columns = validate_set_operation_columns("INTERSECT", &left, &right)?;
         Ok(BoundStatement::Intersect(BoundIntersect {
+            all,
             columns,
             left: Box::new(left),
             right: Box::new(right),

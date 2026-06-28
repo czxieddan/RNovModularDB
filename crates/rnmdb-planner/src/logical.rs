@@ -43,10 +43,12 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
     },
     Intersect {
+        all: bool,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
     Except {
+        all: bool,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
@@ -353,10 +355,12 @@ impl LogicalPlanner {
                 right: Box::new(self.plan(&union.right)?),
             }),
             BoundStatement::Intersect(intersect) => Ok(LogicalPlan::Intersect {
+                all: intersect.all,
                 left: Box::new(self.plan(&intersect.left)?),
                 right: Box::new(self.plan(&intersect.right)?),
             }),
             BoundStatement::Except(except) => Ok(LogicalPlan::Except {
+                all: except.all,
                 left: Box::new(self.plan(&except.left)?),
                 right: Box::new(self.plan(&except.right)?),
             }),
@@ -497,13 +501,15 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
-        LogicalPlan::Intersect { left, right } => {
-            out.push_str(&format!("{prefix}Intersect DISTINCT\n"));
+        LogicalPlan::Intersect { all, left, right } => {
+            let mode = if *all { "ALL" } else { "DISTINCT" };
+            out.push_str(&format!("{prefix}Intersect {mode}\n"));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
-        LogicalPlan::Except { left, right } => {
-            out.push_str(&format!("{prefix}Except DISTINCT\n"));
+        LogicalPlan::Except { all, left, right } => {
+            let mode = if *all { "ALL" } else { "DISTINCT" };
+            out.push_str(&format!("{prefix}Except {mode}\n"));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }

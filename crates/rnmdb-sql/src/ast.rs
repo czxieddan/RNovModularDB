@@ -520,10 +520,12 @@ pub enum Statement {
         right: Box<Statement>,
     },
     Intersect {
+        all: bool,
         left: Box<Statement>,
         right: Box<Statement>,
     },
     Except {
+        all: bool,
         left: Box<Statement>,
         right: Box<Statement>,
     },
@@ -571,6 +573,7 @@ pub struct BoundUnion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundIntersect {
+    pub all: bool,
     pub columns: Vec<BoundColumn>,
     pub left: Box<BoundStatement>,
     pub right: Box<BoundStatement>,
@@ -578,6 +581,7 @@ pub struct BoundIntersect {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundExcept {
+    pub all: bool,
     pub columns: Vec<BoundColumn>,
     pub left: Box<BoundStatement>,
     pub right: Box<BoundStatement>,
