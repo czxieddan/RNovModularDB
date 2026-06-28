@@ -2,7 +2,8 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundStatement, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, TransactionAction,
+    BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, ObjectName, OrderByExpr,
+    TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -165,6 +166,7 @@ pub enum LogicalPlan {
     },
     Explain {
         analyze: bool,
+        format: ExplainFormat,
         input: Box<LogicalPlan>,
     },
     Parallel {
@@ -543,8 +545,13 @@ impl LogicalPlanner {
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
             }),
-            BoundStatement::Explain { analyze, statement } => Ok(LogicalPlan::Explain {
+            BoundStatement::Explain {
+                analyze,
+                format,
+                statement,
+            } => Ok(LogicalPlan::Explain {
                 analyze: *analyze,
+                format: *format,
                 input: Box::new(self.plan(statement)?),
             }),
         }
@@ -875,8 +882,17 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::Transaction { action } => {
             out.push_str(&format!("{prefix}Transaction action={action}\n"));
         }
-        LogicalPlan::Explain { analyze, input } => {
-            out.push_str(&format!("{prefix}Explain analyze={analyze}\n"));
+        LogicalPlan::Explain {
+            analyze,
+            format,
+            input,
+        } => {
+            let format = if *format == ExplainFormat::Logical {
+                ""
+            } else {
+                explain_format_suffix(*format)
+            };
+            out.push_str(&format!("{prefix}Explain analyze={analyze}{format}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Parallel { hint, input } => {
@@ -938,6 +954,14 @@ fn format_plan_cost(cost: PlanCost) -> String {
         cost.row_width_bytes,
         cost.total()
     )
+}
+
+fn explain_format_suffix(format: ExplainFormat) -> &'static str {
+    match format {
+        ExplainFormat::Logical => "",
+        ExplainFormat::Costs => " format=costs",
+        ExplainFormat::Physical => " format=physical",
+    }
 }
 
 fn plan_selection(

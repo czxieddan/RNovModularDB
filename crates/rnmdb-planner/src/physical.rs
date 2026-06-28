@@ -3,7 +3,7 @@ use crate::{
     logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
 };
 use rnmdb_common::ids::RelationId;
-use rnmdb_sql::ast::{Expr, OrderByExpr};
+use rnmdb_sql::ast::{ExplainFormat, Expr, OrderByExpr};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PhysicalPlan {
@@ -86,6 +86,7 @@ pub enum PhysicalPlan {
     },
     Explain {
         analyze: bool,
+        format: ExplainFormat,
         input: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -225,8 +226,13 @@ impl PhysicalPlanner {
                 action: action.clone(),
                 cost,
             },
-            LogicalPlan::Explain { analyze, input } => PhysicalPlan::Explain {
+            LogicalPlan::Explain {
+                analyze,
+                format,
+                input,
+            } => PhysicalPlan::Explain {
                 analyze: *analyze,
+                format: *format,
                 input: Box::new(self.plan(input)),
                 cost,
             },
@@ -400,11 +406,17 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         }
         PhysicalPlan::Explain {
             analyze,
+            format,
             input,
             cost,
         } => {
+            let format = if *format == ExplainFormat::Logical {
+                ""
+            } else {
+                explain_format_suffix(*format)
+            };
             out.push_str(&format!(
-                "{prefix}Explain analyze={analyze}{}\n",
+                "{prefix}Explain analyze={analyze}{format}{}\n",
                 cost_suffix(*cost)
             ));
             write_physical_plan(input, indent + 1, out);
@@ -419,6 +431,14 @@ fn cost_suffix(cost: PlanCost) -> String {
         cost.row_width_bytes,
         cost.total()
     )
+}
+
+fn explain_format_suffix(format: ExplainFormat) -> &'static str {
+    match format {
+        ExplainFormat::Logical => "",
+        ExplainFormat::Costs => " format=costs",
+        ExplainFormat::Physical => " format=physical",
+    }
 }
 
 fn ddl_description(plan: &LogicalPlan) -> String {

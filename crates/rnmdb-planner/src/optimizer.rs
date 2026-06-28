@@ -154,8 +154,13 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             count,
             input: Box::new(annotate_parallel(*input, workers)),
         },
-        LogicalPlan::Explain { analyze, input } => LogicalPlan::Explain {
+        LogicalPlan::Explain {
             analyze,
+            format,
+            input,
+        } => LogicalPlan::Explain {
+            analyze,
+            format,
             input: Box::new(annotate_parallel(*input, workers)),
         },
         LogicalPlan::Parallel { hint, input } => LogicalPlan::Parallel {

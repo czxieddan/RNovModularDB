@@ -450,6 +450,13 @@ pub enum TransactionAction {
     Rollback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExplainFormat {
+    Logical,
+    Costs,
+    Physical,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     CreateTable {
@@ -576,6 +583,7 @@ pub enum Statement {
     },
     Explain {
         analyze: bool,
+        format: ExplainFormat,
         statement: Box<Statement>,
     },
 }
@@ -768,6 +776,7 @@ pub enum BoundStatement {
     },
     Explain {
         analyze: bool,
+        format: ExplainFormat,
         statement: Box<BoundStatement>,
     },
 }

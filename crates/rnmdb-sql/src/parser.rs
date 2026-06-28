@@ -4,8 +4,8 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, RangeLiteralBounds,
-        SelectItem, SortDirection, Statement, TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, Ident, ObjectName, OrderByExpr,
+        RangeLiteralBounds, SelectItem, SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -74,12 +74,38 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Explain)?;
-        let analyze = self.consume_if(&TokenKind::Analyze);
+        let mut analyze = false;
+        let mut format = ExplainFormat::Logical;
+        loop {
+            if self.consume_if(&TokenKind::Analyze) {
+                if analyze {
+                    return Err(self.error("duplicate EXPLAIN ANALYZE option"));
+                }
+                analyze = true;
+                continue;
+            }
+            if self.consume_identifier_keyword("costs") {
+                if format != ExplainFormat::Logical {
+                    return Err(self.error("conflicting EXPLAIN format options"));
+                }
+                format = ExplainFormat::Costs;
+                continue;
+            }
+            if self.consume_identifier_keyword("physical") {
+                if format != ExplainFormat::Logical {
+                    return Err(self.error("conflicting EXPLAIN format options"));
+                }
+                format = ExplainFormat::Physical;
+                continue;
+            }
+            break;
+        }
         if matches!(self.peek_kind(), Some(TokenKind::Explain)) {
             return Err(self.error("nested EXPLAIN is not supported"));
         }
         Ok(Statement::Explain {
             analyze,
+            format,
             statement: Box::new(self.parse_statement()?),
         })
     }
@@ -1294,6 +1320,18 @@ impl Parser {
             return false;
         };
         if same_token_variant(actual, expected) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_identifier_keyword(&mut self, expected: &str) -> bool {
+        let Some(TokenKind::Identifier(value)) = self.peek_kind() else {
+            return false;
+        };
+        if value == expected {
             self.bump();
             true
         } else {

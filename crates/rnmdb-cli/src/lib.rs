@@ -9,9 +9,11 @@ use rnmdb_executor::{
     memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
     vector::VectorBatch,
 };
-use rnmdb_planner::{logical::LogicalPlanner, optimizer::RuleOptimizer};
+use rnmdb_planner::{
+    cost::CostModel, logical::LogicalPlanner, optimizer::RuleOptimizer, physical::PhysicalPlanner,
+};
 use rnmdb_sql::{
-    ast::{BoundStatement, ColumnDef, ObjectName},
+    ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName},
     binder::Binder,
     parser::parse_statement,
 };
@@ -198,23 +200,26 @@ impl LocalSession {
                     .execute_parallel(&plan, self.execution.parallel_query())
                     .map(CommandOutput::Rows)
             }
-            BoundStatement::Explain { analyze, statement } => {
+            BoundStatement::Explain {
+                analyze,
+                format,
+                statement,
+            } => {
                 let plan = self.optimize_read_plan(self.planner.plan(statement)?);
+                let mut text = self.explain_plan(&plan, *format);
                 if *analyze {
                     let started = Instant::now();
                     let batch = self
                         .executor
                         .execute_parallel(&plan, self.execution.parallel_query())?;
                     let elapsed = started.elapsed();
-                    Ok(CommandOutput::Text(format!(
-                        "{}Analyze rows={} elapsed_us={}\n",
-                        plan.explain(),
+                    text.push_str(&format!(
+                        "Analyze rows={} elapsed_us={}\n",
                         batch.rows().len(),
                         elapsed.as_micros()
-                    )))
-                } else {
-                    Ok(CommandOutput::Text(plan.explain()))
+                    ));
                 }
+                Ok(CommandOutput::Text(text))
             }
             _ => {
                 let plan = self.planner.plan(&bound)?;
@@ -431,6 +436,20 @@ impl LocalSession {
     ) -> rnmdb_planner::logical::LogicalPlan {
         self.optimizer
             .optimize_parallel(plan, self.execution.worker_threads())
+    }
+
+    fn explain_plan(
+        &self,
+        plan: &rnmdb_planner::logical::LogicalPlan,
+        format: ExplainFormat,
+    ) -> String {
+        match format {
+            ExplainFormat::Logical => plan.explain(),
+            ExplainFormat::Costs => plan.explain_with_costs(&CostModel::default()),
+            ExplainFormat::Physical => PhysicalPlanner::new(CostModel::default())
+                .plan(plan)
+                .explain(),
+        }
     }
 }
 
