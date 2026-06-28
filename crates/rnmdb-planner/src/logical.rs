@@ -267,7 +267,8 @@ impl LogicalPlanner {
                 let grouped = !select.group_by.is_empty();
                 let aggregate_functions = select_aggregate_functions(select);
                 let mut order_by = select.order_by.clone();
-                let mut project_internal_outputs = !select.hidden_aggregates.is_empty();
+                let mut project_internal_outputs =
+                    !select.hidden_group_keys.is_empty() || !select.hidden_aggregates.is_empty();
                 if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
                     plan = LogicalPlan::Sort {
                         keys: order_by.clone(),
@@ -278,6 +279,7 @@ impl LogicalPlanner {
                     let mut items = select
                         .projection
                         .iter()
+                        .chain(select.hidden_group_keys.iter())
                         .chain(select.hidden_aggregates.iter())
                         .map(|item| GroupedAggregateItem {
                             name: item.column.name.clone(),

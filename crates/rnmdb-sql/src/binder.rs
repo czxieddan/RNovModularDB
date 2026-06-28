@@ -528,6 +528,7 @@ impl<'a> Binder<'a> {
         if aggregate_count == 0 && !bound_group_by.is_empty() {
             self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
+        let mut hidden_group_keys = Vec::new();
         let mut hidden_aggregates = Vec::new();
         let having = if let Some(having) = having {
             if bound_group_by.is_empty() && aggregate_count == 0 {
@@ -539,10 +540,13 @@ impl<'a> Binder<'a> {
             let having = self.rewrite_grouped_having_expr(
                 table,
                 &projection,
+                &bound_group_by,
+                &mut hidden_group_keys,
                 &mut hidden_aggregates,
                 having,
             )?;
             let mut grouped_outputs = projection.clone();
+            grouped_outputs.extend(hidden_group_keys.iter().cloned());
             grouped_outputs.extend(hidden_aggregates.iter().cloned());
             self.validate_grouped_having_expr(&grouped_outputs, &having)?;
             Some(having)
@@ -582,6 +586,7 @@ impl<'a> Binder<'a> {
             table: from.clone(),
             distinct,
             projection,
+            hidden_group_keys,
             hidden_aggregates,
             columns,
             selection: selection.clone(),
@@ -1014,9 +1019,28 @@ impl<'a> Binder<'a> {
         &self,
         table: &Table,
         projection: &[BoundSelectItem],
+        group_by: &[Expr],
+        hidden_group_keys: &mut Vec<BoundSelectItem>,
         hidden_aggregates: &mut Vec<BoundSelectItem>,
         expr: &Expr,
     ) -> Result<Expr> {
+        if let Some(item) = projection
+            .iter()
+            .chain(hidden_group_keys.iter())
+            .chain(hidden_aggregates.iter())
+            .find(|item| &item.expr == expr)
+        {
+            return Ok(Expr::Identifier(Ident::new(item.column.name.as_str())));
+        }
+        if group_by.iter().any(|group| group == expr) {
+            return self.rewrite_having_group_key_expr(
+                table,
+                projection,
+                hidden_group_keys,
+                hidden_aggregates,
+                expr,
+            );
+        }
         match expr {
             Expr::CountStar
             | Expr::Count(_)
@@ -1030,6 +1054,8 @@ impl<'a> Binder<'a> {
                 left: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     left,
                 )?),
@@ -1037,6 +1063,8 @@ impl<'a> Binder<'a> {
                 right: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     right,
                 )?),
@@ -1046,6 +1074,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1053,6 +1083,8 @@ impl<'a> Binder<'a> {
             Expr::Not(expr) => Ok(Expr::Not(Box::new(self.rewrite_grouped_having_expr(
                 table,
                 projection,
+                group_by,
+                hidden_group_keys,
                 hidden_aggregates,
                 expr,
             )?))),
@@ -1060,6 +1092,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1073,6 +1107,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1083,6 +1119,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1096,12 +1134,16 @@ impl<'a> Binder<'a> {
                 left: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     left,
                 )?),
                 right: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     right,
                 )?),
@@ -1116,18 +1158,24 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
                 low: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     low,
                 )?),
                 high: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     high,
                 )?),
@@ -1141,6 +1189,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1150,6 +1200,8 @@ impl<'a> Binder<'a> {
                         self.rewrite_grouped_having_expr(
                             table,
                             projection,
+                            group_by,
+                            hidden_group_keys,
                             hidden_aggregates,
                             value,
                         )
@@ -1165,12 +1217,16 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
                 pattern: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     pattern,
                 )?),
@@ -1179,7 +1235,14 @@ impl<'a> Binder<'a> {
             Expr::Coalesce(values) => values
                 .iter()
                 .map(|value| {
-                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, value)
+                    self.rewrite_grouped_having_expr(
+                        table,
+                        projection,
+                        group_by,
+                        hidden_group_keys,
+                        hidden_aggregates,
+                        value,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Expr::Coalesce),
@@ -1187,12 +1250,16 @@ impl<'a> Binder<'a> {
                 left: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     left,
                 )?),
                 right: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     right,
                 )?),
@@ -1208,6 +1275,8 @@ impl<'a> Binder<'a> {
                         self.rewrite_grouped_having_expr(
                             table,
                             projection,
+                            group_by,
+                            hidden_group_keys,
                             hidden_aggregates,
                             operand,
                         )
@@ -1221,12 +1290,16 @@ impl<'a> Binder<'a> {
                             condition: self.rewrite_grouped_having_expr(
                                 table,
                                 projection,
+                                group_by,
+                                hidden_group_keys,
                                 hidden_aggregates,
                                 &arm.condition,
                             )?,
                             result: self.rewrite_grouped_having_expr(
                                 table,
                                 projection,
+                                group_by,
+                                hidden_group_keys,
                                 hidden_aggregates,
                                 &arm.result,
                             )?,
@@ -1239,6 +1312,8 @@ impl<'a> Binder<'a> {
                         self.rewrite_grouped_having_expr(
                             table,
                             projection,
+                            group_by,
+                            hidden_group_keys,
                             hidden_aggregates,
                             else_expr,
                         )
@@ -1250,6 +1325,8 @@ impl<'a> Binder<'a> {
                 expr: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     expr,
                 )?),
@@ -1258,7 +1335,14 @@ impl<'a> Binder<'a> {
             Expr::Array(values) => values
                 .iter()
                 .map(|value| {
-                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, value)
+                    self.rewrite_grouped_having_expr(
+                        table,
+                        projection,
+                        group_by,
+                        hidden_group_keys,
+                        hidden_aggregates,
+                        value,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(Expr::Array),
@@ -1270,12 +1354,16 @@ impl<'a> Binder<'a> {
                 lower: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     lower,
                 )?),
                 upper: Box::new(self.rewrite_grouped_having_expr(
                     table,
                     projection,
+                    group_by,
+                    hidden_group_keys,
                     hidden_aggregates,
                     upper,
                 )?),
@@ -1284,7 +1372,14 @@ impl<'a> Binder<'a> {
             Expr::Call { name, args } => args
                 .iter()
                 .map(|arg| {
-                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, arg)
+                    self.rewrite_grouped_having_expr(
+                        table,
+                        projection,
+                        group_by,
+                        hidden_group_keys,
+                        hidden_aggregates,
+                        arg,
+                    )
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(|args| Expr::Call {
@@ -1298,6 +1393,52 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::HStore(_) => Ok(expr.clone()),
         }
+    }
+
+    fn rewrite_having_group_key_expr(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        hidden_group_keys: &mut Vec<BoundSelectItem>,
+        hidden_aggregates: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<Expr> {
+        if let Some(item) = projection
+            .iter()
+            .chain(hidden_group_keys.iter())
+            .find(|item| &item.expr == expr)
+        {
+            return Ok(Expr::Identifier(Ident::new(item.column.name.as_str())));
+        }
+
+        let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer GROUP BY expression type: {expr}"),
+            )
+        })?;
+        let existing_columns = projection
+            .iter()
+            .chain(hidden_group_keys.iter())
+            .chain(hidden_aggregates.iter())
+            .map(|item| item.column.clone())
+            .collect::<Vec<_>>();
+        let base_name = match expr {
+            Expr::Identifier(identifier) => identifier.as_str(),
+            _ => "group_key",
+        };
+        let column = BoundColumn {
+            name: unique_column_name(&existing_columns, base_name),
+            data_type,
+            nullable: hidden_group_key_nullable(table, expr),
+            encrypted: false,
+        };
+        let name = column.name.clone();
+        hidden_group_keys.push(BoundSelectItem {
+            column,
+            expr: expr.clone(),
+        });
+        Ok(Expr::Identifier(Ident::new(name.as_str())))
     }
 
     fn rewrite_having_aggregate_expr(
@@ -2694,6 +2835,20 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
             | Expr::Min(_)
             | Expr::Max(_)
     )
+}
+
+fn hidden_group_key_nullable(table: &Table, expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(identifier) => table
+            .columns()
+            .iter()
+            .find(|column| column.name().eq_ignore_ascii_case(identifier.as_str()))
+            .map(|column| column.nullable())
+            .unwrap_or(true),
+        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) => false,
+        Expr::Null => true,
+        _ => true,
+    }
 }
 
 fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
