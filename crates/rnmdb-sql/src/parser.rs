@@ -86,12 +86,17 @@ impl Parser {
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Create)?;
+        let unique = self.consume_if(&TokenKind::Unique);
         match self.peek_kind() {
+            Some(TokenKind::Index) => self.parse_create_index_tail(unique),
             Some(TokenKind::Table) => self.parse_create_table_tail(),
             Some(TokenKind::Function) => self.parse_create_function_tail(),
             Some(TokenKind::OperatorKeyword) => self.parse_create_operator_tail(),
             Some(TokenKind::Role) => self.parse_create_role_tail(),
             Some(TokenKind::Policy) => self.parse_create_policy_tail(),
+            Some(kind) if unique => {
+                Err(self.error(format!("unexpected CREATE UNIQUE target {kind:?}")))
+            }
             Some(kind) => Err(self.error(format!("unexpected CREATE target {kind:?}"))),
             None => Err(self.error("expected CREATE target")),
         }
@@ -113,6 +118,23 @@ impl Parser {
         self.expect_keyword(TokenKind::RightParen)?;
 
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Index)?;
+        let name = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let columns = self.parse_ident_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+        })
     }
 
     fn parse_alter(&mut self) -> Result<Statement> {
@@ -1182,6 +1204,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Delete, TokenKind::Delete)
             | (TokenKind::Set, TokenKind::Set)
             | (TokenKind::Create, TokenKind::Create)
+            | (TokenKind::Index, TokenKind::Index)
+            | (TokenKind::Unique, TokenKind::Unique)
             | (TokenKind::Alter, TokenKind::Alter)
             | (TokenKind::Drop, TokenKind::Drop)
             | (TokenKind::Add, TokenKind::Add)

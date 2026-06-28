@@ -86,6 +86,13 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<ColumnDef>,
     },
+    CreateIndex {
+        name: String,
+        relation_id: RelationId,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+    },
     AlterTableAddColumn {
         relation_id: RelationId,
         table: String,
@@ -209,6 +216,19 @@ impl LogicalPlanner {
             BoundStatement::CreateTable { name, columns } => Ok(LogicalPlan::CreateTable {
                 table: object_name(name),
                 columns: columns.clone(),
+            }),
+            BoundStatement::CreateIndex {
+                name,
+                relation_id,
+                table,
+                columns,
+                unique,
+            } => Ok(LogicalPlan::CreateIndex {
+                name: object_name(name),
+                relation_id: *relation_id,
+                table: object_name(table),
+                columns: columns.iter().map(|column| column.name.clone()).collect(),
+                unique: *unique,
             }),
             BoundStatement::AlterTableAddColumn {
                 relation_id,
@@ -603,6 +623,19 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .map(|column| column.name.as_str().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ));
+        }
+        LogicalPlan::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            ..
+        } => {
+            let mode = if *unique { "unique " } else { "" };
+            out.push_str(&format!(
+                "{prefix}CreateIndex {mode}name={name} table={table} columns={}\n",
+                columns.join(", ")
             ));
         }
         LogicalPlan::AlterTableAddColumn { table, column, .. } => {

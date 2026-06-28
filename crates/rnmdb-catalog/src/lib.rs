@@ -105,6 +105,7 @@ pub struct Catalog {
     schemas: BTreeMap<String, Schema>,
     functions: Vec<Function>,
     operators: Vec<Operator>,
+    indexes: Vec<Index>,
     roles: BTreeMap<String, Role>,
     grants: Vec<TableGrant>,
     row_policies: BTreeMap<RelationId, Vec<RowPolicy>>,
@@ -122,6 +123,7 @@ impl Catalog {
             schemas: BTreeMap::new(),
             functions: Vec::new(),
             operators: Vec::new(),
+            indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
             row_policies: BTreeMap::new(),
@@ -138,6 +140,16 @@ impl Catalog {
 
     pub fn operators(&self) -> &[Operator] {
         &self.operators
+    }
+
+    pub fn indexes(&self) -> &[Index] {
+        &self.indexes
+    }
+
+    pub fn get_index(&self, schema_name: &str, index_name: &str) -> Option<&Index> {
+        self.indexes
+            .iter()
+            .find(|index| index.schema_name == schema_name && index.name == index_name)
     }
 
     pub fn get_role(&self, name: &str) -> Option<&Role> {
@@ -303,6 +315,44 @@ impl Catalog {
         Ok(operator)
     }
 
+    pub fn create_index(
+        &mut self,
+        schema_name: &str,
+        index_name: impl Into<String>,
+        relation_id: RelationId,
+        columns: Vec<String>,
+        unique: bool,
+    ) -> Result<Index> {
+        let index_name = index_name.into();
+        validate_identifier("index", &index_name)?;
+        if !self.schemas.contains_key(schema_name) {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("schema does not exist: {schema_name}"),
+            ));
+        }
+        if self.get_index(schema_name, &index_name).is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("index already exists: {schema_name}.{index_name}"),
+            ));
+        }
+        let table = self.table_by_relation_id(relation_id).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, "indexed relation does not exist")
+        })?;
+        validate_index_columns(table, &columns)?;
+        let index = Index {
+            schema_name: schema_name.to_string(),
+            name: index_name,
+            relation_id,
+            table_name: table.name.clone(),
+            columns,
+            unique,
+        };
+        self.indexes.push(index.clone());
+        Ok(index)
+    }
+
     pub fn create_role(&mut self, name: impl Into<String>) -> Result<Role> {
         let name = name.into();
         validate_identifier("role", &name)?;
@@ -394,18 +444,20 @@ impl Catalog {
     }
 
     fn ensure_relation_exists(&self, relation_id: RelationId) -> Result<()> {
-        if self.schemas.values().any(|schema| {
-            schema
-                .tables
-                .values()
-                .any(|table| table.relation_id == relation_id)
-        }) {
+        if self.table_by_relation_id(relation_id).is_some() {
             return Ok(());
         }
         Err(RnovError::new(
             ErrorKind::NotFound,
             "relation does not exist",
         ))
+    }
+
+    fn table_by_relation_id(&self, relation_id: RelationId) -> Option<&Table> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
+            .find(|table| table.relation_id == relation_id)
     }
 }
 
@@ -499,6 +551,42 @@ impl Operator {
 
     pub fn symbol(&self) -> &str {
         self.signature.symbol()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Index {
+    schema_name: String,
+    name: String,
+    relation_id: RelationId,
+    table_name: String,
+    columns: Vec<String>,
+    unique: bool,
+}
+
+impl Index {
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn relation_id(&self) -> RelationId {
+        self.relation_id
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn unique(&self) -> bool {
+        self.unique
     }
 }
 
@@ -604,11 +692,42 @@ fn validate_columns(columns: &[Column]) -> Result<()> {
     Ok(())
 }
 
+fn validate_index_columns(table: &Table, columns: &[String]) -> Result<()> {
+    if columns.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "index must have at least one column",
+        ));
+    }
+
+    let mut seen = BTreeMap::new();
+    for column in columns {
+        validate_identifier("index column", column)?;
+        if seen.insert(column.as_str(), ()).is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate index column: {column}"),
+            ));
+        }
+        if table
+            .columns
+            .iter()
+            .all(|existing| existing.name != *column)
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("index column does not exist: {column}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -659,6 +778,19 @@ impl CatalogCodec {
             encode_sql_type(&mut out, &operator.signature.right_type);
             encode_sql_type(&mut out, &operator.signature.result_type);
             write_u64(&mut out, operator.signature.function_id.get());
+        }
+
+        write_u32(&mut out, catalog.indexes.len() as u32);
+        for index in &catalog.indexes {
+            write_string(&mut out, &index.schema_name)?;
+            write_string(&mut out, &index.name)?;
+            write_u64(&mut out, index.relation_id.get());
+            write_string(&mut out, &index.table_name)?;
+            out.push(u8::from(index.unique));
+            write_u32(&mut out, index.columns.len() as u32);
+            for column in &index.columns {
+                write_string(&mut out, column)?;
+            }
         }
 
         write_u32(&mut out, catalog.roles.len() as u32);
@@ -715,6 +847,7 @@ impl CatalogCodec {
             schemas: BTreeMap::new(),
             functions: Vec::new(),
             operators: Vec::new(),
+            indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
             row_policies: BTreeMap::new(),
@@ -796,6 +929,28 @@ impl CatalogCodec {
                     result_type,
                     function_id,
                 },
+            });
+        }
+
+        let index_count = reader.read_u32("index count")? as usize;
+        for _ in 0..index_count {
+            let schema_name = reader.read_string("index schema")?;
+            let name = reader.read_string("index name")?;
+            let relation_id = RelationId::new(reader.read_u64("index relation id")?);
+            let table_name = reader.read_string("index table")?;
+            let unique = reader.read_bool("index unique")?;
+            let column_count = reader.read_u32("index column count")? as usize;
+            let mut columns = Vec::with_capacity(column_count);
+            for _ in 0..column_count {
+                columns.push(reader.read_string("index column")?);
+            }
+            catalog.indexes.push(Index {
+                schema_name,
+                name,
+                relation_id,
+                table_name,
+                columns,
+                unique,
             });
         }
 

@@ -440,6 +440,7 @@ impl MemoryExecutor {
                 self.create_table(table, columns)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
+            LogicalPlan::CreateIndex { .. } => Ok(ExecutionResult::SchemaChanged),
             LogicalPlan::AlterTableAddColumn { table, column, .. } => {
                 let table = self.tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))

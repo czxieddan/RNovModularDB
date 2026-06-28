@@ -27,6 +27,12 @@ impl<'a> Binder<'a> {
                 name: name.clone(),
                 columns: columns.clone(),
             }),
+            Statement::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+            } => self.bind_create_index(name, table, columns, *unique),
             Statement::AlterTableAddColumn { table, column } => {
                 let resolved = self.resolve_table(table)?;
                 Ok(BoundStatement::AlterTableAddColumn {
@@ -146,6 +152,39 @@ impl<'a> Binder<'a> {
             relation_id,
             name: name.clone(),
             if_exists,
+        })
+    }
+
+    fn bind_create_index(
+        &self,
+        name: &ObjectName,
+        table: &ObjectName,
+        columns: &[Ident],
+        unique: bool,
+    ) -> Result<BoundStatement> {
+        let table_schema = table.schema().unwrap_or("public");
+        let index_schema = name.schema().unwrap_or(table_schema);
+        if self
+            .catalog
+            .get_index(index_schema, name.object())
+            .is_some()
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("index already exists: {index_schema}.{}", name.object()),
+            ));
+        }
+        let resolved = self.resolve_table(table)?;
+        let mut bound_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            bound_columns.push(self.resolve_column(resolved, column.as_str())?);
+        }
+        Ok(BoundStatement::CreateIndex {
+            name: ObjectName::qualified(index_schema, name.object()),
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            columns: bound_columns,
+            unique,
         })
     }
 

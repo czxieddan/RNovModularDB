@@ -456,6 +456,12 @@ pub enum Statement {
         name: ObjectName,
         columns: Vec<ColumnDef>,
     },
+    CreateIndex {
+        name: ObjectName,
+        table: ObjectName,
+        columns: Vec<Ident>,
+        unique: bool,
+    },
     AlterTableAddColumn {
         table: ObjectName,
         column: ColumnDef,
@@ -646,6 +652,13 @@ pub enum BoundStatement {
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDef>,
+    },
+    CreateIndex {
+        name: ObjectName,
+        relation_id: RelationId,
+        table: ObjectName,
+        columns: Vec<BoundColumn>,
+        unique: bool,
     },
     AlterTableAddColumn {
         relation_id: RelationId,

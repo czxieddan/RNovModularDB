@@ -73,6 +73,16 @@ impl LocalSession {
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
+            BoundStatement::CreateIndex {
+                name,
+                relation_id,
+                columns,
+                unique,
+                ..
+            } => {
+                self.apply_catalog_create_index(name, *relation_id, columns, *unique)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             BoundStatement::AlterTableAddColumn { table, column, .. } => {
                 self.apply_catalog_add_column(table, column)?;
                 let plan = self.planner.plan(&bound)?;
@@ -165,6 +175,23 @@ impl LocalSession {
             .create_table(schema, name.object(), columns)?
             .relation_id();
         self.grant_local_table_privileges(relation_id)
+    }
+
+    fn apply_catalog_create_index(
+        &mut self,
+        name: &ObjectName,
+        relation_id: RelationId,
+        columns: &[rnmdb_sql::ast::BoundColumn],
+        unique: bool,
+    ) -> Result<()> {
+        let schema = name.schema().unwrap_or("public");
+        let columns = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        self.catalog
+            .create_index(schema, name.object(), relation_id, columns, unique)?;
+        Ok(())
     }
 
     fn apply_catalog_add_column(&mut self, table: &ObjectName, column: &ColumnDef) -> Result<()> {
