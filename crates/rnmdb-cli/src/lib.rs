@@ -99,6 +99,13 @@ impl LocalSession {
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
+            BoundStatement::DropTable {
+                name, if_exists, ..
+            } => {
+                self.apply_catalog_drop_table(name, *if_exists)?;
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan).map(CommandOutput::from)
+            }
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -226,6 +233,18 @@ impl LocalSession {
         self.catalog
             .add_column(schema, table.object(), column.to_catalog_column())?;
         Ok(())
+    }
+
+    fn apply_catalog_drop_table(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {
+        let schema = name.schema().unwrap_or("public");
+        match self.catalog.drop_table(schema, name.object())? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("table does not exist: {schema}.{}", name.object()),
+            )),
+        }
     }
 
     fn grant_local_table_privileges(&mut self, relation_id: RelationId) -> Result<()> {

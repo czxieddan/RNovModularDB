@@ -237,6 +237,25 @@ impl Catalog {
         self.schemas.get(schema_name)?.tables.get(table_name)
     }
 
+    pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<Option<Table>> {
+        let schema = self.schemas.get_mut(schema_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("schema does not exist: {schema_name}"),
+            )
+        })?;
+        let Some(table) = schema.tables.remove(table_name) else {
+            return Ok(None);
+        };
+
+        self.indexes
+            .retain(|index| index.relation_id != table.relation_id);
+        self.grants
+            .retain(|grant| grant.relation_id != table.relation_id);
+        self.row_policies.remove(&table.relation_id);
+        Ok(Some(table))
+    }
+
     pub fn add_column(
         &mut self,
         schema_name: &str,
