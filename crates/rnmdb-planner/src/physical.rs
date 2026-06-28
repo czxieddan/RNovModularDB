@@ -561,16 +561,7 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
 }
 
 fn is_index_literal(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Null
-            | Expr::Bool(_)
-            | Expr::Integer(_)
-            | Expr::String(_)
-            | Expr::Array(_)
-            | Expr::Range { .. }
-            | Expr::HStore(_)
-    )
+    matches!(expr, Expr::Integer(_) | Expr::String(_))
 }
 
 fn cost_suffix(cost: PlanCost) -> String {

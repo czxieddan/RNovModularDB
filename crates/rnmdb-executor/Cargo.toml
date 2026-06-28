@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 rnmdb-common.workspace = true
 rnmdb-fts.workspace = true
+rnmdb-index.workspace = true
 rnmdb-planner.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-types.workspace = true

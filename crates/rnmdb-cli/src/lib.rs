@@ -90,6 +90,8 @@ impl LocalSession {
                 if_not_exists,
                 ..
             } => {
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan)?;
                 self.apply_catalog_create_index(
                     name,
                     *relation_id,
@@ -100,6 +102,8 @@ impl LocalSession {
                 Ok(CommandOutput::SchemaChanged)
             }
             BoundStatement::DropIndex { name, if_exists } => {
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan)?;
                 self.apply_catalog_drop_index(name, *if_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }

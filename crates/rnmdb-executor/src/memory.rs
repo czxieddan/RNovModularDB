@@ -9,8 +9,11 @@ use std::{
 };
 
 use rnmdb_common::Result;
-use rnmdb_common::{ErrorKind, RnovError};
+use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
+use rnmdb_index::{
+    CompositeIndexKey, IndexKey, IndexPointer, MemoryBTreeIndex, MemoryCompositeIndex,
+};
 use rnmdb_planner::{
     cost::TableStatistics,
     logical::{
@@ -25,10 +28,13 @@ use rnmdb_types::{
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
 
+const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
+
 #[derive(Clone, Debug)]
 pub struct MemoryTable {
     columns: Vec<ColumnSchema>,
     rows: Vec<Row>,
+    indexes: BTreeMap<String, MemoryTableIndex>,
 }
 
 impl MemoryTable {
@@ -37,6 +43,7 @@ impl MemoryTable {
         Ok(Self {
             columns,
             rows: Vec::new(),
+            indexes: BTreeMap::new(),
         })
     }
 
@@ -46,8 +53,14 @@ impl MemoryTable {
 
     pub fn insert(&mut self, row: Row) -> Result<()> {
         let batch = VectorBatch::new(self.columns.clone(), vec![row.clone()])?;
-        self.rows
-            .push(batch.rows().first().expect("validated row").clone());
+        let row = batch.rows().first().expect("validated row").clone();
+        let pointer = pointer_for_slot(self.rows.len())?;
+        let mut indexes = self.indexes.clone();
+        for index in indexes.values_mut() {
+            index.insert_row(&row, pointer)?;
+        }
+        self.rows.push(row);
+        self.indexes = indexes;
         Ok(())
     }
 
@@ -124,6 +137,37 @@ impl MemoryTable {
         Ok(())
     }
 
+    fn create_index(&mut self, name: &str, columns: &[String], unique: bool) -> Result<()> {
+        if self.indexes.contains_key(name) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("index already exists: {name}"),
+            ));
+        }
+        let mut index = MemoryTableIndex::new(name, &self.columns, columns, unique)?;
+        for (slot, row) in self.rows.iter().enumerate() {
+            index.insert_row(row, pointer_for_slot(slot)?)?;
+        }
+        self.indexes.insert(name.to_string(), index);
+        Ok(())
+    }
+
+    fn drop_index(&mut self, name: &str) -> bool {
+        self.indexes.remove(name).is_some()
+    }
+
+    fn rebuild_indexes(&mut self) -> Result<()> {
+        let mut indexes = self.indexes.clone();
+        for index in indexes.values_mut() {
+            index.clear();
+            for (slot, row) in self.rows.iter().enumerate() {
+                index.insert_row(row, pointer_for_slot(slot)?)?;
+            }
+        }
+        self.indexes = indexes;
+        Ok(())
+    }
+
     fn estimated_row_width_bytes(&self) -> f64 {
         if self.rows.is_empty() {
             return schema_row_width_bytes(&self.columns);
@@ -140,6 +184,107 @@ impl MemoryTable {
             })
             .sum::<usize>();
         (total_bytes as f64 / self.rows.len() as f64).max(1.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MemoryTableIndex {
+    BTree {
+        column_index: usize,
+        index: MemoryBTreeIndex,
+    },
+    Composite {
+        column_indexes: Vec<usize>,
+        index: MemoryCompositeIndex,
+    },
+}
+
+impl MemoryTableIndex {
+    fn new(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        columns: &[String],
+        unique: bool,
+    ) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "index must have at least one column",
+            ));
+        }
+        let column_indexes = columns
+            .iter()
+            .map(|column| column_index(table_columns, column))
+            .collect::<Result<Vec<_>>>()?;
+        if column_indexes.len() == 1 {
+            let index = if unique {
+                MemoryBTreeIndex::unique(name)
+            } else {
+                MemoryBTreeIndex::non_unique(name)
+            };
+            return Ok(Self::BTree {
+                column_index: column_indexes[0],
+                index,
+            });
+        }
+
+        let index = if unique {
+            MemoryCompositeIndex::unique(name)
+        } else {
+            MemoryCompositeIndex::non_unique(name)
+        };
+        Ok(Self::Composite {
+            column_indexes,
+            index,
+        })
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::BTree { index, .. } => {
+                let name = index.name().to_string();
+                let unique = index.is_unique();
+                *index = if unique {
+                    MemoryBTreeIndex::unique(name)
+                } else {
+                    MemoryBTreeIndex::non_unique(name)
+                };
+            }
+            Self::Composite { index, .. } => {
+                let name = index.name().to_string();
+                let unique = index.is_unique();
+                *index = if unique {
+                    MemoryCompositeIndex::unique(name)
+                } else {
+                    MemoryCompositeIndex::non_unique(name)
+                };
+            }
+        }
+    }
+
+    fn insert_row(&mut self, row: &Row, pointer: IndexPointer) -> Result<()> {
+        match self {
+            Self::BTree {
+                column_index,
+                index,
+                ..
+            } => {
+                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                index.insert(key, pointer)
+            }
+            Self::Composite {
+                column_indexes,
+                index,
+                ..
+            } => {
+                let Some(key) = composite_key_from_row(row, column_indexes)? else {
+                    return Ok(());
+                };
+                index.insert(key, pointer)
+            }
+        }
     }
 }
 
@@ -478,8 +623,27 @@ impl MemoryExecutor {
                 self.create_table(table, columns, *if_not_exists)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
-            LogicalPlan::CreateIndex { .. } => Ok(ExecutionResult::SchemaChanged),
-            LogicalPlan::DropIndex { .. } => Ok(ExecutionResult::SchemaChanged),
+            LogicalPlan::CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+                ..
+            } => {
+                self.create_index(name, table, columns, *unique, *if_not_exists)?;
+                Ok(ExecutionResult::SchemaChanged)
+            }
+            LogicalPlan::DropIndex { name, if_exists } => {
+                if self.drop_index(name) || *if_exists {
+                    Ok(ExecutionResult::SchemaChanged)
+                } else {
+                    Err(RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("index not found: {name}"),
+                    ))
+                }
+            }
             LogicalPlan::AlterTableAddColumn {
                 table,
                 column,
@@ -571,6 +735,27 @@ impl MemoryExecutor {
         self.tables.insert(name.to_string(), table);
         Ok(())
     }
+
+    fn create_index(
+        &mut self,
+        name: &str,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+        })?;
+        if table.indexes.contains_key(name) && if_not_exists {
+            return Ok(());
+        }
+        table.create_index(name, columns, unique)
+    }
+
+    fn drop_index(&mut self, name: &str) -> bool {
+        self.tables.values_mut().any(|table| table.drop_index(name))
+    }
 }
 
 fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
@@ -604,6 +789,42 @@ fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
     }
 }
 
+fn pointer_for_slot(slot: usize) -> Result<IndexPointer> {
+    let slot_id = u16::try_from(slot).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "memory table has too many rows for in-memory index pointers",
+        )
+    })?;
+    Ok(IndexPointer::new(MEMORY_INDEX_PAGE_ID, slot_id))
+}
+
+fn index_key_from_value(value: &SqlValue) -> Result<Option<IndexKey>> {
+    match value {
+        SqlValue::Null => Ok(None),
+        SqlValue::Int64(value) => Ok(Some(IndexKey::Int64(*value))),
+        SqlValue::Text(value) => Ok(Some(IndexKey::Text(value.clone()))),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported indexed value type: {:?}", other.data_type()),
+        )),
+    }
+}
+
+fn composite_key_from_row(
+    row: &Row,
+    column_indexes: &[usize],
+) -> Result<Option<CompositeIndexKey>> {
+    let mut keys = Vec::with_capacity(column_indexes.len());
+    for index in column_indexes {
+        let Some(key) = index_key_from_value(&row.values()[*index])? else {
+            return Ok(None);
+        };
+        keys.push(key);
+    }
+    CompositeIndexKey::new(keys).map(Some)
+}
+
 fn update_rows(
     table: &mut MemoryTable,
     assignments: &[(String, Expr)],
@@ -611,9 +832,12 @@ fn update_rows(
 ) -> Result<u64> {
     let columns = table.columns.clone();
     let assignments = compile_assignments(&columns, assignments)?;
+    let original_rows = table.rows.clone();
+    let original_indexes = table.indexes.clone();
+    let mut rows = original_rows.clone();
     let mut affected = 0;
 
-    for row in &mut table.rows {
+    for row in &mut rows {
         if row_matches(&columns, row, selection)? {
             let mut updated = row.clone();
             for (index, expr) in &assignments {
@@ -625,15 +849,23 @@ fn update_rows(
         }
     }
 
+    table.rows = rows;
+    if let Err(err) = table.rebuild_indexes() {
+        table.rows = original_rows;
+        table.indexes = original_indexes;
+        return Err(err);
+    }
     Ok(affected)
 }
 
 fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64> {
     let columns = table.columns.clone();
-    let mut kept = Vec::with_capacity(table.rows.len());
+    let original_rows = table.rows.clone();
+    let original_indexes = table.indexes.clone();
+    let mut kept = Vec::with_capacity(original_rows.len());
     let mut affected = 0;
 
-    for row in table.rows.drain(..) {
+    for row in original_rows.iter().cloned() {
         if row_matches(&columns, &row, selection)? {
             affected += 1;
         } else {
@@ -642,6 +874,11 @@ fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64>
     }
 
     table.rows = kept;
+    if let Err(err) = table.rebuild_indexes() {
+        table.rows = original_rows;
+        table.indexes = original_indexes;
+        return Err(err);
+    }
     Ok(affected)
 }
 
