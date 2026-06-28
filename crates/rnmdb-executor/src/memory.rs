@@ -1030,6 +1030,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::IsTruth { .. } => Ok(SqlType::Bool),
+        Expr::IsUnknown { .. } => Ok(SqlType::Bool),
         Expr::IsDistinctFrom { left, right, .. } => {
             projection_null_safe_comparison_type(columns, left, right)
         }
@@ -1251,6 +1252,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             value,
             negated,
         } => eval_is_truth_expr(columns, row, expr, *value, *negated),
+        Expr::IsUnknown { expr, negated } => eval_is_unknown_expr(columns, row, expr, *negated),
         Expr::IsDistinctFrom {
             left,
             right,
@@ -1473,6 +1475,28 @@ fn eval_is_truth_expr(
         }
     };
     Ok(SqlValue::Bool(if negated { !truth } else { truth }))
+}
+
+fn eval_is_unknown_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    negated: bool,
+) -> Result<SqlValue> {
+    let unknown = match eval_expr(columns, row, expr)? {
+        SqlValue::Bool(_) => false,
+        SqlValue::Null => true,
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "IS UNKNOWN requires BOOL operand, got {:?}",
+                    other.data_type()
+                ),
+            ));
+        }
+    };
+    Ok(SqlValue::Bool(if negated { !unknown } else { unknown }))
 }
 
 fn eval_is_distinct_from_expr(

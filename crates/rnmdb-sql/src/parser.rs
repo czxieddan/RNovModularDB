@@ -493,6 +493,12 @@ impl Parser {
                     negated,
                 });
             }
+            if self.consume_if(&TokenKind::Unknown) {
+                return Ok(Expr::IsUnknown {
+                    expr: Box::new(expr),
+                    negated,
+                });
+            }
             self.expect_keyword(TokenKind::Null)?;
             return Ok(Expr::IsNull {
                 expr: Box::new(expr),
@@ -1096,6 +1102,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Null, TokenKind::Null)
             | (TokenKind::True, TokenKind::True)
             | (TokenKind::False, TokenKind::False)
+            | (TokenKind::Unknown, TokenKind::Unknown)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
             | (TokenKind::Explain, TokenKind::Explain)
             | (TokenKind::Analyze, TokenKind::Analyze)

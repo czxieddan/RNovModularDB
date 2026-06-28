@@ -673,6 +673,7 @@ impl<'a> Binder<'a> {
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::IsTruth { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::IsUnknown { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::IsDistinctFrom { left, right, .. } => {
                 self.validate_group_by_expr_shape(left)?;
                 self.validate_group_by_expr_shape(right)
@@ -827,6 +828,10 @@ impl<'a> Binder<'a> {
             } => Ok(Expr::IsTruth {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 value: *value,
+                negated: *negated,
+            }),
+            Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
                 negated: *negated,
             }),
             Expr::IsDistinctFrom {
@@ -1047,7 +1052,13 @@ impl<'a> Binder<'a> {
                 let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
                     return Ok(None);
                 };
-                self.infer_truth_test_result_type(*value, &data_type)
+                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
+            }
+            Expr::IsUnknown { expr, .. } => {
+                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
             }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
@@ -1409,7 +1420,13 @@ impl<'a> Binder<'a> {
                 let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(SqlType::Bool));
                 };
-                self.infer_truth_test_result_type(*value, &data_type)
+                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
+            }
+            Expr::IsUnknown { expr, .. } => {
+                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
             }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
@@ -1678,7 +1695,13 @@ impl<'a> Binder<'a> {
                 let Some(data_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
                 };
-                self.infer_truth_test_result_type(*value, &data_type)
+                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
+            }
+            Expr::IsUnknown { expr, .. } => {
+                let Some(data_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
             }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_expr_type(table, left)? else {
@@ -1881,13 +1904,12 @@ impl<'a> Binder<'a> {
 
     fn infer_truth_test_result_type(
         &self,
-        value: bool,
+        name: &str,
         data_type: &SqlType,
     ) -> Result<Option<SqlType>> {
         if matches!(data_type, SqlType::Bool | SqlType::Null) {
             Ok(Some(SqlType::Bool))
         } else {
-            let name = if value { "IS TRUE" } else { "IS FALSE" };
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("{name} requires BOOL operand, got {data_type:?}"),
@@ -2203,6 +2225,10 @@ fn is_arithmetic_operator(op: &str) -> bool {
 
 fn is_text_concat_operator(op: &str) -> bool {
     op == "||"
+}
+
+fn truth_test_name(value: bool) -> &'static str {
+    if value { "IS TRUE" } else { "IS FALSE" }
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {

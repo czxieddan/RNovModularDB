@@ -122,6 +122,10 @@ pub enum Expr {
         value: bool,
         negated: bool,
     },
+    IsUnknown {
+        expr: Box<Expr>,
+        negated: bool,
+    },
     IsDistinctFrom {
         left: Box<Expr>,
         right: Box<Expr>,
@@ -273,6 +277,13 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IS NOT {value}")
                 } else {
                     write!(f, "{expr} IS {value}")
+                }
+            }
+            Self::IsUnknown { expr, negated } => {
+                if *negated {
+                    write!(f, "{expr} IS NOT UNKNOWN")
+                } else {
+                    write!(f, "{expr} IS UNKNOWN")
                 }
             }
             Self::IsDistinctFrom {
