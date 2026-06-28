@@ -143,6 +143,11 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<CaseWhen>,
+        else_expr: Option<Box<Expr>>,
+    },
     Cast {
         expr: Box<Expr>,
         data_type: SqlType,
@@ -151,6 +156,12 @@ pub enum Expr {
         name: ObjectName,
         args: Vec<Expr>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaseWhen {
+    pub condition: Expr,
+    pub result: Expr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,6 +321,23 @@ impl fmt::Display for Expr {
                 f.write_str(")")
             }
             Self::NullIf { left, right } => write!(f, "nullif({left}, {right})"),
+            Self::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                f.write_str("CASE")?;
+                if let Some(operand) = operand {
+                    write!(f, " {operand}")?;
+                }
+                for arm in whens {
+                    write!(f, " WHEN {} THEN {}", arm.condition, arm.result)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    write!(f, " ELSE {else_expr}")?;
+                }
+                f.write_str(" END")
+            }
             Self::Cast { expr, data_type } => {
                 write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
             }

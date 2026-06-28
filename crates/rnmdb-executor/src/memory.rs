@@ -14,7 +14,7 @@ use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_planner::logical::{
     AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind, LogicalPlan,
 };
-use rnmdb_sql::ast::{ColumnDef, Expr, OrderByExpr, SortDirection};
+use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
 };
@@ -1036,6 +1036,11 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Coalesce(values) => projection_coalesce_type(columns, values),
         Expr::NullIf { left, right } => projection_nullif_type(columns, left, right),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => projection_case_type(columns, operand.as_deref(), whens, else_expr.as_deref()),
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1118,6 +1123,83 @@ fn projection_null_safe_comparison_type(
     }
 }
 
+fn projection_case_type(
+    columns: &[ColumnSchema],
+    operand: Option<&Expr>,
+    whens: &[CaseWhen],
+    else_expr: Option<&Expr>,
+) -> Result<SqlType> {
+    if whens.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "CASE requires at least one WHEN arm",
+        ));
+    }
+
+    let operand_type = operand
+        .map(|operand| projection_type(columns, operand))
+        .transpose()?;
+    let mut result_types = Vec::with_capacity(whens.len());
+    for arm in whens {
+        let condition_type = projection_type(columns, &arm.condition)?;
+        case_condition_type(operand_type.as_ref(), &condition_type)?;
+        result_types.push(projection_type(columns, &arm.result)?);
+    }
+    let else_type = else_expr
+        .map(|else_expr| projection_type(columns, else_expr))
+        .transpose()?
+        .unwrap_or(SqlType::Null);
+    case_result_type(&result_types, &else_type)
+}
+
+fn case_condition_type(operand_type: Option<&SqlType>, condition_type: &SqlType) -> Result<()> {
+    match operand_type {
+        Some(operand_type) => {
+            if matches!(operand_type, SqlType::Null)
+                || matches!(condition_type, SqlType::Null)
+                || operand_type == condition_type
+            {
+                Ok(())
+            } else {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "CASE operand and WHEN expressions must have matching types",
+                ))
+            }
+        }
+        None => {
+            if matches!(condition_type, SqlType::Bool | SqlType::Null) {
+                Ok(())
+            } else {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("CASE WHEN condition must be BOOL, got {condition_type:?}"),
+                ))
+            }
+        }
+    }
+}
+
+fn case_result_type(result_types: &[SqlType], else_type: &SqlType) -> Result<SqlType> {
+    let mut result_type = None;
+    for value_type in result_types.iter().chain(std::iter::once(else_type)) {
+        if value_type == &SqlType::Null {
+            continue;
+        }
+        match &result_type {
+            Some(existing) if existing != value_type => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "CASE result expressions must have matching types",
+                ));
+            }
+            Some(_) => {}
+            None => result_type = Some(value_type.clone()),
+        }
+    }
+    Ok(result_type.unwrap_or(SqlType::Null))
+}
+
 fn sortable_type(data_type: &SqlType) -> bool {
     matches!(
         data_type,
@@ -1185,6 +1267,17 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         } => eval_like_expr(columns, row, expr, pattern, *negated),
         Expr::Coalesce(values) => eval_coalesce_expr(columns, row, values),
         Expr::NullIf { left, right } => eval_nullif_expr(columns, row, left, right),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => eval_case_expr(
+            columns,
+            row,
+            operand.as_deref(),
+            whens,
+            else_expr.as_deref(),
+        ),
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
         Expr::Call { name, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -1458,6 +1551,52 @@ fn eval_coalesce_expr(columns: &[ColumnSchema], row: &Row, values: &[Expr]) -> R
         }
     }
     Ok(SqlValue::Null)
+}
+
+fn eval_case_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    operand: Option<&Expr>,
+    whens: &[CaseWhen],
+    else_expr: Option<&Expr>,
+) -> Result<SqlValue> {
+    if whens.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "CASE requires at least one WHEN arm",
+        ));
+    }
+
+    let operand_value = operand
+        .map(|operand| eval_expr(columns, row, operand))
+        .transpose()?;
+    for arm in whens {
+        let matched = if let Some(operand_value) = &operand_value {
+            let condition = eval_expr(columns, row, &arm.condition)?;
+            if !operand_value.is_null()
+                && !condition.is_null()
+                && operand_value.data_type() != condition.data_type()
+            {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "CASE operand and WHEN expressions must have matching types",
+                ));
+            }
+            operand_value.sql_eq(&condition) == Truth::True
+        } else {
+            bool_truth(eval_expr(columns, row, &arm.condition)?)? == Truth::True
+        };
+
+        if matched {
+            return eval_expr(columns, row, &arm.result);
+        }
+    }
+
+    if let Some(else_expr) = else_expr {
+        eval_expr(columns, row, else_expr)
+    } else {
+        Ok(SqlValue::Null)
+    }
 }
 
 fn eval_nullif_expr(

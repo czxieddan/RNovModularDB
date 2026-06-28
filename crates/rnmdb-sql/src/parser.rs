@@ -4,7 +4,7 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, RangeLiteralBounds,
+        Assignment, CaseWhen, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, RangeLiteralBounds,
         SelectItem, SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
@@ -602,6 +602,7 @@ impl Parser {
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {
         match self.peek_kind().cloned() {
+            Some(TokenKind::Case) => self.parse_case_expr(),
             Some(TokenKind::Identifier(_)) => {
                 let first = self.parse_ident()?;
                 if first.as_str() == "array" && self.consume_if(&TokenKind::LeftBracket) {
@@ -718,6 +719,42 @@ impl Parser {
             Some(kind) => Err(self.error(format!("unexpected expression token {kind:?}"))),
             None => Err(self.error("expected expression")),
         }
+    }
+
+    fn parse_case_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(TokenKind::Case)?;
+        let operand = if self.consume_if(&TokenKind::When) {
+            None
+        } else {
+            let operand = self.parse_expr()?;
+            self.expect_keyword(TokenKind::When)?;
+            Some(Box::new(operand))
+        };
+
+        let mut whens = Vec::new();
+        loop {
+            let condition = self.parse_expr()?;
+            self.expect_keyword(TokenKind::Then)?;
+            let result = self.parse_expr()?;
+            whens.push(CaseWhen { condition, result });
+
+            if !self.consume_if(&TokenKind::When) {
+                break;
+            }
+        }
+
+        let else_expr = if self.consume_if(&TokenKind::Else) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword(TokenKind::End)?;
+
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        })
     }
 
     fn parse_hstore_literal_tail(&mut self) -> Result<Expr> {
@@ -1016,6 +1053,11 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::And, TokenKind::And)
             | (TokenKind::Or, TokenKind::Or)
             | (TokenKind::Not, TokenKind::Not)
+            | (TokenKind::Case, TokenKind::Case)
+            | (TokenKind::When, TokenKind::When)
+            | (TokenKind::Then, TokenKind::Then)
+            | (TokenKind::Else, TokenKind::Else)
+            | (TokenKind::End, TokenKind::End)
             | (TokenKind::Is, TokenKind::Is)
             | (TokenKind::Between, TokenKind::Between)
             | (TokenKind::In, TokenKind::In)

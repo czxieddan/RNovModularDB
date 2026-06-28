@@ -7,8 +7,8 @@ use rnmdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundRowPolicy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundUpdate, Expr, Ident, ObjectName, OrderByExpr, SelectItem,
-    Statement,
+    BoundSelectItem, BoundStatement, BoundUpdate, CaseWhen, Expr, Ident, ObjectName, OrderByExpr,
+    SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -699,6 +699,23 @@ impl<'a> Binder<'a> {
                 self.validate_group_by_expr_shape(left)?;
                 self.validate_group_by_expr_shape(right)
             }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.validate_group_by_expr_shape(operand)?;
+                }
+                for arm in whens {
+                    self.validate_group_by_expr_shape(&arm.condition)?;
+                    self.validate_group_by_expr_shape(&arm.result)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.validate_group_by_expr_shape(else_expr)?;
+                }
+                Ok(())
+            }
             Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
                 Err(RnovError::new(
@@ -850,6 +867,32 @@ impl<'a> Binder<'a> {
             Expr::NullIf { left, right } => Ok(Expr::NullIf {
                 left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
                 right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+            }),
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => Ok(Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|operand| self.rewrite_grouped_having_expr(projection, operand))
+                    .transpose()?
+                    .map(Box::new),
+                whens: whens
+                    .iter()
+                    .map(|arm| {
+                        Ok(CaseWhen {
+                            condition: self
+                                .rewrite_grouped_having_expr(projection, &arm.condition)?,
+                            result: self.rewrite_grouped_having_expr(projection, &arm.result)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|else_expr| self.rewrite_grouped_having_expr(projection, else_expr))
+                    .transpose()?
+                    .map(Box::new),
             }),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
@@ -1064,6 +1107,46 @@ impl<'a> Binder<'a> {
                     return Ok(None);
                 };
                 self.infer_nullif_result_type(&left_type, &right_type)
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                let operand_type = match operand {
+                    Some(operand) => {
+                        match self.infer_grouped_output_expr_type(projection, operand)? {
+                            Some(data_type) => Some(data_type),
+                            None => return Ok(None),
+                        }
+                    }
+                    None => None,
+                };
+                let mut result_types = Vec::with_capacity(whens.len());
+                for arm in whens {
+                    let Some(condition_type) =
+                        self.infer_grouped_output_expr_type(projection, &arm.condition)?
+                    else {
+                        return Ok(None);
+                    };
+                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
+                    let Some(result_type) =
+                        self.infer_grouped_output_expr_type(projection, &arm.result)?
+                    else {
+                        return Ok(None);
+                    };
+                    result_types.push(result_type);
+                }
+                let else_type = match else_expr {
+                    Some(else_expr) => {
+                        self.infer_grouped_output_expr_type(projection, else_expr)?
+                    }
+                    None => Some(SqlType::Null),
+                };
+                let Some(else_type) = else_type else {
+                    return Ok(None);
+                };
+                self.infer_case_result_type(&result_types, &else_type)
             }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_grouped_output_expr_type(projection, expr)?
@@ -1373,6 +1456,40 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_nullif_result_type(&left_type, &right_type)
             }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                let operand_type = match operand {
+                    Some(operand) => match self.infer_policy_expr_type(table, operand)? {
+                        Some(data_type) => Some(data_type),
+                        None => return Ok(None),
+                    },
+                    None => None,
+                };
+                let mut result_types = Vec::with_capacity(whens.len());
+                for arm in whens {
+                    let Some(condition_type) =
+                        self.infer_policy_expr_type(table, &arm.condition)?
+                    else {
+                        return Ok(None);
+                    };
+                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
+                    let Some(result_type) = self.infer_policy_expr_type(table, &arm.result)? else {
+                        return Ok(None);
+                    };
+                    result_types.push(result_type);
+                }
+                let else_type = match else_expr {
+                    Some(else_expr) => self.infer_policy_expr_type(table, else_expr)?,
+                    None => Some(SqlType::Null),
+                };
+                let Some(else_type) = else_type else {
+                    return Ok(None);
+                };
+                self.infer_case_result_type(&result_types, &else_type)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(data_type.clone()));
@@ -1602,6 +1719,38 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_nullif_result_type(&left_type, &right_type)
             }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                let operand_type = match operand {
+                    Some(operand) => match self.infer_expr_type(table, operand)? {
+                        Some(data_type) => Some(data_type),
+                        None => return Ok(None),
+                    },
+                    None => None,
+                };
+                let mut result_types = Vec::with_capacity(whens.len());
+                for arm in whens {
+                    let Some(condition_type) = self.infer_expr_type(table, &arm.condition)? else {
+                        return Ok(None);
+                    };
+                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
+                    let Some(result_type) = self.infer_expr_type(table, &arm.result)? else {
+                        return Ok(None);
+                    };
+                    result_types.push(result_type);
+                }
+                let else_type = match else_expr {
+                    Some(else_expr) => self.infer_expr_type(table, else_expr)?,
+                    None => Some(SqlType::Null),
+                };
+                let Some(else_type) = else_type else {
+                    return Ok(None);
+                };
+                self.infer_case_result_type(&result_types, &else_type)
+            }
             Expr::Cast { expr, data_type } => {
                 let Some(source_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -1792,6 +1941,69 @@ impl<'a> Binder<'a> {
                 format!("{name} requires matching operand types"),
             ))
         }
+    }
+
+    fn infer_case_condition_type(
+        &self,
+        operand_type: Option<&SqlType>,
+        condition_type: &SqlType,
+    ) -> Result<()> {
+        match operand_type {
+            Some(operand_type) => {
+                if matches!(operand_type, SqlType::Null)
+                    || matches!(condition_type, SqlType::Null)
+                    || operand_type == condition_type
+                {
+                    Ok(())
+                } else {
+                    Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "CASE operand and WHEN expressions must have matching types",
+                    ))
+                }
+            }
+            None => {
+                if matches!(condition_type, SqlType::Bool | SqlType::Null) {
+                    Ok(())
+                } else {
+                    Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("CASE WHEN condition must be BOOL, got {condition_type:?}"),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn infer_case_result_type(
+        &self,
+        result_types: &[SqlType],
+        else_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if result_types.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "CASE requires at least one WHEN arm",
+            ));
+        }
+
+        let mut result_type = None;
+        for value_type in result_types.iter().chain(std::iter::once(else_type)) {
+            if value_type == &SqlType::Null {
+                continue;
+            }
+            match &result_type {
+                Some(existing) if existing != value_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "CASE result expressions must have matching types",
+                    ));
+                }
+                Some(_) => {}
+                None => result_type = Some(value_type.clone()),
+            }
+        }
+        Ok(Some(result_type.unwrap_or(SqlType::Null)))
     }
 
     fn infer_between_result_type(
