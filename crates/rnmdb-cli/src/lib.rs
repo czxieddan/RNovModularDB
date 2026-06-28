@@ -119,7 +119,7 @@ impl LocalSession {
                     .grant_table_privilege(*role_id, *relation_id, *privilege)?;
                 Ok(CommandOutput::SchemaChanged)
             }
-            BoundStatement::Select(_) => {
+            statement if is_read_query(statement) => {
                 let plan = self.optimize_read_plan(self.planner.plan(&bound)?);
                 self.executor
                     .execute_parallel(&plan, self.execution.parallel_query())
@@ -194,6 +194,17 @@ impl LocalSession {
         self.optimizer
             .optimize_parallel(plan, self.execution.worker_threads())
     }
+}
+
+fn is_read_query(statement: &BoundStatement) -> bool {
+    matches!(
+        statement,
+        BoundStatement::Select(_)
+            | BoundStatement::Union(_)
+            | BoundStatement::Intersect(_)
+            | BoundStatement::Except(_)
+            | BoundStatement::Query(_)
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

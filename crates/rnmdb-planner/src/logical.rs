@@ -384,6 +384,15 @@ impl LogicalPlanner {
                 left: Box::new(self.plan(&except.left)?),
                 right: Box::new(self.plan(&except.right)?),
             }),
+            BoundStatement::Query(query) => {
+                let plan = self.plan(&query.input)?;
+                Ok(apply_query_tail(
+                    plan,
+                    &query.order_by,
+                    query.limit,
+                    query.offset,
+                ))
+            }
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -723,6 +732,33 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn apply_query_tail(
+    mut plan: LogicalPlan,
+    order_by: &[OrderByExpr],
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> LogicalPlan {
+    if !order_by.is_empty() {
+        plan = LogicalPlan::Sort {
+            keys: order_by.to_vec(),
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = offset {
+        plan = LogicalPlan::Offset {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = limit {
+        plan = LogicalPlan::Limit {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    plan
 }
 
 fn sql_type_list(types: &[SqlType]) -> String {

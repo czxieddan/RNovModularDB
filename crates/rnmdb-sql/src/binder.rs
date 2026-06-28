@@ -6,7 +6,7 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIntersect,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIntersect, BoundQuery,
     BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
     CaseWhen, Expr, Ident, ObjectName, OrderByExpr, SelectItem, Statement,
 };
@@ -119,6 +119,12 @@ impl<'a> Binder<'a> {
                 self.bind_intersect(*all, left, right, role_id)
             }
             Statement::Except { all, left, right } => self.bind_except(*all, left, right, role_id),
+            Statement::Query {
+                input,
+                order_by,
+                limit,
+                offset,
+            } => self.bind_query(input, order_by, *limit, *offset, role_id),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -141,6 +147,26 @@ impl<'a> Binder<'a> {
             name: name.clone(),
             if_exists,
         })
+    }
+
+    fn bind_query(
+        &self,
+        input: &Statement,
+        order_by: &[OrderByExpr],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        let input = self.bind_for_role(input, role_id)?;
+        let columns = query_output_columns(&input)?.to_vec();
+        let order_by = self.bind_query_output_order_by(&columns, order_by)?;
+        Ok(BoundStatement::Query(BoundQuery {
+            columns,
+            input: Box::new(input),
+            order_by,
+            limit,
+            offset,
+        }))
     }
 
     fn bind_create_operator(
@@ -610,6 +636,74 @@ impl<'a> Binder<'a> {
             expr,
             direction: order_by.direction,
         })
+    }
+
+    fn bind_query_output_order_by(
+        &self,
+        columns: &[BoundColumn],
+        order_by: &[OrderByExpr],
+    ) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| self.bind_query_output_sort_expr(columns, order_by))
+            .collect()
+    }
+
+    fn bind_query_output_sort_expr(
+        &self,
+        columns: &[BoundColumn],
+        order_by: &OrderByExpr,
+    ) -> Result<OrderByExpr> {
+        let column = match &order_by.expr {
+            Expr::Integer(value) => self.query_output_ordinal_column(columns, *value, "ORDER BY")?,
+            Expr::Identifier(identifier) => columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "ORDER BY for set operation queries must reference an output column: {}",
+                            identifier.as_str()
+                        ),
+                    )
+                })?,
+            _ => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "ORDER BY for set operation queries must reference an output column or position",
+                ));
+            }
+        };
+        self.ensure_sortable_type(&column.data_type)?;
+        Ok(OrderByExpr {
+            expr: Expr::Identifier(Ident::new(column.name.as_str())),
+            direction: order_by.direction,
+        })
+    }
+
+    fn query_output_ordinal_column<'b>(
+        &self,
+        columns: &'b [BoundColumn],
+        value: i64,
+        clause_name: &str,
+    ) -> Result<&'b BoundColumn> {
+        let ordinal = usize::try_from(value).map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{clause_name} position must be positive: {value}"),
+            )
+        })?;
+        if ordinal == 0 || ordinal > columns.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{clause_name} position {ordinal} is out of range for {} query output columns",
+                    columns.len()
+                ),
+            ));
+        }
+        Ok(&columns[ordinal - 1])
     }
 
     fn bind_grouped_sort_expr(
@@ -2359,6 +2453,7 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
         BoundStatement::Union(union) => Ok(&union.columns),
         BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
         BoundStatement::Except(except) => Ok(&except.columns),
+        BoundStatement::Query(query) => Ok(&query.columns),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "set operation operands must be SELECT queries",

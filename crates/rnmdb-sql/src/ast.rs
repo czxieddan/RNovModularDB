@@ -529,6 +529,12 @@ pub enum Statement {
         left: Box<Statement>,
         right: Box<Statement>,
     },
+    Query {
+        input: Box<Statement>,
+        order_by: Vec<OrderByExpr>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     Transaction {
         action: TransactionAction,
     },
@@ -585,6 +591,15 @@ pub struct BoundExcept {
     pub columns: Vec<BoundColumn>,
     pub left: Box<BoundStatement>,
     pub right: Box<BoundStatement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundQuery {
+    pub columns: Vec<BoundColumn>,
+    pub input: Box<BoundStatement>,
+    pub order_by: Vec<OrderByExpr>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -672,6 +687,7 @@ pub enum BoundStatement {
     Union(BoundUnion),
     Intersect(BoundIntersect),
     Except(BoundExcept),
+    Query(BoundQuery),
     Transaction {
         action: TransactionAction,
     },

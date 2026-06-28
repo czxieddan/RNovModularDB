@@ -32,6 +32,19 @@ struct Parser {
     position: usize,
 }
 
+#[derive(Default)]
+struct QueryTail {
+    order_by: Vec<OrderByExpr>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+impl QueryTail {
+    fn is_empty(&self) -> bool {
+        self.order_by.is_empty() && self.limit.is_none() && self.offset.is_none()
+    }
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -296,7 +309,7 @@ impl Parser {
         Ok(Statement::Transaction { action })
     }
 
-    fn parse_select(&mut self) -> Result<Statement> {
+    fn parse_select_core(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
         let distinct = self.consume_if(&TokenKind::Distinct);
         if !distinct {
@@ -338,27 +351,6 @@ impl Parser {
         } else {
             None
         };
-        let order_by = if self.consume_if(&TokenKind::Order) {
-            self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_list()?
-        } else {
-            Vec::new()
-        };
-        let limit = if self.consume_if(&TokenKind::Limit) {
-            self.parse_limit_count()?
-        } else {
-            None
-        };
-        let offset = if self.consume_if(&TokenKind::Offset) {
-            Some(self.parse_offset_count()?)
-        } else {
-            None
-        };
-        let fetch = self.parse_fetch_count()?;
-        if limit.is_some() && fetch.is_some() {
-            return Err(self.error("LIMIT and FETCH cannot be used together"));
-        }
-        let limit = limit.or(fetch);
         Ok(Statement::Select {
             distinct,
             projection,
@@ -366,44 +358,49 @@ impl Parser {
             selection,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
         })
     }
 
     fn parse_query(&mut self) -> Result<Statement> {
-        let mut statement = self.parse_select()?;
+        let mut statement = self.parse_select_core()?;
+        let mut set_operation = false;
         loop {
             if self.consume_if(&TokenKind::Union) {
                 let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select()?;
+                let right = self.parse_select_core()?;
                 statement = Statement::Union {
                     all,
                     left: Box::new(statement),
                     right: Box::new(right),
                 };
+                set_operation = true;
             } else if self.consume_if(&TokenKind::Intersect) {
                 let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select()?;
+                let right = self.parse_select_core()?;
                 statement = Statement::Intersect {
                     all,
                     left: Box::new(statement),
                     right: Box::new(right),
                 };
+                set_operation = true;
             } else if self.consume_if(&TokenKind::Except) {
                 let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select()?;
+                let right = self.parse_select_core()?;
                 statement = Statement::Except {
                     all,
                     left: Box::new(statement),
                     right: Box::new(right),
                 };
+                set_operation = true;
             } else {
                 break;
             }
         }
-        Ok(statement)
+        let tail = self.parse_query_tail()?;
+        Ok(apply_query_tail(statement, tail, set_operation))
     }
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
@@ -966,6 +963,34 @@ impl Parser {
         Ok(expressions)
     }
 
+    fn parse_query_tail(&mut self) -> Result<QueryTail> {
+        let order_by = if self.consume_if(&TokenKind::Order) {
+            self.expect_keyword(TokenKind::By)?;
+            self.parse_order_by_list()?
+        } else {
+            Vec::new()
+        };
+        let limit = if self.consume_if(&TokenKind::Limit) {
+            self.parse_limit_count()?
+        } else {
+            None
+        };
+        let offset = if self.consume_if(&TokenKind::Offset) {
+            Some(self.parse_offset_count()?)
+        } else {
+            None
+        };
+        let fetch = self.parse_fetch_count()?;
+        if limit.is_some() && fetch.is_some() {
+            return Err(self.error("LIMIT and FETCH cannot be used together"));
+        }
+        Ok(QueryTail {
+            order_by,
+            limit: limit.or(fetch),
+            offset,
+        })
+    }
+
     fn parse_limit_count(&mut self) -> Result<Option<usize>> {
         if self.consume_if(&TokenKind::All) {
             Ok(None)
@@ -1223,6 +1248,47 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::LeftBracket, TokenKind::LeftBracket)
             | (TokenKind::RightBracket, TokenKind::RightBracket)
     )
+}
+
+fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) -> Statement {
+    if tail.is_empty() {
+        return statement;
+    }
+    if set_operation {
+        return Statement::Query {
+            input: Box::new(statement),
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        };
+    }
+    match statement {
+        Statement::Select {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            ..
+        } => Statement::Select {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
+        other => Statement::Query {
+            input: Box::new(other),
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
+    }
 }
 
 fn sort_direction_with_nulls(direction: SortDirection, nulls_first: bool) -> SortDirection {
