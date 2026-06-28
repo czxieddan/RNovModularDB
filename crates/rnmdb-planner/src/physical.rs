@@ -1,0 +1,446 @@
+use crate::{
+    cost::{CostModel, PlanCost},
+    logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
+};
+use rnmdb_common::ids::RelationId;
+use rnmdb_sql::ast::{Expr, OrderByExpr};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PhysicalPlan {
+    SeqScan {
+        relation_id: RelationId,
+        table: String,
+        cost: PlanCost,
+    },
+    TextSearchScan {
+        relation_id: RelationId,
+        table: String,
+        column: String,
+        query: String,
+        cost: PlanCost,
+    },
+    Filter {
+        predicate: Expr,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Projection {
+        items: Vec<ProjectionItem>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Aggregate {
+        items: Vec<AggregateItem>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    GroupedAggregate {
+        group_by: Vec<Expr>,
+        items: Vec<GroupedAggregateItem>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Distinct {
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Sort {
+        keys: Vec<OrderByExpr>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Limit {
+        count: usize,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Offset {
+        count: usize,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    SetOperation {
+        kind: SetOperationKind,
+        all: bool,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Parallel {
+        hint: ParallelPlanHint,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Mutation {
+        kind: MutationKind,
+        table: String,
+        cost: PlanCost,
+    },
+    Ddl {
+        description: String,
+        cost: PlanCost,
+    },
+    Transaction {
+        action: String,
+        cost: PlanCost,
+    },
+    Explain {
+        analyze: bool,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOperationKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhysicalPlanner {
+    cost_model: CostModel,
+}
+
+impl PhysicalPlanner {
+    pub fn new(cost_model: CostModel) -> Self {
+        Self { cost_model }
+    }
+
+    pub fn plan(&self, logical: &LogicalPlan) -> PhysicalPlan {
+        let cost = self.cost_model.estimate(logical);
+        match logical {
+            LogicalPlan::Scan { relation_id, table } => PhysicalPlan::SeqScan {
+                relation_id: *relation_id,
+                table: table.clone(),
+                cost,
+            },
+            LogicalPlan::TextSearch {
+                relation_id,
+                table,
+                column,
+                query,
+                ..
+            } => PhysicalPlan::TextSearchScan {
+                relation_id: *relation_id,
+                table: table.clone(),
+                column: column.clone(),
+                query: query.clone(),
+                cost,
+            },
+            LogicalPlan::Filter { predicate, input } => PhysicalPlan::Filter {
+                predicate: predicate.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Project { items, input } => PhysicalPlan::Projection {
+                items: items.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Aggregate { items, input } => PhysicalPlan::Aggregate {
+                items: items.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::GroupedAggregate {
+                group_by,
+                items,
+                input,
+            } => PhysicalPlan::GroupedAggregate {
+                group_by: group_by.clone(),
+                items: items.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Distinct { input } => PhysicalPlan::Distinct {
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Sort { keys, input } => PhysicalPlan::Sort {
+                keys: keys.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Limit { count, input } => PhysicalPlan::Limit {
+                count: *count,
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Offset { count, input } => PhysicalPlan::Offset {
+                count: *count,
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Union { all, left, right } => PhysicalPlan::SetOperation {
+                kind: SetOperationKind::Union,
+                all: *all,
+                left: Box::new(self.plan(left)),
+                right: Box::new(self.plan(right)),
+                cost,
+            },
+            LogicalPlan::Intersect { all, left, right } => PhysicalPlan::SetOperation {
+                kind: SetOperationKind::Intersect,
+                all: *all,
+                left: Box::new(self.plan(left)),
+                right: Box::new(self.plan(right)),
+                cost,
+            },
+            LogicalPlan::Except { all, left, right } => PhysicalPlan::SetOperation {
+                kind: SetOperationKind::Except,
+                all: *all,
+                left: Box::new(self.plan(left)),
+                right: Box::new(self.plan(right)),
+                cost,
+            },
+            LogicalPlan::Parallel { hint, input } => PhysicalPlan::Parallel {
+                hint: hint.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            LogicalPlan::Insert { table, .. } => PhysicalPlan::Mutation {
+                kind: MutationKind::Insert,
+                table: table.clone(),
+                cost,
+            },
+            LogicalPlan::Update { table, .. } => PhysicalPlan::Mutation {
+                kind: MutationKind::Update,
+                table: table.clone(),
+                cost,
+            },
+            LogicalPlan::Delete { table, .. } => PhysicalPlan::Mutation {
+                kind: MutationKind::Delete,
+                table: table.clone(),
+                cost,
+            },
+            LogicalPlan::Transaction { action } => PhysicalPlan::Transaction {
+                action: action.clone(),
+                cost,
+            },
+            LogicalPlan::Explain { analyze, input } => PhysicalPlan::Explain {
+                analyze: *analyze,
+                input: Box::new(self.plan(input)),
+                cost,
+            },
+            other => PhysicalPlan::Ddl {
+                description: ddl_description(other),
+                cost,
+            },
+        }
+    }
+}
+
+impl PhysicalPlan {
+    pub fn cost(&self) -> PlanCost {
+        match self {
+            PhysicalPlan::SeqScan { cost, .. }
+            | PhysicalPlan::TextSearchScan { cost, .. }
+            | PhysicalPlan::Filter { cost, .. }
+            | PhysicalPlan::Projection { cost, .. }
+            | PhysicalPlan::Aggregate { cost, .. }
+            | PhysicalPlan::GroupedAggregate { cost, .. }
+            | PhysicalPlan::Distinct { cost, .. }
+            | PhysicalPlan::Sort { cost, .. }
+            | PhysicalPlan::Limit { cost, .. }
+            | PhysicalPlan::Offset { cost, .. }
+            | PhysicalPlan::SetOperation { cost, .. }
+            | PhysicalPlan::Parallel { cost, .. }
+            | PhysicalPlan::Mutation { cost, .. }
+            | PhysicalPlan::Ddl { cost, .. }
+            | PhysicalPlan::Transaction { cost, .. }
+            | PhysicalPlan::Explain { cost, .. } => *cost,
+        }
+    }
+
+    pub fn explain(&self) -> String {
+        let mut out = String::new();
+        write_physical_plan(self, 0, &mut out);
+        out
+    }
+}
+
+fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
+    let prefix = "  ".repeat(indent);
+    match plan {
+        PhysicalPlan::SeqScan { table, cost, .. } => {
+            out.push_str(&format!(
+                "{prefix}SeqScan table={table}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::TextSearchScan {
+            table,
+            column,
+            query,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}TextSearchScan table={table} column={column} query='{query}'{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::Filter {
+            predicate,
+            input,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}Filter predicate={predicate}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Projection { items, input, cost } => {
+            let columns = items
+                .iter()
+                .map(|item| format!("{} := {}", item.name, item.expr))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{prefix}Projection {columns}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Aggregate { items, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Aggregate items={}{}\n",
+                items.len(),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::GroupedAggregate {
+            group_by,
+            items,
+            input,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}GroupedAggregate groups={} items={}{}\n",
+                group_by.len(),
+                items.len(),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Distinct { input, cost } => {
+            out.push_str(&format!("{prefix}Distinct{}\n", cost_suffix(*cost)));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Sort { keys, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Sort keys={}{}\n",
+                keys.len(),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Limit { count, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Limit count={count}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Offset { count, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Offset count={count}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::SetOperation {
+            kind,
+            all,
+            left,
+            right,
+            cost,
+        } => {
+            let mode = if *all { "ALL" } else { "DISTINCT" };
+            out.push_str(&format!("{prefix}{kind:?} {mode}{}\n", cost_suffix(*cost)));
+            write_physical_plan(left, indent + 1, out);
+            write_physical_plan(right, indent + 1, out);
+        }
+        PhysicalPlan::Parallel { hint, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Parallel workers={} reason={}{}\n",
+                hint.workers,
+                hint.reason,
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Mutation { kind, table, cost } => {
+            out.push_str(&format!(
+                "{prefix}{kind:?} table={table}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::Ddl { description, cost } => {
+            out.push_str(&format!(
+                "{prefix}Ddl {description}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::Transaction { action, cost } => {
+            out.push_str(&format!(
+                "{prefix}Transaction action={action}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::Explain {
+            analyze,
+            input,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}Explain analyze={analyze}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+    }
+}
+
+fn cost_suffix(cost: PlanCost) -> String {
+    format!(
+        " rows={:.0} width={:.0} cost={:.2}",
+        cost.rows,
+        cost.row_width_bytes,
+        cost.total()
+    )
+}
+
+fn ddl_description(plan: &LogicalPlan) -> String {
+    match plan {
+        LogicalPlan::CreateTable { table, .. } => format!("CreateTable table={table}"),
+        LogicalPlan::CreateIndex { name, .. } => format!("CreateIndex name={name}"),
+        LogicalPlan::AlterTableAddColumn { table, column, .. } => {
+            format!("AlterTableAddColumn table={table} column={}", column.name)
+        }
+        LogicalPlan::DropTable { table, .. } => format!("DropTable table={table}"),
+        LogicalPlan::DropIndex { name, .. } => format!("DropIndex name={name}"),
+        LogicalPlan::DropFunction { name, .. } => format!("DropFunction name={name}"),
+        LogicalPlan::DropOperator { symbol, .. } => format!("DropOperator symbol={symbol}"),
+        LogicalPlan::DropRole { name, .. } => format!("DropRole name={name}"),
+        LogicalPlan::DropPolicy { name, .. } => format!("DropPolicy name={name}"),
+        LogicalPlan::CreateFunction { name, .. } => format!("CreateFunction name={name}"),
+        LogicalPlan::CreateOperator { symbol, .. } => format!("CreateOperator symbol={symbol}"),
+        LogicalPlan::CreateRole { name, .. } => format!("CreateRole name={name}"),
+        LogicalPlan::CreatePolicy { name, .. } => format!("CreatePolicy name={name}"),
+        LogicalPlan::GrantTablePrivilege { relation_id, .. } => {
+            format!("GrantTablePrivilege relation={relation_id}")
+        }
+        _ => "Unsupported".to_string(),
+    }
+}
