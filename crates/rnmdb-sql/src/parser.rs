@@ -1,4 +1,4 @@
-use rnmdb_catalog::Privilege;
+use rnmdb_catalog::{IndexMethod, Privilege};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlType;
 
@@ -169,6 +169,7 @@ impl Parser {
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_object_name()?;
+        let method = self.parse_optional_index_method()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let columns = self.parse_ident_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
@@ -177,9 +178,22 @@ impl Parser {
             name,
             table,
             columns,
+            method,
             unique,
             if_not_exists,
         })
+    }
+
+    fn parse_optional_index_method(&mut self) -> Result<IndexMethod> {
+        if !self.consume_if(&TokenKind::Using) {
+            return Ok(IndexMethod::BTree);
+        }
+        let method = self.parse_ident()?;
+        match method.as_str() {
+            "btree" => Ok(IndexMethod::BTree),
+            "hash" => Ok(IndexMethod::Hash),
+            unknown => Err(self.error(format!("unsupported index method {unknown}"))),
+        }
     }
 
     fn parse_alter(&mut self) -> Result<Statement> {

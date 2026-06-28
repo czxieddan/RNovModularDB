@@ -262,6 +262,7 @@ version = "0.1.0"
 name = "rnmdb-executor"
 version = "0.1.0"
 dependencies = [
+ "rnmdb-catalog",
  "rnmdb-common",
  "rnmdb-fts",
  "rnmdb-index",

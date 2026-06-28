@@ -4,6 +4,7 @@ use crate::{
     cost::{CostModel, PlanCost},
     logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
 };
+use rnmdb_catalog::IndexMethod;
 use rnmdb_common::ids::RelationId;
 use rnmdb_sql::ast::{ExplainFormat, Expr, OrderByExpr};
 
@@ -146,10 +147,11 @@ impl IndexCatalog {
 
     fn best_for_column(&self, relation_id: RelationId, column: &str) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
-            index
-                .columns
-                .first()
-                .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
+            index.supports_equality()
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
         })
     }
 
@@ -159,7 +161,8 @@ impl IndexCatalog {
         column: &str,
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
-            index.columns.len() == 1
+            index.supports_range()
+                && index.columns.len() == 1
                 && index
                     .columns
                     .first()
@@ -173,6 +176,7 @@ pub struct IndexAccessPath {
     name: String,
     relation_id: RelationId,
     columns: Vec<String>,
+    method: IndexMethod,
     unique: bool,
 }
 
@@ -181,14 +185,24 @@ impl IndexAccessPath {
         name: impl Into<String>,
         relation_id: RelationId,
         columns: Vec<String>,
+        method: IndexMethod,
         unique: bool,
     ) -> Self {
         Self {
             name: name.into(),
             relation_id,
             columns,
+            method,
             unique,
         }
+    }
+
+    fn supports_equality(&self) -> bool {
+        matches!(self.method, IndexMethod::BTree | IndexMethod::Hash)
+    }
+
+    fn supports_range(&self) -> bool {
+        self.method == IndexMethod::BTree
     }
 }
 

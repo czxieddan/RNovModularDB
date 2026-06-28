@@ -1,6 +1,6 @@
 use std::fmt;
 
-use rnmdb_catalog::{Column, OperatorSignature, Privilege};
+use rnmdb_catalog::{Column, IndexMethod, OperatorSignature, Privilege};
 use rnmdb_common::ids::{RelationId, RoleId};
 use rnmdb_types::SqlType;
 
@@ -468,6 +468,7 @@ pub enum Statement {
         name: ObjectName,
         table: ObjectName,
         columns: Vec<Ident>,
+        method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
     },
@@ -697,6 +698,7 @@ pub enum BoundStatement {
         relation_id: RelationId,
         table: ObjectName,
         columns: Vec<BoundColumn>,
+        method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
     },

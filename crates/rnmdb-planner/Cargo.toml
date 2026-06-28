@@ -6,13 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rnmdb-catalog.workspace = true
 rnmdb-common.workspace = true
 rnmdb-fts.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-types.workspace = true
-
-[dev-dependencies]
-rnmdb-catalog.workspace = true
 
 [lib]
 path = "src/lib.rs"

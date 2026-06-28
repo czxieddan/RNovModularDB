@@ -9,12 +9,13 @@ use std::{
     thread,
 };
 
+use rnmdb_catalog::IndexMethod;
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
     CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, MemoryBTreeIndex,
-    MemoryCompositeIndex,
+    MemoryCompositeIndex, MemoryHashIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -241,14 +242,20 @@ impl MemoryTable {
         Ok(())
     }
 
-    fn create_index(&mut self, name: &str, columns: &[String], unique: bool) -> Result<()> {
+    fn create_index(
+        &mut self,
+        name: &str,
+        columns: &[String],
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<()> {
         if self.indexes.contains_key(name) {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("index already exists: {name}"),
             ));
         }
-        let mut index = MemoryTableIndex::new(name, &self.columns, columns, unique)?;
+        let mut index = MemoryTableIndex::new(name, &self.columns, columns, method, unique)?;
         for (slot, row) in self.rows.iter().enumerate() {
             index.insert_row(row, pointer_for_slot(slot)?)?;
         }
@@ -297,6 +304,10 @@ enum MemoryTableIndex {
         column_index: usize,
         index: MemoryBTreeIndex,
     },
+    Hash {
+        column_index: usize,
+        index: MemoryHashIndex,
+    },
     Composite {
         column_indexes: Vec<usize>,
         index: MemoryCompositeIndex,
@@ -308,6 +319,7 @@ impl MemoryTableIndex {
         name: &str,
         table_columns: &[ColumnSchema],
         columns: &[String],
+        method: IndexMethod,
         unique: bool,
     ) -> Result<Self> {
         if columns.is_empty() {
@@ -321,15 +333,36 @@ impl MemoryTableIndex {
             .map(|column| column_index(table_columns, column))
             .collect::<Result<Vec<_>>>()?;
         if column_indexes.len() == 1 {
-            let index = if unique {
-                MemoryBTreeIndex::unique(name)
-            } else {
-                MemoryBTreeIndex::non_unique(name)
+            return match method {
+                IndexMethod::BTree => {
+                    let index = if unique {
+                        MemoryBTreeIndex::unique(name)
+                    } else {
+                        MemoryBTreeIndex::non_unique(name)
+                    };
+                    Ok(Self::BTree {
+                        column_index: column_indexes[0],
+                        index,
+                    })
+                }
+                IndexMethod::Hash => {
+                    let index = if unique {
+                        MemoryHashIndex::unique(name)
+                    } else {
+                        MemoryHashIndex::non_unique(name)
+                    };
+                    Ok(Self::Hash {
+                        column_index: column_indexes[0],
+                        index,
+                    })
+                }
             };
-            return Ok(Self::BTree {
-                column_index: column_indexes[0],
-                index,
-            });
+        }
+        if method == IndexMethod::Hash {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "hash indexes support exactly one column",
+            ));
         }
 
         let index = if unique {
@@ -352,6 +385,15 @@ impl MemoryTableIndex {
                     MemoryBTreeIndex::unique(name)
                 } else {
                     MemoryBTreeIndex::non_unique(name)
+                };
+            }
+            Self::Hash { index, .. } => {
+                let name = index.name().to_string();
+                let unique = index.is_unique();
+                *index = if unique {
+                    MemoryHashIndex::unique(name)
+                } else {
+                    MemoryHashIndex::non_unique(name)
                 };
             }
             Self::Composite { index, .. } => {
@@ -378,6 +420,16 @@ impl MemoryTableIndex {
                 };
                 index.insert(key, pointer)
             }
+            Self::Hash {
+                column_index,
+                index,
+                ..
+            } => {
+                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                index.insert(key, pointer)
+            }
             Self::Composite {
                 column_indexes,
                 index,
@@ -394,6 +446,7 @@ impl MemoryTableIndex {
     fn supports_leading_column(&self, column: usize) -> bool {
         match self {
             Self::BTree { column_index, .. } => *column_index == column,
+            Self::Hash { column_index, .. } => *column_index == column,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
     }
@@ -405,6 +458,11 @@ impl MemoryTableIndex {
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
         match self {
             Self::BTree {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => Ok(index.point_lookup(key)),
+            Self::Hash {
                 column_index,
                 index,
                 ..
@@ -927,11 +985,12 @@ impl MemoryExecutor {
                 name,
                 table,
                 columns,
+                method,
                 unique,
                 if_not_exists,
                 ..
             } => {
-                self.create_index(name, table, columns, *unique, *if_not_exists)?;
+                self.create_index(name, table, columns, *method, *unique, *if_not_exists)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropIndex { name, if_exists } => {
@@ -1041,6 +1100,7 @@ impl MemoryExecutor {
         name: &str,
         table: &str,
         columns: &[String],
+        method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
     ) -> Result<()> {
@@ -1050,7 +1110,7 @@ impl MemoryExecutor {
         if table.indexes.contains_key(name) && if_not_exists {
             return Ok(());
         }
-        table.create_index(name, columns, unique)
+        table.create_index(name, columns, method, unique)
     }
 
     fn drop_index(&mut self, name: &str) -> bool {

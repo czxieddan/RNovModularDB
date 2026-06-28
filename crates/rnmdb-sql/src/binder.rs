@@ -1,4 +1,4 @@
-use rnmdb_catalog::{Catalog, OperatorSignature, Privilege, Table};
+use rnmdb_catalog::{Catalog, IndexMethod, OperatorSignature, Privilege, Table};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{RelationId, RoleId},
@@ -36,9 +36,10 @@ impl<'a> Binder<'a> {
                 name,
                 table,
                 columns,
+                method,
                 unique,
                 if_not_exists,
-            } => self.bind_create_index(name, table, columns, *unique, *if_not_exists),
+            } => self.bind_create_index(name, table, columns, *method, *unique, *if_not_exists),
             Statement::AlterTableAddColumn {
                 table,
                 column,
@@ -350,6 +351,7 @@ impl<'a> Binder<'a> {
         name: &ObjectName,
         table: &ObjectName,
         columns: &[Ident],
+        method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
     ) -> Result<BoundStatement> {
@@ -376,6 +378,7 @@ impl<'a> Binder<'a> {
             relation_id: resolved.relation_id(),
             table: table.clone(),
             columns: bound_columns,
+            method,
             unique,
             if_not_exists,
         })

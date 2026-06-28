@@ -86,6 +86,7 @@ impl LocalSession {
                 name,
                 relation_id,
                 columns,
+                method,
                 unique,
                 if_not_exists,
                 ..
@@ -96,6 +97,7 @@ impl LocalSession {
                     name,
                     *relation_id,
                     columns,
+                    *method,
                     *unique,
                     *if_not_exists,
                 )?;
@@ -261,6 +263,7 @@ impl LocalSession {
         name: &ObjectName,
         relation_id: RelationId,
         columns: &[rnmdb_sql::ast::BoundColumn],
+        method: rnmdb_catalog::IndexMethod,
         unique: bool,
         if_not_exists: bool,
     ) -> Result<()> {
@@ -272,8 +275,14 @@ impl LocalSession {
             .iter()
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        self.catalog
-            .create_index(schema, name.object(), relation_id, columns, unique)?;
+        self.catalog.create_index_with_method(
+            schema,
+            name.object(),
+            relation_id,
+            columns,
+            method,
+            unique,
+        )?;
         Ok(())
     }
 
@@ -461,6 +470,7 @@ impl LocalSession {
                 format!("{}.{}", index.schema_name(), index.name()),
                 index.relation_id(),
                 index.columns().to_vec(),
+                index.method(),
                 index.unique(),
             ));
         }

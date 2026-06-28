@@ -109,6 +109,57 @@ fn cloned_bound(bound: Bound<&IndexKey>) -> Bound<IndexKey> {
 }
 
 #[derive(Clone, Debug)]
+pub struct MemoryHashIndex {
+    name: String,
+    unique: bool,
+    entries: BTreeMap<IndexKey, Vec<IndexPointer>>,
+}
+
+impl MemoryHashIndex {
+    pub fn unique(name: impl Into<String>) -> Self {
+        Self::new(name, true)
+    }
+
+    pub fn non_unique(name: impl Into<String>) -> Self {
+        Self::new(name, false)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn is_unique(&self) -> bool {
+        self.unique
+    }
+
+    pub fn insert(&mut self, key: IndexKey, pointer: IndexPointer) -> Result<()> {
+        let pointers = self.entries.entry(key).or_default();
+        if self.unique && !pointers.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unique hash index violation: {}", self.name),
+            ));
+        }
+        if !pointers.contains(&pointer) {
+            pointers.push(pointer);
+        }
+        Ok(())
+    }
+
+    pub fn point_lookup(&self, key: &IndexKey) -> Vec<IndexPointer> {
+        self.entries.get(key).cloned().unwrap_or_default()
+    }
+
+    fn new(name: impl Into<String>, unique: bool) -> Self {
+        Self {
+            name: name.into(),
+            unique,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct InvertedTextIndex {
     name: String,
     terms: BTreeMap<String, BTreeSet<IndexPointer>>,

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rnmdb-catalog.workspace = true
 rnmdb-common.workspace = true
 rnmdb-fts.workspace = true
 rnmdb-index.workspace = true

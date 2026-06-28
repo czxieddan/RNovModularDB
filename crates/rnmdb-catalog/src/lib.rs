@@ -51,6 +51,21 @@ impl Column {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexMethod {
+    BTree,
+    Hash,
+}
+
+impl IndexMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BTree => "btree",
+            Self::Hash => "hash",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Table {
     relation_id: RelationId,
@@ -430,6 +445,25 @@ impl Catalog {
         columns: Vec<String>,
         unique: bool,
     ) -> Result<Index> {
+        self.create_index_with_method(
+            schema_name,
+            index_name,
+            relation_id,
+            columns,
+            IndexMethod::BTree,
+            unique,
+        )
+    }
+
+    pub fn create_index_with_method(
+        &mut self,
+        schema_name: &str,
+        index_name: impl Into<String>,
+        relation_id: RelationId,
+        columns: Vec<String>,
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<Index> {
         let index_name = index_name.into();
         validate_identifier("index", &index_name)?;
         if !self.schemas.contains_key(schema_name) {
@@ -454,6 +488,7 @@ impl Catalog {
             relation_id,
             table_name: table.name.clone(),
             columns,
+            method,
             unique,
         };
         self.indexes.push(index.clone());
@@ -704,6 +739,7 @@ pub struct Index {
     relation_id: RelationId,
     table_name: String,
     columns: Vec<String>,
+    method: IndexMethod,
     unique: bool,
 }
 
@@ -726,6 +762,10 @@ impl Index {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    pub fn method(&self) -> IndexMethod {
+        self.method
     }
 
     pub fn unique(&self) -> bool {
@@ -870,7 +910,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 2;
+    const VERSION: u16 = 3;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -930,6 +970,7 @@ impl CatalogCodec {
             write_u64(&mut out, index.relation_id.get());
             write_string(&mut out, &index.table_name)?;
             out.push(u8::from(index.unique));
+            out.push(encode_index_method(index.method));
             write_u32(&mut out, index.columns.len() as u32);
             for column in &index.columns {
                 write_string(&mut out, column)?;
@@ -1082,6 +1123,7 @@ impl CatalogCodec {
             let relation_id = RelationId::new(reader.read_u64("index relation id")?);
             let table_name = reader.read_string("index table")?;
             let unique = reader.read_bool("index unique")?;
+            let method = decode_index_method(reader.read_u8("index method")?)?;
             let column_count = reader.read_u32("index column count")? as usize;
             let mut columns = Vec::with_capacity(column_count);
             for _ in 0..column_count {
@@ -1093,6 +1135,7 @@ impl CatalogCodec {
                 relation_id,
                 table_name,
                 columns,
+                method,
                 unique,
             });
         }
@@ -1196,6 +1239,24 @@ fn decode_sql_type(reader: &mut CatalogReader<'_>) -> Result<SqlType> {
         unknown => Err(RnovError::new(
             ErrorKind::Corruption,
             format!("unknown sql type tag {unknown}"),
+        )),
+    }
+}
+
+fn encode_index_method(method: IndexMethod) -> u8 {
+    match method {
+        IndexMethod::BTree => 0,
+        IndexMethod::Hash => 1,
+    }
+}
+
+fn decode_index_method(raw: u8) -> Result<IndexMethod> {
+    match raw {
+        0 => Ok(IndexMethod::BTree),
+        1 => Ok(IndexMethod::Hash),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown index method tag {unknown}"),
         )),
     }
 }

@@ -1,3 +1,4 @@
+use rnmdb_catalog::IndexMethod;
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
@@ -95,6 +96,7 @@ pub enum LogicalPlan {
         relation_id: RelationId,
         table: String,
         columns: Vec<String>,
+        method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
     },
@@ -261,6 +263,7 @@ impl LogicalPlanner {
                 relation_id,
                 table,
                 columns,
+                method,
                 unique,
                 if_not_exists,
             } => Ok(LogicalPlan::CreateIndex {
@@ -268,6 +271,7 @@ impl LogicalPlanner {
                 relation_id: *relation_id,
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
+                method: *method,
                 unique: *unique,
                 if_not_exists: *if_not_exists,
             }),
@@ -738,6 +742,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             table,
             columns,
+            method,
             unique,
             if_not_exists,
             ..
@@ -749,7 +754,8 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 ""
             };
             out.push_str(&format!(
-                "{prefix}CreateIndex {mode}name={name} table={table} columns={}{}\n",
+                "{prefix}CreateIndex {mode}name={name} table={table} method={} columns={}{}\n",
+                method.as_str(),
                 columns.join(", "),
                 exists
             ));
