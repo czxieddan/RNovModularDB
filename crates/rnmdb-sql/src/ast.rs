@@ -558,6 +558,7 @@ pub struct BoundSelect {
     pub table: ObjectName,
     pub distinct: bool,
     pub projection: Vec<BoundSelectItem>,
+    pub hidden_aggregates: Vec<BoundSelectItem>,
     pub columns: Vec<BoundColumn>,
     pub selection: Option<Expr>,
     pub group_by: Vec<Expr>,

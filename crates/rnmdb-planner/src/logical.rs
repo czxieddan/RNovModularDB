@@ -267,23 +267,24 @@ impl LogicalPlanner {
                 let grouped = !select.group_by.is_empty();
                 let aggregate_functions = select_aggregate_functions(select);
                 let mut order_by = select.order_by.clone();
+                let mut project_internal_outputs = !select.hidden_aggregates.is_empty();
                 if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
                     plan = LogicalPlan::Sort {
                         keys: order_by.clone(),
                         input: Box::new(plan),
                     };
                 }
-                let mut project_grouped_sort_keys = false;
                 let mut plan = if grouped {
                     let mut items = select
                         .projection
                         .iter()
+                        .chain(select.hidden_aggregates.iter())
                         .map(|item| GroupedAggregateItem {
                             name: item.column.name.clone(),
                             kind: grouped_aggregate_item_kind(&item.expr),
                         })
                         .collect::<Vec<_>>();
-                    project_grouped_sort_keys =
+                    project_internal_outputs |=
                         add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
                     LogicalPlan::GroupedAggregate {
                         group_by: select.group_by.clone(),
@@ -295,6 +296,7 @@ impl LogicalPlanner {
                         items: select
                             .projection
                             .iter()
+                            .chain(select.hidden_aggregates.iter())
                             .zip(functions)
                             .map(|(item, function)| AggregateItem {
                                 name: item.column.name.clone(),
@@ -334,7 +336,7 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     };
                 }
-                if project_grouped_sort_keys {
+                if project_internal_outputs {
                     plan = LogicalPlan::Project {
                         items: select
                             .projection
@@ -775,8 +777,13 @@ fn select_aggregate_functions(
     if select.projection.is_empty() {
         return None;
     }
-    let mut functions = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
+    let mut functions =
+        Vec::with_capacity(select.projection.len() + select.hidden_aggregates.len());
+    for item in select
+        .projection
+        .iter()
+        .chain(select.hidden_aggregates.iter())
+    {
         functions.push(aggregate_function(&item.expr)?);
     }
     Some(functions)

@@ -528,6 +528,7 @@ impl<'a> Binder<'a> {
         if aggregate_count == 0 && !bound_group_by.is_empty() {
             self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
+        let mut hidden_aggregates = Vec::new();
         let having = if let Some(having) = having {
             if bound_group_by.is_empty() && aggregate_count == 0 {
                 return Err(RnovError::new(
@@ -535,8 +536,15 @@ impl<'a> Binder<'a> {
                     "HAVING requires GROUP BY or aggregate projection in this SQL slice",
                 ));
             }
-            let having = self.rewrite_grouped_having_expr(&projection, having)?;
-            self.validate_grouped_having_expr(&projection, &having)?;
+            let having = self.rewrite_grouped_having_expr(
+                table,
+                &projection,
+                &mut hidden_aggregates,
+                having,
+            )?;
+            let mut grouped_outputs = projection.clone();
+            grouped_outputs.extend(hidden_aggregates.iter().cloned());
+            self.validate_grouped_having_expr(&grouped_outputs, &having)?;
             Some(having)
         } else {
             None
@@ -572,6 +580,7 @@ impl<'a> Binder<'a> {
             table: from.clone(),
             distinct,
             projection,
+            hidden_aggregates,
             columns,
             selection: selection.clone(),
             group_by: bound_group_by,
@@ -985,7 +994,9 @@ impl<'a> Binder<'a> {
 
     fn rewrite_grouped_having_expr(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
         expr: &Expr,
     ) -> Result<Expr> {
         match expr {
@@ -994,32 +1005,46 @@ impl<'a> Binder<'a> {
             | Expr::CountDistinct(_)
             | Expr::Sum(_)
             | Expr::Min(_)
-            | Expr::Max(_) => projection
-                .iter()
-                .find(|item| &item.expr == expr)
-                .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
-                .ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "HAVING aggregate expression must appear in SELECT projection: {expr}"
-                        ),
-                    )
-                }),
+            | Expr::Max(_) => {
+                self.rewrite_having_aggregate_expr(table, projection, hidden_aggregates, expr)
+            }
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
+                left: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    left,
+                )?),
                 op: op.clone(),
-                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+                right: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    right,
+                )?),
             }),
             Expr::Unary { op, expr } => Ok(Expr::Unary {
                 op: op.clone(),
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
             }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.rewrite_grouped_having_expr(projection, expr)?,
-            ))),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.rewrite_grouped_having_expr(
+                table,
+                projection,
+                hidden_aggregates,
+                expr,
+            )?))),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
                 negated: *negated,
             }),
             Expr::IsTruth {
@@ -1027,12 +1052,22 @@ impl<'a> Binder<'a> {
                 value,
                 negated,
             } => Ok(Expr::IsTruth {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
                 value: *value,
                 negated: *negated,
             }),
             Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
                 negated: *negated,
             }),
             Expr::IsDistinctFrom {
@@ -1040,8 +1075,18 @@ impl<'a> Binder<'a> {
                 right,
                 negated,
             } => Ok(Expr::IsDistinctFrom {
-                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
-                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+                left: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    left,
+                )?),
+                right: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    right,
+                )?),
                 negated: *negated,
             }),
             Expr::Between {
@@ -1050,9 +1095,24 @@ impl<'a> Binder<'a> {
                 high,
                 negated,
             } => Ok(Expr::Between {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
-                low: Box::new(self.rewrite_grouped_having_expr(projection, low)?),
-                high: Box::new(self.rewrite_grouped_having_expr(projection, high)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
+                low: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    low,
+                )?),
+                high: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    high,
+                )?),
                 negated: *negated,
             }),
             Expr::InList {
@@ -1060,10 +1120,22 @@ impl<'a> Binder<'a> {
                 values,
                 negated,
             } => Ok(Expr::InList {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
                 values: values
                     .iter()
-                    .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                    .map(|value| {
+                        self.rewrite_grouped_having_expr(
+                            table,
+                            projection,
+                            hidden_aggregates,
+                            value,
+                        )
+                    })
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
             }),
@@ -1072,18 +1144,40 @@ impl<'a> Binder<'a> {
                 pattern,
                 negated,
             } => Ok(Expr::Like {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
-                pattern: Box::new(self.rewrite_grouped_having_expr(projection, pattern)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
+                pattern: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    pattern,
+                )?),
                 negated: *negated,
             }),
             Expr::Coalesce(values) => values
                 .iter()
-                .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                .map(|value| {
+                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, value)
+                })
                 .collect::<Result<Vec<_>>>()
                 .map(Expr::Coalesce),
             Expr::NullIf { left, right } => Ok(Expr::NullIf {
-                left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
-                right: Box::new(self.rewrite_grouped_having_expr(projection, right)?),
+                left: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    left,
+                )?),
+                right: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    right,
+                )?),
             }),
             Expr::Case {
                 operand,
@@ -1092,32 +1186,62 @@ impl<'a> Binder<'a> {
             } => Ok(Expr::Case {
                 operand: operand
                     .as_ref()
-                    .map(|operand| self.rewrite_grouped_having_expr(projection, operand))
+                    .map(|operand| {
+                        self.rewrite_grouped_having_expr(
+                            table,
+                            projection,
+                            hidden_aggregates,
+                            operand,
+                        )
+                    })
                     .transpose()?
                     .map(Box::new),
                 whens: whens
                     .iter()
                     .map(|arm| {
                         Ok(CaseWhen {
-                            condition: self
-                                .rewrite_grouped_having_expr(projection, &arm.condition)?,
-                            result: self.rewrite_grouped_having_expr(projection, &arm.result)?,
+                            condition: self.rewrite_grouped_having_expr(
+                                table,
+                                projection,
+                                hidden_aggregates,
+                                &arm.condition,
+                            )?,
+                            result: self.rewrite_grouped_having_expr(
+                                table,
+                                projection,
+                                hidden_aggregates,
+                                &arm.result,
+                            )?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
                 else_expr: else_expr
                     .as_ref()
-                    .map(|else_expr| self.rewrite_grouped_having_expr(projection, else_expr))
+                    .map(|else_expr| {
+                        self.rewrite_grouped_having_expr(
+                            table,
+                            projection,
+                            hidden_aggregates,
+                            else_expr,
+                        )
+                    })
                     .transpose()?
                     .map(Box::new),
             }),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    expr,
+                )?),
                 data_type: data_type.clone(),
             }),
             Expr::Array(values) => values
                 .iter()
-                .map(|value| self.rewrite_grouped_having_expr(projection, value))
+                .map(|value| {
+                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, value)
+                })
                 .collect::<Result<Vec<_>>>()
                 .map(Expr::Array),
             Expr::Range {
@@ -1125,13 +1249,25 @@ impl<'a> Binder<'a> {
                 upper,
                 bounds,
             } => Ok(Expr::Range {
-                lower: Box::new(self.rewrite_grouped_having_expr(projection, lower)?),
-                upper: Box::new(self.rewrite_grouped_having_expr(projection, upper)?),
+                lower: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    lower,
+                )?),
+                upper: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    hidden_aggregates,
+                    upper,
+                )?),
                 bounds: *bounds,
             }),
             Expr::Call { name, args } => args
                 .iter()
-                .map(|arg| self.rewrite_grouped_having_expr(projection, arg))
+                .map(|arg| {
+                    self.rewrite_grouped_having_expr(table, projection, hidden_aggregates, arg)
+                })
                 .collect::<Result<Vec<_>>>()
                 .map(|args| Expr::Call {
                     name: name.clone(),
@@ -1144,6 +1280,101 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::HStore(_) => Ok(expr.clone()),
         }
+    }
+
+    fn rewrite_having_aggregate_expr(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
+        expr: &Expr,
+    ) -> Result<Expr> {
+        if let Some(item) = projection
+            .iter()
+            .chain(hidden_aggregates.iter())
+            .find(|item| &item.expr == expr)
+        {
+            return Ok(Expr::Identifier(Ident::new(item.column.name.as_str())));
+        }
+
+        let item = self.hidden_having_aggregate_item(table, projection, hidden_aggregates, expr)?;
+        let name = item.column.name.clone();
+        hidden_aggregates.push(item);
+        Ok(Expr::Identifier(Ident::new(name.as_str())))
+    }
+
+    fn hidden_having_aggregate_item(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        hidden_aggregates: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<BoundSelectItem> {
+        let existing_columns = projection
+            .iter()
+            .chain(hidden_aggregates.iter())
+            .map(|item| item.column.clone())
+            .collect::<Vec<_>>();
+        let column = match expr {
+            Expr::CountStar => {
+                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
+            }
+            Expr::Count(expr) | Expr::CountDistinct(expr) => {
+                let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("cannot infer COUNT expression type: {expr}"),
+                    )
+                })?;
+                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
+            }
+            Expr::Sum(expr) => {
+                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("cannot infer SUM expression type: {expr}"),
+                    )
+                })?;
+                if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("SUM expression must be INT64, got {expr_type:?}"),
+                    ));
+                }
+                aggregate_bound_column(&existing_columns, "sum", SqlType::Int64, true)
+            }
+            Expr::Min(expr) => {
+                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("cannot infer MIN expression type: {expr}"),
+                    )
+                })?;
+                self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
+                aggregate_bound_column(&existing_columns, "min", expr_type, true)
+            }
+            Expr::Max(expr) => {
+                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("cannot infer MAX expression type: {expr}"),
+                    )
+                })?;
+                self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
+                aggregate_bound_column(&existing_columns, "max", expr_type, true)
+            }
+            _ => {
+                return Err(RnovError::new(
+                    ErrorKind::Internal,
+                    "hidden HAVING aggregate requires aggregate expression",
+                ));
+            }
+        };
+
+        Ok(BoundSelectItem {
+            column,
+            expr: expr.clone(),
+        })
     }
 
     fn infer_grouped_output_expr_type(
