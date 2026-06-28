@@ -896,6 +896,16 @@ impl Parser {
                 let _ = self.consume_if(&TokenKind::Asc);
                 SortDirection::Asc
             };
+            let direction = if self.consume_if(&TokenKind::Nulls) {
+                if self.consume_if(&TokenKind::First) {
+                    sort_direction_with_nulls(direction, true)
+                } else {
+                    self.expect_keyword(TokenKind::Last)?;
+                    sort_direction_with_nulls(direction, false)
+                }
+            } else {
+                direction
+            };
             expressions.push(OrderByExpr { expr, direction });
             if self.consume_if(&TokenKind::Comma) {
                 continue;
@@ -1072,6 +1082,9 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::By, TokenKind::By)
             | (TokenKind::Asc, TokenKind::Asc)
             | (TokenKind::Desc, TokenKind::Desc)
+            | (TokenKind::Nulls, TokenKind::Nulls)
+            | (TokenKind::First, TokenKind::First)
+            | (TokenKind::Last, TokenKind::Last)
             | (TokenKind::Limit, TokenKind::Limit)
             | (TokenKind::Offset, TokenKind::Offset)
             | (TokenKind::Function, TokenKind::Function)
@@ -1115,4 +1128,24 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::LeftBracket, TokenKind::LeftBracket)
             | (TokenKind::RightBracket, TokenKind::RightBracket)
     )
+}
+
+fn sort_direction_with_nulls(direction: SortDirection, nulls_first: bool) -> SortDirection {
+    match (direction, nulls_first) {
+        (SortDirection::Asc | SortDirection::AscNullsFirst | SortDirection::AscNullsLast, true) => {
+            SortDirection::AscNullsFirst
+        }
+        (
+            SortDirection::Asc | SortDirection::AscNullsFirst | SortDirection::AscNullsLast,
+            false,
+        ) => SortDirection::AscNullsLast,
+        (
+            SortDirection::Desc | SortDirection::DescNullsFirst | SortDirection::DescNullsLast,
+            true,
+        ) => SortDirection::DescNullsFirst,
+        (
+            SortDirection::Desc | SortDirection::DescNullsFirst | SortDirection::DescNullsLast,
+            false,
+        ) => SortDirection::DescNullsLast,
+    }
 }

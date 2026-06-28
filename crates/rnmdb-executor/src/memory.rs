@@ -927,11 +927,7 @@ fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
 
 fn compare_sort_rows(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
     for (index, key) in keys.iter().enumerate() {
-        let ordering = compare_sort_values(&left.keys[index], &right.keys[index]);
-        let ordering = match key.direction {
-            SortDirection::Asc => ordering,
-            SortDirection::Desc => ordering.reverse(),
-        };
+        let ordering = compare_sort_values(&left.keys[index], &right.keys[index], key.direction);
         if ordering != Ordering::Equal {
             return ordering;
         }
@@ -939,18 +935,53 @@ fn compare_sort_rows(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> O
     left.original_index.cmp(&right.original_index)
 }
 
-fn compare_sort_values(left: &SqlValue, right: &SqlValue) -> Ordering {
-    match (left, right) {
-        (SqlValue::Null, SqlValue::Null) => Ordering::Equal,
-        (SqlValue::Null, _) => Ordering::Greater,
-        (_, SqlValue::Null) => Ordering::Less,
+fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirection) -> Ordering {
+    match (left.is_null(), right.is_null()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => {
+            return if sort_nulls_first(direction) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (false, true) => {
+            return if sort_nulls_first(direction) {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        (false, false) => {}
+    }
+
+    let ordering = match (left, right) {
         (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
         (SqlValue::Int64(left), SqlValue::Int64(right)) => left.cmp(right),
         (SqlValue::UInt64(left), SqlValue::UInt64(right)) => left.cmp(right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
         (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
         _ => Ordering::Equal,
+    };
+    if sort_descending(direction) {
+        ordering.reverse()
+    } else {
+        ordering
     }
+}
+
+fn sort_descending(direction: SortDirection) -> bool {
+    matches!(
+        direction,
+        SortDirection::Desc | SortDirection::DescNullsFirst | SortDirection::DescNullsLast
+    )
+}
+
+fn sort_nulls_first(direction: SortDirection) -> bool {
+    matches!(
+        direction,
+        SortDirection::AscNullsFirst | SortDirection::Desc | SortDirection::DescNullsFirst
+    )
 }
 
 fn apply_limit_cancellable(

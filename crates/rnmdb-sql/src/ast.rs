@@ -423,6 +423,10 @@ fn format_sql_type(data_type: &SqlType) -> String {
 pub enum SortDirection {
     Asc,
     Desc,
+    AscNullsFirst,
+    AscNullsLast,
+    DescNullsFirst,
+    DescNullsLast,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

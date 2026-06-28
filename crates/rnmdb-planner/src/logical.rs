@@ -717,5 +717,9 @@ fn sort_direction_name(direction: rnmdb_sql::ast::SortDirection) -> &'static str
     match direction {
         rnmdb_sql::ast::SortDirection::Asc => "ASC",
         rnmdb_sql::ast::SortDirection::Desc => "DESC",
+        rnmdb_sql::ast::SortDirection::AscNullsFirst => "ASC NULLS FIRST",
+        rnmdb_sql::ast::SortDirection::AscNullsLast => "ASC NULLS LAST",
+        rnmdb_sql::ast::SortDirection::DescNullsFirst => "DESC NULLS FIRST",
+        rnmdb_sql::ast::SortDirection::DescNullsLast => "DESC NULLS LAST",
     }
 }
