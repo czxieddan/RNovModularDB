@@ -559,6 +559,7 @@ impl<'a> Binder<'a> {
                     bound_order_by.push(self.bind_grouped_sort_expr(
                         table,
                         &projection,
+                        &mut hidden_aggregates,
                         &bound_group_by,
                         order_by,
                     )?);
@@ -569,6 +570,7 @@ impl<'a> Binder<'a> {
                 bound_order_by.push(self.bind_grouped_sort_expr(
                     table,
                     &projection,
+                    &mut hidden_aggregates,
                     &bound_group_by,
                     order_by,
                 )?);
@@ -719,6 +721,7 @@ impl<'a> Binder<'a> {
         &self,
         table: &Table,
         projection: &[BoundSelectItem],
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
         group_by: &[Expr],
         order_by: &OrderByExpr,
     ) -> Result<OrderByExpr> {
@@ -729,13 +732,28 @@ impl<'a> Binder<'a> {
                     .name
                     .as_str(),
             )),
-            _ => projection
-                .iter()
-                .find(|item| item.expr == order_by.expr)
-                .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
-                .unwrap_or_else(|| order_by.expr.clone()),
+            _ => {
+                if let Some(item) = projection
+                    .iter()
+                    .chain(hidden_aggregates.iter())
+                    .find(|item| item.expr == order_by.expr)
+                {
+                    Expr::Identifier(Ident::new(item.column.name.as_str()))
+                } else if is_aggregate_expr(&order_by.expr) {
+                    self.rewrite_having_aggregate_expr(
+                        table,
+                        projection,
+                        hidden_aggregates,
+                        &order_by.expr,
+                    )?
+                } else {
+                    order_by.expr.clone()
+                }
+            }
         };
-        self.validate_grouped_sort_expr(table, projection, group_by, &expr)?;
+        let mut grouped_outputs = projection.to_vec();
+        grouped_outputs.extend(hidden_aggregates.iter().cloned());
+        self.validate_grouped_sort_expr(table, &grouped_outputs, group_by, &expr)?;
         Ok(OrderByExpr {
             expr,
             direction: order_by.direction,
