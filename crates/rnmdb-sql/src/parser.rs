@@ -938,7 +938,11 @@ impl Parser {
         if !self.consume_if(&TokenKind::First) {
             self.expect_keyword(TokenKind::Next)?;
         }
-        let count = self.parse_row_count("FETCH")?;
+        let count = if matches!(self.peek_kind(), Some(TokenKind::Row | TokenKind::Rows)) {
+            1
+        } else {
+            self.parse_row_count("FETCH")?
+        };
         if !self.consume_if(&TokenKind::Row) {
             self.expect_keyword(TokenKind::Rows)?;
         }
