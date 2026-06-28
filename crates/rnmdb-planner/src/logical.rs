@@ -114,6 +114,7 @@ pub enum LogicalPlan {
         name: String,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
     },
     CreateOperator {
         symbol: String,
@@ -124,11 +125,13 @@ pub enum LogicalPlan {
     },
     CreateRole {
         name: String,
+        if_not_exists: bool,
     },
     CreatePolicy {
         name: String,
         relation_id: RelationId,
         predicate: String,
+        if_not_exists: bool,
     },
     GrantTablePrivilege {
         role_id: RoleId,
@@ -441,10 +444,12 @@ impl LogicalPlanner {
                 name,
                 argument_types,
                 return_type,
+                if_not_exists,
             } => Ok(LogicalPlan::CreateFunction {
                 name: name.as_str().to_string(),
                 argument_types: argument_types.clone(),
                 return_type: return_type.clone(),
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreateOperator { signature } => Ok(LogicalPlan::CreateOperator {
                 symbol: signature.symbol().to_string(),
@@ -453,17 +458,23 @@ impl LogicalPlanner {
                 result_type: signature.result_type().clone(),
                 function_id: signature.function_id(),
             }),
-            BoundStatement::CreateRole { name } => Ok(LogicalPlan::CreateRole {
+            BoundStatement::CreateRole {
+                name,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateRole {
                 name: name.as_str().to_string(),
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreatePolicy {
                 name,
                 relation_id,
                 predicate,
+                if_not_exists,
             } => Ok(LogicalPlan::CreatePolicy {
                 name: name.as_str().to_string(),
                 relation_id: *relation_id,
                 predicate: predicate.clone(),
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::GrantTablePrivilege {
                 role_id,
@@ -707,10 +718,17 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             argument_types,
             return_type,
+            if_not_exists,
         } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{prefix}CreateFunction name={name} args={} returns={return_type:?}\n",
-                sql_type_list(argument_types)
+                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{}\n",
+                sql_type_list(argument_types),
+                exists
             ));
         }
         LogicalPlan::CreateOperator {
@@ -724,16 +742,30 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}\n"
             ));
         }
-        LogicalPlan::CreateRole { name } => {
-            out.push_str(&format!("{prefix}CreateRole name={name}\n"));
+        LogicalPlan::CreateRole {
+            name,
+            if_not_exists,
+        } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
+            out.push_str(&format!("{prefix}CreateRole name={name}{exists}\n"));
         }
         LogicalPlan::CreatePolicy {
             name,
             relation_id,
             predicate,
+            if_not_exists,
         } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}\n"
+                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{exists}\n"
             ));
         }
         LogicalPlan::GrantTablePrivilege {

@@ -481,6 +481,7 @@ pub enum Statement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
     },
     CreateOperator {
         symbol: String,
@@ -491,11 +492,13 @@ pub enum Statement {
     },
     CreateRole {
         name: Ident,
+        if_not_exists: bool,
     },
     CreatePolicy {
         name: Ident,
         table: ObjectName,
         predicate: Expr,
+        if_not_exists: bool,
     },
     GrantTablePrivilege {
         privilege: Privilege,
@@ -688,17 +691,20 @@ pub enum BoundStatement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
     },
     CreateOperator {
         signature: OperatorSignature,
     },
     CreateRole {
         name: Ident,
+        if_not_exists: bool,
     },
     CreatePolicy {
         name: Ident,
         relation_id: RelationId,
         predicate: String,
+        if_not_exists: bool,
     },
     GrantTablePrivilege {
         role_id: RoleId,

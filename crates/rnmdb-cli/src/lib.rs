@@ -119,11 +119,13 @@ impl LocalSession {
                 name,
                 argument_types,
                 return_type,
+                if_not_exists,
             } => {
-                self.catalog.register_function(
+                self.apply_catalog_create_function(
                     name.as_str(),
-                    argument_types.clone(),
-                    return_type.clone(),
+                    argument_types,
+                    return_type,
+                    *if_not_exists,
                 )?;
                 Ok(CommandOutput::SchemaChanged)
             }
@@ -131,20 +133,25 @@ impl LocalSession {
                 self.catalog.register_operator(signature.clone())?;
                 Ok(CommandOutput::SchemaChanged)
             }
-            BoundStatement::CreateRole { name } => {
-                self.catalog.create_role(name.as_str())?;
+            BoundStatement::CreateRole {
+                name,
+                if_not_exists,
+            } => {
+                self.apply_catalog_create_role(name.as_str(), *if_not_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }
             BoundStatement::CreatePolicy {
                 name,
                 relation_id,
                 predicate,
+                if_not_exists,
             } => {
-                self.catalog.add_row_policy(RowPolicy::new(
+                self.apply_catalog_create_policy(
                     name.as_str(),
                     *relation_id,
                     predicate.as_str(),
-                ))?;
+                    *if_not_exists,
+                )?;
                 Ok(CommandOutput::SchemaChanged)
             }
             BoundStatement::GrantTablePrivilege {
@@ -276,6 +283,44 @@ impl LocalSession {
                 format!("table does not exist: {schema}.{}", name.object()),
             )),
         }
+    }
+
+    fn apply_catalog_create_function(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+        return_type: &SqlType,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self.catalog.get_function(name, argument_types).is_some() && if_not_exists {
+            return Ok(());
+        }
+        self.catalog
+            .register_function(name, argument_types.to_vec(), return_type.clone())?;
+        Ok(())
+    }
+
+    fn apply_catalog_create_role(&mut self, name: &str, if_not_exists: bool) -> Result<()> {
+        if self.catalog.get_role(name).is_some() && if_not_exists {
+            return Ok(());
+        }
+        self.catalog.create_role(name)?;
+        Ok(())
+    }
+
+    fn apply_catalog_create_policy(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        predicate: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self.catalog.get_row_policy(relation_id, name).is_some() && if_not_exists {
+            return Ok(());
+        }
+        self.catalog
+            .add_row_policy(RowPolicy::new(name, relation_id, predicate))?;
+        Ok(())
     }
 
     fn grant_local_table_privileges(&mut self, relation_id: RelationId) -> Result<()> {

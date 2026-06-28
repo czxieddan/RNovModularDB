@@ -230,6 +230,7 @@ impl Parser {
 
     fn parse_create_function_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Function)?;
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let argument_types = if self.consume_if(&TokenKind::RightParen) {
@@ -245,6 +246,7 @@ impl Parser {
             name,
             argument_types,
             return_type,
+            if_not_exists,
         })
     }
 
@@ -279,13 +281,16 @@ impl Parser {
 
     fn parse_create_role_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Role)?;
+        let if_not_exists = self.parse_if_not_exists()?;
         Ok(Statement::CreateRole {
             name: self.parse_ident()?,
+            if_not_exists,
         })
     }
 
     fn parse_create_policy_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Policy)?;
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_object_name()?;
@@ -297,7 +302,18 @@ impl Parser {
             name,
             table,
             predicate,
+            if_not_exists,
         })
+    }
+
+    fn parse_if_not_exists(&mut self) -> Result<bool> {
+        if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Not)?;
+            self.expect_keyword(TokenKind::Exists)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn parse_grant(&mut self) -> Result<Statement> {

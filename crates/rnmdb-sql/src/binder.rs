@@ -69,11 +69,25 @@ impl<'a> Binder<'a> {
                 name,
                 argument_types,
                 return_type,
-            } => Ok(BoundStatement::CreateFunction {
-                name: name.clone(),
-                argument_types: argument_types.clone(),
-                return_type: return_type.clone(),
-            }),
+                if_not_exists,
+            } => {
+                if self.catalog.functions().iter().any(|function| {
+                    function.name() == name.as_str()
+                        && function.argument_types() == argument_types.as_slice()
+                }) && !if_not_exists
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("function already exists: {}", name.as_str()),
+                    ));
+                }
+                Ok(BoundStatement::CreateFunction {
+                    name: name.clone(),
+                    argument_types: argument_types.clone(),
+                    return_type: return_type.clone(),
+                    if_not_exists: *if_not_exists,
+                })
+            }
             Statement::CreateOperator {
                 symbol,
                 left_type,
@@ -87,17 +101,45 @@ impl<'a> Binder<'a> {
                 result_type,
                 function.as_str(),
             ),
-            Statement::CreateRole { name } => Ok(BoundStatement::CreateRole { name: name.clone() }),
+            Statement::CreateRole {
+                name,
+                if_not_exists,
+            } => {
+                if self.catalog.get_role(name.as_str()).is_some() && !if_not_exists {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("role already exists: {}", name.as_str()),
+                    ));
+                }
+                Ok(BoundStatement::CreateRole {
+                    name: name.clone(),
+                    if_not_exists: *if_not_exists,
+                })
+            }
             Statement::CreatePolicy {
                 name,
                 table,
                 predicate,
+                if_not_exists,
             } => {
                 let table = self.resolve_table(table)?;
+                if self
+                    .catalog
+                    .row_policies(table.relation_id())
+                    .iter()
+                    .any(|policy| policy.name() == name.as_str())
+                    && !if_not_exists
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("row policy already exists: {}", name.as_str()),
+                    ));
+                }
                 Ok(BoundStatement::CreatePolicy {
                     name: name.clone(),
                     relation_id: table.relation_id(),
                     predicate: predicate.to_string(),
+                    if_not_exists: *if_not_exists,
                 })
             }
             Statement::GrantTablePrivilege {

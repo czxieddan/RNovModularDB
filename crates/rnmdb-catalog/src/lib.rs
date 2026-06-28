@@ -138,6 +138,12 @@ impl Catalog {
         &self.functions
     }
 
+    pub fn get_function(&self, name: &str, argument_types: &[SqlType]) -> Option<&Function> {
+        self.functions
+            .iter()
+            .find(|function| function.name == name && function.argument_types == argument_types)
+    }
+
     pub fn operators(&self) -> &[Operator] {
         &self.operators
     }
@@ -455,6 +461,16 @@ impl Catalog {
                 "row policy predicate cannot be empty",
             ));
         }
+        if self
+            .row_policies(policy.relation_id)
+            .iter()
+            .any(|existing| existing.name == policy.name)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("row policy already exists: {}", policy.name),
+            ));
+        }
 
         let mut policy = policy;
         policy.policy_id = PolicyId::new(self.next_policy_id);
@@ -471,6 +487,12 @@ impl Catalog {
             .get(&relation_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn get_row_policy(&self, relation_id: RelationId, name: &str) -> Option<&RowPolicy> {
+        self.row_policies(relation_id)
+            .iter()
+            .find(|policy| policy.name == name)
     }
 
     fn ensure_role_exists(&self, role_id: RoleId) -> Result<()> {
