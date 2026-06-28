@@ -519,6 +519,10 @@ pub enum Statement {
         left: Box<Statement>,
         right: Box<Statement>,
     },
+    Intersect {
+        left: Box<Statement>,
+        right: Box<Statement>,
+    },
     Transaction {
         action: TransactionAction,
     },
@@ -556,6 +560,13 @@ pub struct BoundSelect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundUnion {
     pub all: bool,
+    pub columns: Vec<BoundColumn>,
+    pub left: Box<BoundStatement>,
+    pub right: Box<BoundStatement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundIntersect {
     pub columns: Vec<BoundColumn>,
     pub left: Box<BoundStatement>,
     pub right: Box<BoundStatement>,
@@ -644,6 +655,7 @@ pub enum BoundStatement {
     Delete(BoundDelete),
     Select(BoundSelect),
     Union(BoundUnion),
+    Intersect(BoundIntersect),
     Transaction {
         action: TransactionAction,
     },

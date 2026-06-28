@@ -61,6 +61,15 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::Union { all, left, right } => LogicalPlan::Union {
+            all,
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+        },
+        LogicalPlan::Intersect { left, right } => LogicalPlan::Intersect {
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+        },
         LogicalPlan::Sort { keys, input } => LogicalPlan::Sort {
             keys,
             input: Box::new(optimize_plan(*input)),
@@ -111,6 +120,15 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
         },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::Union { all, left, right } => LogicalPlan::Union {
+            all,
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
+        },
+        LogicalPlan::Intersect { left, right } => LogicalPlan::Intersect {
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
         },
         LogicalPlan::Sort { keys, input } => LogicalPlan::Sort {
             keys,

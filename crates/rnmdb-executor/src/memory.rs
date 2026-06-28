@@ -275,6 +275,11 @@ impl MemoryExecutor {
                 let right = self.execute_cancellable(right, cancellation)?;
                 apply_union_cancellable(left, right, *all, cancellation)
             }
+            LogicalPlan::Intersect { left, right } => {
+                let left = self.execute_cancellable(left, cancellation)?;
+                let right = self.execute_cancellable(right, cancellation)?;
+                apply_intersect_cancellable(left, right, cancellation)
+            }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -374,6 +379,11 @@ impl MemoryExecutor {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
                 apply_union_cancellable(left, right, *all, cancellation)
+            }
+            LogicalPlan::Intersect { left, right } => {
+                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                apply_intersect_cancellable(left, right, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -911,12 +921,37 @@ fn apply_union_cancellable(
     }
 }
 
+fn apply_intersect_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_set_operation_columns("INTERSECT", &left, &right)?;
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if right.rows().contains(row) && !rows.contains(row) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
 fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
+    validate_set_operation_columns("UNION", left, right)
+}
+
+fn validate_set_operation_columns(
+    operation: &str,
+    left: &VectorBatch,
+    right: &VectorBatch,
+) -> Result<()> {
     if left.columns().len() != right.columns().len() {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!(
-                "UNION column count mismatch: left has {}, right has {}",
+                "{operation} column count mismatch: left has {}, right has {}",
                 left.columns().len(),
                 right.columns().len()
             ),
@@ -927,7 +962,7 @@ fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()>
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!(
-                    "UNION column {} type mismatch: left is {:?}, right is {:?}",
+                    "{operation} column {} type mismatch: left is {:?}, right is {:?}",
                     index + 1,
                     left.data_type(),
                     right.data_type()

@@ -42,6 +42,10 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
     },
+    Intersect {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
     Sort {
         keys: Vec<OrderByExpr>,
         input: Box<LogicalPlan>,
@@ -344,6 +348,10 @@ impl LogicalPlanner {
                 left: Box::new(self.plan(&union.left)?),
                 right: Box::new(self.plan(&union.right)?),
             }),
+            BoundStatement::Intersect(intersect) => Ok(LogicalPlan::Intersect {
+                left: Box::new(self.plan(&intersect.left)?),
+                right: Box::new(self.plan(&intersect.right)?),
+            }),
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -478,6 +486,11 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::Union { all, left, right } => {
             let mode = if *all { "ALL" } else { "DISTINCT" };
             out.push_str(&format!("{prefix}Union {mode}\n"));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
+        }
+        LogicalPlan::Intersect { left, right } => {
+            out.push_str(&format!("{prefix}Intersect DISTINCT\n"));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }

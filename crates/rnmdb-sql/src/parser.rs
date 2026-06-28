@@ -374,14 +374,27 @@ impl Parser {
 
     fn parse_query(&mut self) -> Result<Statement> {
         let mut statement = self.parse_select()?;
-        while self.consume_if(&TokenKind::Union) {
-            let all = self.consume_if(&TokenKind::All);
-            let right = self.parse_select()?;
-            statement = Statement::Union {
-                all,
-                left: Box::new(statement),
-                right: Box::new(right),
-            };
+        loop {
+            if self.consume_if(&TokenKind::Union) {
+                let all = self.consume_if(&TokenKind::All);
+                let right = self.parse_select()?;
+                statement = Statement::Union {
+                    all,
+                    left: Box::new(statement),
+                    right: Box::new(right),
+                };
+            } else if self.consume_if(&TokenKind::Intersect) {
+                if self.consume_if(&TokenKind::All) {
+                    return Err(self.error("INTERSECT ALL is not supported yet"));
+                }
+                let right = self.parse_select()?;
+                statement = Statement::Intersect {
+                    left: Box::new(statement),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
         }
         Ok(statement)
     }
@@ -1125,6 +1138,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
         (left, right),
         (TokenKind::Select, TokenKind::Select)
             | (TokenKind::Union, TokenKind::Union)
+            | (TokenKind::Intersect, TokenKind::Intersect)
             | (TokenKind::Distinct, TokenKind::Distinct)
             | (TokenKind::All, TokenKind::All)
             | (TokenKind::As, TokenKind::As)

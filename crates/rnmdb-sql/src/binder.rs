@@ -6,9 +6,9 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundRowPolicy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, Expr, Ident, ObjectName,
-    OrderByExpr, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundIntersect, BoundRowPolicy,
+    BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, Expr, Ident,
+    ObjectName, OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -115,6 +115,7 @@ impl<'a> Binder<'a> {
                 *offset, role_id,
             ),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
+            Statement::Intersect { left, right } => self.bind_intersect(left, right, role_id),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -260,34 +261,26 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let left = self.bind_for_role(left, role_id)?;
         let right = self.bind_for_role(right, role_id)?;
-        let left_columns = query_output_columns(&left)?;
-        let right_columns = query_output_columns(&right)?;
-        if left_columns.len() != right_columns.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "UNION column count mismatch: left has {}, right has {}",
-                    left_columns.len(),
-                    right_columns.len()
-                ),
-            ));
-        }
-        for (index, (left, right)) in left_columns.iter().zip(right_columns.iter()).enumerate() {
-            if left.data_type != right.data_type {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "UNION column {} type mismatch: left is {:?}, right is {:?}",
-                        index + 1,
-                        left.data_type,
-                        right.data_type
-                    ),
-                ));
-            }
-        }
+        let columns = validate_set_operation_columns("UNION", &left, &right)?;
         Ok(BoundStatement::Union(BoundUnion {
             all,
-            columns: left_columns.to_vec(),
+            columns,
+            left: Box::new(left),
+            right: Box::new(right),
+        }))
+    }
+
+    fn bind_intersect(
+        &self,
+        left: &Statement,
+        right: &Statement,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        let left = self.bind_for_role(left, role_id)?;
+        let right = self.bind_for_role(right, role_id)?;
+        let columns = validate_set_operation_columns("INTERSECT", &left, &right)?;
+        Ok(BoundStatement::Intersect(BoundIntersect {
+            columns,
             left: Box::new(left),
             right: Box::new(right),
         }))
@@ -2318,11 +2311,45 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
     match statement {
         BoundStatement::Select(select) => Ok(&select.columns),
         BoundStatement::Union(union) => Ok(&union.columns),
+        BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
-            "UNION operands must be SELECT queries",
+            "set operation operands must be SELECT queries",
         )),
     }
+}
+
+fn validate_set_operation_columns(
+    operation: &str,
+    left: &BoundStatement,
+    right: &BoundStatement,
+) -> Result<Vec<BoundColumn>> {
+    let left_columns = query_output_columns(left)?;
+    let right_columns = query_output_columns(right)?;
+    if left_columns.len() != right_columns.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{operation} column count mismatch: left has {}, right has {}",
+                left_columns.len(),
+                right_columns.len()
+            ),
+        ));
+    }
+    for (index, (left, right)) in left_columns.iter().zip(right_columns.iter()).enumerate() {
+        if left.data_type != right.data_type {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{operation} column {} type mismatch: left is {:?}, right is {:?}",
+                    index + 1,
+                    left.data_type,
+                    right.data_type
+                ),
+            ));
+        }
+    }
+    Ok(left_columns.to_vec())
 }
 
 fn aggregate_bound_column(
