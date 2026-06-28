@@ -342,7 +342,7 @@ impl Parser {
             Vec::new()
         };
         let limit = if self.consume_if(&TokenKind::Limit) {
-            Some(self.parse_row_count("LIMIT")?)
+            self.parse_limit_count()?
         } else {
             None
         };
@@ -915,6 +915,14 @@ impl Parser {
         Ok(expressions)
     }
 
+    fn parse_limit_count(&mut self) -> Result<Option<usize>> {
+        if self.consume_if(&TokenKind::All) {
+            Ok(None)
+        } else {
+            self.parse_row_count("LIMIT").map(Some)
+        }
+    }
+
     fn parse_row_count(&mut self, clause: &'static str) -> Result<usize> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Integer(value)) => {
@@ -1059,6 +1067,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
         (left, right),
         (TokenKind::Select, TokenKind::Select)
             | (TokenKind::Distinct, TokenKind::Distinct)
+            | (TokenKind::All, TokenKind::All)
             | (TokenKind::As, TokenKind::As)
             | (TokenKind::Insert, TokenKind::Insert)
             | (TokenKind::Into, TokenKind::Into)

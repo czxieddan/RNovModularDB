@@ -33,6 +33,7 @@ impl Token {
 pub enum TokenKind {
     Select,
     Distinct,
+    All,
     As,
     Insert,
     Into,
@@ -173,6 +174,7 @@ impl<'a> Lexer<'a> {
         let kind = match normalized.as_str() {
             "select" => TokenKind::Select,
             "distinct" => TokenKind::Distinct,
+            "all" => TokenKind::All,
             "as" => TokenKind::As,
             "insert" => TokenKind::Insert,
             "into" => TokenKind::Into,
