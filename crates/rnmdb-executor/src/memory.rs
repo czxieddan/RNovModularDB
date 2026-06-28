@@ -734,7 +734,9 @@ fn grouped_aggregate_value(batch: &VectorBatch, item: &GroupedAggregateItem) -> 
 
 fn aggregate_column_schema(batch: &VectorBatch, item: &AggregateItem) -> Result<ColumnSchema> {
     match &item.function {
-        AggregateFunction::CountStar | AggregateFunction::Count(_) => {
+        AggregateFunction::CountStar
+        | AggregateFunction::Count(_)
+        | AggregateFunction::CountDistinct(_) => {
             Ok(ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null())
         }
         AggregateFunction::Sum(_) => Ok(ColumnSchema::new(item.name.as_str(), SqlType::Int64)),
@@ -762,6 +764,23 @@ fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<
                 }
             }
             Ok(SqlValue::Int64(count))
+        }
+        AggregateFunction::CountDistinct(expr) => {
+            let mut values = Vec::new();
+            for row in batch.rows() {
+                let value = eval_expr(batch.columns(), row, expr)?;
+                if !value.is_null() && !values.contains(&value) {
+                    values.push(value);
+                }
+            }
+            Ok(SqlValue::Int64(i64::try_from(values.len()).map_err(
+                |_| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "COUNT(DISTINCT expr) result exceeds int64",
+                    )
+                },
+            )?))
         }
         AggregateFunction::Sum(expr) => {
             let mut sum: Option<i64> = None;
@@ -1020,7 +1039,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "COUNT(*) requires aggregate execution",
         )),
-        Expr::Count(_) => Err(RnovError::new(
+        Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "COUNT(expr) requires aggregate execution",
         )),
@@ -1258,7 +1277,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             ErrorKind::InvalidInput,
             "COUNT(*) requires aggregate execution",
         )),
-        Expr::Count(_) => Err(RnovError::new(
+        Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "COUNT(expr) requires aggregate execution",
         )),

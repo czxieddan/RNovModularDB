@@ -133,6 +133,7 @@ pub struct AggregateItem {
 pub enum AggregateFunction {
     CountStar,
     Count(Expr),
+    CountDistinct(Expr),
     Sum(Expr),
     Min(Expr),
     Max(Expr),
@@ -688,6 +689,7 @@ fn aggregate_function(expr: &Expr) -> Option<AggregateFunction> {
     match expr {
         Expr::CountStar => Some(AggregateFunction::CountStar),
         Expr::Count(expr) => Some(AggregateFunction::Count((**expr).clone())),
+        Expr::CountDistinct(expr) => Some(AggregateFunction::CountDistinct((**expr).clone())),
         Expr::Sum(expr) => Some(AggregateFunction::Sum((**expr).clone())),
         Expr::Min(expr) => Some(AggregateFunction::Min((**expr).clone())),
         Expr::Max(expr) => Some(AggregateFunction::Max((**expr).clone())),
@@ -699,6 +701,7 @@ fn aggregate_function_name(function: &AggregateFunction) -> String {
     match function {
         AggregateFunction::CountStar => "count(*)".to_string(),
         AggregateFunction::Count(expr) => format!("count({expr})"),
+        AggregateFunction::CountDistinct(expr) => format!("count(DISTINCT {expr})"),
         AggregateFunction::Sum(expr) => format!("sum({expr})"),
         AggregateFunction::Min(expr) => format!("min({expr})"),
         AggregateFunction::Max(expr) => format!("max({expr})"),

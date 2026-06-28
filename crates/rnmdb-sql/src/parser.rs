@@ -681,6 +681,15 @@ impl Parser {
                     }
                     let args = if self.consume_if(&TokenKind::RightParen) {
                         Vec::new()
+                    } else if self.consume_if(&TokenKind::Distinct) {
+                        let expr = self.parse_expr()?;
+                        self.expect_keyword(TokenKind::RightParen)?;
+                        if name.schema().is_none() && name.object() == "count" {
+                            return Ok(Expr::CountDistinct(Box::new(expr)));
+                        }
+                        return Err(self.error(format!(
+                            "DISTINCT arguments are not supported for function {name}"
+                        )));
                     } else {
                         let args = self.parse_expr_list()?;
                         self.expect_keyword(TokenKind::RightParen)?;

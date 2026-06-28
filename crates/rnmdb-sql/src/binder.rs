@@ -328,6 +328,24 @@ impl<'a> Binder<'a> {
                     columns.push(column);
                 }
                 SelectItem::Expr {
+                    expr: Expr::CountDistinct(expr),
+                    alias,
+                } => {
+                    let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("cannot infer COUNT DISTINCT expression type: {expr}"),
+                        )
+                    })?;
+                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::CountDistinct(expr.clone()),
+                    });
+                    columns.push(column);
+                }
+                SelectItem::Expr {
                     expr: Expr::Sum(expr),
                     alias,
                 } => {
@@ -721,12 +739,15 @@ impl<'a> Binder<'a> {
                 Ok(())
             }
             Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "GROUP BY does not support aggregate expressions",
-                ))
-            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support aggregate expressions",
+            )),
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "GROUP BY does not support function calls yet",
@@ -792,20 +813,23 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Expr> {
         match expr {
-            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
-                projection
-                    .iter()
-                    .find(|item| &item.expr == expr)
-                    .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "HAVING aggregate expression must appear in SELECT projection: {expr}"
-                            ),
-                        )
-                    })
-            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_) => projection
+                .iter()
+                .find(|item| &item.expr == expr)
+                .map(|item| Expr::Identifier(Ident::new(item.column.name.as_str())))
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "HAVING aggregate expression must appear in SELECT projection: {expr}"
+                        ),
+                    )
+                }),
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
                 left: Box::new(self.rewrite_grouped_having_expr(projection, left)?),
                 op: op.clone(),
@@ -969,12 +993,15 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
-            Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_) => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "HAVING only supports projected aggregate output columns yet",
-                ))
-            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING only supports projected aggregate output columns yet",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -1329,7 +1356,7 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
             )),
-            Expr::Count(_) => Err(RnovError::new(
+            Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "COUNT(expr) is only supported as a SELECT projection",
             )),
@@ -1609,7 +1636,7 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
             )),
-            Expr::Count(_) => Err(RnovError::new(
+            Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "COUNT(expr) is only supported as a SELECT projection",
             )),
@@ -2235,7 +2262,12 @@ fn truth_test_name(value: bool) -> &'static str {
 fn is_aggregate_expr(expr: &Expr) -> bool {
     matches!(
         expr,
-        Expr::CountStar | Expr::Count(_) | Expr::Sum(_) | Expr::Min(_) | Expr::Max(_)
+        Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_)
     )
 }
 
