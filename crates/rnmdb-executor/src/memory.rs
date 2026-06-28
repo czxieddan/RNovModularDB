@@ -11,8 +11,12 @@ use std::{
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
-use rnmdb_planner::logical::{
-    AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind, LogicalPlan,
+use rnmdb_planner::{
+    cost::TableStatistics,
+    logical::{
+        AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
+        LogicalPlan,
+    },
 };
 use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
@@ -50,6 +54,14 @@ impl MemoryTable {
     pub fn scan(&self) -> VectorBatch {
         VectorBatch::new(self.columns.clone(), self.rows.clone())
             .expect("stored rows are validated on insert")
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn statistics(&self) -> TableStatistics {
+        TableStatistics::new(self.row_count() as f64, self.estimated_row_width_bytes())
     }
 
     pub fn scan_parallel(&self, config: ParallelQueryConfig) -> Result<VectorBatch> {
@@ -110,6 +122,24 @@ impl MemoryTable {
         self.columns = columns;
         self.rows = rows;
         Ok(())
+    }
+
+    fn estimated_row_width_bytes(&self) -> f64 {
+        if self.rows.is_empty() {
+            return schema_row_width_bytes(&self.columns);
+        }
+
+        let total_bytes = self
+            .rows
+            .iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|value| value.encode().len())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        (total_bytes as f64 / self.rows.len() as f64).max(1.0)
     }
 }
 
@@ -211,6 +241,10 @@ impl MemoryExecutor {
         }
         self.tables.insert(name, table);
         Ok(())
+    }
+
+    pub fn table_statistics(&self, name: &str) -> Option<TableStatistics> {
+        self.tables.get(name).map(MemoryTable::statistics)
     }
 
     pub fn execute(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
@@ -548,6 +582,26 @@ fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
         schema = schema.encrypted();
     }
     schema
+}
+
+fn schema_row_width_bytes(columns: &[ColumnSchema]) -> f64 {
+    columns
+        .iter()
+        .map(|column| sql_type_width_bytes(column.data_type()))
+        .sum::<f64>()
+        .max(1.0)
+}
+
+fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
+    match data_type {
+        SqlType::Null => 1.0,
+        SqlType::Bool => 1.0,
+        SqlType::Int64 | SqlType::UInt64 => 8.0,
+        SqlType::Text | SqlType::Bytes => 32.0,
+        SqlType::HStore | SqlType::TextVector => 64.0,
+        SqlType::Array(_) => 32.0,
+        SqlType::Range(_) => 16.0,
+    }
 }
 
 fn update_rows(

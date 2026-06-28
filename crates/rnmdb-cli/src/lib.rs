@@ -10,7 +10,10 @@ use rnmdb_executor::{
     vector::VectorBatch,
 };
 use rnmdb_planner::{
-    cost::CostModel, logical::LogicalPlanner, optimizer::RuleOptimizer, physical::PhysicalPlanner,
+    cost::{CostModel, StatisticsCatalog},
+    logical::{LogicalPlan, LogicalPlanner},
+    optimizer::RuleOptimizer,
+    physical::PhysicalPlanner,
 };
 use rnmdb_sql::{
     ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName},
@@ -430,25 +433,59 @@ impl LocalSession {
         Ok(())
     }
 
-    fn optimize_read_plan(
-        &self,
-        plan: rnmdb_planner::logical::LogicalPlan,
-    ) -> rnmdb_planner::logical::LogicalPlan {
+    fn optimize_read_plan(&self, plan: LogicalPlan) -> LogicalPlan {
         self.optimizer
             .optimize_parallel(plan, self.execution.worker_threads())
     }
 
-    fn explain_plan(
-        &self,
-        plan: &rnmdb_planner::logical::LogicalPlan,
-        format: ExplainFormat,
-    ) -> String {
+    fn explain_plan(&self, plan: &LogicalPlan, format: ExplainFormat) -> String {
+        let cost_model = self.cost_model_for_plan(plan);
         match format {
             ExplainFormat::Logical => plan.explain(),
-            ExplainFormat::Costs => plan.explain_with_costs(&CostModel::default()),
-            ExplainFormat::Physical => PhysicalPlanner::new(CostModel::default())
-                .plan(plan)
-                .explain(),
+            ExplainFormat::Costs => plan.explain_with_costs(&cost_model),
+            ExplainFormat::Physical => PhysicalPlanner::new(cost_model).plan(plan).explain(),
+        }
+    }
+
+    fn cost_model_for_plan(&self, plan: &LogicalPlan) -> CostModel {
+        let mut statistics = StatisticsCatalog::new();
+        self.collect_plan_statistics(plan, &mut statistics);
+        CostModel::new(statistics)
+    }
+
+    fn collect_plan_statistics(&self, plan: &LogicalPlan, statistics: &mut StatisticsCatalog) {
+        match plan {
+            LogicalPlan::Scan { relation_id, table } => {
+                if let Some(table_statistics) = self.executor.table_statistics(table) {
+                    statistics.set_table(*relation_id, table_statistics);
+                }
+            }
+            LogicalPlan::TextSearch {
+                relation_id, table, ..
+            } => {
+                if let Some(table_statistics) = self.executor.table_statistics(table) {
+                    statistics.set_table(*relation_id, table_statistics);
+                }
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::GroupedAggregate { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Offset { input, .. }
+            | LogicalPlan::Explain { input, .. }
+            | LogicalPlan::Parallel { input, .. } => {
+                self.collect_plan_statistics(input, statistics);
+            }
+            LogicalPlan::Union { left, right, .. }
+            | LogicalPlan::Intersect { left, right, .. }
+            | LogicalPlan::Except { left, right, .. } => {
+                self.collect_plan_statistics(left, statistics);
+                self.collect_plan_statistics(right, statistics);
+            }
+            _ => {}
         }
     }
 }
