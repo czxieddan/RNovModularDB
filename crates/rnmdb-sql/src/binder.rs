@@ -652,6 +652,7 @@ impl<'a> Binder<'a> {
                         | "-"
                         | "*"
                         | "/"
+                        | "%"
                 ) {
                     return Err(RnovError::new(
                         ErrorKind::InvalidInput,
@@ -2220,7 +2221,7 @@ fn is_boolean_connector(op: &str) -> bool {
 }
 
 fn is_arithmetic_operator(op: &str) -> bool {
-    matches!(op, "+" | "-" | "*" | "/")
+    matches!(op, "+" | "-" | "*" | "/" | "%")
 }
 
 fn is_text_concat_operator(op: &str) -> bool {

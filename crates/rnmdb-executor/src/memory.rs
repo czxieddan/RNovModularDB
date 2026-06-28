@@ -1335,7 +1335,7 @@ fn eval_binary_expr(
 ) -> Result<SqlValue> {
     match op {
         "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
-        "+" | "-" | "*" | "/" => eval_arithmetic_expr(columns, row, left, op, right),
+        "+" | "-" | "*" | "/" | "%" => eval_arithmetic_expr(columns, row, left, op, right),
         "||" => eval_text_concat_expr(columns, row, left, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
@@ -1408,6 +1408,12 @@ fn eval_arithmetic_expr(
                 return Err(RnovError::new(ErrorKind::InvalidInput, "division by zero"));
             }
             left.checked_div(right)
+        }
+        "%" => {
+            if right == 0 {
+                return Err(RnovError::new(ErrorKind::InvalidInput, "modulo by zero"));
+            }
+            left.checked_rem(right)
         }
         _ => unreachable!("matched arithmetic operator"),
     }
@@ -1830,7 +1836,7 @@ fn boolean_operator(op: &str) -> bool {
 }
 
 fn arithmetic_operator(op: &str) -> bool {
-    matches!(op, "+" | "-" | "*" | "/")
+    matches!(op, "+" | "-" | "*" | "/" | "%")
 }
 
 fn text_concat_operator(op: &str) -> bool {

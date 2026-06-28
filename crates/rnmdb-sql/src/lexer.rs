@@ -328,6 +328,18 @@ fn is_identifier_continue(byte: u8) -> bool {
 fn is_operator_byte(byte: u8) -> bool {
     matches!(
         byte,
-        b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'/' | b'@' | b'|' | b'&' | b'~' | b'#' | b'?'
+        b'=' | b'<'
+            | b'>'
+            | b'!'
+            | b'+'
+            | b'-'
+            | b'/'
+            | b'%'
+            | b'@'
+            | b'|'
+            | b'&'
+            | b'~'
+            | b'#'
+            | b'?'
     )
 }

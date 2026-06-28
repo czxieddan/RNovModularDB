@@ -610,7 +610,7 @@ impl Parser {
         loop {
             let op = match self.peek_kind().cloned() {
                 Some(TokenKind::Star) => "*".to_string(),
-                Some(TokenKind::Operator(op)) if op == "/" => op,
+                Some(TokenKind::Operator(op)) if matches!(op.as_str(), "/" | "%") => op,
                 _ => break,
             };
             self.bump();
