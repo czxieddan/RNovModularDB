@@ -354,6 +354,11 @@ impl Parser {
         } else {
             None
         };
+        let fetch = self.parse_fetch_count()?;
+        if limit.is_some() && fetch.is_some() {
+            return Err(self.error("LIMIT and FETCH cannot be used together"));
+        }
+        let limit = limit.or(fetch);
         Ok(Statement::Select {
             distinct,
             projection,
@@ -926,6 +931,21 @@ impl Parser {
         }
     }
 
+    fn parse_fetch_count(&mut self) -> Result<Option<usize>> {
+        if !self.consume_if(&TokenKind::Fetch) {
+            return Ok(None);
+        }
+        if !self.consume_if(&TokenKind::First) {
+            self.expect_keyword(TokenKind::Next)?;
+        }
+        let count = self.parse_row_count("FETCH")?;
+        if !self.consume_if(&TokenKind::Row) {
+            self.expect_keyword(TokenKind::Rows)?;
+        }
+        self.expect_keyword(TokenKind::Only)?;
+        Ok(Some(count))
+    }
+
     fn parse_row_count(&mut self, clause: &'static str) -> Result<usize> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Integer(value)) => {
@@ -1099,6 +1119,11 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Last, TokenKind::Last)
             | (TokenKind::Limit, TokenKind::Limit)
             | (TokenKind::Offset, TokenKind::Offset)
+            | (TokenKind::Fetch, TokenKind::Fetch)
+            | (TokenKind::Next, TokenKind::Next)
+            | (TokenKind::Row, TokenKind::Row)
+            | (TokenKind::Rows, TokenKind::Rows)
+            | (TokenKind::Only, TokenKind::Only)
             | (TokenKind::Function, TokenKind::Function)
             | (TokenKind::Returns, TokenKind::Returns)
             | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)
