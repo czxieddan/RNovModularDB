@@ -32,6 +32,7 @@ impl Token {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
     Select,
+    Union,
     Distinct,
     All,
     As,
@@ -178,6 +179,7 @@ impl<'a> Lexer<'a> {
         let normalized = raw.to_ascii_lowercase();
         let kind = match normalized.as_str() {
             "select" => TokenKind::Select,
+            "union" => TokenKind::Union,
             "distinct" => TokenKind::Distinct,
             "all" => TokenKind::All,
             "as" => TokenKind::As,

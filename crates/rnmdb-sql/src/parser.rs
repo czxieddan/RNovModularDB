@@ -49,7 +49,7 @@ impl Parser {
             Some(TokenKind::Insert) => self.parse_insert(),
             Some(TokenKind::Update) => self.parse_update(),
             Some(TokenKind::Delete) => self.parse_delete(),
-            Some(TokenKind::Select) => self.parse_select(),
+            Some(TokenKind::Select) => self.parse_query(),
             Some(TokenKind::Begin) => self.parse_transaction(TransactionAction::Begin),
             Some(TokenKind::Commit) => self.parse_transaction(TransactionAction::Commit),
             Some(TokenKind::Rollback) => self.parse_transaction(TransactionAction::Rollback),
@@ -370,6 +370,20 @@ impl Parser {
             limit,
             offset,
         })
+    }
+
+    fn parse_query(&mut self) -> Result<Statement> {
+        let mut statement = self.parse_select()?;
+        while self.consume_if(&TokenKind::Union) {
+            let all = self.consume_if(&TokenKind::All);
+            let right = self.parse_select()?;
+            statement = Statement::Union {
+                all,
+                left: Box::new(statement),
+                right: Box::new(right),
+            };
+        }
+        Ok(statement)
     }
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
@@ -1110,6 +1124,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
     matches!(
         (left, right),
         (TokenKind::Select, TokenKind::Select)
+            | (TokenKind::Union, TokenKind::Union)
             | (TokenKind::Distinct, TokenKind::Distinct)
             | (TokenKind::All, TokenKind::All)
             | (TokenKind::As, TokenKind::As)

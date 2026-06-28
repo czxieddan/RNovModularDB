@@ -514,6 +514,11 @@ pub enum Statement {
         limit: Option<usize>,
         offset: Option<usize>,
     },
+    Union {
+        all: bool,
+        left: Box<Statement>,
+        right: Box<Statement>,
+    },
     Transaction {
         action: TransactionAction,
     },
@@ -546,6 +551,14 @@ pub struct BoundSelect {
     pub offset: Option<usize>,
     pub applied_row_policies: Vec<String>,
     pub row_policy_predicates: Vec<BoundRowPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundUnion {
+    pub all: bool,
+    pub columns: Vec<BoundColumn>,
+    pub left: Box<BoundStatement>,
+    pub right: Box<BoundStatement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -630,6 +643,7 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Select(BoundSelect),
+    Union(BoundUnion),
     Transaction {
         action: TransactionAction,
     },

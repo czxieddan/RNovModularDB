@@ -270,6 +270,11 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
             }
+            LogicalPlan::Union { all, left, right } => {
+                let left = self.execute_cancellable(left, cancellation)?;
+                let right = self.execute_cancellable(right, cancellation)?;
+                apply_union_cancellable(left, right, *all, cancellation)
+            }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -364,6 +369,11 @@ impl MemoryExecutor {
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
+            }
+            LogicalPlan::Union { all, left, right } => {
+                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                apply_union_cancellable(left, right, *all, cancellation)
             }
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -874,6 +884,58 @@ fn apply_distinct_cancellable(
     }
     cancellation.check()?;
     VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+fn apply_union_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    all: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_union_columns(&left, &right)?;
+    let mut rows = Vec::with_capacity(left.rows().len() + right.rows().len());
+    for row in left.rows() {
+        cancellation.check()?;
+        rows.push(row.clone());
+    }
+    for row in right.rows() {
+        cancellation.check()?;
+        rows.push(row.clone());
+    }
+    cancellation.check()?;
+    let batch = VectorBatch::new(left.columns().to_vec(), rows)?;
+    if all {
+        Ok(batch)
+    } else {
+        apply_distinct_cancellable(batch, cancellation)
+    }
+}
+
+fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
+    if left.columns().len() != right.columns().len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "UNION column count mismatch: left has {}, right has {}",
+                left.columns().len(),
+                right.columns().len()
+            ),
+        ));
+    }
+    for (index, (left, right)) in left.columns().iter().zip(right.columns()).enumerate() {
+        if left.data_type() != right.data_type() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "UNION column {} type mismatch: left is {:?}, right is {:?}",
+                    index + 1,
+                    left.data_type(),
+                    right.data_type()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

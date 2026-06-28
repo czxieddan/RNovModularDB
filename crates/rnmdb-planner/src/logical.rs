@@ -37,6 +37,11 @@ pub enum LogicalPlan {
     Distinct {
         input: Box<LogicalPlan>,
     },
+    Union {
+        all: bool,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
     Sort {
         keys: Vec<OrderByExpr>,
         input: Box<LogicalPlan>,
@@ -334,6 +339,11 @@ impl LogicalPlanner {
                     Ok(plan)
                 }
             }
+            BoundStatement::Union(union) => Ok(LogicalPlan::Union {
+                all: union.all,
+                left: Box::new(self.plan(&union.left)?),
+                right: Box::new(self.plan(&union.right)?),
+            }),
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -464,6 +474,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::Distinct { input } => {
             out.push_str(&format!("{prefix}Distinct\n"));
             write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Union { all, left, right } => {
+            let mode = if *all { "ALL" } else { "DISTINCT" };
+            out.push_str(&format!("{prefix}Union {mode}\n"));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
         }
         LogicalPlan::Sort { keys, input } => {
             let keys = keys
