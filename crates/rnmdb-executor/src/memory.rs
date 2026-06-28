@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
+    ops::Bound,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -84,6 +85,32 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn index_range_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        lower: Option<&Expr>,
+        lower_inclusive: bool,
+        upper: Option<&Expr>,
+        upper_inclusive: bool,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let lower = maybe_bound_key_from_expr(lower)?;
+        let upper = maybe_bound_key_from_expr(upper)?;
+        let pointers = index.range_lookup(
+            column_index,
+            bound_ref(lower.as_ref(), lower_inclusive),
+            bound_ref(upper.as_ref(), upper_inclusive),
+        )?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
         let column_index = column_index(&self.columns, column)?;
         let Some(key) = maybe_index_key_from_literal_expr(value)? else {
@@ -97,6 +124,35 @@ impl MemoryTable {
             return Ok(None);
         };
         let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_index_range_scan(
+        &self,
+        column: &str,
+        lower: Option<&Expr>,
+        lower_inclusive: bool,
+        upper: Option<&Expr>,
+        upper_inclusive: bool,
+    ) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let lower = maybe_bound_key_from_expr(lower)?;
+        let upper = maybe_bound_key_from_expr(upper)?;
+        if lower.is_none() && upper.is_none() {
+            return Ok(None);
+        }
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_single_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.range_lookup(
+            column_index,
+            bound_ref(lower.as_ref(), lower_inclusive),
+            bound_ref(upper.as_ref(), upper_inclusive),
+        )?;
         self.rows_for_pointers(&pointers).map(Some)
     }
 
@@ -342,6 +398,10 @@ impl MemoryTableIndex {
         }
     }
 
+    fn supports_single_column(&self, column: usize) -> bool {
+        matches!(self, Self::BTree { column_index, .. } if *column_index == column)
+    }
+
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
         match self {
             Self::BTree {
@@ -358,6 +418,22 @@ impl MemoryTableIndex {
                 parts.extend((1..column_indexes.len()).map(|_| None));
                 index.skip_scan(&CompositeKeyPattern::new(parts)?)
             }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn range_lookup(
+        &self,
+        column: usize,
+        lower: Bound<&IndexKey>,
+        upper: Bound<&IndexKey>,
+    ) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::BTree {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => Ok(index.range_scan_bounds(lower, upper)),
             _ => Ok(Vec::new()),
         }
     }
@@ -595,6 +671,29 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .index_scan(index, column, value),
+            PhysicalPlan::IndexRangeScan {
+                table,
+                index,
+                column,
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .index_range_scan(
+                    index,
+                    column,
+                    lower.as_ref(),
+                    *lower_inclusive,
+                    upper.as_ref(),
+                    *upper_inclusive,
+                ),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
@@ -967,16 +1066,26 @@ impl MemoryExecutor {
         let LogicalPlan::Scan { table, .. } = input else {
             return Ok(None);
         };
-        let Some((column, value)) = indexable_equality(predicate) else {
-            return Ok(None);
-        };
         let table = self.tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
-        let Some(batch) = table.try_index_scan(column, value)? else {
-            return Ok(None);
-        };
-        apply_filter_cancellable(batch, predicate, cancellation).map(Some)
+        if let Some((column, value)) = indexable_equality(predicate) {
+            if let Some(batch) = table.try_index_scan(column, value)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
+        if let Some(range) = indexable_range(predicate) {
+            if let Some(batch) = table.try_index_range_scan(
+                range.column,
+                range.lower,
+                range.lower_inclusive,
+                range.upper,
+                range.upper_inclusive,
+            )? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1038,6 +1147,20 @@ fn maybe_index_key_from_literal_expr(expr: &Expr) -> Result<Option<IndexKey>> {
     }
 }
 
+fn maybe_bound_key_from_expr(expr: Option<&Expr>) -> Result<Option<IndexKey>> {
+    expr.map(maybe_index_key_from_literal_expr)
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn bound_ref(key: Option<&IndexKey>, inclusive: bool) -> Bound<&IndexKey> {
+    match (key, inclusive) {
+        (Some(key), true) => Bound::Included(key),
+        (Some(key), false) => Bound::Excluded(key),
+        (None, _) => Bound::Unbounded,
+    }
+}
+
 fn index_key_from_value(value: &SqlValue) -> Result<Option<IndexKey>> {
     match value {
         SqlValue::Null => Ok(None),
@@ -1064,6 +1187,15 @@ fn composite_key_from_row(
     CompositeIndexKey::new(keys).map(Some)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexableRange<'a> {
+    column: &'a str,
+    lower: Option<&'a Expr>,
+    lower_inclusive: bool,
+    upper: Option<&'a Expr>,
+    upper_inclusive: bool,
+}
+
 fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
     let Expr::Binary { left, op, right } = predicate else {
         return None;
@@ -1077,6 +1209,79 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
         }
         (value, Expr::Identifier(column)) if is_index_literal(value) => {
             Some((column.as_str(), value))
+        }
+        _ => None,
+    }
+}
+
+fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    match (left.as_ref(), op.as_str(), right.as_ref()) {
+        (Expr::Identifier(column), ">", value) if is_index_literal(value) => Some(IndexableRange {
+            column: column.as_str(),
+            lower: Some(value),
+            lower_inclusive: false,
+            upper: None,
+            upper_inclusive: true,
+        }),
+        (Expr::Identifier(column), ">=", value) if is_index_literal(value) => {
+            Some(IndexableRange {
+                column: column.as_str(),
+                lower: Some(value),
+                lower_inclusive: true,
+                upper: None,
+                upper_inclusive: true,
+            })
+        }
+        (Expr::Identifier(column), "<", value) if is_index_literal(value) => Some(IndexableRange {
+            column: column.as_str(),
+            lower: None,
+            lower_inclusive: true,
+            upper: Some(value),
+            upper_inclusive: false,
+        }),
+        (Expr::Identifier(column), "<=", value) if is_index_literal(value) => {
+            Some(IndexableRange {
+                column: column.as_str(),
+                lower: None,
+                lower_inclusive: true,
+                upper: Some(value),
+                upper_inclusive: true,
+            })
+        }
+        (value, "<", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
+            column: column.as_str(),
+            lower: Some(value),
+            lower_inclusive: false,
+            upper: None,
+            upper_inclusive: true,
+        }),
+        (value, "<=", Expr::Identifier(column)) if is_index_literal(value) => {
+            Some(IndexableRange {
+                column: column.as_str(),
+                lower: Some(value),
+                lower_inclusive: true,
+                upper: None,
+                upper_inclusive: true,
+            })
+        }
+        (value, ">", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
+            column: column.as_str(),
+            lower: None,
+            lower_inclusive: true,
+            upper: Some(value),
+            upper_inclusive: false,
+        }),
+        (value, ">=", Expr::Identifier(column)) if is_index_literal(value) => {
+            Some(IndexableRange {
+                column: column.as_str(),
+                lower: None,
+                lower_inclusive: true,
+                upper: Some(value),
+                upper_inclusive: true,
+            })
         }
         _ => None,
     }

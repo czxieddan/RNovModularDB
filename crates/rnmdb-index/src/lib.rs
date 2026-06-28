@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound,
+};
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::PageId};
 use rnmdb_types::{HStore, HStoreValue, SqlArray, SqlRange, SqlType, SqlValue, TextVector};
@@ -72,8 +75,18 @@ impl MemoryBTreeIndex {
     }
 
     pub fn range_scan(&self, lower: &IndexKey, upper: &IndexKey) -> Vec<IndexPointer> {
+        self.range_scan_bounds(Bound::Included(lower), Bound::Included(upper))
+    }
+
+    pub fn range_scan_bounds(
+        &self,
+        lower: Bound<&IndexKey>,
+        upper: Bound<&IndexKey>,
+    ) -> Vec<IndexPointer> {
+        let lower = cloned_bound(lower);
+        let upper = cloned_bound(upper);
         self.entries
-            .range(lower.clone()..=upper.clone())
+            .range((lower, upper))
             .flat_map(|(_, pointers)| pointers.iter().copied())
             .collect()
     }
@@ -84,6 +97,14 @@ impl MemoryBTreeIndex {
             unique,
             entries: BTreeMap::new(),
         }
+    }
+}
+
+fn cloned_bound(bound: Bound<&IndexKey>) -> Bound<IndexKey> {
+    match bound {
+        Bound::Included(key) => Bound::Included(key.clone()),
+        Bound::Excluded(key) => Bound::Excluded(key.clone()),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
