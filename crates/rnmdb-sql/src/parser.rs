@@ -299,6 +299,9 @@ impl Parser {
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
         let distinct = self.consume_if(&TokenKind::Distinct);
+        if !distinct {
+            let _ = self.consume_if(&TokenKind::All);
+        }
         let mut projection = Vec::new();
         loop {
             if self.consume_if(&TokenKind::Star) {
