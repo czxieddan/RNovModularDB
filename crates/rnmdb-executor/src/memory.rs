@@ -12,7 +12,8 @@ use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
-    CompositeIndexKey, IndexKey, IndexPointer, MemoryBTreeIndex, MemoryCompositeIndex,
+    CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, MemoryBTreeIndex,
+    MemoryCompositeIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -20,6 +21,7 @@ use rnmdb_planner::{
         AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
         LogicalPlan,
     },
+    physical::{PhysicalPlan, SetOperationKind},
 };
 use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
@@ -67,6 +69,52 @@ impl MemoryTable {
     pub fn scan(&self) -> VectorBatch {
         VectorBatch::new(self.columns.clone(), self.rows.clone())
             .expect("stored rows are validated on insert")
+    }
+
+    fn index_scan(&self, index_name: &str, column: &str, value: &Expr) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let key = index_key_from_literal_expr(value)?;
+        let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers)
+    }
+
+    fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let Some(key) = maybe_index_key_from_literal_expr(value)? else {
+            return Ok(None);
+        };
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_leading_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn rows_for_pointers(&self, pointers: &[IndexPointer]) -> Result<VectorBatch> {
+        let mut rows = Vec::with_capacity(pointers.len());
+        for pointer in pointers {
+            if pointer.page_id() != MEMORY_INDEX_PAGE_ID {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "memory index pointer references an unexpected page",
+                ));
+            }
+            let row = self.rows.get(pointer.slot_id() as usize).ok_or_else(|| {
+                RnovError::new(ErrorKind::InvalidInput, "memory index pointer is stale")
+            })?;
+            rows.push(row.clone());
+        }
+        VectorBatch::new(self.columns.clone(), rows)
     }
 
     pub fn row_count(&self) -> usize {
@@ -286,6 +334,33 @@ impl MemoryTableIndex {
             }
         }
     }
+
+    fn supports_leading_column(&self, column: usize) -> bool {
+        match self {
+            Self::BTree { column_index, .. } => *column_index == column,
+            Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
+        }
+    }
+
+    fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::BTree {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => Ok(index.point_lookup(key)),
+            Self::Composite {
+                column_indexes,
+                index,
+            } if column_indexes.first() == Some(&column) => {
+                let mut parts = Vec::with_capacity(column_indexes.len());
+                parts.push(Some(key.clone()));
+                parts.extend((1..column_indexes.len()).map(|_| None));
+                index.skip_scan(&CompositeKeyPattern::new(parts)?)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -411,6 +486,11 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 }),
             LogicalPlan::Filter { predicate, input } => {
+                if let Some(batch) =
+                    self.execute_indexed_filter_scan(predicate, input, cancellation)?
+                {
+                    return Ok(batch);
+                }
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
@@ -484,6 +564,122 @@ impl MemoryExecutor {
         }
     }
 
+    pub fn execute_physical(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
+        self.execute_physical_cancellable(plan, &CancellationToken::default())
+    }
+
+    pub fn execute_physical_cancellable(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        cancellation.check()?;
+        match plan {
+            PhysicalPlan::SeqScan { table, .. } => self
+                .tables
+                .get(table)
+                .map(MemoryTable::scan)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                }),
+            PhysicalPlan::IndexScan {
+                table,
+                index,
+                column,
+                value,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .index_scan(index, column, value),
+            PhysicalPlan::TextSearchScan {
+                table,
+                column,
+                query,
+                ..
+            } => {
+                let batch = self
+                    .tables
+                    .get(table)
+                    .map(MemoryTable::scan)
+                    .ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                apply_text_search_cancellable(batch, column, query, cancellation)
+            }
+            PhysicalPlan::Filter {
+                predicate, input, ..
+            } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_filter_cancellable(batch, predicate, cancellation)
+            }
+            PhysicalPlan::Projection { items, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_projection_cancellable(batch, items, cancellation)
+            }
+            PhysicalPlan::Aggregate { items, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_aggregate_cancellable(batch, items, cancellation)
+            }
+            PhysicalPlan::GroupedAggregate {
+                group_by,
+                items,
+                input,
+                ..
+            } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+            }
+            PhysicalPlan::Distinct { input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_distinct_cancellable(batch, cancellation)
+            }
+            PhysicalPlan::Sort { keys, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_sort_cancellable(batch, keys, cancellation)
+            }
+            PhysicalPlan::Limit { count, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_limit_cancellable(batch, *count, cancellation)
+            }
+            PhysicalPlan::Offset { count, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_offset_cancellable(batch, *count, cancellation)
+            }
+            PhysicalPlan::SetOperation {
+                kind,
+                all,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.execute_physical_cancellable(left, cancellation)?;
+                let right = self.execute_physical_cancellable(right, cancellation)?;
+                match kind {
+                    SetOperationKind::Union => {
+                        apply_union_cancellable(left, right, *all, cancellation)
+                    }
+                    SetOperationKind::Intersect => {
+                        apply_intersect_cancellable(left, right, *all, cancellation)
+                    }
+                    SetOperationKind::Except => {
+                        apply_except_cancellable(left, right, *all, cancellation)
+                    }
+                }
+            }
+            PhysicalPlan::Parallel { input, .. } => {
+                self.execute_physical_cancellable(input, cancellation)
+            }
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory executor cannot execute this physical plan",
+            )),
+        }
+    }
+
     pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
         self.execute(plan)
     }
@@ -521,6 +717,11 @@ impl MemoryExecutor {
                 })?
                 .scan_parallel_cancellable(config, cancellation),
             LogicalPlan::Filter { predicate, input } => {
+                if let Some(batch) =
+                    self.execute_indexed_filter_scan(predicate, input, cancellation)?
+                {
+                    return Ok(batch);
+                }
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
@@ -756,6 +957,27 @@ impl MemoryExecutor {
     fn drop_index(&mut self, name: &str) -> bool {
         self.tables.values_mut().any(|table| table.drop_index(name))
     }
+
+    fn execute_indexed_filter_scan(
+        &self,
+        predicate: &Expr,
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<VectorBatch>> {
+        let LogicalPlan::Scan { table, .. } = input else {
+            return Ok(None);
+        };
+        let Some((column, value)) = indexable_equality(predicate) else {
+            return Ok(None);
+        };
+        let table = self.tables.get(table).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+        })?;
+        let Some(batch) = table.try_index_scan(column, value)? else {
+            return Ok(None);
+        };
+        apply_filter_cancellable(batch, predicate, cancellation).map(Some)
+    }
 }
 
 fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
@@ -799,6 +1021,23 @@ fn pointer_for_slot(slot: usize) -> Result<IndexPointer> {
     Ok(IndexPointer::new(MEMORY_INDEX_PAGE_ID, slot_id))
 }
 
+fn index_key_from_literal_expr(expr: &Expr) -> Result<IndexKey> {
+    maybe_index_key_from_literal_expr(expr)?.ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported index scan value: {expr}"),
+        )
+    })
+}
+
+fn maybe_index_key_from_literal_expr(expr: &Expr) -> Result<Option<IndexKey>> {
+    match expr {
+        Expr::Integer(value) => Ok(Some(IndexKey::Int64(*value))),
+        Expr::String(value) => Ok(Some(IndexKey::Text(value.clone()))),
+        _ => Ok(None),
+    }
+}
+
 fn index_key_from_value(value: &SqlValue) -> Result<Option<IndexKey>> {
     match value {
         SqlValue::Null => Ok(None),
@@ -823,6 +1062,28 @@ fn composite_key_from_row(
         keys.push(key);
     }
     CompositeIndexKey::new(keys).map(Some)
+}
+
+fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), value) if is_index_literal(value) => {
+            Some((column.as_str(), value))
+        }
+        (value, Expr::Identifier(column)) if is_index_literal(value) => {
+            Some((column.as_str(), value))
+        }
+        _ => None,
+    }
+}
+
+fn is_index_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Integer(_) | Expr::String(_))
 }
 
 fn update_rows(
