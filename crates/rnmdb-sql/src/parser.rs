@@ -479,6 +479,20 @@ impl Parser {
                     negated,
                 });
             }
+            if self.consume_if(&TokenKind::True) {
+                return Ok(Expr::IsTruth {
+                    expr: Box::new(expr),
+                    value: true,
+                    negated,
+                });
+            }
+            if self.consume_if(&TokenKind::False) {
+                return Ok(Expr::IsTruth {
+                    expr: Box::new(expr),
+                    value: false,
+                    negated,
+                });
+            }
             self.expect_keyword(TokenKind::Null)?;
             return Ok(Expr::IsNull {
                 expr: Box::new(expr),

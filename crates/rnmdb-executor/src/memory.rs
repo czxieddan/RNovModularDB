@@ -1029,6 +1029,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         )),
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
+        Expr::IsTruth { .. } => Ok(SqlType::Bool),
         Expr::IsDistinctFrom { left, right, .. } => {
             projection_null_safe_comparison_type(columns, left, right)
         }
@@ -1245,6 +1246,11 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Unary { op, expr } => eval_unary_arithmetic_expr(columns, row, op, expr),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),
         Expr::IsNull { expr, negated } => eval_is_null_expr(columns, row, expr, *negated),
+        Expr::IsTruth {
+            expr,
+            value,
+            negated,
+        } => eval_is_truth_expr(columns, row, expr, *value, *negated),
         Expr::IsDistinctFrom {
             left,
             right,
@@ -1446,6 +1452,27 @@ fn eval_is_null_expr(
 ) -> Result<SqlValue> {
     let is_null = matches!(eval_expr(columns, row, expr)?, SqlValue::Null);
     Ok(SqlValue::Bool(if negated { !is_null } else { is_null }))
+}
+
+fn eval_is_truth_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    value: bool,
+    negated: bool,
+) -> Result<SqlValue> {
+    let truth = match eval_expr(columns, row, expr)? {
+        SqlValue::Bool(actual) => actual == value,
+        SqlValue::Null => false,
+        other => {
+            let name = if value { "IS TRUE" } else { "IS FALSE" };
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{name} requires BOOL operand, got {:?}", other.data_type()),
+            ));
+        }
+    };
+    Ok(SqlValue::Bool(if negated { !truth } else { truth }))
 }
 
 fn eval_is_distinct_from_expr(

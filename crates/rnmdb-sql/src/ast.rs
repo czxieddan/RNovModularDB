@@ -117,6 +117,11 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    IsTruth {
+        expr: Box<Expr>,
+        value: bool,
+        negated: bool,
+    },
     IsDistinctFrom {
         left: Box<Expr>,
         right: Box<Expr>,
@@ -256,6 +261,18 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IS NOT NULL")
                 } else {
                     write!(f, "{expr} IS NULL")
+                }
+            }
+            Self::IsTruth {
+                expr,
+                value,
+                negated,
+            } => {
+                let value = if *value { "TRUE" } else { "FALSE" };
+                if *negated {
+                    write!(f, "{expr} IS NOT {value}")
+                } else {
+                    write!(f, "{expr} IS {value}")
                 }
             }
             Self::IsDistinctFrom {

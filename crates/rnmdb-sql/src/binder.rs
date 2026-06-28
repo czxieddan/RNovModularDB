@@ -672,6 +672,7 @@ impl<'a> Binder<'a> {
             }
             Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
             Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::IsTruth { expr, .. } => self.validate_group_by_expr_shape(expr),
             Expr::IsDistinctFrom { left, right, .. } => {
                 self.validate_group_by_expr_shape(left)?;
                 self.validate_group_by_expr_shape(right)
@@ -817,6 +818,15 @@ impl<'a> Binder<'a> {
             ))),
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
                 expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                negated: *negated,
+            }),
+            Expr::IsTruth {
+                expr,
+                value,
+                negated,
+            } => Ok(Expr::IsTruth {
+                expr: Box::new(self.rewrite_grouped_having_expr(projection, expr)?),
+                value: *value,
                 negated: *negated,
             }),
             Expr::IsDistinctFrom {
@@ -1032,6 +1042,12 @@ impl<'a> Binder<'a> {
             Expr::IsNull { expr, .. } => {
                 let _ = self.infer_grouped_output_expr_type(projection, expr)?;
                 Ok(Some(SqlType::Bool))
+            }
+            Expr::IsTruth { expr, value, .. } => {
+                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_truth_test_result_type(*value, &data_type)
             }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
@@ -1389,6 +1405,12 @@ impl<'a> Binder<'a> {
                 let _ = self.infer_policy_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
             }
+            Expr::IsTruth { expr, value, .. } => {
+                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
+                    return Ok(Some(SqlType::Bool));
+                };
+                self.infer_truth_test_result_type(*value, &data_type)
+            }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
                     return Ok(Some(SqlType::Bool));
@@ -1652,6 +1674,12 @@ impl<'a> Binder<'a> {
                 let _ = self.infer_expr_type(table, expr)?;
                 Ok(Some(SqlType::Bool))
             }
+            Expr::IsTruth { expr, value, .. } => {
+                let Some(data_type) = self.infer_expr_type(table, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_truth_test_result_type(*value, &data_type)
+            }
             Expr::IsDistinctFrom { left, right, .. } => {
                 let Some(left_type) = self.infer_expr_type(table, left)? else {
                     return Ok(None);
@@ -1847,6 +1875,22 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("NOT requires BOOL operand, got {data_type:?}"),
+            ))
+        }
+    }
+
+    fn infer_truth_test_result_type(
+        &self,
+        value: bool,
+        data_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(data_type, SqlType::Bool | SqlType::Null) {
+            Ok(Some(SqlType::Bool))
+        } else {
+            let name = if value { "IS TRUE" } else { "IS FALSE" };
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{name} requires BOOL operand, got {data_type:?}"),
             ))
         }
     }
