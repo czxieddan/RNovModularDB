@@ -436,16 +436,33 @@ impl MemoryExecutor {
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
         match plan {
-            LogicalPlan::CreateTable { table, columns } => {
-                self.create_table(table, columns)?;
+            LogicalPlan::CreateTable {
+                table,
+                columns,
+                if_not_exists,
+            } => {
+                self.create_table(table, columns, *if_not_exists)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::CreateIndex { .. } => Ok(ExecutionResult::SchemaChanged),
             LogicalPlan::DropIndex { .. } => Ok(ExecutionResult::SchemaChanged),
-            LogicalPlan::AlterTableAddColumn { table, column, .. } => {
+            LogicalPlan::AlterTableAddColumn {
+                table,
+                column,
+                if_not_exists,
+                ..
+            } => {
                 let table = self.tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
+                if table
+                    .columns()
+                    .iter()
+                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+                    && *if_not_exists
+                {
+                    return Ok(ExecutionResult::SchemaChanged);
+                }
                 table.add_column(column_schema_from_def(column))?;
                 Ok(ExecutionResult::SchemaChanged)
             }
@@ -500,8 +517,16 @@ impl MemoryExecutor {
         self.execute_mut(plan)
     }
 
-    fn create_table(&mut self, name: &str, columns: &[ColumnDef]) -> Result<()> {
+    fn create_table(
+        &mut self,
+        name: &str,
+        columns: &[ColumnDef],
+        if_not_exists: bool,
+    ) -> Result<()> {
         if self.tables.contains_key(name) {
+            if if_not_exists {
+                return Ok(());
+            }
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("table already exists: {name}"),

@@ -23,9 +23,14 @@ impl<'a> Binder<'a> {
 
     pub fn bind_for_role(&self, statement: &Statement, role_id: RoleId) -> Result<BoundStatement> {
         match statement {
-            Statement::CreateTable { name, columns } => Ok(BoundStatement::CreateTable {
+            Statement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => Ok(BoundStatement::CreateTable {
                 name: name.clone(),
                 columns: columns.clone(),
+                if_not_exists: *if_not_exists,
             }),
             Statement::CreateIndex {
                 name,
@@ -34,12 +39,28 @@ impl<'a> Binder<'a> {
                 unique,
                 if_not_exists,
             } => self.bind_create_index(name, table, columns, *unique, *if_not_exists),
-            Statement::AlterTableAddColumn { table, column } => {
+            Statement::AlterTableAddColumn {
+                table,
+                column,
+                if_not_exists,
+            } => {
                 let resolved = self.resolve_table(table)?;
+                if resolved
+                    .columns()
+                    .iter()
+                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+                    && !if_not_exists
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("column already exists: {}", column.name),
+                    ));
+                }
                 Ok(BoundStatement::AlterTableAddColumn {
                     relation_id: resolved.relation_id(),
                     table: table.clone(),
                     column: column.clone(),
+                    if_not_exists: *if_not_exists,
                 })
             }
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),

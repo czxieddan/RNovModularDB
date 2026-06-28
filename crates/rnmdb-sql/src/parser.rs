@@ -104,6 +104,13 @@ impl Parser {
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Table)?;
+        let if_not_exists = if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Not)?;
+            self.expect_keyword(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let mut columns = Vec::new();
@@ -117,7 +124,11 @@ impl Parser {
         }
         self.expect_keyword(TokenKind::RightParen)?;
 
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        })
     }
 
     fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
@@ -151,8 +162,19 @@ impl Parser {
         let table = self.parse_object_name()?;
         self.expect_keyword(TokenKind::Add)?;
         self.expect_keyword(TokenKind::Column)?;
+        let if_not_exists = if self.consume_if(&TokenKind::If) {
+            self.expect_keyword(TokenKind::Not)?;
+            self.expect_keyword(TokenKind::Exists)?;
+            true
+        } else {
+            false
+        };
         let column = self.parse_column_def()?;
-        Ok(Statement::AlterTableAddColumn { table, column })
+        Ok(Statement::AlterTableAddColumn {
+            table,
+            column,
+            if_not_exists,
+        })
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {

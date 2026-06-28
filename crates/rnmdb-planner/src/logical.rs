@@ -85,6 +85,7 @@ pub enum LogicalPlan {
     CreateTable {
         table: String,
         columns: Vec<ColumnDef>,
+        if_not_exists: bool,
     },
     CreateIndex {
         name: String,
@@ -98,6 +99,7 @@ pub enum LogicalPlan {
         relation_id: RelationId,
         table: String,
         column: ColumnDef,
+        if_not_exists: bool,
     },
     DropTable {
         relation_id: Option<RelationId>,
@@ -218,9 +220,14 @@ impl LogicalPlanner {
 
     pub fn plan(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
         match statement {
-            BoundStatement::CreateTable { name, columns } => Ok(LogicalPlan::CreateTable {
+            BoundStatement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateTable {
                 table: object_name(name),
                 columns: columns.clone(),
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreateIndex {
                 name,
@@ -241,10 +248,12 @@ impl LogicalPlanner {
                 relation_id,
                 table,
                 column,
+                if_not_exists,
             } => Ok(LogicalPlan::AlterTableAddColumn {
                 relation_id: *relation_id,
                 table: object_name(table),
                 column: column.clone(),
+                if_not_exists: *if_not_exists,
             }),
             BoundStatement::DropTable {
                 relation_id,
@@ -626,14 +635,24 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             }
             out.push('\n');
         }
-        LogicalPlan::CreateTable { table, columns } => {
+        LogicalPlan::CreateTable {
+            table,
+            columns,
+            if_not_exists,
+        } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{prefix}CreateTable table={table} columns={}\n",
+                "{prefix}CreateTable table={table} columns={}{}\n",
                 columns
                     .iter()
                     .map(|column| column.name.as_str().to_string())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                exists
             ));
         }
         LogicalPlan::CreateIndex {
@@ -656,10 +675,20 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 exists
             ));
         }
-        LogicalPlan::AlterTableAddColumn { table, column, .. } => {
+        LogicalPlan::AlterTableAddColumn {
+            table,
+            column,
+            if_not_exists,
+            ..
+        } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "{prefix}AlterTableAddColumn table={table} column={}\n",
-                column.name
+                "{prefix}AlterTableAddColumn table={table} column={}{}\n",
+                column.name, exists
             ));
         }
         LogicalPlan::DropTable {

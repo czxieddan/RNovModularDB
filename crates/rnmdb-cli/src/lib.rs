@@ -68,8 +68,12 @@ impl LocalSession {
         let bound = Binder::new(&self.catalog).bind_for_role(&statement, self.role_id)?;
 
         match &bound {
-            BoundStatement::CreateTable { name, columns } => {
-                self.apply_catalog_create_table(name, columns)?;
+            BoundStatement::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+            } => {
+                self.apply_catalog_create_table(name, columns, *if_not_exists)?;
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
@@ -94,8 +98,13 @@ impl LocalSession {
                 self.apply_catalog_drop_index(name, *if_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }
-            BoundStatement::AlterTableAddColumn { table, column, .. } => {
-                self.apply_catalog_add_column(table, column)?;
+            BoundStatement::AlterTableAddColumn {
+                table,
+                column,
+                if_not_exists,
+                ..
+            } => {
+                self.apply_catalog_add_column(table, column, *if_not_exists)?;
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
@@ -182,8 +191,12 @@ impl LocalSession {
         &mut self,
         name: &ObjectName,
         columns: &[ColumnDef],
+        if_not_exists: bool,
     ) -> Result<()> {
         let schema = name.schema().unwrap_or("public");
+        if self.catalog.get_table(schema, name.object()).is_some() && if_not_exists {
+            return Ok(());
+        }
         let columns = columns
             .iter()
             .map(ColumnDef::to_catalog_column)
@@ -228,8 +241,26 @@ impl LocalSession {
         }
     }
 
-    fn apply_catalog_add_column(&mut self, table: &ObjectName, column: &ColumnDef) -> Result<()> {
+    fn apply_catalog_add_column(
+        &mut self,
+        table: &ObjectName,
+        column: &ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<()> {
         let schema = table.schema().unwrap_or("public");
+        if self
+            .catalog
+            .get_table(schema, table.object())
+            .is_some_and(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+            })
+            && if_not_exists
+        {
+            return Ok(());
+        }
         self.catalog
             .add_column(schema, table.object(), column.to_catalog_column())?;
         Ok(())

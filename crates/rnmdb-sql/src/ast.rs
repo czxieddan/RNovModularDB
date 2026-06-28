@@ -455,6 +455,7 @@ pub enum Statement {
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDef>,
+        if_not_exists: bool,
     },
     CreateIndex {
         name: ObjectName,
@@ -466,6 +467,7 @@ pub enum Statement {
     AlterTableAddColumn {
         table: ObjectName,
         column: ColumnDef,
+        if_not_exists: bool,
     },
     DropTable {
         name: ObjectName,
@@ -657,6 +659,7 @@ pub enum BoundStatement {
     CreateTable {
         name: ObjectName,
         columns: Vec<ColumnDef>,
+        if_not_exists: bool,
     },
     CreateIndex {
         name: ObjectName,
@@ -670,6 +673,7 @@ pub enum BoundStatement {
         relation_id: RelationId,
         table: ObjectName,
         column: ColumnDef,
+        if_not_exists: bool,
     },
     DropTable {
         relation_id: Option<RelationId>,
