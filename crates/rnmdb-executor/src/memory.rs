@@ -12,7 +12,7 @@ use std::{
 use rnmdb_catalog::IndexMethod;
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
-use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
+use rnmdb_fts::{SimpleTokenizer, TextPhraseQuery, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
     AxisBounds, BlockRange, BlockSummaryIndex, BoundingBox, CompositeIndexKey, CompositeKeyPattern,
     IndexKey, IndexPointer, InvertedTextIndex, InvertedValueIndex, MemoryBTreeIndex,
@@ -3209,11 +3209,83 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             else_expr,
         } => projection_case_type(columns, operand.as_deref(), whens, else_expr.as_deref()),
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
-        Expr::Call { name, .. } => Err(RnovError::new(
+        Expr::Call { name, args } => projection_call_type(columns, name.object(), args),
+    }
+}
+
+fn projection_call_type(columns: &[ColumnSchema], name: &str, args: &[Expr]) -> Result<SqlType> {
+    match name {
+        "text_rank" => {
+            ensure_function_arity(name, args, 2)?;
+            let value_type = projection_type(columns, &args[0])?;
+            if !matches!(
+                value_type,
+                SqlType::Text | SqlType::TextVector | SqlType::Null
+            ) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "text_rank value argument requires TEXT or TEXTVECTOR, got {value_type:?}"
+                    ),
+                ));
+            }
+
+            let query_type = projection_type(columns, &args[1])?;
+            if !matches!(query_type, SqlType::Text | SqlType::Null) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("text_rank query argument requires TEXT, got {query_type:?}"),
+                ));
+            }
+            Ok(SqlType::Int64)
+        }
+        "text_phrase_match" => {
+            ensure_function_arity(name, args, 3)?;
+            let value_type = projection_type(columns, &args[0])?;
+            if !matches!(
+                value_type,
+                SqlType::Text | SqlType::TextVector | SqlType::Null
+            ) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "text_phrase_match value argument requires TEXT or TEXTVECTOR, got {value_type:?}"
+                    ),
+                ));
+            }
+
+            let phrase_type = projection_type(columns, &args[1])?;
+            if !matches!(phrase_type, SqlType::Text | SqlType::Null) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("text_phrase_match phrase argument requires TEXT, got {phrase_type:?}"),
+                ));
+            }
+
+            let gap_type = projection_type(columns, &args[2])?;
+            if !matches!(gap_type, SqlType::Int64 | SqlType::Null) {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("text_phrase_match gap argument requires INT64, got {gap_type:?}"),
+                ));
+            }
+            Ok(SqlType::Bool)
+        }
+        other => Err(RnovError::new(
             ErrorKind::InvalidInput,
-            format!("memory projection does not support function call {name}"),
+            format!("memory projection does not support function call {other}"),
         )),
     }
+}
+
+fn ensure_function_arity(name: &str, args: &[Expr], expected: usize) -> Result<()> {
+    if args.len() == expected {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("{name} expects {expected} arguments, got {}", args.len()),
+    ))
 }
 
 fn projection_coalesce_type(columns: &[ColumnSchema], values: &[Expr]) -> Result<SqlType> {
@@ -3452,11 +3524,102 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             else_expr.as_deref(),
         ),
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
-        Expr::Call { name, .. } => Err(RnovError::new(
+        Expr::Call { name, args } => eval_call_expr(columns, row, name.object(), args),
+    }
+}
+
+fn eval_call_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    name: &str,
+    args: &[Expr],
+) -> Result<SqlValue> {
+    match name {
+        "text_rank" => eval_text_rank(columns, row, args),
+        "text_phrase_match" => eval_text_phrase_match(columns, row, args),
+        other => Err(RnovError::new(
             ErrorKind::InvalidInput,
-            format!("memory projection does not support function call {name}"),
+            format!("memory projection does not support function call {other}"),
         )),
     }
+}
+
+fn eval_text_rank(columns: &[ColumnSchema], row: &Row, args: &[Expr]) -> Result<SqlValue> {
+    ensure_function_arity("text_rank", args, 2)?;
+    let Some(vector) =
+        text_vector_from_search_value(eval_expr(columns, row, &args[0])?, "text_rank")?
+    else {
+        return Ok(SqlValue::Null);
+    };
+
+    let query = match eval_expr(columns, row, &args[1])? {
+        SqlValue::Null => return Ok(SqlValue::Null),
+        SqlValue::Text(query) => TextQuery::parse(&query)?,
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "text_rank query argument requires TEXT, got {:?}",
+                    other.data_type()
+                ),
+            ));
+        }
+    };
+
+    Ok(query
+        .rank(&vector)
+        .map(|rank| SqlValue::Int64(i64::from(rank.score())))
+        .unwrap_or(SqlValue::Null))
+}
+
+fn eval_text_phrase_match(columns: &[ColumnSchema], row: &Row, args: &[Expr]) -> Result<SqlValue> {
+    ensure_function_arity("text_phrase_match", args, 3)?;
+    let Some(vector) =
+        text_vector_from_search_value(eval_expr(columns, row, &args[0])?, "text_phrase_match")?
+    else {
+        return Ok(SqlValue::Bool(false));
+    };
+
+    let phrase_text = match eval_expr(columns, row, &args[1])? {
+        SqlValue::Null => return Ok(SqlValue::Bool(false)),
+        SqlValue::Text(phrase) => phrase,
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "text_phrase_match phrase argument requires TEXT, got {:?}",
+                    other.data_type()
+                ),
+            ));
+        }
+    };
+    let max_gap = match eval_expr(columns, row, &args[2])? {
+        SqlValue::Null => return Ok(SqlValue::Bool(false)),
+        SqlValue::Int64(max_gap) if max_gap > 0 => u32::try_from(max_gap).map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "text_phrase_match gap argument exceeds UINT32",
+            )
+        })?,
+        SqlValue::Int64(_) => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "text_phrase_match gap argument must be greater than zero",
+            ));
+        }
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "text_phrase_match gap argument requires INT64, got {:?}",
+                    other.data_type()
+                ),
+            ));
+        }
+    };
+
+    let phrase = TextPhraseQuery::within(phrase_text.split_whitespace(), max_gap)?;
+    Ok(SqlValue::Bool(phrase.matches(&vector)))
 }
 
 fn eval_binary_expr(
@@ -4123,6 +4286,23 @@ fn text_value_matches(
             ErrorKind::InvalidInput,
             format!(
                 "text search cannot evaluate value type {:?}",
+                other.data_type()
+            ),
+        )),
+    }
+}
+
+fn text_vector_from_search_value(value: SqlValue, function: &str) -> Result<Option<TextVector>> {
+    match value {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(text) => Ok(Some(
+            TextVectorBuilder::new(SimpleTokenizer::new()).build(&text)?,
+        )),
+        SqlValue::TextVector(vector) => Ok(Some(vector)),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{function} value argument requires TEXT or TEXTVECTOR, got {:?}",
                 other.data_type()
             ),
         )),

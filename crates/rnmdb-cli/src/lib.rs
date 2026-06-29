@@ -578,7 +578,7 @@ impl Default for LocalExecutionConfig {
 }
 
 fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
-    let text_contains = catalog.register_function(
+    let text_contains_text = catalog.register_function(
         "text_contains",
         vec![SqlType::Text, SqlType::Text],
         SqlType::Bool,
@@ -588,8 +588,40 @@ fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
         SqlType::Text,
         SqlType::Text,
         SqlType::Bool,
-        text_contains.function_id(),
+        text_contains_text.function_id(),
     ))?;
+    let text_contains_vector = catalog.register_function(
+        "text_contains",
+        vec![SqlType::TextVector, SqlType::Text],
+        SqlType::Bool,
+    )?;
+    catalog.register_operator(OperatorSignature::new(
+        "@@",
+        SqlType::TextVector,
+        SqlType::Text,
+        SqlType::Bool,
+        text_contains_vector.function_id(),
+    ))?;
+    catalog.register_function(
+        "text_rank",
+        vec![SqlType::Text, SqlType::Text],
+        SqlType::Int64,
+    )?;
+    catalog.register_function(
+        "text_rank",
+        vec![SqlType::TextVector, SqlType::Text],
+        SqlType::Int64,
+    )?;
+    catalog.register_function(
+        "text_phrase_match",
+        vec![SqlType::Text, SqlType::Text, SqlType::Int64],
+        SqlType::Bool,
+    )?;
+    catalog.register_function(
+        "text_phrase_match",
+        vec![SqlType::TextVector, SqlType::Text, SqlType::Int64],
+        SqlType::Bool,
+    )?;
     Ok(())
 }
 
