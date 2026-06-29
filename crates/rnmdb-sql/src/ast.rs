@@ -69,6 +69,13 @@ pub struct ColumnDef {
     pub data_type: SqlType,
     pub nullable: bool,
     pub encrypted: bool,
+    pub generated: Option<GeneratedColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeneratedColumn {
+    pub expr: Expr,
+    pub stored: bool,
 }
 
 impl ColumnDef {
@@ -79,6 +86,9 @@ impl ColumnDef {
         }
         if self.encrypted {
             column = column.encrypted();
+        }
+        if let Some(generated) = &self.generated {
+            column = column.generated(generated.expr.to_string(), generated.stored);
         }
         column
     }
@@ -595,6 +605,7 @@ pub struct BoundColumn {
     pub data_type: SqlType,
     pub nullable: bool,
     pub encrypted: bool,
+    pub generated: Option<GeneratedColumn>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

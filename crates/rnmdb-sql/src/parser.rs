@@ -4,8 +4,8 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, Ident, ObjectName, OrderByExpr,
-        RangeLiteralBounds, SelectItem, SortDirection, Statement, TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, ObjectName,
+        OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -319,6 +319,7 @@ impl Parser {
         let data_type = self.parse_type()?;
         let mut nullable = true;
         let mut encrypted = false;
+        let mut generated = None;
 
         loop {
             match self.peek_kind() {
@@ -331,6 +332,19 @@ impl Parser {
                     self.bump();
                     encrypted = true;
                 }
+                Some(TokenKind::Generated) => {
+                    if generated.is_some() {
+                        return Err(self.error("column has duplicate generated expression"));
+                    }
+                    self.bump();
+                    self.expect_keyword(TokenKind::Always)?;
+                    self.expect_keyword(TokenKind::As)?;
+                    self.expect_keyword(TokenKind::LeftParen)?;
+                    let expr = self.parse_expr()?;
+                    self.expect_keyword(TokenKind::RightParen)?;
+                    self.expect_keyword(TokenKind::Stored)?;
+                    generated = Some(GeneratedColumn { expr, stored: true });
+                }
                 _ => break,
             }
         }
@@ -340,6 +354,7 @@ impl Parser {
             data_type,
             nullable,
             encrypted,
+            generated,
         })
     }
 
@@ -1443,6 +1458,9 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::False, TokenKind::False)
             | (TokenKind::Unknown, TokenKind::Unknown)
             | (TokenKind::Encrypted, TokenKind::Encrypted)
+            | (TokenKind::Generated, TokenKind::Generated)
+            | (TokenKind::Always, TokenKind::Always)
+            | (TokenKind::Stored, TokenKind::Stored)
             | (TokenKind::Explain, TokenKind::Explain)
             | (TokenKind::Analyze, TokenKind::Analyze)
             | (TokenKind::Comma, TokenKind::Comma)

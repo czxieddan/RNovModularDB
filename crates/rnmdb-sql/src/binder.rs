@@ -8,7 +8,7 @@ use rnmdb_types::SqlType;
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIntersect, BoundQuery,
     BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
-    CaseWhen, Expr, Ident, ObjectName, OrderByExpr, SelectItem, Statement,
+    CaseWhen, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -27,11 +27,14 @@ impl<'a> Binder<'a> {
                 name,
                 columns,
                 if_not_exists,
-            } => Ok(BoundStatement::CreateTable {
-                name: name.clone(),
-                columns: columns.clone(),
-                if_not_exists: *if_not_exists,
-            }),
+            } => {
+                self.validate_create_columns(columns)?;
+                Ok(BoundStatement::CreateTable {
+                    name: name.clone(),
+                    columns: columns.clone(),
+                    if_not_exists: *if_not_exists,
+                })
+            }
             Statement::CreateIndex {
                 name,
                 table,
@@ -57,6 +60,7 @@ impl<'a> Binder<'a> {
                         format!("column already exists: {}", column.name),
                     ));
                 }
+                self.validate_column_definition(column)?;
                 Ok(BoundStatement::AlterTableAddColumn {
                     relation_id: resolved.relation_id(),
                     table: table.clone(),
@@ -440,6 +444,56 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn validate_create_columns(&self, columns: &[ColumnDef]) -> Result<()> {
+        let mut available = Vec::new();
+        for column in columns {
+            self.validate_column_definition(column)?;
+            if let Some(generated) = &column.generated {
+                let generated_type =
+                    self.infer_expr_type_from_columns(&available, &generated.expr)?;
+                if generated_type != Some(column.data_type.clone()) {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "generated column {} expression type {:?} does not match declared type {:?}",
+                            column.name,
+                            generated_type.unwrap_or(SqlType::Null),
+                            column.data_type
+                        ),
+                    ));
+                }
+                if !generated.stored {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "only stored generated columns are supported",
+                    ));
+                }
+            }
+            available.push(BoundColumn {
+                name: column.name.as_str().to_string(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                encrypted: column.encrypted,
+                generated: column.generated.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_column_definition(&self, column: &ColumnDef) -> Result<()> {
+        if column
+            .generated
+            .as_ref()
+            .is_some_and(|generated| !generated.stored)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "only stored generated columns are supported",
+            ));
+        }
+        Ok(())
+    }
+
     fn bind_insert(
         &self,
         table_name: &ObjectName,
@@ -452,6 +506,15 @@ impl<'a> Binder<'a> {
         let mut bound_columns = Vec::with_capacity(columns.len());
         for (ident, value) in columns.iter().zip(values) {
             let column = self.resolve_column(table, ident.as_str())?;
+            if column.generated.is_some() {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "cannot insert explicit value for generated column {}",
+                        column.name
+                    ),
+                ));
+            }
             self.ensure_expr_assignable(table, &column, value)?;
             bound_columns.push(column);
         }
@@ -475,6 +538,12 @@ impl<'a> Binder<'a> {
         let mut bound_assignments = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let column = self.resolve_column(table, assignment.column.as_str())?;
+            if column.generated.is_some() {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot update generated column {}", column.name),
+                ));
+            }
             self.ensure_expr_assignable(table, &column, &assignment.value)?;
             bound_assignments.push(BoundAssignment {
                 column,
@@ -597,6 +666,15 @@ impl<'a> Binder<'a> {
                             data_type: column.data_type().clone(),
                             nullable: column.nullable(),
                             encrypted: column.is_encrypted(),
+                            generated: column
+                                .generated_expr()
+                                .map(|expr| {
+                                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
+                                        expr,
+                                        stored: column.generated_stored(),
+                                    })
+                                })
+                                .transpose()?,
                         };
                         projection.push(BoundSelectItem {
                             column: bound_column.clone(),
@@ -739,6 +817,7 @@ impl<'a> Binder<'a> {
                         data_type,
                         nullable: true,
                         encrypted: false,
+                        generated: None,
                     };
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
@@ -1667,6 +1746,7 @@ impl<'a> Binder<'a> {
             data_type,
             nullable: hidden_group_key_nullable(table, expr),
             encrypted: false,
+            generated: None,
         };
         let name = column.name.clone();
         hidden_group_keys.push(BoundSelectItem {
@@ -2083,11 +2163,22 @@ impl<'a> Binder<'a> {
                 )
             })?;
 
+        let generated = column
+            .generated_expr()
+            .map(|expr| {
+                parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
+                    expr,
+                    stored: column.generated_stored(),
+                })
+            })
+            .transpose()?;
+
         Ok(BoundColumn {
             name: column.name().to_string(),
             data_type: column.data_type().clone(),
             nullable: column.nullable(),
             encrypted: column.is_encrypted(),
+            generated,
         })
     }
 
@@ -2666,6 +2757,74 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn infer_expr_type_from_columns(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Identifier(identifier) => columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|column| Some(column.data_type.clone()))
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("column does not exist: {}", identifier.as_str()),
+                    )
+                }),
+            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::String(_) => Ok(Some(SqlType::Text)),
+            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
+            Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::Binary { left, right, .. } => {
+                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+                    return Ok(None);
+                };
+                self.infer_operator_result_type(expr, &left_type, &right_type)
+            }
+            Expr::Unary { op, expr } => {
+                let Some(data_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_unary_arithmetic_result_type(op, &data_type)
+            }
+            Expr::Cast { expr, data_type } => {
+                let Some(source_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+                    return Ok(None);
+                };
+                self.infer_cast_result_type(&source_type, data_type)
+            }
+            Expr::Coalesce(values) => {
+                let mut value_types = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value_type) = self.infer_expr_type_from_columns(columns, value)?
+                    else {
+                        return Ok(None);
+                    };
+                    value_types.push(value_type);
+                }
+                self.infer_coalesce_result_type(&value_types)
+            }
+            Expr::NullIf { left, right } => {
+                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+                    return Ok(None);
+                };
+                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+                    return Ok(None);
+                };
+                self.infer_nullif_result_type(&left_type, &right_type)
+            }
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported generated column expression: {other}"),
+            )),
+        }
+    }
+
     fn infer_operator_result_type(
         &self,
         expr: &Expr,
@@ -3224,6 +3383,7 @@ fn aggregate_bound_column(
         data_type,
         nullable,
         encrypted: false,
+        generated: None,
     }
 }
 

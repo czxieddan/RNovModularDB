@@ -1,4 +1,5 @@
 use rnmdb_common::{ErrorKind, Result, RnovError};
+use rnmdb_sql::ast::GeneratedColumn;
 use rnmdb_types::{SqlType, SqlValue};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7,6 +8,7 @@ pub struct ColumnSchema {
     data_type: SqlType,
     nullable: bool,
     encrypted: bool,
+    generated: Option<GeneratedColumn>,
 }
 
 impl ColumnSchema {
@@ -16,6 +18,7 @@ impl ColumnSchema {
             data_type,
             nullable: true,
             encrypted: false,
+            generated: None,
         }
     }
 
@@ -26,6 +29,11 @@ impl ColumnSchema {
 
     pub fn encrypted(mut self) -> Self {
         self.encrypted = true;
+        self
+    }
+
+    pub fn with_generated(mut self, generated: GeneratedColumn) -> Self {
+        self.generated = Some(generated);
         self
     }
 
@@ -43,6 +51,10 @@ impl ColumnSchema {
 
     pub fn is_encrypted(&self) -> bool {
         self.encrypted
+    }
+
+    pub fn generated(&self) -> Option<&GeneratedColumn> {
+        self.generated.as_ref()
     }
 }
 

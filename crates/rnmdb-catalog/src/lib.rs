@@ -12,6 +12,8 @@ pub struct Column {
     data_type: SqlType,
     nullable: bool,
     encrypted: bool,
+    generated_expr: Option<String>,
+    generated_stored: bool,
 }
 
 impl Column {
@@ -21,6 +23,8 @@ impl Column {
             data_type,
             nullable: true,
             encrypted: false,
+            generated_expr: None,
+            generated_stored: false,
         }
     }
 
@@ -31,6 +35,12 @@ impl Column {
 
     pub fn encrypted(mut self) -> Self {
         self.encrypted = true;
+        self
+    }
+
+    pub fn generated(mut self, expr: impl Into<String>, stored: bool) -> Self {
+        self.generated_expr = Some(expr.into());
+        self.generated_stored = stored;
         self
     }
 
@@ -48,6 +58,14 @@ impl Column {
 
     pub fn is_encrypted(&self) -> bool {
         self.encrypted
+    }
+
+    pub fn generated_expr(&self) -> Option<&str> {
+        self.generated_expr.as_deref()
+    }
+
+    pub fn generated_stored(&self) -> bool {
+        self.generated_stored
     }
 }
 
@@ -916,7 +934,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 3;
+    const VERSION: u16 = 4;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -944,6 +962,14 @@ impl CatalogCodec {
                     encode_sql_type(&mut out, &column.data_type);
                     out.push(u8::from(column.nullable));
                     out.push(u8::from(column.encrypted));
+                    match &column.generated_expr {
+                        Some(expr) => {
+                            out.push(1);
+                            write_string(&mut out, expr)?;
+                            out.push(u8::from(column.generated_stored));
+                        }
+                        None => out.push(0),
+                    }
                 }
             }
         }
@@ -1063,11 +1089,22 @@ impl CatalogCodec {
                     let data_type = decode_sql_type(&mut reader)?;
                     let nullable = reader.read_bool("column nullable")?;
                     let encrypted = reader.read_bool("column encrypted")?;
+                    let has_generated = reader.read_bool("column generated")?;
+                    let (generated_expr, generated_stored) = if has_generated {
+                        (
+                            Some(reader.read_string("column generated expression")?),
+                            reader.read_bool("column generated stored")?,
+                        )
+                    } else {
+                        (None, false)
+                    };
                     columns.push(Column {
                         name,
                         data_type,
                         nullable,
                         encrypted,
+                        generated_expr,
+                        generated_stored,
                     });
                 }
                 schema.tables.insert(

@@ -1986,6 +1986,9 @@ fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
     if column.encrypted {
         schema = schema.encrypted();
     }
+    if let Some(generated) = &column.generated {
+        schema = schema.with_generated(generated.clone());
+    }
     schema
 }
 
@@ -2499,6 +2502,7 @@ fn update_rows(
             for (index, expr) in &assignments {
                 updated.set_value(*index, eval_expr(&columns, row, expr)?);
             }
+            recompute_generated_values(&columns, &mut updated)?;
             VectorBatch::new(columns.clone(), vec![updated.clone()])?;
             *row = updated;
             affected += 1;
@@ -2553,7 +2557,14 @@ fn compile_assignments(
                 format!("duplicate update column: {column}"),
             ));
         }
-        compiled.push((column_index(columns, column)?, expr.clone()));
+        let column_index = column_index(columns, column)?;
+        if columns[column_index].generated().is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot update generated column {column}"),
+            ));
+        }
+        compiled.push((column_index, expr.clone()));
     }
     Ok(compiled)
 }
@@ -2577,7 +2588,13 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
                 format!("duplicate insert column: {column}"),
             ));
         }
-        let _ = column_index(table.columns(), column)?;
+        let column_index = column_index(table.columns(), column)?;
+        if table.columns()[column_index].generated().is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot insert explicit value for generated column {column}"),
+            ));
+        }
     }
 
     let mut row_values = Vec::with_capacity(table.columns().len());
@@ -2592,7 +2609,26 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
         row_values.push(value);
     }
 
-    table.insert(Row::new(row_values))
+    let mut row = Row::new(row_values);
+    recompute_generated_values(table.columns(), &mut row)?;
+    table.insert(row)
+}
+
+fn recompute_generated_values(columns: &[ColumnSchema], row: &mut Row) -> Result<()> {
+    for (index, column) in columns.iter().enumerate() {
+        let Some(generated) = column.generated() else {
+            continue;
+        };
+        if !generated.stored {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "only stored generated columns are supported",
+            ));
+        }
+        let value = eval_expr(columns, row, &generated.expr)?;
+        row.set_value(index, value);
+    }
+    Ok(())
 }
 
 fn apply_filter_cancellable(
@@ -2659,6 +2695,9 @@ fn column_schema_like(column: &ColumnSchema, name: String) -> ColumnSchema {
     }
     if column.is_encrypted() {
         schema = schema.encrypted();
+    }
+    if let Some(generated) = column.generated() {
+        schema = schema.with_generated(generated.clone());
     }
     schema
 }
