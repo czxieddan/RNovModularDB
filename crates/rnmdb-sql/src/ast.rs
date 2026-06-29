@@ -97,6 +97,10 @@ impl ColumnDef {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
     Identifier(Ident),
+    QualifiedIdentifier {
+        qualifier: Ident,
+        name: Ident,
+    },
     Integer(i64),
     String(String),
     Bool(bool),
@@ -228,6 +232,7 @@ impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Identifier(ident) => write!(f, "{ident}"),
+            Self::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
             Self::Integer(value) => write!(f, "{value}"),
             Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
             Self::Bool(true) => f.write_str("TRUE"),
@@ -454,6 +459,12 @@ pub struct Assignment {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LateralJoin {
+    pub table: ObjectName,
+    pub on: Expr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexKeyDef {
     Column(Ident),
     Expression(Expr),
@@ -583,6 +594,18 @@ pub enum Statement {
         limit: Option<usize>,
         offset: Option<usize>,
     },
+    SelectLateral {
+        distinct: bool,
+        projection: Vec<SelectItem>,
+        from: ObjectName,
+        lateral_join: LateralJoin,
+        selection: Option<Expr>,
+        group_by: Vec<Expr>,
+        having: Option<Expr>,
+        order_by: Vec<OrderByExpr>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     Union {
         all: bool,
         left: Box<Statement>,
@@ -642,6 +665,7 @@ impl BoundIndexKey {
 pub struct BoundSelect {
     pub relation_id: RelationId,
     pub table: ObjectName,
+    pub lateral_join: Option<BoundLateralJoin>,
     pub distinct: bool,
     pub projection: Vec<BoundSelectItem>,
     pub hidden_group_keys: Vec<BoundSelectItem>,
@@ -655,6 +679,14 @@ pub struct BoundSelect {
     pub offset: Option<usize>,
     pub applied_row_policies: Vec<String>,
     pub row_policy_predicates: Vec<BoundRowPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundLateralJoin {
+    pub inner_relation_id: RelationId,
+    pub inner_table: ObjectName,
+    pub inner_column: String,
+    pub outer_column: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

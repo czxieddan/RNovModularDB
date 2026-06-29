@@ -372,6 +372,15 @@ impl LogicalPlanner {
                     plan =
                         plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
                 }
+                if let Some(lateral_join) = &select.lateral_join {
+                    plan = LogicalPlan::SidewaysLookup {
+                        outer: Box::new(plan),
+                        inner_relation_id: lateral_join.inner_relation_id,
+                        inner_table: object_name(&lateral_join.inner_table),
+                        inner_column: lateral_join.inner_column.clone(),
+                        outer_column: lateral_join.outer_column.clone(),
+                    };
+                }
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }

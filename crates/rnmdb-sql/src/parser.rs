@@ -5,8 +5,8 @@ use rnmdb_types::SqlType;
 use crate::{
     ast::{
         Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
-        ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection, Statement,
-        TransactionAction,
+        LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection,
+        Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -561,6 +561,17 @@ impl Parser {
         }
         self.expect_keyword(TokenKind::From)?;
         let from = self.parse_object_name()?;
+        let lateral_join = if self.consume_if(&TokenKind::Join) {
+            self.expect_keyword(TokenKind::Lateral)?;
+            let table = self.parse_object_name()?;
+            self.expect_keyword(TokenKind::On)?;
+            Some(LateralJoin {
+                table,
+                on: self.parse_expr()?,
+            })
+        } else {
+            None
+        };
         let selection = if self.consume_if(&TokenKind::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -577,17 +588,32 @@ impl Parser {
         } else {
             None
         };
-        Ok(Statement::Select {
-            distinct,
-            projection,
-            from,
-            selection,
-            group_by,
-            having,
-            order_by: Vec::new(),
-            limit: None,
-            offset: None,
-        })
+        if let Some(lateral_join) = lateral_join {
+            Ok(Statement::SelectLateral {
+                distinct,
+                projection,
+                from,
+                lateral_join,
+                selection,
+                group_by,
+                having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })
+        } else {
+            Ok(Statement::Select {
+                distinct,
+                projection,
+                from,
+                selection,
+                group_by,
+                having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })
+        }
     }
 
     fn parse_query(&mut self) -> Result<Statement> {
@@ -995,10 +1021,14 @@ impl Parser {
                         });
                     }
                     Ok(Expr::Call { name, args })
-                } else if name.schema().is_none() {
-                    Ok(Expr::Identifier(Ident::new(name.object())))
                 } else {
-                    Ok(Expr::Identifier(Ident::new(name.object())))
+                    match name.schema() {
+                        Some(qualifier) => Ok(Expr::QualifiedIdentifier {
+                            qualifier: Ident::new(qualifier),
+                            name: Ident::new(name.object()),
+                        }),
+                        None => Ok(Expr::Identifier(Ident::new(name.object()))),
+                    }
                 }
             }
             Some(TokenKind::Integer(value)) => {
@@ -1430,6 +1460,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Exists, TokenKind::Exists)
             | (TokenKind::Table, TokenKind::Table)
             | (TokenKind::From, TokenKind::From)
+            | (TokenKind::Join, TokenKind::Join)
+            | (TokenKind::Lateral, TokenKind::Lateral)
             | (TokenKind::Where, TokenKind::Where)
             | (TokenKind::Group, TokenKind::Group)
             | (TokenKind::Having, TokenKind::Having)
@@ -1518,6 +1550,27 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             distinct,
             projection,
             from,
+            selection,
+            group_by,
+            having,
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
+        Statement::SelectLateral {
+            distinct,
+            projection,
+            from,
+            lateral_join,
+            selection,
+            group_by,
+            having,
+            ..
+        } => Statement::SelectLateral {
+            distinct,
+            projection,
+            from,
+            lateral_join,
             selection,
             group_by,
             having,

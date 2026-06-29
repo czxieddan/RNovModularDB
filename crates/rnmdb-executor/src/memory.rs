@@ -151,7 +151,7 @@ impl MemoryTable {
         column: &str,
         value: &SqlValue,
     ) -> Result<VectorBatch> {
-        let index = self.indexes.get(index_name).ok_or_else(|| {
+        let index = self.lookup_index(index_name).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("index not found: {index_name}"),
@@ -163,6 +163,20 @@ impl MemoryTable {
         };
         let pointers = index.point_lookup(column_index, &key)?;
         self.rows_for_pointers(&pointers)
+    }
+
+    fn point_lookup_index_for_column(&self, column: usize) -> Option<&str> {
+        self.indexes
+            .iter()
+            .find(|(_, index)| index.supports_point_lookup_column(column))
+            .map(|(name, _)| name.as_str())
+    }
+
+    fn lookup_index(&self, name: &str) -> Option<&MemoryTableIndex> {
+        self.indexes.get(name).or_else(|| {
+            name.rsplit_once('.')
+                .and_then(|(_, unqualified)| self.indexes.get(unqualified))
+        })
     }
 
     fn text_index_scan(
@@ -1081,6 +1095,16 @@ impl MemoryTableIndex {
         matches!(self, Self::Composite { column_indexes, .. } if column_indexes.contains(&column))
     }
 
+    fn supports_point_lookup_column(&self, column: usize) -> bool {
+        match self {
+            Self::BTree { column_index, .. } | Self::Hash { column_index, .. } => {
+                *column_index == column
+            }
+            Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
+            _ => false,
+        }
+    }
+
     fn supports_text_column(&self, column: usize) -> bool {
         matches!(self, Self::GinText { column_index, .. } if *column_index == column)
     }
@@ -1436,6 +1460,19 @@ impl MemoryExecutor {
                 let batch = table.scan();
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
+            LogicalPlan::SidewaysLookup {
+                outer,
+                inner_table,
+                inner_column,
+                outer_column,
+                ..
+            } => self.execute_logical_sideways_lookup(
+                outer,
+                inner_table,
+                inner_column,
+                outer_column,
+                cancellation,
+            ),
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -1797,6 +1834,53 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
+    fn execute_logical_sideways_lookup(
+        &self,
+        outer: &LogicalPlan,
+        inner_table: &str,
+        inner_column: &str,
+        outer_column: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let outer_batch = self.execute_cancellable(outer, cancellation)?;
+        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
+        let inner = self.tables.get(inner_table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {inner_table}"),
+            )
+        })?;
+        let inner_column_index = column_index(inner.columns(), inner_column)?;
+        let inner_index = inner
+            .point_lookup_index_for_column(inner_column_index)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("JOIN LATERAL requires an index on {inner_table}.{inner_column}"),
+                )
+            })?;
+        let columns = joined_columns(outer_batch.columns(), inner.columns())?;
+        let mut rows = Vec::new();
+
+        for outer_row in outer_batch.rows() {
+            cancellation.check()?;
+            let lookup_value = &outer_row.values()[outer_column_index];
+            let inner_batch =
+                inner.index_point_lookup_value(inner_index, inner_column, lookup_value)?;
+            for inner_row in inner_batch.rows() {
+                cancellation.check()?;
+                let mut values =
+                    Vec::with_capacity(outer_row.values().len() + inner_row.values().len());
+                values.extend_from_slice(outer_row.values());
+                values.extend_from_slice(inner_row.values());
+                rows.push(Row::new(values));
+            }
+        }
+
+        cancellation.check()?;
+        VectorBatch::new(columns, rows)
+    }
+
     pub fn execute_parallel(
         &self,
         plan: &LogicalPlan,
@@ -1845,6 +1929,19 @@ impl MemoryExecutor {
                 let batch = table.scan_parallel_cancellable(config, cancellation)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
+            LogicalPlan::SidewaysLookup {
+                outer,
+                inner_table,
+                inner_column,
+                outer_column,
+                ..
+            } => self.execute_logical_sideways_lookup(
+                outer,
+                inner_table,
+                inner_column,
+                outer_column,
+                cancellation,
+            ),
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -3414,6 +3511,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             let index = column_index(columns, identifier.as_str())?;
             Ok(columns[index].data_type().clone())
         }
+        Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "bound memory projection must not contain qualified column references",
+        )),
         Expr::Integer(_) => Ok(SqlType::Int64),
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Bool(_) => Ok(SqlType::Bool),
@@ -3721,6 +3822,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             let index = column_index(columns, identifier.as_str())?;
             Ok(row.values()[index].clone())
         }
+        Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "bound memory expression must not contain qualified column references",
+        )),
         Expr::Integer(_)
         | Expr::String(_)
         | Expr::Bool(_)

@@ -7,9 +7,9 @@ use rnmdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
-    BoundIntersect, BoundQuery, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement,
-    BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, ObjectName,
-    OrderByExpr, SelectItem, Statement,
+    BoundIntersect, BoundLateralJoin, BoundQuery, BoundRowPolicy, BoundSelect, BoundSelectItem,
+    BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef,
+    LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -205,8 +205,32 @@ impl<'a> Binder<'a> {
                 limit,
                 offset,
             } => self.bind_select(
-                *distinct, projection, from, selection, group_by, having, order_by, *limit,
+                *distinct, projection, from, None, selection, group_by, having, order_by, *limit,
                 *offset, role_id,
+            ),
+            Statement::SelectLateral {
+                distinct,
+                projection,
+                from,
+                lateral_join,
+                selection,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+            } => self.bind_select(
+                *distinct,
+                projection,
+                from,
+                Some(lateral_join),
+                selection,
+                group_by,
+                having,
+                order_by,
+                *limit,
+                *offset,
+                role_id,
             ),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
             Statement::Intersect { all, left, right } => {
@@ -686,6 +710,7 @@ impl<'a> Binder<'a> {
         distinct: bool,
         select_items: &[SelectItem],
         from: &ObjectName,
+        lateral_join: Option<&LateralJoin>,
         selection: &Option<Expr>,
         group_by: &[Expr],
         having: &Option<Expr>,
@@ -696,6 +721,22 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(from)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Select)?;
+        if let Some(lateral_join) = lateral_join {
+            return self.bind_lateral_select(
+                distinct,
+                select_items,
+                from,
+                table,
+                lateral_join,
+                selection,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+                role_id,
+            );
+        }
 
         let mut columns = Vec::new();
         let mut projection = Vec::new();
@@ -738,6 +779,19 @@ impl<'a> Binder<'a> {
                     columns.push(column);
                 }
                 SelectItem::Expr {
+                    expr: Expr::QualifiedIdentifier { qualifier, name },
+                    alias,
+                } => {
+                    self.ensure_table_qualifier(table, qualifier)?;
+                    let column = self.resolve_column(table, name.as_str())?;
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Identifier(name.clone()),
+                    });
+                    columns.push(column);
+                }
+                SelectItem::Expr {
                     expr: Expr::CountStar,
                     alias,
                 } => {
@@ -753,7 +807,8 @@ impl<'a> Binder<'a> {
                     expr: Expr::Count(expr),
                     alias,
                 } => {
-                    let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer COUNT expression type: {expr}"),
@@ -763,7 +818,7 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: Expr::Count(expr.clone()),
+                        expr: Expr::Count(Box::new(expr)),
                     });
                     columns.push(column);
                 }
@@ -771,7 +826,8 @@ impl<'a> Binder<'a> {
                     expr: Expr::CountDistinct(expr),
                     alias,
                 } => {
-                    let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer COUNT DISTINCT expression type: {expr}"),
@@ -781,7 +837,7 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: Expr::CountDistinct(expr.clone()),
+                        expr: Expr::CountDistinct(Box::new(expr)),
                     });
                     columns.push(column);
                 }
@@ -789,7 +845,8 @@ impl<'a> Binder<'a> {
                     expr: Expr::Sum(expr),
                     alias,
                 } => {
-                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer SUM expression type: {expr}"),
@@ -805,7 +862,7 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: Expr::Sum(expr.clone()),
+                        expr: Expr::Sum(Box::new(expr)),
                     });
                     columns.push(column);
                 }
@@ -813,7 +870,8 @@ impl<'a> Binder<'a> {
                     expr: Expr::Min(expr),
                     alias,
                 } => {
-                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer MIN expression type: {expr}"),
@@ -824,7 +882,7 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: Expr::Min(expr.clone()),
+                        expr: Expr::Min(Box::new(expr)),
                     });
                     columns.push(column);
                 }
@@ -832,7 +890,8 @@ impl<'a> Binder<'a> {
                     expr: Expr::Max(expr),
                     alias,
                 } => {
-                    let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer MAX expression type: {expr}"),
@@ -843,12 +902,13 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: Expr::Max(expr.clone()),
+                        expr: Expr::Max(Box::new(expr)),
                     });
                     columns.push(column);
                 }
                 SelectItem::Expr { expr, alias } => {
-                    let data_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
                             format!("cannot infer select expression type: {expr}"),
@@ -864,7 +924,7 @@ impl<'a> Binder<'a> {
                     let column = aliased_bound_column(column, alias);
                     projection.push(BoundSelectItem {
                         column: column.clone(),
-                        expr: expr.clone(),
+                        expr,
                     });
                     columns.push(column);
                 }
@@ -910,10 +970,19 @@ impl<'a> Binder<'a> {
             None
         };
         if let Some(selection) = selection {
-            self.validate_predicate(table, selection)?;
+            let selection = self.rewrite_table_qualified_expr(table, selection)?;
+            self.validate_predicate(table, &selection)?;
         }
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_table_qualified_expr(table, selection))
+            .transpose()?;
         let mut bound_order_by = Vec::with_capacity(order_by.len());
         for order_by in order_by {
+            let order_by = OrderByExpr {
+                expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
+                direction: order_by.direction,
+            };
             if group_by.is_empty() {
                 if aggregate_count > 0 {
                     bound_order_by.push(self.bind_grouped_sort_expr(
@@ -921,10 +990,14 @@ impl<'a> Binder<'a> {
                         &projection,
                         &mut hidden_aggregates,
                         &bound_group_by,
-                        order_by,
+                        &order_by,
                     )?);
                 } else {
-                    bound_order_by.push(self.bind_plain_sort_expr(table, &projection, order_by)?);
+                    bound_order_by.push(self.bind_plain_sort_expr(
+                        table,
+                        &projection,
+                        &order_by,
+                    )?);
                 }
             } else {
                 bound_order_by.push(self.bind_grouped_sort_expr(
@@ -932,7 +1005,7 @@ impl<'a> Binder<'a> {
                     &projection,
                     &mut hidden_aggregates,
                     &bound_group_by,
-                    order_by,
+                    &order_by,
                 )?);
             }
         }
@@ -940,12 +1013,13 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
             table: from.clone(),
+            lateral_join: None,
             distinct,
             projection,
             hidden_group_keys,
             hidden_aggregates,
             columns,
-            selection: selection.clone(),
+            selection,
             group_by: bound_group_by,
             having,
             order_by: bound_order_by,
@@ -956,8 +1030,154 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn bind_lateral_select(
+        &self,
+        distinct: bool,
+        select_items: &[SelectItem],
+        from: &ObjectName,
+        outer_table: &Table,
+        lateral_join: &LateralJoin,
+        selection: &Option<Expr>,
+        group_by: &[Expr],
+        having: &Option<Expr>,
+        order_by: &[OrderByExpr],
+        limit: Option<usize>,
+        offset: Option<usize>,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        if !group_by.is_empty() || having.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL does not support GROUP BY or HAVING in this SQL slice",
+            ));
+        }
+
+        let inner_table = self.resolve_table(&lateral_join.table)?;
+        self.require_table_privilege(role_id, inner_table.relation_id(), Privilege::Select)?;
+        let lateral_columns = lateral_join_columns(outer_table, inner_table)?;
+        let lateral_bound_columns = lateral_columns_to_bound(&lateral_columns);
+        let (inner_column, outer_column) = self.bind_lateral_equality(
+            outer_table,
+            from,
+            inner_table,
+            &lateral_join.table,
+            &lateral_join.on,
+        )?;
+
+        let mut projection = Vec::new();
+        let mut columns = Vec::new();
+        for item in select_items {
+            match item {
+                SelectItem::Wildcard => {
+                    for lateral_column in &lateral_columns {
+                        projection.push(BoundSelectItem {
+                            column: lateral_column.column.clone(),
+                            expr: Expr::Identifier(Ident::new(lateral_column.output_name.as_str())),
+                        });
+                        columns.push(lateral_column.column.clone());
+                    }
+                }
+                SelectItem::Expr { expr, alias } => {
+                    let expr = self.rewrite_lateral_expr(&lateral_columns, expr)?;
+                    let data_type = self
+                        .infer_expr_type_from_columns(&lateral_bound_columns, &expr)?
+                        .ok_or_else(|| {
+                            RnovError::new(
+                                ErrorKind::InvalidInput,
+                                format!("cannot infer select expression type: {expr}"),
+                            )
+                        })?;
+                    let column = match &expr {
+                        Expr::Identifier(identifier) => lateral_columns
+                            .iter()
+                            .find(|column| {
+                                column.output_name.eq_ignore_ascii_case(identifier.as_str())
+                            })
+                            .map(|column| column.column.clone())
+                            .unwrap_or_else(|| BoundColumn {
+                                name: format!("expr{}", columns.len() + 1),
+                                data_type: data_type.clone(),
+                                nullable: true,
+                                encrypted: false,
+                                generated: None,
+                            }),
+                        _ => BoundColumn {
+                            name: format!("expr{}", columns.len() + 1),
+                            data_type,
+                            nullable: true,
+                            encrypted: false,
+                            generated: None,
+                        },
+                    };
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr,
+                    });
+                    columns.push(column);
+                }
+            }
+        }
+
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_lateral_expr(&lateral_columns, selection))
+            .transpose()?;
+        if let Some(selection) = &selection {
+            self.validate_predicate_from_columns(&lateral_bound_columns, selection)?;
+        }
+
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
+        for order_by in order_by {
+            let order_by = OrderByExpr {
+                expr: self.rewrite_lateral_expr(&lateral_columns, &order_by.expr)?,
+                direction: order_by.direction,
+            };
+            bound_order_by.push(self.bind_plain_output_sort_expr(
+                &lateral_bound_columns,
+                &projection,
+                &order_by,
+            )?);
+        }
+
+        Ok(BoundStatement::Select(BoundSelect {
+            relation_id: outer_table.relation_id(),
+            table: from.clone(),
+            lateral_join: Some(BoundLateralJoin {
+                inner_relation_id: inner_table.relation_id(),
+                inner_table: lateral_join.table.clone(),
+                inner_column,
+                outer_column,
+            }),
+            distinct,
+            projection,
+            hidden_group_keys: Vec::new(),
+            hidden_aggregates: Vec::new(),
+            columns,
+            selection,
+            group_by: Vec::new(),
+            having: None,
+            order_by: bound_order_by,
+            limit,
+            offset,
+            applied_row_policies: self.applied_row_policy_names(outer_table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(outer_table)?,
+        }))
+    }
+
     fn validate_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
         match self.infer_expr_type(table, expr)? {
+            Some(SqlType::Bool | SqlType::Null) => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("predicate must be bool, got {other:?}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_predicate_from_columns(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
+        match self.infer_expr_type_from_columns(columns, expr)? {
             Some(SqlType::Bool | SqlType::Null) => Ok(()),
             Some(other) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -982,6 +1202,44 @@ impl<'a> Binder<'a> {
                 format!("ORDER BY expression type is not sortable: {other:?}"),
             )),
             None => Ok(()),
+        }
+    }
+
+    fn bind_plain_output_sort_expr(
+        &self,
+        columns: &[BoundColumn],
+        projection: &[BoundSelectItem],
+        order_by: &OrderByExpr,
+    ) -> Result<OrderByExpr> {
+        let expr = match &order_by.expr {
+            Expr::Integer(value) => self
+                .projection_ordinal_item(projection, *value, "ORDER BY")?
+                .expr
+                .clone(),
+            Expr::Identifier(identifier) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| item.expr.clone())
+                .unwrap_or_else(|| order_by.expr.clone()),
+            _ => order_by.expr.clone(),
+        };
+        match self.infer_expr_type_from_columns(columns, &expr)? {
+            Some(
+                SqlType::Null
+                | SqlType::Bool
+                | SqlType::Int64
+                | SqlType::UInt64
+                | SqlType::Text
+                | SqlType::Bytes,
+            )
+            | None => Ok(OrderByExpr {
+                expr,
+                direction: order_by.direction,
+            }),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ORDER BY expression type is not sortable: {other:?}"),
+            )),
         }
     }
 
@@ -1194,6 +1452,7 @@ impl<'a> Binder<'a> {
     fn validate_group_by_expr_shape(&self, expr: &Expr) -> Result<()> {
         match expr {
             Expr::Identifier(_)
+            | Expr::QualifiedIdentifier { .. }
             | Expr::Integer(_)
             | Expr::String(_)
             | Expr::Bool(_)
@@ -1743,6 +2002,7 @@ impl<'a> Binder<'a> {
                     args,
                 }),
             Expr::Identifier(_)
+            | Expr::QualifiedIdentifier { .. }
             | Expr::Integer(_)
             | Expr::String(_)
             | Expr::Bool(_)
@@ -1912,6 +2172,10 @@ impl<'a> Binder<'a> {
                         ),
                     )
                 }),
+            Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support qualified column references after binding",
+            )),
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
@@ -2224,6 +2488,318 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn ensure_table_qualifier(&self, table: &Table, qualifier: &Ident) -> Result<()> {
+        if qualifier.as_str().eq_ignore_ascii_case(table.name())
+            || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
+        {
+            Ok(())
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "qualified column references table {}, but current table is {}",
+                    qualifier.as_str(),
+                    table.name()
+                ),
+            ))
+        }
+    }
+
+    fn rewrite_table_qualified_expr(&self, table: &Table, expr: &Expr) -> Result<Expr> {
+        self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            self.ensure_table_qualifier(table, qualifier)?;
+            let _ = self.resolve_column(table, name.as_str())?;
+            Ok(Expr::Identifier(name.clone()))
+        })
+    }
+
+    fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
+        self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            let matches = columns
+                .iter()
+                .filter(|column| {
+                    column.table_name.eq_ignore_ascii_case(qualifier.as_str())
+                        && column.source_name.eq_ignore_ascii_case(name.as_str())
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [column] => Ok(Expr::Identifier(Ident::new(column.output_name.as_str()))),
+                [] => Err(RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {qualifier}.{name}"),
+                )),
+                _ => Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("ambiguous qualified column reference: {qualifier}.{name}"),
+                )),
+            }
+        })
+    }
+
+    fn rewrite_qualified_expr<F>(&self, expr: &Expr, resolver: &mut F) -> Result<Expr>
+    where
+        F: FnMut(&Ident, &Ident) -> Result<Expr>,
+    {
+        match expr {
+            Expr::QualifiedIdentifier { qualifier, name } => resolver(qualifier, name),
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
+                op: op.clone(),
+                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+            }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                negated: *negated,
+            }),
+            Expr::IsTruth {
+                expr,
+                value,
+                negated,
+            } => Ok(Expr::IsTruth {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                value: *value,
+                negated: *negated,
+            }),
+            Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                negated: *negated,
+            }),
+            Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => Ok(Expr::IsDistinctFrom {
+                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
+                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
+                negated: *negated,
+            }),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => Ok(Expr::Between {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                low: Box::new(self.rewrite_qualified_expr(low, resolver)?),
+                high: Box::new(self.rewrite_qualified_expr(high, resolver)?),
+                negated: *negated,
+            }),
+            Expr::InList {
+                expr,
+                values,
+                negated,
+            } => Ok(Expr::InList {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                values: values
+                    .iter()
+                    .map(|value| self.rewrite_qualified_expr(value, resolver))
+                    .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            }),
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+            } => Ok(Expr::Like {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                pattern: Box::new(self.rewrite_qualified_expr(pattern, resolver)?),
+                negated: *negated,
+            }),
+            Expr::Coalesce(values) => values
+                .iter()
+                .map(|value| self.rewrite_qualified_expr(value, resolver))
+                .collect::<Result<Vec<_>>>()
+                .map(Expr::Coalesce),
+            Expr::NullIf { left, right } => Ok(Expr::NullIf {
+                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
+                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
+            }),
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => Ok(Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|operand| self.rewrite_qualified_expr(operand, resolver))
+                    .transpose()?
+                    .map(Box::new),
+                whens: whens
+                    .iter()
+                    .map(|arm| {
+                        Ok(CaseWhen {
+                            condition: self.rewrite_qualified_expr(&arm.condition, resolver)?,
+                            result: self.rewrite_qualified_expr(&arm.result, resolver)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|else_expr| self.rewrite_qualified_expr(else_expr, resolver))
+                    .transpose()?
+                    .map(Box::new),
+            }),
+            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
+                data_type: data_type.clone(),
+            }),
+            Expr::Call { name, args } => args
+                .iter()
+                .map(|arg| self.rewrite_qualified_expr(arg, resolver))
+                .collect::<Result<Vec<_>>>()
+                .map(|args| Expr::Call {
+                    name: name.clone(),
+                    args,
+                }),
+            Expr::Count(expr) => Ok(Expr::Count(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::CountDistinct(expr) => Ok(Expr::CountDistinct(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::Sum(expr) => Ok(Expr::Sum(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::Min(expr) => Ok(Expr::Min(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::Max(expr) => Ok(Expr::Max(Box::new(
+                self.rewrite_qualified_expr(expr, resolver)?,
+            ))),
+            Expr::Array(values) => values
+                .iter()
+                .map(|value| self.rewrite_qualified_expr(value, resolver))
+                .collect::<Result<Vec<_>>>()
+                .map(Expr::Array),
+            Expr::Range {
+                lower,
+                upper,
+                bounds,
+            } => Ok(Expr::Range {
+                lower: Box::new(self.rewrite_qualified_expr(lower, resolver)?),
+                upper: Box::new(self.rewrite_qualified_expr(upper, resolver)?),
+                bounds: *bounds,
+            }),
+            Expr::Identifier(_)
+            | Expr::Integer(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::CountStar
+            | Expr::HStore(_) => Ok(expr.clone()),
+        }
+    }
+
+    fn bind_lateral_equality(
+        &self,
+        outer_table: &Table,
+        outer_name: &ObjectName,
+        inner_table: &Table,
+        inner_name: &ObjectName,
+        expr: &Expr,
+    ) -> Result<(String, String)> {
+        let Expr::Binary { left, op, right } = expr else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL requires an equality ON predicate",
+            ));
+        };
+        if op != "=" {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL requires an equality ON predicate",
+            ));
+        }
+        let left =
+            self.lateral_column_ref(outer_table, outer_name, inner_table, inner_name, left)?;
+        let right =
+            self.lateral_column_ref(outer_table, outer_name, inner_table, inner_name, right)?;
+        match (left.side, right.side) {
+            (LateralSide::Inner, LateralSide::Outer) => {
+                self.ensure_lateral_column_types_match(&left.column, &right.column)?;
+                Ok((left.column.name, right.column.name))
+            }
+            (LateralSide::Outer, LateralSide::Inner) => {
+                self.ensure_lateral_column_types_match(&right.column, &left.column)?;
+                Ok((right.column.name, left.column.name))
+            }
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL ON must compare one inner column with one outer column",
+            )),
+        }
+    }
+
+    fn lateral_column_ref(
+        &self,
+        outer_table: &Table,
+        outer_name: &ObjectName,
+        inner_table: &Table,
+        inner_name: &ObjectName,
+        expr: &Expr,
+    ) -> Result<LateralColumnRef> {
+        let Expr::QualifiedIdentifier { qualifier, name } = expr else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL ON must use qualified column references",
+            ));
+        };
+        if self.object_matches_qualifier(inner_table, inner_name, qualifier) {
+            let column = self.resolve_column(inner_table, name.as_str())?;
+            return Ok(LateralColumnRef {
+                side: LateralSide::Inner,
+                column,
+            });
+        }
+        if self.object_matches_qualifier(outer_table, outer_name, qualifier) {
+            let column = self.resolve_column(outer_table, name.as_str())?;
+            return Ok(LateralColumnRef {
+                side: LateralSide::Outer,
+                column,
+            });
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("JOIN LATERAL ON references unknown table qualifier {qualifier}"),
+        ))
+    }
+
+    fn object_matches_qualifier(
+        &self,
+        table: &Table,
+        object_name: &ObjectName,
+        qualifier: &Ident,
+    ) -> bool {
+        qualifier.as_str().eq_ignore_ascii_case(table.name())
+            || qualifier
+                .as_str()
+                .eq_ignore_ascii_case(object_name.object())
+    }
+
+    fn ensure_lateral_column_types_match(
+        &self,
+        inner_column: &BoundColumn,
+        outer_column: &BoundColumn,
+    ) -> Result<()> {
+        if inner_column.data_type == outer_column.data_type {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "JOIN LATERAL column types must match, got {:?} and {:?}",
+                inner_column.data_type, outer_column.data_type
+            ),
+        ))
+    }
+
     fn require_table_privilege(
         &self,
         role_id: RoleId,
@@ -2280,6 +2856,11 @@ impl<'a> Binder<'a> {
         match expr {
             Expr::Identifier(identifier) => {
                 let column = self.resolve_column(table, identifier.as_str())?;
+                Ok(Some(column.data_type))
+            }
+            Expr::QualifiedIdentifier { qualifier, name } => {
+                self.ensure_table_qualifier(table, qualifier)?;
+                let column = self.resolve_column(table, name.as_str())?;
                 Ok(Some(column.data_type))
             }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
@@ -2562,6 +3143,11 @@ impl<'a> Binder<'a> {
                 let column = self.resolve_column(table, identifier.as_str())?;
                 Ok(Some(column.data_type))
             }
+            Expr::QualifiedIdentifier { qualifier, name } => {
+                self.ensure_table_qualifier(table, qualifier)?;
+                let column = self.resolve_column(table, name.as_str())?;
+                Ok(Some(column.data_type))
+            }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
@@ -2815,6 +3401,10 @@ impl<'a> Binder<'a> {
                         format!("column does not exist: {}", identifier.as_str()),
                     )
                 }),
+            Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "bound expressions must not contain qualified column references",
+            )),
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
@@ -3404,6 +3994,60 @@ fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
             })
         })
         .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LateralColumn {
+    table_name: String,
+    source_name: String,
+    output_name: String,
+    column: BoundColumn,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LateralColumnRef {
+    side: LateralSide,
+    column: BoundColumn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LateralSide {
+    Outer,
+    Inner,
+}
+
+fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColumn>> {
+    let mut columns = Vec::new();
+    for column in bound_columns_for_table(outer)? {
+        columns.push(LateralColumn {
+            table_name: outer.name().to_string(),
+            source_name: column.name.clone(),
+            output_name: column.name.clone(),
+            column,
+        });
+    }
+    for mut column in bound_columns_for_table(inner)? {
+        let source_name = column.name.clone();
+        let mut output_name = column.name.clone();
+        while columns
+            .iter()
+            .any(|existing| existing.output_name == output_name)
+        {
+            output_name = format!("inner_{output_name}");
+        }
+        column.name = output_name.clone();
+        columns.push(LateralColumn {
+            table_name: inner.name().to_string(),
+            source_name,
+            output_name,
+            column,
+        });
+    }
+    Ok(columns)
+}
+
+fn lateral_columns_to_bound(columns: &[LateralColumn]) -> Vec<BoundColumn> {
+    columns.iter().map(|column| column.column.clone()).collect()
 }
 
 fn validate_set_operation_columns(
