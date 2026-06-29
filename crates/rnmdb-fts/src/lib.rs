@@ -37,28 +37,75 @@ pub trait Tokenizer {
     fn tokenize(&self, input: &str) -> Result<Vec<Token>>;
 }
 
+pub trait TermStemmer {
+    fn stem(&self, term: &str) -> Result<String>;
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SimpleTokenizer {
+pub struct IdentityStemmer;
+
+impl TermStemmer for IdentityStemmer {
+    fn stem(&self, term: &str) -> Result<String> {
+        Ok(term.to_string())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimpleTokenizer<S = IdentityStemmer> {
     stop_words: BTreeSet<String>,
+    stemmer: S,
+}
+
+impl Default for SimpleTokenizer<IdentityStemmer> {
+    fn default() -> Self {
+        Self {
+            stop_words: BTreeSet::new(),
+            stemmer: IdentityStemmer,
+        }
+    }
 }
 
 impl SimpleTokenizer {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    pub fn with_stop_words<I, S>(mut self, stop_words: I) -> Self
+impl<S> SimpleTokenizer<S>
+where
+    S: TermStemmer,
+{
+    pub fn with_stop_words<I, W>(mut self, stop_words: I) -> Self
     where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        I: IntoIterator<Item = W>,
+        W: AsRef<str>,
     {
         for word in stop_words {
-            let normalized = normalize_term(word.as_ref());
-            if !normalized.is_empty() {
-                self.stop_words.insert(normalized);
+            if let Ok(normalized) = normalize_term_with_stemmer(word.as_ref(), &self.stemmer) {
+                if !normalized.is_empty() {
+                    self.stop_words.insert(normalized);
+                }
             }
         }
         self
+    }
+
+    pub fn with_stemmer<T>(self, stemmer: T) -> SimpleTokenizer<T>
+    where
+        T: TermStemmer,
+    {
+        let stop_words = self
+            .stop_words
+            .into_iter()
+            .filter_map(|word| match stemmer.stem(&word) {
+                Ok(stemmed) if !stemmed.is_empty() => Some(stemmed),
+                _ => None,
+            })
+            .collect();
+        SimpleTokenizer {
+            stop_words,
+            stemmer,
+        }
     }
 
     pub fn stop_words(&self) -> &BTreeSet<String> {
@@ -66,11 +113,14 @@ impl SimpleTokenizer {
     }
 
     pub fn tokenize(&self, input: &str) -> Result<Vec<Token>> {
-        tokenize_with_stop_words(input, &self.stop_words)
+        tokenize_with_stop_words_and_stemmer(input, &self.stop_words, &self.stemmer)
     }
 }
 
-impl Tokenizer for SimpleTokenizer {
+impl<S> Tokenizer for SimpleTokenizer<S>
+where
+    S: TermStemmer,
+{
     fn tokenize(&self, input: &str) -> Result<Vec<Token>> {
         self.tokenize(input)
     }
@@ -119,6 +169,7 @@ fn flush_token(
     current: &mut String,
     raw_position: &mut u32,
     stop_words: &BTreeSet<String>,
+    stemmer: &impl TermStemmer,
     tokens: &mut Vec<Token>,
 ) -> Result<()> {
     if current.is_empty() {
@@ -131,14 +182,19 @@ fn flush_token(
             "token position overflow while building text vector",
         )
     })?;
-    if !stop_words.contains(current) {
-        tokens.push(Token::new(current.clone(), *raw_position)?);
+    let term = stemmer.stem(current)?;
+    if !term.is_empty() && !stop_words.contains(&term) {
+        tokens.push(Token::new(term, *raw_position)?);
     }
     current.clear();
     Ok(())
 }
 
-fn tokenize_with_stop_words(input: &str, stop_words: &BTreeSet<String>) -> Result<Vec<Token>> {
+fn tokenize_with_stop_words_and_stemmer(
+    input: &str,
+    stop_words: &BTreeSet<String>,
+    stemmer: &impl TermStemmer,
+) -> Result<Vec<Token>> {
     let mut tokens = Vec::new();
     let mut raw_position = 0_u32;
     let mut current = String::new();
@@ -147,10 +203,22 @@ fn tokenize_with_stop_words(input: &str, stop_words: &BTreeSet<String>) -> Resul
         if character.is_alphanumeric() {
             current.extend(character.to_lowercase());
         } else {
-            flush_token(&mut current, &mut raw_position, stop_words, &mut tokens)?;
+            flush_token(
+                &mut current,
+                &mut raw_position,
+                stop_words,
+                stemmer,
+                &mut tokens,
+            )?;
         }
     }
-    flush_token(&mut current, &mut raw_position, stop_words, &mut tokens)?;
+    flush_token(
+        &mut current,
+        &mut raw_position,
+        stop_words,
+        stemmer,
+        &mut tokens,
+    )?;
 
     Ok(tokens)
 }
@@ -162,6 +230,15 @@ fn normalize_term(term: &str) -> String {
         .collect()
 }
 
+fn normalize_term_with_stemmer(term: &str, stemmer: &impl TermStemmer) -> Result<String> {
+    let normalized = normalize_term(term);
+    if normalized.is_empty() {
+        Ok(normalized)
+    } else {
+        stemmer.stem(&normalized)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TextQuery {
     root: TextQueryExpr,
@@ -169,7 +246,11 @@ pub struct TextQuery {
 
 impl TextQuery {
     pub fn parse(input: &str) -> Result<Self> {
-        let tokens = QueryLexer::new(input).tokenize()?;
+        Self::parse_with_stemmer(input, &IdentityStemmer)
+    }
+
+    pub fn parse_with_stemmer(input: &str, stemmer: &impl TermStemmer) -> Result<Self> {
+        let tokens = QueryLexer::new(input).tokenize_with_stemmer(stemmer)?;
         if tokens.is_empty() {
             return Err(RnovError::new(ErrorKind::InvalidInput, "empty text query"));
         }
@@ -361,10 +442,28 @@ impl TextPhraseQuery {
         Self::within(terms, 1)
     }
 
+    pub fn exact_with_stemmer<I, S, T>(terms: I, stemmer: &T) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+        T: TermStemmer,
+    {
+        Self::within_with_stemmer(terms, 1, stemmer)
+    }
+
     pub fn within<I, S>(terms: I, max_gap: u32) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
+    {
+        Self::within_with_stemmer(terms, max_gap, &IdentityStemmer)
+    }
+
+    pub fn within_with_stemmer<I, S, T>(terms: I, max_gap: u32, stemmer: &T) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+        T: TermStemmer,
     {
         if max_gap == 0 {
             return Err(RnovError::new(
@@ -375,7 +474,7 @@ impl TextPhraseQuery {
 
         let mut normalized_terms = Vec::new();
         for term in terms {
-            let normalized = normalize_term(term.as_ref());
+            let normalized = normalize_term_with_stemmer(term.as_ref(), stemmer)?;
             if normalized.is_empty() {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -455,7 +554,7 @@ impl<'a> QueryLexer<'a> {
         Self { input }
     }
 
-    fn tokenize(&self) -> Result<Vec<QueryToken>> {
+    fn tokenize_with_stemmer(&self, stemmer: &impl TermStemmer) -> Result<Vec<QueryToken>> {
         let mut tokens = Vec::new();
         let mut chars = self.input.chars().peekable();
 
@@ -478,7 +577,10 @@ impl<'a> QueryLexer<'a> {
                             break;
                         }
                     }
-                    tokens.push(QueryToken::Term(term));
+                    let term = stemmer.stem(&term)?;
+                    if !term.is_empty() {
+                        tokens.push(QueryToken::Term(term));
+                    }
                 }
                 invalid => {
                     return Err(RnovError::new(
