@@ -357,6 +357,26 @@ impl CostModel {
             rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.2,
         )
     }
+
+    pub fn estimate_inverted_text_scan(
+        &self,
+        relation_id: RelationId,
+        required_terms: usize,
+    ) -> PlanCost {
+        let stats = self.statistics.table(relation_id);
+        let term_count = required_terms.max(1);
+        let selectivity = (DEFAULT_TEXT_SEARCH_SELECTIVITY / term_count as f64).max(0.0025);
+        let rows = (stats.row_count() * selectivity)
+            .max(1.0)
+            .min(stats.row_count());
+        PlanCost::new(
+            rows,
+            stats.row_width_bytes(),
+            term_count as f64 * self.parameters.cpu_operator_cost
+                + rows * self.parameters.cpu_tuple_cost,
+            rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.05,
+        )
+    }
 }
 
 impl Default for CostModel {

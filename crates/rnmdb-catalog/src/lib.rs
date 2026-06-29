@@ -55,6 +55,7 @@ impl Column {
 pub enum IndexMethod {
     BTree,
     Hash,
+    Gin,
 }
 
 impl IndexMethod {
@@ -62,6 +63,7 @@ impl IndexMethod {
         match self {
             Self::BTree => "btree",
             Self::Hash => "hash",
+            Self::Gin => "gin",
         }
     }
 }
@@ -1247,6 +1249,7 @@ fn encode_index_method(method: IndexMethod) -> u8 {
     match method {
         IndexMethod::BTree => 0,
         IndexMethod::Hash => 1,
+        IndexMethod::Gin => 2,
     }
 }
 
@@ -1254,6 +1257,7 @@ fn decode_index_method(raw: u8) -> Result<IndexMethod> {
     match raw {
         0 => Ok(IndexMethod::BTree),
         1 => Ok(IndexMethod::Hash),
+        2 => Ok(IndexMethod::Gin),
         unknown => Err(RnovError::new(
             ErrorKind::Corruption,
             format!("unknown index method tag {unknown}"),

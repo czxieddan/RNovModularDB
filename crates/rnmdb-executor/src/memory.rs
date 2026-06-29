@@ -14,8 +14,8 @@ use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
-    CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, MemoryBTreeIndex,
-    MemoryCompositeIndex, MemoryHashIndex,
+    CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, InvertedTextIndex,
+    MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -27,7 +27,8 @@ use rnmdb_planner::{
 };
 use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
-    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, Truth,
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
+    TextVector, Truth,
 };
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
@@ -125,6 +126,29 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn text_index_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let required_terms = required_text_query_terms(query)?;
+        if required_terms.is_empty() {
+            return apply_text_search_cancellable(self.scan(), column, query, cancellation);
+        }
+        let pointers = index.text_lookup(column_index, &required_terms)?;
+        let batch = self.rows_for_pointers(&pointers)?;
+        apply_text_search_cancellable(batch, column, query, cancellation)
+    }
+
     fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
         let column_index = column_index(&self.columns, column)?;
         let Some(key) = maybe_index_key_from_literal_expr(value)? else {
@@ -155,6 +179,29 @@ impl MemoryTable {
         };
         let pointers = index.skip_lookup(column_index, &key)?;
         self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_text_index_scan(
+        &self,
+        column: &str,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let required_terms = required_text_query_terms(query)?;
+        if required_terms.is_empty() {
+            return Ok(None);
+        }
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_text_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.text_lookup(column_index, &required_terms)?;
+        let batch = self.rows_for_pointers(&pointers)?;
+        apply_text_search_cancellable(batch, column, query, cancellation).map(Some)
     }
 
     fn try_index_range_scan(
@@ -337,6 +384,10 @@ enum MemoryTableIndex {
         column_index: usize,
         index: MemoryHashIndex,
     },
+    GinText {
+        column_index: usize,
+        index: InvertedTextIndex,
+    },
     Composite {
         column_indexes: Vec<usize>,
         index: MemoryCompositeIndex,
@@ -385,13 +436,43 @@ impl MemoryTableIndex {
                         index,
                     })
                 }
+                IndexMethod::Gin => {
+                    if unique {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "gin indexes do not support uniqueness",
+                        ));
+                    }
+                    let column_index = column_indexes[0];
+                    match table_columns[column_index].data_type() {
+                        SqlType::Text | SqlType::TextVector => Ok(Self::GinText {
+                            column_index,
+                            index: InvertedTextIndex::new(name),
+                        }),
+                        other => Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "gin text index requires TEXT or TEXTVECTOR column, got {other:?}"
+                            ),
+                        )),
+                    }
+                }
             };
         }
-        if method == IndexMethod::Hash {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "hash indexes support exactly one column",
-            ));
+        match method {
+            IndexMethod::Hash => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "hash indexes support exactly one column",
+                ));
+            }
+            IndexMethod::Gin => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "gin indexes support exactly one column",
+                ));
+            }
+            IndexMethod::BTree => {}
         }
 
         let index = if unique {
@@ -424,6 +505,10 @@ impl MemoryTableIndex {
                 } else {
                     MemoryHashIndex::non_unique(name)
                 };
+            }
+            Self::GinText { index, .. } => {
+                let name = index.name().to_string();
+                *index = InvertedTextIndex::new(name);
             }
             Self::Composite { index, .. } => {
                 let name = index.name().to_string();
@@ -459,6 +544,16 @@ impl MemoryTableIndex {
                 };
                 index.insert(key, pointer)
             }
+            Self::GinText {
+                column_index,
+                index,
+                ..
+            } => {
+                let Some(vector) = text_vector_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                index.insert_document(pointer, &vector)
+            }
             Self::Composite {
                 column_indexes,
                 index,
@@ -476,6 +571,7 @@ impl MemoryTableIndex {
         match self {
             Self::BTree { column_index, .. } => *column_index == column,
             Self::Hash { column_index, .. } => *column_index == column,
+            Self::GinText { .. } => false,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
     }
@@ -486,6 +582,10 @@ impl MemoryTableIndex {
 
     fn supports_skip_column(&self, column: usize) -> bool {
         matches!(self, Self::Composite { column_indexes, .. } if column_indexes.contains(&column))
+    }
+
+    fn supports_text_column(&self, column: usize) -> bool {
+        matches!(self, Self::GinText { column_index, .. } if *column_index == column)
     }
 
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
@@ -508,6 +608,19 @@ impl MemoryTableIndex {
                 parts.push(Some(key.clone()));
                 parts.extend((1..column_indexes.len()).map(|_| None));
                 index.skip_scan(&CompositeKeyPattern::new(parts)?)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn text_lookup(&self, column: usize, required_terms: &[String]) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::GinText {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => {
+                Ok(index.lookup_all(required_terms.iter().map(String::as_str)))
             }
             _ => Ok(Vec::new()),
         }
@@ -685,13 +798,13 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .map(MemoryTable::scan)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?;
+                let table = self.tables.get(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                    return Ok(batch);
+                }
+                let batch = table.scan();
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::Project { items, input } => {
@@ -831,6 +944,19 @@ impl MemoryExecutor {
                     })?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
+            PhysicalPlan::InvertedTextScan {
+                table,
+                index,
+                column,
+                query,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .text_index_scan(index, column, query, cancellation),
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -952,13 +1078,13 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?
-                    .scan_parallel_cancellable(config, cancellation)?;
+                let table = self.tables.get(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                    return Ok(batch);
+                }
+                let batch = table.scan_parallel_cancellable(config, cancellation)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::Project { items, input } => {
@@ -1285,6 +1411,36 @@ fn bound_ref(key: Option<&IndexKey>, inclusive: bool) -> Bound<&IndexKey> {
         (Some(key), true) => Bound::Included(key),
         (Some(key), false) => Bound::Excluded(key),
         (None, _) => Bound::Unbounded,
+    }
+}
+
+fn required_text_query_terms(query: &str) -> Result<Vec<String>> {
+    Ok(TextQuery::parse(query)?
+        .required_terms()
+        .into_iter()
+        .map(str::to_string)
+        .collect())
+}
+
+fn text_vector_from_value(value: &SqlValue) -> Result<Option<TextVector>> {
+    let vector = match value {
+        SqlValue::Null => return Ok(None),
+        SqlValue::Text(text) => TextVectorBuilder::new(SimpleTokenizer::new()).build(text)?,
+        SqlValue::TextVector(vector) => vector.clone(),
+        other => {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "gin text index cannot index value type {:?}",
+                    other.data_type()
+                ),
+            ));
+        }
+    };
+    if vector.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(vector))
     }
 }
 

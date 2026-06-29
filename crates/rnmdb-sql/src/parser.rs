@@ -192,6 +192,7 @@ impl Parser {
         match method.as_str() {
             "btree" => Ok(IndexMethod::BTree),
             "hash" => Ok(IndexMethod::Hash),
+            "gin" | "inverted" => Ok(IndexMethod::Gin),
             unknown => Err(self.error(format!("unsupported index method {unknown}"))),
         }
     }

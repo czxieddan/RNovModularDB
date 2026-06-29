@@ -49,6 +49,14 @@ pub enum PhysicalPlan {
         query: String,
         cost: PlanCost,
     },
+    InvertedTextScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        query: String,
+        cost: PlanCost,
+    },
     Filter {
         predicate: Expr,
         input: Box<PhysicalPlan>,
@@ -195,6 +203,21 @@ impl IndexCatalog {
                     .any(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
+
+    fn best_text_search_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_text_search()
+                && index.columns.len() == 1
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,6 +257,10 @@ impl IndexAccessPath {
     fn supports_skip_scan(&self) -> bool {
         self.method == IndexMethod::BTree && self.columns.len() > 1
     }
+
+    fn supports_text_search(&self) -> bool {
+        self.method == IndexMethod::Gin
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -268,14 +295,20 @@ impl PhysicalPlanner {
                 table,
                 column,
                 query,
-                ..
+                cost_hint,
             } => PhysicalPlan::TextSearchScan {
                 relation_id: *relation_id,
                 table: table.clone(),
                 column: column.clone(),
                 query: query.clone(),
                 cost,
-            },
+            }
+            .indexed_if_cheaper(
+                &self.indexes,
+                &self.cost_model,
+                *relation_id,
+                cost_hint.required_terms.len(),
+            ),
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(scan) = self.index_scan(predicate, input, cost) {
                     return scan;
@@ -389,6 +422,50 @@ impl PhysicalPlanner {
 }
 
 impl PhysicalPlan {
+    fn indexed_if_cheaper(
+        self,
+        indexes: &IndexCatalog,
+        cost_model: &CostModel,
+        relation_id: RelationId,
+        required_terms: usize,
+    ) -> Self {
+        let PhysicalPlan::TextSearchScan {
+            relation_id: scan_relation_id,
+            table,
+            column,
+            query,
+            cost,
+        } = self
+        else {
+            return self;
+        };
+
+        if required_terms > 0 {
+            if let Some(index) = indexes.best_text_search_for(relation_id, &column) {
+                let index_cost =
+                    cost_model.estimate_inverted_text_scan(relation_id, required_terms);
+                if index_cost.total() <= cost.total() {
+                    return PhysicalPlan::InvertedTextScan {
+                        relation_id: scan_relation_id,
+                        table,
+                        index: index.name.clone(),
+                        column,
+                        query,
+                        cost: index_cost,
+                    };
+                }
+            }
+        }
+
+        PhysicalPlan::TextSearchScan {
+            relation_id: scan_relation_id,
+            table,
+            column,
+            query,
+            cost,
+        }
+    }
+
     pub fn cost(&self) -> PlanCost {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
@@ -396,6 +473,7 @@ impl PhysicalPlan {
             | PhysicalPlan::IndexRangeScan { cost, .. }
             | PhysicalPlan::IndexSkipScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
+            | PhysicalPlan::InvertedTextScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -484,6 +562,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}TextSearchScan table={table} column={column} query='{query}'{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::InvertedTextScan {
+            table,
+            index,
+            column,
+            query,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}InvertedTextScan table={table} index={index} column={column} query='{query}'{}\n",
                 cost_suffix(*cost)
             ));
         }
