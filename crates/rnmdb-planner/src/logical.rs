@@ -27,6 +27,13 @@ pub enum LogicalPlan {
         query: String,
         cost_hint: TextSearchCostHint,
     },
+    SidewaysLookup {
+        outer: Box<LogicalPlan>,
+        inner_relation_id: RelationId,
+        inner_table: String,
+        inner_column: String,
+        outer_column: String,
+    },
     Project {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
@@ -596,6 +603,18 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}TextSearch table={table} column={column} query='{query}'\n"
             ));
         }
+        LogicalPlan::SidewaysLookup {
+            outer,
+            inner_table,
+            inner_column,
+            outer_column,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column}\n"
+            ));
+            write_plan(outer, indent + 1, out);
+        }
         LogicalPlan::Project { items, input } => {
             let columns = items
                 .iter()
@@ -937,6 +956,10 @@ fn write_plan_with_costs(
         | LogicalPlan::Parallel { input, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(input, indent + 1, cost_model, out);
+        }
+        LogicalPlan::SidewaysLookup { outer, .. } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(outer, indent + 1, cost_model, out);
         }
         LogicalPlan::Union { left, right, .. }
         | LogicalPlan::Intersect { left, right, .. }

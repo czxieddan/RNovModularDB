@@ -173,6 +173,21 @@ impl CostModel {
                     rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.25,
                 )
             }
+            LogicalPlan::SidewaysLookup {
+                outer,
+                inner_relation_id,
+                ..
+            } => {
+                let outer = self.estimate(outer);
+                let inner = self.estimate_index_scan(*inner_relation_id, false);
+                let probes = outer.rows.max(1.0);
+                PlanCost::new(
+                    (outer.rows * inner.rows).max(1.0),
+                    outer.row_width_bytes + inner.row_width_bytes,
+                    outer.cpu + probes * inner.cpu,
+                    outer.io + probes * inner.io,
+                )
+            }
             LogicalPlan::Filter { input, .. } => {
                 let input = self.estimate(input);
                 input

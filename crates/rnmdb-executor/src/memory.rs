@@ -128,6 +128,26 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn index_point_lookup_value(
+        &self,
+        index_name: &str,
+        column: &str,
+        value: &SqlValue,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let Some(key) = index_key_from_value(value)? else {
+            return VectorBatch::new(self.columns.clone(), Vec::new());
+        };
+        let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn text_index_scan(
         &self,
         index_name: &str,
@@ -1442,6 +1462,21 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .bounds_overlap_scan(index, column, bounds),
+            PhysicalPlan::SidewaysIndexLookup {
+                outer,
+                inner_table,
+                inner_index,
+                inner_column,
+                outer_column,
+                ..
+            } => self.execute_sideways_index_lookup(
+                outer,
+                inner_table,
+                inner_index,
+                inner_column,
+                outer_column,
+                cancellation,
+            ),
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -1522,6 +1557,45 @@ impl MemoryExecutor {
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         self.execute_cancellable(plan, cancellation)
+    }
+
+    fn execute_sideways_index_lookup(
+        &self,
+        outer: &PhysicalPlan,
+        inner_table: &str,
+        inner_index: &str,
+        inner_column: &str,
+        outer_column: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let outer_batch = self.execute_physical_cancellable(outer, cancellation)?;
+        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
+        let inner = self.tables.get(inner_table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {inner_table}"),
+            )
+        })?;
+        let columns = joined_columns(outer_batch.columns(), inner.columns())?;
+        let mut rows = Vec::new();
+
+        for outer_row in outer_batch.rows() {
+            cancellation.check()?;
+            let lookup_value = &outer_row.values()[outer_column_index];
+            let inner_batch =
+                inner.index_point_lookup_value(inner_index, inner_column, lookup_value)?;
+            for inner_row in inner_batch.rows() {
+                cancellation.check()?;
+                let mut values =
+                    Vec::with_capacity(outer_row.values().len() + inner_row.values().len());
+                values.extend_from_slice(outer_row.values());
+                values.extend_from_slice(inner_row.values());
+                rows.push(Row::new(values));
+            }
+        }
+
+        cancellation.check()?;
+        VectorBatch::new(columns, rows)
     }
 
     pub fn execute_parallel(
@@ -2510,6 +2584,30 @@ fn apply_projection_cancellable(
 
     cancellation.check()?;
     VectorBatch::new(columns, rows)
+}
+
+fn joined_columns(outer: &[ColumnSchema], inner: &[ColumnSchema]) -> Result<Vec<ColumnSchema>> {
+    let mut columns = outer.to_vec();
+    for column in inner {
+        let mut name = column.name().to_string();
+        while columns.iter().any(|existing| existing.name() == name) {
+            name = format!("inner_{name}");
+        }
+        columns.push(column_schema_like(column, name));
+    }
+    let _ = VectorBatch::new(columns.clone(), Vec::new())?;
+    Ok(columns)
+}
+
+fn column_schema_like(column: &ColumnSchema, name: String) -> ColumnSchema {
+    let mut schema = ColumnSchema::new(name, column.data_type().clone());
+    if !column.nullable() {
+        schema = schema.not_null();
+    }
+    if column.is_encrypted() {
+        schema = schema.encrypted();
+    }
+    schema
 }
 
 fn apply_aggregate_cancellable(

@@ -92,6 +92,19 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             hint,
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::SidewaysLookup {
+            outer,
+            inner_relation_id,
+            inner_table,
+            inner_column,
+            outer_column,
+        } => LogicalPlan::SidewaysLookup {
+            outer: Box::new(optimize_plan(*outer)),
+            inner_relation_id,
+            inner_table,
+            inner_column,
+            outer_column,
+        },
         other => other,
     }
 }
@@ -166,6 +179,19 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
         LogicalPlan::Parallel { hint, input } => LogicalPlan::Parallel {
             hint,
             input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::SidewaysLookup {
+            outer,
+            inner_relation_id,
+            inner_table,
+            inner_column,
+            outer_column,
+        } => LogicalPlan::SidewaysLookup {
+            outer: Box::new(annotate_parallel(*outer, workers)),
+            inner_relation_id,
+            inner_table,
+            inner_column,
+            outer_column,
         },
         other => other,
     }

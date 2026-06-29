@@ -92,6 +92,15 @@ pub enum PhysicalPlan {
         bounds: Expr,
         cost: PlanCost,
     },
+    SidewaysIndexLookup {
+        outer: Box<PhysicalPlan>,
+        inner_relation_id: RelationId,
+        inner_table: String,
+        inner_index: String,
+        inner_column: String,
+        outer_column: String,
+        cost: PlanCost,
+    },
     Filter {
         predicate: Expr,
         input: Box<PhysicalPlan>,
@@ -245,6 +254,14 @@ impl IndexCatalog {
                     .first()
                     .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
         })
+    }
+
+    fn best_sideways_lookup_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.best_for_column(relation_id, column)
     }
 
     fn best_single_column_for(
@@ -457,6 +474,20 @@ impl PhysicalPlanner {
                 *relation_id,
                 cost_hint.required_terms.len(),
             ),
+            LogicalPlan::SidewaysLookup {
+                outer,
+                inner_relation_id,
+                inner_table,
+                inner_column,
+                outer_column,
+            } => self.sideways_lookup_plan(
+                outer,
+                *inner_relation_id,
+                inner_table,
+                inner_column,
+                outer_column,
+                cost,
+            ),
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(scan) = self.index_scan(predicate, input, cost) {
                     return scan;
@@ -626,6 +657,7 @@ impl PhysicalPlan {
             | PhysicalPlan::BlockSummaryScan { cost, .. }
             | PhysicalPlan::RangeOverlapScan { cost, .. }
             | PhysicalPlan::BoundsOverlapScan { cost, .. }
+            | PhysicalPlan::SidewaysIndexLookup { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -787,6 +819,21 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        PhysicalPlan::SidewaysIndexLookup {
+            outer,
+            inner_table,
+            inner_index,
+            inner_column,
+            outer_column,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}SidewaysIndexLookup inner={inner_table} index={inner_index} inner_column={inner_column} outer_column={outer_column}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(outer, indent + 1, out);
+        }
         PhysicalPlan::Filter {
             predicate,
             input,
@@ -918,6 +965,49 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
 }
 
 impl PhysicalPlanner {
+    fn sideways_lookup_plan(
+        &self,
+        outer: &LogicalPlan,
+        inner_relation_id: RelationId,
+        inner_table: &str,
+        inner_column: &str,
+        outer_column: &str,
+        fallback_cost: PlanCost,
+    ) -> PhysicalPlan {
+        let outer = Box::new(self.plan(outer));
+        if let Some(index) = self
+            .indexes
+            .best_sideways_lookup_for(inner_relation_id, inner_column)
+        {
+            let lookup_cost = self
+                .cost_model
+                .estimate_index_scan(inner_relation_id, index.unique);
+            let outer_rows = outer.cost().rows.max(1.0);
+            let cost = PlanCost::new(
+                (outer_rows * lookup_cost.rows).max(1.0),
+                outer.cost().row_width_bytes + lookup_cost.row_width_bytes,
+                outer.cost().cpu + outer_rows * lookup_cost.cpu,
+                outer.cost().io + outer_rows * lookup_cost.io,
+            );
+            return PhysicalPlan::SidewaysIndexLookup {
+                outer,
+                inner_relation_id,
+                inner_table: inner_table.to_string(),
+                inner_index: index.name.clone(),
+                inner_column: inner_column.to_string(),
+                outer_column: outer_column.to_string(),
+                cost,
+            };
+        }
+
+        PhysicalPlan::Ddl {
+            description: format!(
+                "SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column}"
+            ),
+            cost: fallback_cost,
+        }
+    }
+
     fn index_scan(
         &self,
         predicate: &Expr,
