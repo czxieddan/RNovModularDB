@@ -194,6 +194,7 @@ impl Parser {
             "hash" => Ok(IndexMethod::Hash),
             "gin" | "inverted" => Ok(IndexMethod::Gin),
             "gist" => Ok(IndexMethod::Gist),
+            "brin" | "summary" => Ok(IndexMethod::Brin),
             unknown => Err(self.error(format!("unsupported index method {unknown}"))),
         }
     }

@@ -65,6 +65,17 @@ pub enum PhysicalPlan {
         query: InvertedValueQuery,
         cost: PlanCost,
     },
+    BlockSummaryScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        lower: Expr,
+        lower_inclusive: bool,
+        upper: Expr,
+        upper_inclusive: bool,
+        cost: PlanCost,
+    },
     RangeOverlapScan {
         relation_id: RelationId,
         table: String,
@@ -305,6 +316,21 @@ impl IndexCatalog {
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
+
+    fn best_block_summary_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_block_summary()
+                && index.columns.len() == 1
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -355,6 +381,10 @@ impl IndexAccessPath {
 
     fn supports_range_overlap(&self) -> bool {
         self.method == IndexMethod::Gist
+    }
+
+    fn supports_block_summary(&self) -> bool {
+        self.method == IndexMethod::Brin
     }
 }
 
@@ -570,6 +600,7 @@ impl PhysicalPlan {
             | PhysicalPlan::TextSearchScan { cost, .. }
             | PhysicalPlan::InvertedTextScan { cost, .. }
             | PhysicalPlan::InvertedValueScan { cost, .. }
+            | PhysicalPlan::BlockSummaryScan { cost, .. }
             | PhysicalPlan::RangeOverlapScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
@@ -685,6 +716,24 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}InvertedValueScan table={table} index={index} column={column} query={query}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::BlockSummaryScan {
+            table,
+            index,
+            column,
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}BlockSummaryScan table={table} index={index} column={column} lower={lower} {} upper={upper} {}{}\n",
+                inclusive_label(*lower_inclusive),
+                inclusive_label(*upper_inclusive),
                 cost_suffix(*cost)
             ));
         }
@@ -909,24 +958,48 @@ impl PhysicalPlanner {
         }
 
         let range = indexable_range(predicate)?;
-        let index = self
+        if let Some(index) = self
             .indexes
-            .best_single_column_for(*relation_id, range.column)?;
-        let cost = self.cost_model.estimate_index_range_scan(*relation_id);
-        if cost.total() > sequential_cost.total() {
-            return None;
+            .best_block_summary_for(*relation_id, range.column)
+        {
+            if let (Some(lower), Some(upper)) = (range.lower, range.upper) {
+                let cost = self.cost_model.estimate_block_summary_scan(*relation_id);
+                if cost.total() <= sequential_cost.total() {
+                    return Some(PhysicalPlan::BlockSummaryScan {
+                        relation_id: *relation_id,
+                        table: table.clone(),
+                        index: index.name.clone(),
+                        column: range.column.to_string(),
+                        lower: lower.clone(),
+                        lower_inclusive: range.lower_inclusive,
+                        upper: upper.clone(),
+                        upper_inclusive: range.upper_inclusive,
+                        cost,
+                    });
+                }
+            }
         }
-        Some(PhysicalPlan::IndexRangeScan {
-            relation_id: *relation_id,
-            table: table.clone(),
-            index: index.name.clone(),
-            column: range.column.to_string(),
-            lower: range.lower.cloned(),
-            lower_inclusive: range.lower_inclusive,
-            upper: range.upper.cloned(),
-            upper_inclusive: range.upper_inclusive,
-            cost,
-        })
+        if let Some(index) = self
+            .indexes
+            .best_single_column_for(*relation_id, range.column)
+        {
+            let cost = self.cost_model.estimate_index_range_scan(*relation_id);
+            if cost.total() > sequential_cost.total() {
+                return None;
+            }
+            return Some(PhysicalPlan::IndexRangeScan {
+                relation_id: *relation_id,
+                table: table.clone(),
+                index: index.name.clone(),
+                column: range.column.to_string(),
+                lower: range.lower.cloned(),
+                lower_inclusive: range.lower_inclusive,
+                upper: range.upper.cloned(),
+                upper_inclusive: range.upper_inclusive,
+                cost,
+            });
+        }
+        None
     }
 }
 
@@ -958,6 +1031,26 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
+    if let Expr::Between {
+        expr,
+        low,
+        high,
+        negated: false,
+    } = predicate
+    {
+        if let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
+        {
+            if is_index_literal(low) && is_index_literal(high) {
+                return Some(IndexableRange {
+                    column: column.as_str(),
+                    lower: Some(low),
+                    lower_inclusive: true,
+                    upper: Some(high),
+                    upper_inclusive: true,
+                });
+            }
+        }
+    }
     let Expr::Binary { left, op, right } = predicate else {
         return None;
     };

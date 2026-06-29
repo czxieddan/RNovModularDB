@@ -14,8 +14,9 @@ use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
-    CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, InvertedTextIndex,
-    InvertedValueIndex, MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
+    BlockRange, BlockSummaryIndex, CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer,
+    InvertedTextIndex, InvertedValueIndex, MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex,
+    MemoryRangeIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -25,7 +26,7 @@ use rnmdb_planner::{
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
-use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
+use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
     TextVector, Truth,
@@ -34,6 +35,7 @@ use rnmdb_types::{
 use crate::vector::{ColumnSchema, Row, VectorBatch};
 
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
+const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct MemoryTable {
@@ -166,6 +168,33 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn block_summary_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        lower: &Expr,
+        lower_inclusive: bool,
+        upper: &Expr,
+        upper_inclusive: bool,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let lower_key = index_key_from_literal_expr(lower)?;
+        let upper_key = index_key_from_literal_expr(upper)?;
+        let pointers = index.block_summary_lookup(column_index, &lower_key, &upper_key)?;
+        let batch = self.rows_for_pointers(&pointers)?;
+        apply_filter_cancellable(
+            batch,
+            &between_predicate(column, lower, lower_inclusive, upper, upper_inclusive),
+            &CancellationToken::default(),
+        )
+    }
+
     fn range_overlap_scan(
         &self,
         index_name: &str,
@@ -254,6 +283,37 @@ impl MemoryTable {
         };
         let pointers = index.inverted_value_lookup(column_index, query)?;
         self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_block_summary_scan(
+        &self,
+        column: &str,
+        lower: Option<&Expr>,
+        lower_inclusive: bool,
+        upper: Option<&Expr>,
+        upper_inclusive: bool,
+    ) -> Result<Option<VectorBatch>> {
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            return Ok(None);
+        };
+        let column_index = column_index(&self.columns, column)?;
+        let lower_key = index_key_from_literal_expr(lower)?;
+        let upper_key = index_key_from_literal_expr(upper)?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_block_summary_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.block_summary_lookup(column_index, &lower_key, &upper_key)?;
+        let batch = self.rows_for_pointers(&pointers)?;
+        apply_filter_cancellable(
+            batch,
+            &between_predicate(column, lower, lower_inclusive, upper, upper_inclusive),
+            &CancellationToken::default(),
+        )
+        .map(Some)
     }
 
     fn try_range_overlap_scan(&self, column: &str, range: &Expr) -> Result<Option<VectorBatch>> {
@@ -462,6 +522,11 @@ enum MemoryTableIndex {
         column_index: usize,
         index: MemoryRangeIndex,
     },
+    BrinSummary {
+        column_index: usize,
+        index: BlockSummaryIndex,
+        entries: Vec<(IndexKey, IndexPointer)>,
+    },
     Composite {
         column_indexes: Vec<usize>,
         index: MemoryCompositeIndex,
@@ -554,6 +619,28 @@ impl MemoryTableIndex {
                         )),
                     }
                 }
+                IndexMethod::Brin => {
+                    if unique {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "brin indexes do not support uniqueness",
+                        ));
+                    }
+                    let column_index = column_indexes[0];
+                    match table_columns[column_index].data_type() {
+                        SqlType::Int64 | SqlType::Text => Ok(Self::BrinSummary {
+                            column_index,
+                            index: BlockSummaryIndex::new(name),
+                            entries: Vec::new(),
+                        }),
+                        other => Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "brin summary index requires INT64 or TEXT column, got {other:?}"
+                            ),
+                        )),
+                    }
+                }
             };
         }
         match method {
@@ -573,6 +660,12 @@ impl MemoryTableIndex {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "gist indexes support exactly one column",
+                ));
+            }
+            IndexMethod::Brin => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "brin indexes support exactly one column",
                 ));
             }
             IndexMethod::BTree => {}
@@ -620,6 +713,11 @@ impl MemoryTableIndex {
             Self::GistRange { index, .. } => {
                 let name = index.name().to_string();
                 *index = MemoryRangeIndex::new(name);
+            }
+            Self::BrinSummary { index, entries, .. } => {
+                let name = index.name().to_string();
+                *index = BlockSummaryIndex::new(name);
+                entries.clear();
             }
             Self::Composite { index, .. } => {
                 let name = index.name().to_string();
@@ -699,6 +797,18 @@ impl MemoryTableIndex {
                 };
                 index.insert_range(pointer, range)
             }
+            Self::BrinSummary {
+                column_index,
+                index,
+                entries,
+                ..
+            } => {
+                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                entries.push((key, pointer));
+                rebuild_block_summary_index(index, entries)
+            }
             Self::Composite {
                 column_indexes,
                 index,
@@ -719,6 +829,7 @@ impl MemoryTableIndex {
             Self::GinText { .. } => false,
             Self::GinValue { .. } => false,
             Self::GistRange { .. } => false,
+            Self::BrinSummary { .. } => false,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
     }
@@ -741,6 +852,10 @@ impl MemoryTableIndex {
 
     fn supports_range_overlap_column(&self, column: usize) -> bool {
         matches!(self, Self::GistRange { column_index, .. } if *column_index == column)
+    }
+
+    fn supports_block_summary_column(&self, column: usize) -> bool {
+        matches!(self, Self::BrinSummary { column_index, .. } if *column_index == column)
     }
 
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
@@ -832,6 +947,26 @@ impl MemoryTableIndex {
                 index,
                 ..
             } if *column_index == column => index.overlap_scan(range),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn block_summary_lookup(
+        &self,
+        column: usize,
+        lower: &IndexKey,
+        upper: &IndexKey,
+    ) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::BrinSummary {
+                column_index,
+                index,
+                entries,
+                ..
+            } if *column_index == column => {
+                let ranges = index.range_candidates(lower, upper)?;
+                block_ranges_to_pointers(&ranges, entries.len())
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -1180,6 +1315,29 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .inverted_value_scan(index, column, query),
+            PhysicalPlan::BlockSummaryScan {
+                table,
+                index,
+                column,
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .block_summary_scan(
+                    index,
+                    column,
+                    lower,
+                    *lower_inclusive,
+                    upper,
+                    *upper_inclusive,
+                ),
             PhysicalPlan::RangeOverlapScan {
                 table,
                 index,
@@ -1574,6 +1732,15 @@ impl MemoryExecutor {
             }
         }
         if let Some(range) = indexable_range(predicate) {
+            if let Some(batch) = table.try_block_summary_scan(
+                range.column,
+                range.lower,
+                range.lower_inclusive,
+                range.upper,
+                range.upper_inclusive,
+            )? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
             if let Some(batch) = table.try_index_range_scan(
                 range.column,
                 range.lower,
@@ -1684,6 +1851,88 @@ fn intersect_pointer_lists(lists: Vec<Vec<IndexPointer>>) -> Vec<IndexPointer> {
     intersection.into_iter().collect()
 }
 
+fn rebuild_block_summary_index(
+    index: &mut BlockSummaryIndex,
+    entries: &[(IndexKey, IndexPointer)],
+) -> Result<()> {
+    let name = index.name().to_string();
+    *index = BlockSummaryIndex::new(name);
+    for (block_index, chunk) in entries.chunks(MEMORY_SUMMARY_BLOCK_ROWS).enumerate() {
+        let first_slot = block_index
+            .checked_mul(MEMORY_SUMMARY_BLOCK_ROWS)
+            .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "summary block overflow"))?;
+        let last_slot = first_slot + chunk.len() - 1;
+        let mut min_key = chunk[0].0.clone();
+        let mut max_key = chunk[0].0.clone();
+        for (key, _) in &chunk[1..] {
+            if *key < min_key {
+                min_key = key.clone();
+            }
+            if *key > max_key {
+                max_key = key.clone();
+            }
+        }
+        index.insert_summary(
+            BlockRange::new(
+                PageId::new(first_slot as u64),
+                PageId::new(last_slot as u64),
+            )?,
+            min_key,
+            max_key,
+        )?;
+    }
+    Ok(())
+}
+
+fn block_ranges_to_pointers(ranges: &[BlockRange], row_count: usize) -> Result<Vec<IndexPointer>> {
+    let mut pointers = BTreeSet::new();
+    for range in ranges {
+        let start = usize::try_from(range.start_page().get()).map_err(|_| {
+            RnovError::new(ErrorKind::InvalidInput, "summary block start exceeds usize")
+        })?;
+        let end = usize::try_from(range.end_page().get()).map_err(|_| {
+            RnovError::new(ErrorKind::InvalidInput, "summary block end exceeds usize")
+        })?;
+        for slot in start..=end.min(row_count.saturating_sub(1)) {
+            pointers.insert(pointer_for_slot(slot)?);
+        }
+    }
+    Ok(pointers.into_iter().collect())
+}
+
+fn between_predicate(
+    column: &str,
+    lower: &Expr,
+    lower_inclusive: bool,
+    upper: &Expr,
+    upper_inclusive: bool,
+) -> Expr {
+    if lower_inclusive && upper_inclusive {
+        Expr::Between {
+            expr: Box::new(Expr::Identifier(Ident::new(column))),
+            low: Box::new(lower.clone()),
+            high: Box::new(upper.clone()),
+            negated: false,
+        }
+    } else {
+        let lower_op = if lower_inclusive { ">=" } else { ">" };
+        let upper_op = if upper_inclusive { "<=" } else { "<" };
+        Expr::Binary {
+            left: Box::new(Expr::Binary {
+                left: Box::new(Expr::Identifier(Ident::new(column))),
+                op: lower_op.to_string(),
+                right: Box::new(lower.clone()),
+            }),
+            op: "AND".to_string(),
+            right: Box::new(Expr::Binary {
+                left: Box::new(Expr::Identifier(Ident::new(column))),
+                op: upper_op.to_string(),
+                right: Box::new(upper.clone()),
+            }),
+        }
+    }
+}
+
 fn text_vector_from_value(value: &SqlValue) -> Result<Option<TextVector>> {
     let vector = match value {
         SqlValue::Null => return Ok(None),
@@ -1760,6 +2009,26 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
+    if let Expr::Between {
+        expr,
+        low,
+        high,
+        negated: false,
+    } = predicate
+    {
+        if let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
+        {
+            if is_index_literal(low) && is_index_literal(high) {
+                return Some(IndexableRange {
+                    column: column.as_str(),
+                    lower: Some(low),
+                    lower_inclusive: true,
+                    upper: Some(high),
+                    upper_inclusive: true,
+                });
+            }
+        }
+    }
     let Expr::Binary { left, op, right } = predicate else {
         return None;
     };
