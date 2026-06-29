@@ -19,7 +19,7 @@ use rnmdb_index::{
     MemoryBoundsIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
 };
 use rnmdb_planner::{
-    cost::TableStatistics,
+    cost::{TableStatistics, TextLexemeStatistics},
     logical::{
         AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
         LogicalPlan,
@@ -434,6 +434,47 @@ impl MemoryTable {
 
     pub fn statistics(&self) -> TableStatistics {
         TableStatistics::new(self.row_count() as f64, self.estimated_row_width_bytes())
+    }
+
+    pub fn text_lexeme_statistics(
+        &self,
+        column: &str,
+        term: &str,
+    ) -> Result<Option<TextLexemeStatistics>> {
+        let column_index = column_index(&self.columns, column)?;
+        match self.columns[column_index].data_type() {
+            SqlType::Text | SqlType::TextVector => {}
+            other => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "text lexeme statistics require TEXT or TEXTVECTOR column, got {other:?}"
+                    ),
+                ));
+            }
+        }
+
+        let mut document_count = 0.0;
+        let mut occurrence_count = 0.0;
+        for row in &self.rows {
+            let Some(vector) = text_vector_from_value(&row.values()[column_index])? else {
+                continue;
+            };
+            let Some(lexeme) = vector.find(term) else {
+                continue;
+            };
+            document_count += 1.0;
+            occurrence_count += lexeme.positions().len() as f64;
+        }
+
+        if document_count == 0.0 {
+            Ok(None)
+        } else {
+            Ok(Some(TextLexemeStatistics::new(
+                document_count,
+                occurrence_count,
+            )))
+        }
     }
 
     pub fn scan_parallel(&self, config: ParallelQueryConfig) -> Result<VectorBatch> {
@@ -1206,6 +1247,18 @@ impl MemoryExecutor {
 
     pub fn table_statistics(&self, name: &str) -> Option<TableStatistics> {
         self.tables.get(name).map(MemoryTable::statistics)
+    }
+
+    pub fn text_lexeme_statistics(
+        &self,
+        table: &str,
+        column: &str,
+        term: &str,
+    ) -> Result<Option<TextLexemeStatistics>> {
+        let Some(table) = self.tables.get(table) else {
+            return Ok(None);
+        };
+        table.text_lexeme_statistics(column, term)
     }
 
     pub fn execute(&self, plan: &LogicalPlan) -> Result<VectorBatch> {

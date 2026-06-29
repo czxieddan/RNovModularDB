@@ -491,10 +491,31 @@ impl LocalSession {
                 }
             }
             LogicalPlan::TextSearch {
-                relation_id, table, ..
+                relation_id,
+                table,
+                column,
+                cost_hint,
+                ..
             } => {
                 if let Some(table_statistics) = self.executor.table_statistics(table) {
                     statistics.set_table(*relation_id, table_statistics);
+                }
+                for term in cost_hint
+                    .required_terms
+                    .iter()
+                    .chain(cost_hint.optional_terms.iter())
+                    .chain(cost_hint.excluded_terms.iter())
+                {
+                    if let Ok(Some(lexeme_statistics)) =
+                        self.executor.text_lexeme_statistics(table, column, term)
+                    {
+                        statistics.set_text_lexeme(
+                            *relation_id,
+                            column.as_str(),
+                            term.as_str(),
+                            lexeme_statistics,
+                        );
+                    }
                 }
             }
             LogicalPlan::Filter { input, .. }

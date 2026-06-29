@@ -472,7 +472,7 @@ impl PhysicalPlanner {
                 &self.indexes,
                 &self.cost_model,
                 *relation_id,
-                cost_hint.required_terms.len(),
+                &cost_hint.required_terms,
             ),
             LogicalPlan::SidewaysLookup {
                 outer,
@@ -606,7 +606,7 @@ impl PhysicalPlan {
         indexes: &IndexCatalog,
         cost_model: &CostModel,
         relation_id: RelationId,
-        required_terms: usize,
+        required_terms: &[String],
     ) -> Self {
         let PhysicalPlan::TextSearchScan {
             relation_id: scan_relation_id,
@@ -619,10 +619,10 @@ impl PhysicalPlan {
             return self;
         };
 
-        if required_terms > 0 {
+        if !required_terms.is_empty() {
             if let Some(index) = indexes.best_text_search_for(relation_id, &column) {
                 let index_cost =
-                    cost_model.estimate_inverted_text_scan(relation_id, required_terms);
+                    cost_model.estimate_inverted_text_scan(relation_id, &column, required_terms);
                 if index_cost.total() <= cost.total() {
                     return PhysicalPlan::InvertedTextScan {
                         relation_id: scan_relation_id,

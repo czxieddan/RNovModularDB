@@ -45,6 +45,7 @@ impl Default for TableStatistics {
 #[derive(Clone, Debug, Default)]
 pub struct StatisticsCatalog {
     tables: BTreeMap<RelationId, TableStatistics>,
+    text_lexemes: BTreeMap<TextLexemeKey, TextLexemeStatistics>,
 }
 
 impl StatisticsCatalog {
@@ -58,6 +59,74 @@ impl StatisticsCatalog {
 
     pub fn table(&self, relation_id: RelationId) -> TableStatistics {
         self.tables.get(&relation_id).copied().unwrap_or_default()
+    }
+
+    pub fn set_text_lexeme(
+        &mut self,
+        relation_id: RelationId,
+        column: impl Into<String>,
+        term: impl Into<String>,
+        statistics: TextLexemeStatistics,
+    ) {
+        self.text_lexemes.insert(
+            TextLexemeKey::new(relation_id, column.into(), term.into()),
+            statistics,
+        );
+    }
+
+    pub fn text_lexeme(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+        term: &str,
+    ) -> Option<TextLexemeStatistics> {
+        self.text_lexemes
+            .get(&TextLexemeKey::new(
+                relation_id,
+                column.to_string(),
+                term.to_string(),
+            ))
+            .copied()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TextLexemeKey {
+    relation_id: RelationId,
+    column: String,
+    term: String,
+}
+
+impl TextLexemeKey {
+    fn new(relation_id: RelationId, column: String, term: String) -> Self {
+        Self {
+            relation_id,
+            column,
+            term,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextLexemeStatistics {
+    document_count: f64,
+    occurrence_count: f64,
+}
+
+impl TextLexemeStatistics {
+    pub fn new(document_count: f64, occurrence_count: f64) -> Self {
+        Self {
+            document_count: document_count.max(0.0),
+            occurrence_count: occurrence_count.max(0.0),
+        }
+    }
+
+    pub fn document_count(self) -> f64 {
+        self.document_count
+    }
+
+    pub fn occurrence_count(self) -> f64 {
+        self.occurrence_count
     }
 }
 
@@ -154,6 +223,7 @@ impl CostModel {
             }
             LogicalPlan::TextSearch {
                 relation_id,
+                column,
                 cost_hint,
                 ..
             } => {
@@ -161,9 +231,13 @@ impl CostModel {
                 let term_count = cost_hint.required_terms.len()
                     + cost_hint.optional_terms.len()
                     + cost_hint.excluded_terms.len();
-                let selectivity =
-                    (DEFAULT_TEXT_SEARCH_SELECTIVITY / term_count.max(1) as f64).max(0.005);
-                let rows = stats.row_count() * selectivity;
+                let rows = self.estimate_text_search_rows(
+                    *relation_id,
+                    column,
+                    &cost_hint.required_terms,
+                    &cost_hint.optional_terms,
+                    &cost_hint.excluded_terms,
+                );
                 PlanCost::new(
                     rows,
                     stats.row_width_bytes(),
@@ -390,12 +464,17 @@ impl CostModel {
     pub fn estimate_inverted_text_scan(
         &self,
         relation_id: RelationId,
-        required_terms: usize,
+        column: &str,
+        required_terms: &[String],
     ) -> PlanCost {
         let stats = self.statistics.table(relation_id);
-        let term_count = required_terms.max(1);
-        let selectivity = (DEFAULT_TEXT_SEARCH_SELECTIVITY / term_count as f64).max(0.0025);
-        let rows = (stats.row_count() * selectivity)
+        let term_count = required_terms.len().max(1);
+        let rows = self
+            .estimate_required_text_rows(relation_id, column, required_terms)
+            .unwrap_or_else(|| {
+                let selectivity = (DEFAULT_TEXT_SEARCH_SELECTIVITY / term_count as f64).max(0.0025);
+                stats.row_count() * selectivity
+            })
             .max(1.0)
             .min(stats.row_count());
         PlanCost::new(
@@ -451,6 +530,47 @@ impl CostModel {
                 + rows * self.parameters.cpu_tuple_cost,
             rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.05,
         )
+    }
+
+    fn estimate_text_search_rows(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+        required_terms: &[String],
+        optional_terms: &[String],
+        excluded_terms: &[String],
+    ) -> f64 {
+        let stats = self.statistics.table(relation_id);
+        if let Some(required_rows) =
+            self.estimate_required_text_rows(relation_id, column, required_terms)
+        {
+            return required_rows.max(0.0).min(stats.row_count());
+        }
+
+        let term_count = required_terms.len() + optional_terms.len() + excluded_terms.len();
+        let selectivity = (DEFAULT_TEXT_SEARCH_SELECTIVITY / term_count.max(1) as f64).max(0.005);
+        stats.row_count() * selectivity
+    }
+
+    fn estimate_required_text_rows(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+        required_terms: &[String],
+    ) -> Option<f64> {
+        if required_terms.is_empty() {
+            return None;
+        }
+
+        required_terms
+            .iter()
+            .map(|term| {
+                self.statistics
+                    .text_lexeme(relation_id, column, term)
+                    .map(TextLexemeStatistics::document_count)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|counts| counts.into_iter().fold(f64::INFINITY, f64::min))
     }
 }
 
