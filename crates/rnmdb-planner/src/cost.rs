@@ -391,6 +391,21 @@ impl CostModel {
             rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.2,
         )
     }
+
+    pub fn estimate_inverted_value_scan(&self, relation_id: RelationId, tokens: usize) -> PlanCost {
+        let stats = self.statistics.table(relation_id);
+        let token_count = tokens.max(1);
+        let rows = (stats.row_count() * DEFAULT_INDEX_SELECTIVITY / token_count as f64)
+            .max(1.0)
+            .min(stats.row_count());
+        PlanCost::new(
+            rows,
+            stats.row_width_bytes(),
+            token_count as f64 * self.parameters.cpu_operator_cost
+                + rows * self.parameters.cpu_tuple_cost,
+            rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.05,
+        )
+    }
 }
 
 impl Default for CostModel {

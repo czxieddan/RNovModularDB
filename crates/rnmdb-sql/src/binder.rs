@@ -2691,6 +2691,12 @@ impl<'a> Binder<'a> {
         if op == "&&" {
             return self.infer_range_overlap_result_type(left_type, right_type);
         }
+        if op == "@>" {
+            return self.infer_contains_result_type(left_type, right_type);
+        }
+        if op == "?" {
+            return self.infer_hstore_key_result_type(left_type, right_type);
+        }
         if is_boolean_connector(op) {
             if matches!(left_type, SqlType::Bool | SqlType::Null)
                 && matches!(right_type, SqlType::Bool | SqlType::Null)
@@ -2803,6 +2809,49 @@ impl<'a> Binder<'a> {
                     "range overlap operator && requires matching RANGE operands, got {left_type:?} and {right_type:?}"
                 ),
             )),
+        }
+    }
+
+    fn infer_contains_result_type(
+        &self,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        match (left_type, right_type) {
+            (SqlType::Array(left), SqlType::Array(right)) if left == right => {
+                Ok(Some(SqlType::Bool))
+            }
+            (SqlType::HStore, SqlType::HStore) => Ok(Some(SqlType::Bool)),
+            (SqlType::Null, SqlType::Array(_))
+            | (SqlType::Array(_), SqlType::Null)
+            | (SqlType::Null, SqlType::HStore)
+            | (SqlType::HStore, SqlType::Null)
+            | (SqlType::Null, SqlType::Null) => Ok(Some(SqlType::Bool)),
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "contains operator @> requires matching ARRAY or HSTORE operands, got {left_type:?} and {right_type:?}"
+                ),
+            )),
+        }
+    }
+
+    fn infer_hstore_key_result_type(
+        &self,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::HStore | SqlType::Null)
+            && matches!(right_type, SqlType::Text | SqlType::Null)
+        {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "hstore key operator ? requires HSTORE and TEXT operands, got {left_type:?} and {right_type:?}"
+                ),
+            ))
         }
     }
 

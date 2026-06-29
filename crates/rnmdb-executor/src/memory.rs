@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::Bound,
     sync::{
         Arc,
@@ -15,7 +15,7 @@ use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
     CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, InvertedTextIndex,
-    MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
+    InvertedValueIndex, MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -23,7 +23,7 @@ use rnmdb_planner::{
         AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
         LogicalPlan,
     },
-    physical::{PhysicalPlan, SetOperationKind},
+    physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
 use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, OrderByExpr, SortDirection};
 use rnmdb_types::{
@@ -149,6 +149,23 @@ impl MemoryTable {
         apply_text_search_cancellable(batch, column, query, cancellation)
     }
 
+    fn inverted_value_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        query: &InvertedValueQuery,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let pointers = index.inverted_value_lookup(column_index, query)?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn range_overlap_scan(
         &self,
         index_name: &str,
@@ -220,6 +237,23 @@ impl MemoryTable {
         let pointers = index.text_lookup(column_index, &required_terms)?;
         let batch = self.rows_for_pointers(&pointers)?;
         apply_text_search_cancellable(batch, column, query, cancellation).map(Some)
+    }
+
+    fn try_inverted_value_scan(
+        &self,
+        column: &str,
+        query: &InvertedValueQuery,
+    ) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_inverted_value_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.inverted_value_lookup(column_index, query)?;
+        self.rows_for_pointers(&pointers).map(Some)
     }
 
     fn try_range_overlap_scan(&self, column: &str, range: &Expr) -> Result<Option<VectorBatch>> {
@@ -420,6 +454,10 @@ enum MemoryTableIndex {
         column_index: usize,
         index: InvertedTextIndex,
     },
+    GinValue {
+        column_index: usize,
+        index: InvertedValueIndex,
+    },
     GistRange {
         column_index: usize,
         index: MemoryRangeIndex,
@@ -485,10 +523,14 @@ impl MemoryTableIndex {
                             column_index,
                             index: InvertedTextIndex::new(name),
                         }),
+                        SqlType::Array(_) | SqlType::HStore => Ok(Self::GinValue {
+                            column_index,
+                            index: InvertedValueIndex::new(name),
+                        }),
                         other => Err(RnovError::new(
                             ErrorKind::InvalidInput,
                             format!(
-                                "gin text index requires TEXT or TEXTVECTOR column, got {other:?}"
+                                "gin index requires TEXT, TEXTVECTOR, ARRAY, or HSTORE column, got {other:?}"
                             ),
                         )),
                     }
@@ -571,6 +613,10 @@ impl MemoryTableIndex {
                 let name = index.name().to_string();
                 *index = InvertedTextIndex::new(name);
             }
+            Self::GinValue { index, .. } => {
+                let name = index.name().to_string();
+                *index = InvertedValueIndex::new(name);
+            }
             Self::GistRange { index, .. } => {
                 let name = index.name().to_string();
                 *index = MemoryRangeIndex::new(name);
@@ -619,6 +665,24 @@ impl MemoryTableIndex {
                 };
                 index.insert_document(pointer, &vector)
             }
+            Self::GinValue {
+                column_index,
+                index,
+                ..
+            } => match &row.values()[*column_index] {
+                SqlValue::Null => Ok(()),
+                SqlValue::Array(array) if array.is_empty() => Ok(()),
+                SqlValue::Array(array) => index.insert_array(pointer, array),
+                SqlValue::HStore(hstore) if hstore.is_empty() => Ok(()),
+                SqlValue::HStore(hstore) => index.insert_hstore(pointer, hstore),
+                other => Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "gin value index cannot index value type {:?}",
+                        other.data_type()
+                    ),
+                )),
+            },
             Self::GistRange {
                 column_index,
                 index,
@@ -653,6 +717,7 @@ impl MemoryTableIndex {
             Self::BTree { column_index, .. } => *column_index == column,
             Self::Hash { column_index, .. } => *column_index == column,
             Self::GinText { .. } => false,
+            Self::GinValue { .. } => false,
             Self::GistRange { .. } => false,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
@@ -668,6 +733,10 @@ impl MemoryTableIndex {
 
     fn supports_text_column(&self, column: usize) -> bool {
         matches!(self, Self::GinText { column_index, .. } if *column_index == column)
+    }
+
+    fn supports_inverted_value_column(&self, column: usize) -> bool {
+        matches!(self, Self::GinValue { column_index, .. } if *column_index == column)
     }
 
     fn supports_range_overlap_column(&self, column: usize) -> bool {
@@ -708,6 +777,50 @@ impl MemoryTableIndex {
             } if *column_index == column => {
                 Ok(index.lookup_all(required_terms.iter().map(String::as_str)))
             }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn inverted_value_lookup(
+        &self,
+        column: usize,
+        query: &InvertedValueQuery,
+    ) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::GinValue {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => match query {
+                InvertedValueQuery::ArrayContains { values } => {
+                    if values.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let mut lists = Vec::with_capacity(values.len());
+                    for value in values {
+                        lists.push(index.lookup_array_value(&literal_value(value)?));
+                    }
+                    Ok(intersect_pointer_lists(lists))
+                }
+                InvertedValueQuery::HStoreKey { key } => Ok(index.lookup_hstore_key(key)),
+                InvertedValueQuery::HStoreContains { entries } => {
+                    if entries.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let lists = entries
+                        .iter()
+                        .map(|(key, value)| {
+                            index.lookup_hstore_pair(
+                                key,
+                                &value.as_ref().map_or(HStoreValue::Null, |value| {
+                                    HStoreValue::Text(value.clone())
+                                }),
+                            )
+                        })
+                        .collect();
+                    Ok(intersect_pointer_lists(lists))
+                }
+            },
             _ => Ok(Vec::new()),
         }
     }
@@ -1054,6 +1167,19 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .text_index_scan(index, column, query, cancellation),
+            PhysicalPlan::InvertedValueScan {
+                table,
+                index,
+                column,
+                query,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .inverted_value_scan(index, column, query),
             PhysicalPlan::RangeOverlapScan {
                 table,
                 index,
@@ -1442,6 +1568,11 @@ impl MemoryExecutor {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
             }
         }
+        if let Some((column, query)) = indexable_inverted_value(predicate) {
+            if let Some(batch) = table.try_inverted_value_scan(column, &query)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
         if let Some(range) = indexable_range(predicate) {
             if let Some(batch) = table.try_index_range_scan(
                 range.column,
@@ -1535,6 +1666,22 @@ fn required_text_query_terms(query: &str) -> Result<Vec<String>> {
         .into_iter()
         .map(str::to_string)
         .collect())
+}
+
+fn intersect_pointer_lists(lists: Vec<Vec<IndexPointer>>) -> Vec<IndexPointer> {
+    let mut lists = lists.into_iter();
+    let Some(first) = lists.next() else {
+        return Vec::new();
+    };
+    let mut intersection = first.into_iter().collect::<BTreeSet<_>>();
+    for list in lists {
+        let set = list.into_iter().collect::<BTreeSet<_>>();
+        intersection = intersection.intersection(&set).copied().collect();
+        if intersection.is_empty() {
+            break;
+        }
+    }
+    intersection.into_iter().collect()
 }
 
 fn text_vector_from_value(value: &SqlValue) -> Result<Option<TextVector>> {
@@ -1695,6 +1842,31 @@ fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
     match (left.as_ref(), right.as_ref()) {
         (Expr::Identifier(column), range @ Expr::Range { .. }) => Some((column.as_str(), range)),
         (range @ Expr::Range { .. }, Expr::Identifier(column)) => Some((column.as_str(), range)),
+        _ => None,
+    }
+}
+
+fn indexable_inverted_value(predicate: &Expr) -> Option<(&str, InvertedValueQuery)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    match (left.as_ref(), op.as_str(), right.as_ref()) {
+        (Expr::Identifier(column), "@>", Expr::Array(values)) => Some((
+            column.as_str(),
+            InvertedValueQuery::ArrayContains {
+                values: values.clone(),
+            },
+        )),
+        (Expr::Identifier(column), "@>", Expr::HStore(entries)) => Some((
+            column.as_str(),
+            InvertedValueQuery::HStoreContains {
+                entries: entries.clone(),
+            },
+        )),
+        (Expr::Identifier(column), "?", Expr::String(key)) => Some((
+            column.as_str(),
+            InvertedValueQuery::HStoreKey { key: key.clone() },
+        )),
         _ => None,
     }
 }
@@ -2742,6 +2914,8 @@ fn eval_binary_expr(
         "+" | "-" | "*" | "/" | "%" => eval_arithmetic_expr(columns, row, left, op, right),
         "||" => eval_text_concat_expr(columns, row, left, right),
         "&&" => eval_range_overlap_expr(columns, row, left, right),
+        "@>" => eval_contains_expr(columns, row, left, right),
+        "?" => eval_hstore_key_expr(columns, row, left, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
@@ -2781,6 +2955,64 @@ fn eval_binary_expr(
         other => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {other}"),
+        )),
+    }
+}
+
+fn eval_contains_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    match (
+        eval_expr(columns, row, left)?,
+        eval_expr(columns, row, right)?,
+    ) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Bool(false)),
+        (SqlValue::Array(left), SqlValue::Array(right)) => Ok(SqlValue::Bool(
+            right
+                .values()
+                .iter()
+                .all(|value| left.values().contains(value)),
+        )),
+        (SqlValue::HStore(left), SqlValue::HStore(right)) => {
+            Ok(SqlValue::Bool(right.iter().all(|(key, value)| {
+                left.get(key).is_some_and(|left| left == value)
+            })))
+        }
+        (left, right) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "contains operator @> requires ARRAY or HSTORE operands, got {:?} and {:?}",
+                left.data_type(),
+                right.data_type()
+            ),
+        )),
+    }
+}
+
+fn eval_hstore_key_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    match (
+        eval_expr(columns, row, left)?,
+        eval_expr(columns, row, right)?,
+    ) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Bool(false)),
+        (SqlValue::HStore(hstore), SqlValue::Text(key)) => {
+            Ok(SqlValue::Bool(hstore.contains_key(&key)))
+        }
+        (left, right) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "hstore key operator ? requires HSTORE and TEXT operands, got {:?} and {:?}",
+                left.data_type(),
+                right.data_type()
+            ),
         )),
     }
 }
@@ -3261,7 +3493,7 @@ fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bo
 fn boolean_operator(op: &str) -> bool {
     matches!(
         op,
-        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "&&" | "AND" | "OR"
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "&&" | "@>" | "?" | "AND" | "OR"
     )
 }
 

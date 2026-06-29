@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use crate::{
     cost::{CostModel, PlanCost},
@@ -55,6 +55,14 @@ pub enum PhysicalPlan {
         index: String,
         column: String,
         query: String,
+        cost: PlanCost,
+    },
+    InvertedValueScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        query: InvertedValueQuery,
         cost: PlanCost,
     },
     RangeOverlapScan {
@@ -152,6 +160,47 @@ pub enum MutationKind {
     Delete,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum InvertedValueQuery {
+    ArrayContains {
+        values: Vec<Expr>,
+    },
+    HStoreKey {
+        key: String,
+    },
+    HStoreContains {
+        entries: Vec<(String, Option<String>)>,
+    },
+}
+
+impl InvertedValueQuery {
+    fn token_count(&self) -> usize {
+        match self {
+            Self::ArrayContains { values } => values.len(),
+            Self::HStoreKey { .. } => 1,
+            Self::HStoreContains { entries } => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.token_count() == 0
+    }
+}
+
+impl fmt::Display for InvertedValueQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ArrayContains { values } => {
+                write!(f, "array_contains({})", Expr::Array(values.clone()))
+            }
+            Self::HStoreKey { key } => write!(f, "hstore_key('{key}')"),
+            Self::HStoreContains { entries } => {
+                write!(f, "hstore_contains({})", Expr::HStore(entries.clone()))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexCatalog {
     indexes: BTreeMap<RelationId, Vec<IndexAccessPath>>,
@@ -241,6 +290,21 @@ impl IndexCatalog {
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
+
+    fn best_inverted_value_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_inverted_value()
+                && index.columns.len() == 1
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +346,10 @@ impl IndexAccessPath {
     }
 
     fn supports_text_search(&self) -> bool {
+        self.method == IndexMethod::Gin
+    }
+
+    fn supports_inverted_value(&self) -> bool {
         self.method == IndexMethod::Gin
     }
 
@@ -501,6 +569,7 @@ impl PhysicalPlan {
             | PhysicalPlan::IndexSkipScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
             | PhysicalPlan::InvertedTextScan { cost, .. }
+            | PhysicalPlan::InvertedValueScan { cost, .. }
             | PhysicalPlan::RangeOverlapScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
@@ -603,6 +672,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}InvertedTextScan table={table} index={index} column={column} query='{query}'{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::InvertedValueScan {
+            table,
+            index,
+            column,
+            query,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}InvertedValueScan table={table} index={index} column={column} query={query}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -806,6 +888,26 @@ impl PhysicalPlanner {
             }
         }
 
+        if let Some((column, query)) = indexable_inverted_value(predicate) {
+            if !query.is_empty() {
+                if let Some(index) = self.indexes.best_inverted_value_for(*relation_id, column) {
+                    let cost = self
+                        .cost_model
+                        .estimate_inverted_value_scan(*relation_id, query.token_count());
+                    if cost.total() <= sequential_cost.total() {
+                        return Some(PhysicalPlan::InvertedValueScan {
+                            relation_id: *relation_id,
+                            table: table.clone(),
+                            index: index.name.clone(),
+                            column: column.to_string(),
+                            query,
+                            cost,
+                        });
+                    }
+                }
+            }
+        }
+
         let range = indexable_range(predicate)?;
         let index = self
             .indexes
@@ -938,6 +1040,31 @@ fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
     match (left.as_ref(), right.as_ref()) {
         (Expr::Identifier(column), range @ Expr::Range { .. }) => Some((column.as_str(), range)),
         (range @ Expr::Range { .. }, Expr::Identifier(column)) => Some((column.as_str(), range)),
+        _ => None,
+    }
+}
+
+fn indexable_inverted_value(predicate: &Expr) -> Option<(&str, InvertedValueQuery)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    match (left.as_ref(), op.as_str(), right.as_ref()) {
+        (Expr::Identifier(column), "@>", Expr::Array(values)) => Some((
+            column.as_str(),
+            InvertedValueQuery::ArrayContains {
+                values: values.clone(),
+            },
+        )),
+        (Expr::Identifier(column), "@>", Expr::HStore(entries)) => Some((
+            column.as_str(),
+            InvertedValueQuery::HStoreContains {
+                entries: entries.clone(),
+            },
+        )),
+        (Expr::Identifier(column), "?", Expr::String(key)) => Some((
+            column.as_str(),
+            InvertedValueQuery::HStoreKey { key: key.clone() },
+        )),
         _ => None,
     }
 }
