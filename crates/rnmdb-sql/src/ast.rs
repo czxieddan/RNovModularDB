@@ -453,6 +453,21 @@ pub struct Assignment {
     pub value: Expr,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexKeyDef {
+    Column(Ident),
+    Expression(Expr),
+}
+
+impl fmt::Display for IndexKeyDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Column(column) => write!(f, "{column}"),
+            Self::Expression(expr) => write!(f, "({expr})"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransactionAction {
     Begin,
@@ -477,7 +492,7 @@ pub enum Statement {
     CreateIndex {
         name: ObjectName,
         table: ObjectName,
-        columns: Vec<Ident>,
+        keys: Vec<IndexKeyDef>,
         method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
@@ -609,6 +624,21 @@ pub struct BoundColumn {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundIndexKey {
+    Column(BoundColumn),
+    Expression { expr: Expr, data_type: SqlType },
+}
+
+impl BoundIndexKey {
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Column(column) => column.name.clone(),
+            Self::Expression { expr, .. } => expr.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundSelect {
     pub relation_id: RelationId,
     pub table: ObjectName,
@@ -708,7 +738,7 @@ pub enum BoundStatement {
         name: ObjectName,
         relation_id: RelationId,
         table: ObjectName,
-        columns: Vec<BoundColumn>,
+        keys: Vec<BoundIndexKey>,
         method: IndexMethod,
         unique: bool,
         if_not_exists: bool,

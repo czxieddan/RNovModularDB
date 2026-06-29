@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use rnmdb_catalog::{Catalog, OperatorSignature, Privilege, RowPolicy};
+use rnmdb_catalog::{Catalog, IndexKey, OperatorSignature, Privilege, RowPolicy};
 use rnmdb_common::{
     Result,
     ids::{DatabaseId, RelationId, RoleId},
@@ -85,7 +85,7 @@ impl LocalSession {
             BoundStatement::CreateIndex {
                 name,
                 relation_id,
-                columns,
+                keys,
                 method,
                 unique,
                 if_not_exists,
@@ -96,7 +96,7 @@ impl LocalSession {
                 self.apply_catalog_create_index(
                     name,
                     *relation_id,
-                    columns,
+                    keys,
                     *method,
                     *unique,
                     *if_not_exists,
@@ -262,7 +262,7 @@ impl LocalSession {
         &mut self,
         name: &ObjectName,
         relation_id: RelationId,
-        columns: &[rnmdb_sql::ast::BoundColumn],
+        keys: &[rnmdb_sql::ast::BoundIndexKey],
         method: rnmdb_catalog::IndexMethod,
         unique: bool,
         if_not_exists: bool,
@@ -271,15 +271,22 @@ impl LocalSession {
         if self.catalog.get_index(schema, name.object()).is_some() && if_not_exists {
             return Ok(());
         }
-        let columns = columns
+        let keys = keys
             .iter()
-            .map(|column| column.name.clone())
+            .map(|key| match key {
+                rnmdb_sql::ast::BoundIndexKey::Column(column) => {
+                    IndexKey::column(column.name.clone())
+                }
+                rnmdb_sql::ast::BoundIndexKey::Expression { expr, .. } => {
+                    IndexKey::expression(expr.to_string())
+                }
+            })
             .collect::<Vec<_>>();
-        self.catalog.create_index_with_method(
+        self.catalog.create_index_with_keys(
             schema,
             name.object(),
             relation_id,
-            columns,
+            keys,
             method,
             unique,
         )?;
@@ -469,7 +476,7 @@ impl LocalSession {
             catalog.add_index(IndexAccessPath::new(
                 format!("{}.{}", index.schema_name(), index.name()),
                 index.relation_id(),
-                index.columns().to_vec(),
+                index.keys().to_vec(),
                 index.method(),
                 index.unique(),
             ));

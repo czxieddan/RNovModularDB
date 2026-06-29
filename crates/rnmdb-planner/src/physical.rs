@@ -4,7 +4,7 @@ use crate::{
     cost::{CostModel, PlanCost},
     logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
 };
-use rnmdb_catalog::IndexMethod;
+use rnmdb_catalog::{IndexKey, IndexMethod};
 use rnmdb_common::ids::RelationId;
 use rnmdb_sql::ast::{ExplainFormat, Expr, OrderByExpr};
 
@@ -20,6 +20,14 @@ pub enum PhysicalPlan {
         table: String,
         index: String,
         column: String,
+        value: Expr,
+        cost: PlanCost,
+    },
+    ExpressionIndexScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        expr: Expr,
         value: Expr,
         cost: PlanCost,
     },
@@ -250,9 +258,22 @@ impl IndexCatalog {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_equality()
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
+        })
+    }
+
+    fn best_for_expression(
+        &self,
+        relation_id: RelationId,
+        expr: &Expr,
+    ) -> Option<&IndexAccessPath> {
+        let expr = expr.to_string();
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_equality()
+                && index
+                    .leading_expression()
+                    .is_some_and(|indexed| indexed == expr)
         })
     }
 
@@ -271,10 +292,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_range()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
         })
     }
@@ -287,11 +307,10 @@ impl IndexCatalog {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_skip_scan()
                 && !index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
                 && index
-                    .columns
+                    .column_names()
                     .iter()
                     .any(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
@@ -304,10 +323,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_text_search()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
@@ -319,10 +337,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_range_overlap()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
@@ -334,10 +351,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_range_overlap()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
@@ -349,10 +365,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_inverted_value()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
@@ -364,10 +379,9 @@ impl IndexCatalog {
     ) -> Option<&IndexAccessPath> {
         self.indexes.get(&relation_id)?.iter().find(|index| {
             index.supports_block_summary()
-                && index.columns.len() == 1
+                && index.keys.len() == 1
                 && index
-                    .columns
-                    .first()
+                    .leading_column()
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
@@ -377,7 +391,7 @@ impl IndexCatalog {
 pub struct IndexAccessPath {
     name: String,
     relation_id: RelationId,
-    columns: Vec<String>,
+    keys: Vec<IndexKey>,
     method: IndexMethod,
     unique: bool,
 }
@@ -386,17 +400,29 @@ impl IndexAccessPath {
     pub fn new(
         name: impl Into<String>,
         relation_id: RelationId,
-        columns: Vec<String>,
+        keys: Vec<IndexKey>,
         method: IndexMethod,
         unique: bool,
     ) -> Self {
         Self {
             name: name.into(),
             relation_id,
-            columns,
+            keys,
             method,
             unique,
         }
+    }
+
+    fn leading_column(&self) -> Option<&str> {
+        self.keys.first()?.as_column()
+    }
+
+    fn leading_expression(&self) -> Option<&str> {
+        self.keys.first()?.as_expression()
+    }
+
+    fn column_names(&self) -> Vec<&str> {
+        self.keys.iter().filter_map(IndexKey::as_column).collect()
     }
 
     fn supports_equality(&self) -> bool {
@@ -408,7 +434,9 @@ impl IndexAccessPath {
     }
 
     fn supports_skip_scan(&self) -> bool {
-        self.method == IndexMethod::BTree && self.columns.len() > 1
+        self.method == IndexMethod::BTree
+            && self.keys.len() > 1
+            && self.keys.iter().all(|key| key.as_column().is_some())
     }
 
     fn supports_text_search(&self) -> bool {
@@ -649,6 +677,7 @@ impl PhysicalPlan {
         match self {
             PhysicalPlan::SeqScan { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
+            | PhysicalPlan::ExpressionIndexScan { cost, .. }
             | PhysicalPlan::IndexRangeScan { cost, .. }
             | PhysicalPlan::IndexSkipScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
@@ -701,6 +730,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}IndexScan table={table} index={index} column={column} value={value}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::ExpressionIndexScan {
+            table,
+            index,
+            expr,
+            value,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}ExpressionIndexScan table={table} index={index} expr={expr} value={value}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -1017,6 +1059,23 @@ impl PhysicalPlanner {
         let LogicalPlan::Scan { relation_id, table } = input else {
             return None;
         };
+        if let Some((expr, value)) = indexable_expression_equality(predicate) {
+            if let Some(index) = self.indexes.best_for_expression(*relation_id, expr) {
+                let cost = self
+                    .cost_model
+                    .estimate_index_scan(*relation_id, index.unique);
+                if cost.total() <= sequential_cost.total() {
+                    return Some(PhysicalPlan::ExpressionIndexScan {
+                        relation_id: *relation_id,
+                        table: table.clone(),
+                        index: index.name.clone(),
+                        expr: expr.clone(),
+                        value: value.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
         if let Some((column, value)) = indexable_equality(predicate) {
             if let Some(index) = self.indexes.best_for_column(*relation_id, column) {
                 let cost = self
@@ -1177,6 +1236,32 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
         }
         _ => None,
     }
+}
+
+fn indexable_expression_equality(predicate: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(_), _) | (_, Expr::Identifier(_)) => None,
+        (expr, value) if is_indexable_expression(expr) && is_index_literal(value) => {
+            Some((expr, value))
+        }
+        (value, expr) if is_index_literal(value) && is_indexable_expression(expr) => {
+            Some((expr, value))
+        }
+        _ => None,
+    }
+}
+
+fn is_indexable_expression(expr: &Expr) -> bool {
+    !matches!(
+        expr,
+        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
+    )
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {

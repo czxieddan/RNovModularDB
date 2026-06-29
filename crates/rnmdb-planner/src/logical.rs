@@ -3,8 +3,8 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, ObjectName, OrderByExpr,
-    TransactionAction,
+    BoundIndexKey, BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, IndexKeyDef, ObjectName,
+    OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -102,7 +102,7 @@ pub enum LogicalPlan {
         name: String,
         relation_id: RelationId,
         table: String,
-        columns: Vec<String>,
+        keys: Vec<IndexKeyDef>,
         method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
@@ -269,7 +269,7 @@ impl LogicalPlanner {
                 name,
                 relation_id,
                 table,
-                columns,
+                keys,
                 method,
                 unique,
                 if_not_exists,
@@ -277,7 +277,7 @@ impl LogicalPlanner {
                 name: object_name(name),
                 relation_id: *relation_id,
                 table: object_name(table),
-                columns: columns.iter().map(|column| column.name.clone()).collect(),
+                keys: keys.iter().map(index_key_def_from_bound).collect(),
                 method: *method,
                 unique: *unique,
                 if_not_exists: *if_not_exists,
@@ -760,7 +760,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::CreateIndex {
             name,
             table,
-            columns,
+            keys,
             method,
             unique,
             if_not_exists,
@@ -773,9 +773,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 ""
             };
             out.push_str(&format!(
-                "{prefix}CreateIndex {mode}name={name} table={table} method={} columns={}{}\n",
+                "{prefix}CreateIndex {mode}name={name} table={table} method={} keys={}{}\n",
                 method.as_str(),
-                columns.join(", "),
+                keys.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 exists
             ));
         }
@@ -1052,6 +1055,13 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn index_key_def_from_bound(key: &BoundIndexKey) -> IndexKeyDef {
+    match key {
+        BoundIndexKey::Column(column) => IndexKeyDef::Column(Ident::new(&column.name)),
+        BoundIndexKey::Expression { expr, .. } => IndexKeyDef::Expression(expr.clone()),
+    }
 }
 
 fn apply_query_tail(

@@ -26,7 +26,7 @@ use rnmdb_planner::{
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
-use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, OrderByExpr, SortDirection};
+use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, OrderByExpr, SortDirection};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
     TextVector, Truth,
@@ -64,7 +64,7 @@ impl MemoryTable {
         let pointer = pointer_for_slot(self.rows.len())?;
         let mut indexes = self.indexes.clone();
         for index in indexes.values_mut() {
-            index.insert_row(&row, pointer)?;
+            index.insert_row(&self.columns, &row, pointer)?;
         }
         self.rows.push(row);
         self.indexes = indexes;
@@ -86,6 +86,23 @@ impl MemoryTable {
         let column_index = column_index(&self.columns, column)?;
         let key = index_key_from_literal_expr(value)?;
         let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers)
+    }
+
+    fn expression_index_scan(
+        &self,
+        index_name: &str,
+        expr: &Expr,
+        value: &Expr,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let key = index_key_from_literal_expr(value)?;
+        let pointers = index.expression_lookup(expr, &key)?;
         self.rows_for_pointers(&pointers)
     }
 
@@ -265,6 +282,19 @@ impl MemoryTable {
         };
         let pointers = index.point_lookup(column_index, &key)?;
         self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_expression_index_scan(&self, expr: &Expr, value: &Expr) -> Result<Option<VectorBatch>> {
+        let Some(key) = maybe_index_key_from_literal_expr(value)? else {
+            return Ok(None);
+        };
+        for index in self.indexes.values() {
+            let pointers = index.expression_lookup(expr, &key)?;
+            if !pointers.is_empty() {
+                return self.rows_for_pointers(&pointers).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     fn try_index_skip_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
@@ -540,7 +570,7 @@ impl MemoryTable {
     fn create_index(
         &mut self,
         name: &str,
-        columns: &[String],
+        keys: &[IndexKeyDef],
         method: IndexMethod,
         unique: bool,
     ) -> Result<()> {
@@ -550,9 +580,9 @@ impl MemoryTable {
                 format!("index already exists: {name}"),
             ));
         }
-        let mut index = MemoryTableIndex::new(name, &self.columns, columns, method, unique)?;
+        let mut index = MemoryTableIndex::new(name, &self.columns, keys, method, unique)?;
         for (slot, row) in self.rows.iter().enumerate() {
-            index.insert_row(row, pointer_for_slot(slot)?)?;
+            index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
         }
         self.indexes.insert(name.to_string(), index);
         Ok(())
@@ -567,7 +597,7 @@ impl MemoryTable {
         for index in indexes.values_mut() {
             index.clear();
             for (slot, row) in self.rows.iter().enumerate() {
-                index.insert_row(row, pointer_for_slot(slot)?)?;
+                index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
             }
         }
         self.indexes = indexes;
@@ -599,8 +629,16 @@ enum MemoryTableIndex {
         column_index: usize,
         index: MemoryBTreeIndex,
     },
+    ExpressionBTree {
+        expr: Expr,
+        index: MemoryBTreeIndex,
+    },
     Hash {
         column_index: usize,
+        index: MemoryHashIndex,
+    },
+    ExpressionHash {
+        expr: Expr,
         index: MemoryHashIndex,
     },
     GinText {
@@ -634,19 +672,63 @@ impl MemoryTableIndex {
     fn new(
         name: &str,
         table_columns: &[ColumnSchema],
-        columns: &[String],
+        keys: &[IndexKeyDef],
         method: IndexMethod,
         unique: bool,
     ) -> Result<Self> {
-        if columns.is_empty() {
+        if keys.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "index must have at least one column",
             ));
         }
-        let column_indexes = columns
+        if let [IndexKeyDef::Expression(expr)] = keys {
+            return match method {
+                IndexMethod::BTree => {
+                    let _ = projection_type(table_columns, expr)?;
+                    let index = if unique {
+                        MemoryBTreeIndex::unique(name)
+                    } else {
+                        MemoryBTreeIndex::non_unique(name)
+                    };
+                    Ok(Self::ExpressionBTree {
+                        expr: expr.clone(),
+                        index,
+                    })
+                }
+                IndexMethod::Hash => {
+                    let _ = projection_type(table_columns, expr)?;
+                    let index = if unique {
+                        MemoryHashIndex::unique(name)
+                    } else {
+                        MemoryHashIndex::non_unique(name)
+                    };
+                    Ok(Self::ExpressionHash {
+                        expr: expr.clone(),
+                        index,
+                    })
+                }
+                _ => Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "expression indexes support only btree and hash methods",
+                )),
+            };
+        }
+        if keys
             .iter()
-            .map(|column| column_index(table_columns, column))
+            .any(|key| matches!(key, IndexKeyDef::Expression(_)))
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "expression indexes support exactly one expression",
+            ));
+        }
+        let column_indexes = keys
+            .iter()
+            .map(|key| match key {
+                IndexKeyDef::Column(column) => column_index(table_columns, column.as_str()),
+                IndexKeyDef::Expression(_) => unreachable!("handled above"),
+            })
             .collect::<Result<Vec<_>>>()?;
         if column_indexes.len() == 1 {
             return match method {
@@ -798,7 +880,25 @@ impl MemoryTableIndex {
                     MemoryBTreeIndex::non_unique(name)
                 };
             }
+            Self::ExpressionBTree { index, .. } => {
+                let name = index.name().to_string();
+                let unique = index.is_unique();
+                *index = if unique {
+                    MemoryBTreeIndex::unique(name)
+                } else {
+                    MemoryBTreeIndex::non_unique(name)
+                };
+            }
             Self::Hash { index, .. } => {
+                let name = index.name().to_string();
+                let unique = index.is_unique();
+                *index = if unique {
+                    MemoryHashIndex::unique(name)
+                } else {
+                    MemoryHashIndex::non_unique(name)
+                };
+            }
+            Self::ExpressionHash { index, .. } => {
                 let name = index.name().to_string();
                 let unique = index.is_unique();
                 *index = if unique {
@@ -840,7 +940,12 @@ impl MemoryTableIndex {
         }
     }
 
-    fn insert_row(&mut self, row: &Row, pointer: IndexPointer) -> Result<()> {
+    fn insert_row(
+        &mut self,
+        columns: &[ColumnSchema],
+        row: &Row,
+        pointer: IndexPointer,
+    ) -> Result<()> {
         match self {
             Self::BTree {
                 column_index,
@@ -852,12 +957,24 @@ impl MemoryTableIndex {
                 };
                 index.insert(key, pointer)
             }
+            Self::ExpressionBTree { expr, index } => {
+                let Some(key) = index_key_from_value(&eval_expr(columns, row, expr)?)? else {
+                    return Ok(());
+                };
+                index.insert(key, pointer)
+            }
             Self::Hash {
                 column_index,
                 index,
                 ..
             } => {
                 let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                index.insert(key, pointer)
+            }
+            Self::ExpressionHash { expr, index } => {
+                let Some(key) = index_key_from_value(&eval_expr(columns, row, expr)?)? else {
                     return Ok(());
                 };
                 index.insert(key, pointer)
@@ -944,7 +1061,9 @@ impl MemoryTableIndex {
     fn supports_leading_column(&self, column: usize) -> bool {
         match self {
             Self::BTree { column_index, .. } => *column_index == column,
+            Self::ExpressionBTree { .. } => false,
             Self::Hash { column_index, .. } => *column_index == column,
+            Self::ExpressionHash { .. } => false,
             Self::GinText { .. } => false,
             Self::GinValue { .. } => false,
             Self::GistRange { .. } => false,
@@ -1003,6 +1122,20 @@ impl MemoryTableIndex {
                 parts.extend((1..column_indexes.len()).map(|_| None));
                 index.skip_scan(&CompositeKeyPattern::new(parts)?)
             }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn expression_lookup(&self, expr: &Expr, key: &IndexKey) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::ExpressionBTree {
+                expr: indexed,
+                index,
+            } if indexed == expr => Ok(index.point_lookup(key)),
+            Self::ExpressionHash {
+                expr: indexed,
+                index,
+            } if indexed == expr => Ok(index.point_lookup(key)),
             _ => Ok(Vec::new()),
         }
     }
@@ -1389,6 +1522,19 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .index_scan(index, column, value),
+            PhysicalPlan::ExpressionIndexScan {
+                table,
+                index,
+                expr,
+                value,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .expression_index_scan(index, expr, value),
             PhysicalPlan::IndexRangeScan {
                 table,
                 index,
@@ -1786,13 +1932,13 @@ impl MemoryExecutor {
             LogicalPlan::CreateIndex {
                 name,
                 table,
-                columns,
+                keys,
                 method,
                 unique,
                 if_not_exists,
                 ..
             } => {
-                self.create_index(name, table, columns, *method, *unique, *if_not_exists)?;
+                self.create_index(name, table, keys, *method, *unique, *if_not_exists)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropIndex { name, if_exists } => {
@@ -1901,7 +2047,7 @@ impl MemoryExecutor {
         &mut self,
         name: &str,
         table: &str,
-        columns: &[String],
+        keys: &[IndexKeyDef],
         method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
@@ -1912,7 +2058,7 @@ impl MemoryExecutor {
         if table.indexes.contains_key(name) && if_not_exists {
             return Ok(());
         }
-        table.create_index(name, columns, method, unique)
+        table.create_index(name, keys, method, unique)
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
@@ -1931,6 +2077,11 @@ impl MemoryExecutor {
         let table = self.tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
+        if let Some((expr, value)) = indexable_expression_equality(predicate) {
+            if let Some(batch) = table.try_expression_index_scan(expr, value)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
         if let Some((column, value)) = indexable_equality(predicate) {
             if let Some(batch) = table.try_index_scan(column, value)? {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
@@ -2232,6 +2383,32 @@ fn indexable_equality(predicate: &Expr) -> Option<(&str, &Expr)> {
         }
         _ => None,
     }
+}
+
+fn indexable_expression_equality(predicate: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(_), _) | (_, Expr::Identifier(_)) => None,
+        (expr, value) if is_indexable_expression(expr) && is_index_literal(value) => {
+            Some((expr, value))
+        }
+        (value, expr) if is_index_literal(value) && is_indexable_expression(expr) => {
+            Some((expr, value))
+        }
+        _ => None,
+    }
+}
+
+fn is_indexable_expression(expr: &Expr) -> bool {
+    !matches!(
+        expr,
+        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
+    )
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {

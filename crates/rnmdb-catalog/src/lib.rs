@@ -91,6 +91,36 @@ impl IndexMethod {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexKey {
+    Column(String),
+    Expression(String),
+}
+
+impl IndexKey {
+    pub fn column(name: impl Into<String>) -> Self {
+        Self::Column(name.into())
+    }
+
+    pub fn expression(expr: impl Into<String>) -> Self {
+        Self::Expression(expr.into())
+    }
+
+    pub fn as_column(&self) -> Option<&str> {
+        match self {
+            Self::Column(name) => Some(name),
+            Self::Expression(_) => None,
+        }
+    }
+
+    pub fn as_expression(&self) -> Option<&str> {
+        match self {
+            Self::Column(_) => None,
+            Self::Expression(expr) => Some(expr),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Table {
     relation_id: RelationId,
     schema_name: String,
@@ -488,6 +518,19 @@ impl Catalog {
         method: IndexMethod,
         unique: bool,
     ) -> Result<Index> {
+        let keys = columns.into_iter().map(IndexKey::column).collect();
+        self.create_index_with_keys(schema_name, index_name, relation_id, keys, method, unique)
+    }
+
+    pub fn create_index_with_keys(
+        &mut self,
+        schema_name: &str,
+        index_name: impl Into<String>,
+        relation_id: RelationId,
+        keys: Vec<IndexKey>,
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<Index> {
         let index_name = index_name.into();
         validate_identifier("index", &index_name)?;
         if !self.schemas.contains_key(schema_name) {
@@ -505,12 +548,17 @@ impl Catalog {
         let table = self.table_by_relation_id(relation_id).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, "indexed relation does not exist")
         })?;
-        validate_index_columns(table, &columns)?;
+        validate_index_keys(table, &keys, method)?;
+        let columns = keys
+            .iter()
+            .filter_map(|key| key.as_column().map(str::to_string))
+            .collect::<Vec<_>>();
         let index = Index {
             schema_name: schema_name.to_string(),
             name: index_name,
             relation_id,
             table_name: table.name.clone(),
+            keys,
             columns,
             method,
             unique,
@@ -762,6 +810,7 @@ pub struct Index {
     name: String,
     relation_id: RelationId,
     table_name: String,
+    keys: Vec<IndexKey>,
     columns: Vec<String>,
     method: IndexMethod,
     unique: bool,
@@ -786,6 +835,10 @@ impl Index {
 
     pub fn columns(&self) -> &[String] {
         &self.columns
+    }
+
+    pub fn keys(&self) -> &[IndexKey] {
+        &self.keys
     }
 
     pub fn method(&self) -> IndexMethod {
@@ -899,32 +952,62 @@ fn validate_columns(columns: &[Column]) -> Result<()> {
     Ok(())
 }
 
-fn validate_index_columns(table: &Table, columns: &[String]) -> Result<()> {
-    if columns.is_empty() {
+fn validate_index_keys(table: &Table, keys: &[IndexKey], method: IndexMethod) -> Result<()> {
+    if keys.is_empty() {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
-            "index must have at least one column",
+            "index must have at least one key",
         ));
     }
 
     let mut seen = BTreeMap::new();
-    for column in columns {
-        validate_identifier("index column", column)?;
-        if seen.insert(column.as_str(), ()).is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("duplicate index column: {column}"),
-            ));
-        }
-        if table
-            .columns
-            .iter()
-            .all(|existing| existing.name != *column)
-        {
-            return Err(RnovError::new(
-                ErrorKind::NotFound,
-                format!("index column does not exist: {column}"),
-            ));
+    for key in keys {
+        match key {
+            IndexKey::Column(column) => {
+                validate_identifier("index column", column)?;
+                if seen.insert(format!("column:{column}"), ()).is_some() {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("duplicate index column: {column}"),
+                    ));
+                }
+                if table
+                    .columns
+                    .iter()
+                    .all(|existing| existing.name != *column)
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("index column does not exist: {column}"),
+                    ));
+                }
+            }
+            IndexKey::Expression(expr) => {
+                if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "expression indexes support only btree and hash methods",
+                    ));
+                }
+                if keys.len() != 1 {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "expression indexes support exactly one expression",
+                    ));
+                }
+                if expr.trim().is_empty() {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "index expression cannot be empty",
+                    ));
+                }
+                if seen.insert(format!("expr:{expr}"), ()).is_some() {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("duplicate index expression: {expr}"),
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -934,7 +1017,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 4;
+    const VERSION: u16 = 5;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1003,9 +1086,18 @@ impl CatalogCodec {
             write_string(&mut out, &index.table_name)?;
             out.push(u8::from(index.unique));
             out.push(encode_index_method(index.method));
-            write_u32(&mut out, index.columns.len() as u32);
-            for column in &index.columns {
-                write_string(&mut out, column)?;
+            write_u32(&mut out, index.keys.len() as u32);
+            for key in &index.keys {
+                match key {
+                    IndexKey::Column(column) => {
+                        out.push(0);
+                        write_string(&mut out, column)?;
+                    }
+                    IndexKey::Expression(expr) => {
+                        out.push(1);
+                        write_string(&mut out, expr)?;
+                    }
+                }
             }
         }
 
@@ -1167,16 +1259,33 @@ impl CatalogCodec {
             let table_name = reader.read_string("index table")?;
             let unique = reader.read_bool("index unique")?;
             let method = decode_index_method(reader.read_u8("index method")?)?;
-            let column_count = reader.read_u32("index column count")? as usize;
-            let mut columns = Vec::with_capacity(column_count);
-            for _ in 0..column_count {
-                columns.push(reader.read_string("index column")?);
+            let key_count = reader.read_u32("index key count")? as usize;
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                let tag = reader.read_u8("index key tag")?;
+                let value = reader.read_string("index key")?;
+                let key = match tag {
+                    0 => IndexKey::Column(value),
+                    1 => IndexKey::Expression(value),
+                    unknown => {
+                        return Err(RnovError::new(
+                            ErrorKind::Corruption,
+                            format!("unknown index key tag {unknown}"),
+                        ));
+                    }
+                };
+                keys.push(key);
             }
+            let columns = keys
+                .iter()
+                .filter_map(|key| key.as_column().map(str::to_string))
+                .collect::<Vec<_>>();
             catalog.indexes.push(Index {
                 schema_name,
                 name,
                 relation_id,
                 table_name,
+                keys,
                 columns,
                 method,
                 unique,

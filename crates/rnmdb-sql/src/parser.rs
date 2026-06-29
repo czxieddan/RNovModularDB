@@ -4,8 +4,9 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, ObjectName,
-        OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection, Statement, TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
+        ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection, Statement,
+        TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -171,17 +172,35 @@ impl Parser {
         let table = self.parse_object_name()?;
         let method = self.parse_optional_index_method()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        let columns = self.parse_ident_list()?;
+        let keys = self.parse_index_keys()?;
         self.expect_keyword(TokenKind::RightParen)?;
 
         Ok(Statement::CreateIndex {
             name,
             table,
-            columns,
+            keys,
             method,
             unique,
             if_not_exists,
         })
+    }
+
+    fn parse_index_keys(&mut self) -> Result<Vec<IndexKeyDef>> {
+        let mut keys = Vec::new();
+        loop {
+            if self.consume_if(&TokenKind::LeftParen) {
+                let expr = self.parse_expr()?;
+                self.expect_keyword(TokenKind::RightParen)?;
+                keys.push(IndexKeyDef::Expression(expr));
+            } else {
+                keys.push(IndexKeyDef::Column(self.parse_ident()?));
+            }
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
     }
 
     fn parse_optional_index_method(&mut self) -> Result<IndexMethod> {

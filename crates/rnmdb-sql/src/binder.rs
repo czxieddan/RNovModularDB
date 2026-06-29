@@ -6,9 +6,10 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIntersect, BoundQuery,
-    BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
-    CaseWhen, ColumnDef, Expr, Ident, ObjectName, OrderByExpr, SelectItem, Statement,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
+    BoundIntersect, BoundQuery, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement,
+    BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, ObjectName,
+    OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -38,11 +39,11 @@ impl<'a> Binder<'a> {
             Statement::CreateIndex {
                 name,
                 table,
-                columns,
+                keys,
                 method,
                 unique,
                 if_not_exists,
-            } => self.bind_create_index(name, table, columns, *method, *unique, *if_not_exists),
+            } => self.bind_create_index(name, table, keys, *method, *unique, *if_not_exists),
             Statement::AlterTableAddColumn {
                 table,
                 column,
@@ -354,7 +355,7 @@ impl<'a> Binder<'a> {
         &self,
         name: &ObjectName,
         table: &ObjectName,
-        columns: &[Ident],
+        keys: &[IndexKeyDef],
         method: IndexMethod,
         unique: bool,
         if_not_exists: bool,
@@ -373,15 +374,56 @@ impl<'a> Binder<'a> {
             ));
         }
         let resolved = self.resolve_table(table)?;
-        let mut bound_columns = Vec::with_capacity(columns.len());
-        for column in columns {
-            bound_columns.push(self.resolve_column(resolved, column.as_str())?);
+        let available_columns = bound_columns_for_table(resolved)?;
+        let mut bound_keys = Vec::with_capacity(keys.len());
+        for key in keys {
+            match key {
+                IndexKeyDef::Column(column) => {
+                    bound_keys.push(BoundIndexKey::Column(
+                        self.resolve_column(resolved, column.as_str())?,
+                    ));
+                }
+                IndexKeyDef::Expression(expr) => {
+                    if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "expression indexes support only btree and hash methods",
+                        ));
+                    }
+                    if keys.len() != 1 {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "expression indexes support exactly one expression",
+                        ));
+                    }
+                    let data_type = self
+                        .infer_expr_type_from_columns(&available_columns, expr)?
+                        .ok_or_else(|| {
+                            RnovError::new(
+                                ErrorKind::InvalidInput,
+                                format!("cannot infer expression index type: {expr}"),
+                            )
+                        })?;
+                    if !matches!(data_type, SqlType::Int64 | SqlType::Text) {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!(
+                                "expression index requires INT64 or TEXT expression, got {data_type:?}"
+                            ),
+                        ));
+                    }
+                    bound_keys.push(BoundIndexKey::Expression {
+                        expr: expr.clone(),
+                        data_type,
+                    });
+                }
+            }
         }
         Ok(BoundStatement::CreateIndex {
             name: ObjectName::qualified(index_schema, name.object()),
             relation_id: resolved.relation_id(),
             table: table.clone(),
-            columns: bound_columns,
+            keys: bound_keys,
             method,
             unique,
             if_not_exists,
@@ -3337,6 +3379,31 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
             "set operation operands must be SELECT queries",
         )),
     }
+}
+
+fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
+    table
+        .columns()
+        .iter()
+        .map(|column| {
+            let generated = column
+                .generated_expr()
+                .map(|expr| {
+                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
+                        expr,
+                        stored: column.generated_stored(),
+                    })
+                })
+                .transpose()?;
+            Ok(BoundColumn {
+                name: column.name().to_string(),
+                data_type: column.data_type().clone(),
+                nullable: column.nullable(),
+                encrypted: column.is_encrypted(),
+                generated,
+            })
+        })
+        .collect()
 }
 
 fn validate_set_operation_columns(
