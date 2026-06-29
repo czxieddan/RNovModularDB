@@ -34,6 +34,14 @@ pub enum PhysicalPlan {
         upper_inclusive: bool,
         cost: PlanCost,
     },
+    IndexSkipScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        value: Expr,
+        cost: PlanCost,
+    },
     TextSearchScan {
         relation_id: RelationId,
         table: String,
@@ -169,6 +177,24 @@ impl IndexCatalog {
                     .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
         })
     }
+
+    fn best_skip_scan_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_skip_scan()
+                && !index
+                    .columns
+                    .first()
+                    .is_some_and(|leading| leading.eq_ignore_ascii_case(column))
+                && index
+                    .columns
+                    .iter()
+                    .any(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +229,10 @@ impl IndexAccessPath {
 
     fn supports_range(&self) -> bool {
         self.method == IndexMethod::BTree
+    }
+
+    fn supports_skip_scan(&self) -> bool {
+        self.method == IndexMethod::BTree && self.columns.len() > 1
     }
 }
 
@@ -364,6 +394,7 @@ impl PhysicalPlan {
             PhysicalPlan::SeqScan { cost, .. }
             | PhysicalPlan::IndexScan { cost, .. }
             | PhysicalPlan::IndexRangeScan { cost, .. }
+            | PhysicalPlan::IndexSkipScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
@@ -428,6 +459,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 inclusive_label(*lower_inclusive),
                 bound_expr(upper),
                 inclusive_label(*upper_inclusive),
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::IndexSkipScan {
+            table,
+            index,
+            column,
+            value,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}IndexSkipScan table={table} index={index} column={column} value={value}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -590,6 +634,19 @@ impl PhysicalPlanner {
                     .estimate_index_scan(*relation_id, index.unique);
                 if cost.total() <= sequential_cost.total() {
                     return Some(PhysicalPlan::IndexScan {
+                        relation_id: *relation_id,
+                        table: table.clone(),
+                        index: index.name.clone(),
+                        column: column.to_string(),
+                        value: value.clone(),
+                        cost,
+                    });
+                }
+            }
+            if let Some(index) = self.indexes.best_skip_scan_for(*relation_id, column) {
+                let cost = self.cost_model.estimate_index_skip_scan(*relation_id);
+                if cost.total() <= sequential_cost.total() {
+                    return Some(PhysicalPlan::IndexSkipScan {
                         relation_id: *relation_id,
                         table: table.clone(),
                         index: index.name.clone(),

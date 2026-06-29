@@ -112,6 +112,19 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn index_skip_scan(&self, index_name: &str, column: &str, value: &Expr) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let key = index_key_from_literal_expr(value)?;
+        let pointers = index.skip_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
         let column_index = column_index(&self.columns, column)?;
         let Some(key) = maybe_index_key_from_literal_expr(value)? else {
@@ -125,6 +138,22 @@ impl MemoryTable {
             return Ok(None);
         };
         let pointers = index.point_lookup(column_index, &key)?;
+        self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_index_skip_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let Some(key) = maybe_index_key_from_literal_expr(value)? else {
+            return Ok(None);
+        };
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_skip_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.skip_lookup(column_index, &key)?;
         self.rows_for_pointers(&pointers).map(Some)
     }
 
@@ -455,6 +484,10 @@ impl MemoryTableIndex {
         matches!(self, Self::BTree { column_index, .. } if *column_index == column)
     }
 
+    fn supports_skip_column(&self, column: usize) -> bool {
+        matches!(self, Self::Composite { column_indexes, .. } if column_indexes.contains(&column))
+    }
+
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
         match self {
             Self::BTree {
@@ -474,6 +507,24 @@ impl MemoryTableIndex {
                 let mut parts = Vec::with_capacity(column_indexes.len());
                 parts.push(Some(key.clone()));
                 parts.extend((1..column_indexes.len()).map(|_| None));
+                index.skip_scan(&CompositeKeyPattern::new(parts)?)
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn skip_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::Composite {
+                column_indexes,
+                index,
+            } => {
+                let Some(part_index) = column_indexes.iter().position(|indexed| *indexed == column)
+                else {
+                    return Ok(Vec::new());
+                };
+                let mut parts = vec![None; column_indexes.len()];
+                parts[part_index] = Some(key.clone());
                 index.skip_scan(&CompositeKeyPattern::new(parts)?)
             }
             _ => Ok(Vec::new()),
@@ -752,6 +803,19 @@ impl MemoryExecutor {
                     upper.as_ref(),
                     *upper_inclusive,
                 ),
+            PhysicalPlan::IndexSkipScan {
+                table,
+                index,
+                column,
+                value,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .index_skip_scan(index, column, value),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
@@ -1131,6 +1195,9 @@ impl MemoryExecutor {
         })?;
         if let Some((column, value)) = indexable_equality(predicate) {
             if let Some(batch) = table.try_index_scan(column, value)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+            if let Some(batch) = table.try_index_skip_scan(column, value)? {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
             }
         }
