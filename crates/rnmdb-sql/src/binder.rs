@@ -2800,8 +2800,15 @@ impl<'a> Binder<'a> {
             (SqlType::Range(left), SqlType::Range(right)) if left == right => {
                 Ok(Some(SqlType::Bool))
             }
+            (SqlType::Array(left), SqlType::Array(right))
+                if left == right && matches!(left.as_ref(), SqlType::Range(_)) =>
+            {
+                Ok(Some(SqlType::Bool))
+            }
             (SqlType::Null, SqlType::Range(_))
             | (SqlType::Range(_), SqlType::Null)
+            | (SqlType::Null, SqlType::Array(_))
+            | (SqlType::Array(_), SqlType::Null)
             | (SqlType::Null, SqlType::Null) => Ok(Some(SqlType::Bool)),
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,

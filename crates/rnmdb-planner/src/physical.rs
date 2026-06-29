@@ -84,6 +84,14 @@ pub enum PhysicalPlan {
         range: Expr,
         cost: PlanCost,
     },
+    BoundsOverlapScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        bounds: Expr,
+        cost: PlanCost,
+    },
     Filter {
         predicate: Expr,
         input: Box<PhysicalPlan>,
@@ -288,6 +296,21 @@ impl IndexCatalog {
     }
 
     fn best_range_overlap_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_range_overlap()
+                && index.columns.len() == 1
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
+
+    fn best_bounds_overlap_for(
         &self,
         relation_id: RelationId,
         column: &str,
@@ -602,6 +625,7 @@ impl PhysicalPlan {
             | PhysicalPlan::InvertedValueScan { cost, .. }
             | PhysicalPlan::BlockSummaryScan { cost, .. }
             | PhysicalPlan::RangeOverlapScan { cost, .. }
+            | PhysicalPlan::BoundsOverlapScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -747,6 +771,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}RangeOverlapScan table={table} index={index} column={column} range={range}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::BoundsOverlapScan {
+            table,
+            index,
+            column,
+            bounds,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}BoundsOverlapScan table={table} index={index} column={column} bounds={bounds}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -931,6 +968,28 @@ impl PhysicalPlanner {
                         index: index.name.clone(),
                         column: column.to_string(),
                         range: range.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
+
+        if let Some((column, bounds)) = indexable_bounds_overlap(predicate) {
+            if let Some(index) = self.indexes.best_bounds_overlap_for(*relation_id, column) {
+                let axes = match bounds {
+                    Expr::Array(values) => values.len(),
+                    _ => 1,
+                };
+                let cost = self
+                    .cost_model
+                    .estimate_bounds_overlap_scan(*relation_id, axes);
+                if cost.total() <= sequential_cost.total() {
+                    return Some(PhysicalPlan::BoundsOverlapScan {
+                        relation_id: *relation_id,
+                        table: table.clone(),
+                        index: index.name.clone(),
+                        column: column.to_string(),
+                        bounds: bounds.clone(),
                         cost,
                     });
                 }
@@ -1133,6 +1192,32 @@ fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
     match (left.as_ref(), right.as_ref()) {
         (Expr::Identifier(column), range @ Expr::Range { .. }) => Some((column.as_str(), range)),
         (range @ Expr::Range { .. }, Expr::Identifier(column)) => Some((column.as_str(), range)),
+        _ => None,
+    }
+}
+
+fn indexable_bounds_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "&&" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), bounds @ Expr::Array(values))
+            if values
+                .iter()
+                .all(|value| matches!(value, Expr::Range { .. })) =>
+        {
+            Some((column.as_str(), bounds))
+        }
+        (bounds @ Expr::Array(values), Expr::Identifier(column))
+            if values
+                .iter()
+                .all(|value| matches!(value, Expr::Range { .. })) =>
+        {
+            Some((column.as_str(), bounds))
+        }
         _ => None,
     }
 }

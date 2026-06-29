@@ -406,6 +406,23 @@ impl CostModel {
         )
     }
 
+    pub fn estimate_bounds_overlap_scan(&self, relation_id: RelationId, axes: usize) -> PlanCost {
+        let stats = self.statistics.table(relation_id);
+        let axis_count = axes.max(1);
+        let rows = (stats.row_count() * DEFAULT_INDEX_RANGE_SELECTIVITY / axis_count as f64)
+            .max(1.0)
+            .min(stats.row_count());
+        let descent_cost = stats.row_count().max(2.0).log2() * self.parameters.cpu_operator_cost;
+        PlanCost::new(
+            rows,
+            stats.row_width_bytes(),
+            descent_cost
+                + axis_count as f64 * self.parameters.cpu_operator_cost
+                + rows * self.parameters.cpu_tuple_cost,
+            rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.15,
+        )
+    }
+
     pub fn estimate_inverted_value_scan(&self, relation_id: RelationId, tokens: usize) -> PlanCost {
         let stats = self.statistics.table(relation_id);
         let token_count = tokens.max(1);

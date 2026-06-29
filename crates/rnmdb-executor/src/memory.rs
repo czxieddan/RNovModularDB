@@ -14,9 +14,9 @@ use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
-    BlockRange, BlockSummaryIndex, CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer,
-    InvertedTextIndex, InvertedValueIndex, MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex,
-    MemoryRangeIndex,
+    AxisBounds, BlockRange, BlockSummaryIndex, BoundingBox, CompositeIndexKey, CompositeKeyPattern,
+    IndexKey, IndexPointer, InvertedTextIndex, InvertedValueIndex, MemoryBTreeIndex,
+    MemoryBoundsIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -213,6 +213,24 @@ impl MemoryTable {
         self.rows_for_pointers(&pointers)
     }
 
+    fn bounds_overlap_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        bounds: &Expr,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let bounds = bounding_box_from_expr(bounds)?;
+        let pointers = index.bounds_overlap_lookup(column_index, &bounds)?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
         let column_index = column_index(&self.columns, column)?;
         let Some(key) = maybe_index_key_from_literal_expr(value)? else {
@@ -327,6 +345,20 @@ impl MemoryTable {
             return Ok(None);
         };
         let pointers = index.range_overlap_lookup(column_index, &range)?;
+        self.rows_for_pointers(&pointers).map(Some)
+    }
+
+    fn try_bounds_overlap_scan(&self, column: &str, bounds: &Expr) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let bounds = bounding_box_from_expr(bounds)?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_bounds_overlap_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.bounds_overlap_lookup(column_index, &bounds)?;
         self.rows_for_pointers(&pointers).map(Some)
     }
 
@@ -522,6 +554,10 @@ enum MemoryTableIndex {
         column_index: usize,
         index: MemoryRangeIndex,
     },
+    GistBounds {
+        column_index: usize,
+        index: MemoryBoundsIndex,
+    },
     BrinSummary {
         column_index: usize,
         index: BlockSummaryIndex,
@@ -613,9 +649,17 @@ impl MemoryTableIndex {
                             column_index,
                             index: MemoryRangeIndex::new(name),
                         }),
+                        SqlType::Array(element) if matches!(element.as_ref(), SqlType::Range(inner) if matches!(inner.as_ref(), SqlType::Int64)) => {
+                            Ok(Self::GistBounds {
+                                column_index,
+                                index: MemoryBoundsIndex::new(name),
+                            })
+                        }
                         other => Err(RnovError::new(
                             ErrorKind::InvalidInput,
-                            format!("gist range index requires RANGE column, got {other:?}"),
+                            format!(
+                                "gist index requires RANGE or RANGE<INT64>[] column, got {other:?}"
+                            ),
                         )),
                     }
                 }
@@ -714,6 +758,10 @@ impl MemoryTableIndex {
                 let name = index.name().to_string();
                 *index = MemoryRangeIndex::new(name);
             }
+            Self::GistBounds { index, .. } => {
+                let name = index.name().to_string();
+                *index = MemoryBoundsIndex::new(name);
+            }
             Self::BrinSummary { index, entries, .. } => {
                 let name = index.name().to_string();
                 *index = BlockSummaryIndex::new(name);
@@ -797,6 +845,16 @@ impl MemoryTableIndex {
                 };
                 index.insert_range(pointer, range)
             }
+            Self::GistBounds {
+                column_index,
+                index,
+                ..
+            } => {
+                let Some(bounds) = bounding_box_from_value(&row.values()[*column_index])? else {
+                    return Ok(());
+                };
+                index.insert_box(pointer, &bounds)
+            }
             Self::BrinSummary {
                 column_index,
                 index,
@@ -829,6 +887,7 @@ impl MemoryTableIndex {
             Self::GinText { .. } => false,
             Self::GinValue { .. } => false,
             Self::GistRange { .. } => false,
+            Self::GistBounds { .. } => false,
             Self::BrinSummary { .. } => false,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
@@ -852,6 +911,10 @@ impl MemoryTableIndex {
 
     fn supports_range_overlap_column(&self, column: usize) -> bool {
         matches!(self, Self::GistRange { column_index, .. } if *column_index == column)
+    }
+
+    fn supports_bounds_overlap_column(&self, column: usize) -> bool {
+        matches!(self, Self::GistBounds { column_index, .. } if *column_index == column)
     }
 
     fn supports_block_summary_column(&self, column: usize) -> bool {
@@ -947,6 +1010,21 @@ impl MemoryTableIndex {
                 index,
                 ..
             } if *column_index == column => index.overlap_scan(range),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn bounds_overlap_lookup(
+        &self,
+        column: usize,
+        bounds: &BoundingBox,
+    ) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::GistBounds {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => index.intersection_scan(bounds),
             _ => Ok(Vec::new()),
         }
     }
@@ -1351,6 +1429,19 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .range_overlap_scan(index, column, range),
+            PhysicalPlan::BoundsOverlapScan {
+                table,
+                index,
+                column,
+                bounds,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .bounds_overlap_scan(index, column, bounds),
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -1723,6 +1814,11 @@ impl MemoryExecutor {
         }
         if let Some((column, range)) = indexable_range_overlap(predicate) {
             if let Some(batch) = table.try_range_overlap_scan(column, range)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
+        if let Some((column, bounds)) = indexable_bounds_overlap(predicate) {
+            if let Some(batch) = table.try_bounds_overlap_scan(column, bounds)? {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
             }
         }
@@ -2115,6 +2211,32 @@ fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
     }
 }
 
+fn indexable_bounds_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "&&" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), bounds @ Expr::Array(values))
+            if values
+                .iter()
+                .all(|value| matches!(value, Expr::Range { .. })) =>
+        {
+            Some((column.as_str(), bounds))
+        }
+        (bounds @ Expr::Array(values), Expr::Identifier(column))
+            if values
+                .iter()
+                .all(|value| matches!(value, Expr::Range { .. })) =>
+        {
+            Some((column.as_str(), bounds))
+        }
+        _ => None,
+    }
+}
+
 fn indexable_inverted_value(predicate: &Expr) -> Option<(&str, InvertedValueQuery)> {
     let Expr::Binary { left, op, right } = predicate else {
         return None;
@@ -2162,6 +2284,74 @@ fn range_from_literal_expr(expr: &Expr) -> Result<SqlRange> {
         unreachable!("range literal conversion returns a range value")
     };
     Ok(range)
+}
+
+fn bounding_box_from_expr(expr: &Expr) -> Result<BoundingBox> {
+    let value = literal_value(expr)?;
+    let Some(bounds) = bounding_box_from_value(&value)? else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported bounds index query: {expr}"),
+        ));
+    };
+    Ok(bounds)
+}
+
+fn bounding_box_from_value(value: &SqlValue) -> Result<Option<BoundingBox>> {
+    let SqlValue::Array(array) = value else {
+        if value.is_null() {
+            return Ok(None);
+        }
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "bounds index requires RANGE<INT64>[] value, got {:?}",
+                value.data_type()
+            ),
+        ));
+    };
+    if array.is_empty() {
+        return Ok(None);
+    }
+    let axes = array
+        .values()
+        .iter()
+        .map(axis_bounds_from_value)
+        .collect::<Result<Vec<_>>>()?;
+    BoundingBox::new(axes).map(Some)
+}
+
+fn axis_bounds_from_value(value: &SqlValue) -> Result<AxisBounds> {
+    let SqlValue::Range(range) = value else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "bounds index array must contain RANGE values",
+        ));
+    };
+    if range.element_type() != &SqlType::Int64 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "bounds index ranges must use INT64 bounds",
+        ));
+    }
+    let lower = axis_bound_value(range.lower(), "lower")?;
+    let upper = axis_bound_value(range.upper(), "upper")?;
+    AxisBounds::new(lower, upper)
+}
+
+fn axis_bound_value(bound: &RangeBound, label: &str) -> Result<i64> {
+    match bound {
+        RangeBound::Included(SqlValue::Int64(value))
+        | RangeBound::Excluded(SqlValue::Int64(value)) => Ok(*value),
+        RangeBound::Unbounded => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("bounds index requires finite {label} bounds"),
+        )),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("bounds index requires INT64 {label} bounds, got {other:?}"),
+        )),
+    }
 }
 
 fn update_rows(
@@ -3300,10 +3490,22 @@ fn eval_range_overlap_expr(
         (SqlValue::Range(left), SqlValue::Range(right)) => {
             Ok(SqlValue::Bool(left.overlaps(&right)?))
         }
+        (SqlValue::Array(left), SqlValue::Array(right))
+            if matches!(left.element_type(), SqlType::Range(_))
+                && matches!(right.element_type(), SqlType::Range(_)) =>
+        {
+            let Some(left) = bounding_box_from_value(&SqlValue::Array(left))? else {
+                return Ok(SqlValue::Bool(false));
+            };
+            let Some(right) = bounding_box_from_value(&SqlValue::Array(right))? else {
+                return Ok(SqlValue::Bool(false));
+            };
+            Ok(SqlValue::Bool(left.intersects(&right)?))
+        }
         (left, right) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!(
-                "range overlap operator && requires RANGE operands, got {:?} and {:?}",
+                "range overlap operator && requires RANGE or RANGE[] operands, got {:?} and {:?}",
                 left.data_type(),
                 right.data_type()
             ),
