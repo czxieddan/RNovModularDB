@@ -57,6 +57,14 @@ pub enum PhysicalPlan {
         query: String,
         cost: PlanCost,
     },
+    RangeOverlapScan {
+        relation_id: RelationId,
+        table: String,
+        index: String,
+        column: String,
+        range: Expr,
+        cost: PlanCost,
+    },
     Filter {
         predicate: Expr,
         input: Box<PhysicalPlan>,
@@ -218,6 +226,21 @@ impl IndexCatalog {
                     .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
         })
     }
+
+    fn best_range_overlap_for(
+        &self,
+        relation_id: RelationId,
+        column: &str,
+    ) -> Option<&IndexAccessPath> {
+        self.indexes.get(&relation_id)?.iter().find(|index| {
+            index.supports_range_overlap()
+                && index.columns.len() == 1
+                && index
+                    .columns
+                    .first()
+                    .is_some_and(|indexed_column| indexed_column.eq_ignore_ascii_case(column))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +283,10 @@ impl IndexAccessPath {
 
     fn supports_text_search(&self) -> bool {
         self.method == IndexMethod::Gin
+    }
+
+    fn supports_range_overlap(&self) -> bool {
+        self.method == IndexMethod::Gist
     }
 }
 
@@ -474,6 +501,7 @@ impl PhysicalPlan {
             | PhysicalPlan::IndexSkipScan { cost, .. }
             | PhysicalPlan::TextSearchScan { cost, .. }
             | PhysicalPlan::InvertedTextScan { cost, .. }
+            | PhysicalPlan::RangeOverlapScan { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -575,6 +603,19 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}InvertedTextScan table={table} index={index} column={column} query='{query}'{}\n",
+                cost_suffix(*cost)
+            ));
+        }
+        PhysicalPlan::RangeOverlapScan {
+            table,
+            index,
+            column,
+            range,
+            cost,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}RangeOverlapScan table={table} index={index} column={column} range={range}{}\n",
                 cost_suffix(*cost)
             ));
         }
@@ -749,6 +790,22 @@ impl PhysicalPlanner {
             }
         }
 
+        if let Some((column, range)) = indexable_range_overlap(predicate) {
+            if let Some(index) = self.indexes.best_range_overlap_for(*relation_id, column) {
+                let cost = self.cost_model.estimate_range_overlap_scan(*relation_id);
+                if cost.total() <= sequential_cost.total() {
+                    return Some(PhysicalPlan::RangeOverlapScan {
+                        relation_id: *relation_id,
+                        table: table.clone(),
+                        index: index.name.clone(),
+                        column: column.to_string(),
+                        range: range.clone(),
+                        cost,
+                    });
+                }
+            }
+        }
+
         let range = indexable_range(predicate)?;
         let index = self
             .indexes
@@ -867,6 +924,20 @@ fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
                 upper_inclusive: true,
             })
         }
+        _ => None,
+    }
+}
+
+fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "&&" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), range @ Expr::Range { .. }) => Some((column.as_str(), range)),
+        (range @ Expr::Range { .. }, Expr::Identifier(column)) => Some((column.as_str(), range)),
         _ => None,
     }
 }

@@ -2688,6 +2688,9 @@ impl<'a> Binder<'a> {
         if is_text_concat_operator(op) {
             return self.infer_text_concat_result_type(op, left_type, right_type);
         }
+        if op == "&&" {
+            return self.infer_range_overlap_result_type(left_type, right_type);
+        }
         if is_boolean_connector(op) {
             if matches!(left_type, SqlType::Bool | SqlType::Null)
                 && matches!(right_type, SqlType::Bool | SqlType::Null)
@@ -2779,6 +2782,27 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 format!("text operator {op} requires TEXT operands"),
             ))
+        }
+    }
+
+    fn infer_range_overlap_result_type(
+        &self,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        match (left_type, right_type) {
+            (SqlType::Range(left), SqlType::Range(right)) if left == right => {
+                Ok(Some(SqlType::Bool))
+            }
+            (SqlType::Null, SqlType::Range(_))
+            | (SqlType::Range(_), SqlType::Null)
+            | (SqlType::Null, SqlType::Null) => Ok(Some(SqlType::Bool)),
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "range overlap operator && requires matching RANGE operands, got {left_type:?} and {right_type:?}"
+                ),
+            )),
         }
     }
 

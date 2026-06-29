@@ -15,7 +15,7 @@ use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
     CompositeIndexKey, CompositeKeyPattern, IndexKey, IndexPointer, InvertedTextIndex,
-    MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex,
+    MemoryBTreeIndex, MemoryCompositeIndex, MemoryHashIndex, MemoryRangeIndex,
 };
 use rnmdb_planner::{
     cost::TableStatistics,
@@ -149,6 +149,24 @@ impl MemoryTable {
         apply_text_search_cancellable(batch, column, query, cancellation)
     }
 
+    fn range_overlap_scan(
+        &self,
+        index_name: &str,
+        column: &str,
+        range: &Expr,
+    ) -> Result<VectorBatch> {
+        let index = self.indexes.get(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        let column_index = column_index(&self.columns, column)?;
+        let range = range_from_literal_expr(range)?;
+        let pointers = index.range_overlap_lookup(column_index, &range)?;
+        self.rows_for_pointers(&pointers)
+    }
+
     fn try_index_scan(&self, column: &str, value: &Expr) -> Result<Option<VectorBatch>> {
         let column_index = column_index(&self.columns, column)?;
         let Some(key) = maybe_index_key_from_literal_expr(value)? else {
@@ -202,6 +220,20 @@ impl MemoryTable {
         let pointers = index.text_lookup(column_index, &required_terms)?;
         let batch = self.rows_for_pointers(&pointers)?;
         apply_text_search_cancellable(batch, column, query, cancellation).map(Some)
+    }
+
+    fn try_range_overlap_scan(&self, column: &str, range: &Expr) -> Result<Option<VectorBatch>> {
+        let column_index = column_index(&self.columns, column)?;
+        let range = range_from_literal_expr(range)?;
+        let Some(index) = self
+            .indexes
+            .values()
+            .find(|index| index.supports_range_overlap_column(column_index))
+        else {
+            return Ok(None);
+        };
+        let pointers = index.range_overlap_lookup(column_index, &range)?;
+        self.rows_for_pointers(&pointers).map(Some)
     }
 
     fn try_index_range_scan(
@@ -388,6 +420,10 @@ enum MemoryTableIndex {
         column_index: usize,
         index: InvertedTextIndex,
     },
+    GistRange {
+        column_index: usize,
+        index: MemoryRangeIndex,
+    },
     Composite {
         column_indexes: Vec<usize>,
         index: MemoryCompositeIndex,
@@ -457,6 +493,25 @@ impl MemoryTableIndex {
                         )),
                     }
                 }
+                IndexMethod::Gist => {
+                    if unique {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "gist indexes do not support uniqueness",
+                        ));
+                    }
+                    let column_index = column_indexes[0];
+                    match table_columns[column_index].data_type() {
+                        SqlType::Range(_) => Ok(Self::GistRange {
+                            column_index,
+                            index: MemoryRangeIndex::new(name),
+                        }),
+                        other => Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            format!("gist range index requires RANGE column, got {other:?}"),
+                        )),
+                    }
+                }
             };
         }
         match method {
@@ -470,6 +525,12 @@ impl MemoryTableIndex {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "gin indexes support exactly one column",
+                ));
+            }
+            IndexMethod::Gist => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "gist indexes support exactly one column",
                 ));
             }
             IndexMethod::BTree => {}
@@ -509,6 +570,10 @@ impl MemoryTableIndex {
             Self::GinText { index, .. } => {
                 let name = index.name().to_string();
                 *index = InvertedTextIndex::new(name);
+            }
+            Self::GistRange { index, .. } => {
+                let name = index.name().to_string();
+                *index = MemoryRangeIndex::new(name);
             }
             Self::Composite { index, .. } => {
                 let name = index.name().to_string();
@@ -554,6 +619,22 @@ impl MemoryTableIndex {
                 };
                 index.insert_document(pointer, &vector)
             }
+            Self::GistRange {
+                column_index,
+                index,
+                ..
+            } => {
+                let SqlValue::Range(range) = &row.values()[*column_index] else {
+                    if row.values()[*column_index].is_null() {
+                        return Ok(());
+                    }
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "gist range index cannot index a non-range value",
+                    ));
+                };
+                index.insert_range(pointer, range)
+            }
             Self::Composite {
                 column_indexes,
                 index,
@@ -572,6 +653,7 @@ impl MemoryTableIndex {
             Self::BTree { column_index, .. } => *column_index == column,
             Self::Hash { column_index, .. } => *column_index == column,
             Self::GinText { .. } => false,
+            Self::GistRange { .. } => false,
             Self::Composite { column_indexes, .. } => column_indexes.first() == Some(&column),
         }
     }
@@ -586,6 +668,10 @@ impl MemoryTableIndex {
 
     fn supports_text_column(&self, column: usize) -> bool {
         matches!(self, Self::GinText { column_index, .. } if *column_index == column)
+    }
+
+    fn supports_range_overlap_column(&self, column: usize) -> bool {
+        matches!(self, Self::GistRange { column_index, .. } if *column_index == column)
     }
 
     fn point_lookup(&self, column: usize, key: &IndexKey) -> Result<Vec<IndexPointer>> {
@@ -622,6 +708,17 @@ impl MemoryTableIndex {
             } if *column_index == column => {
                 Ok(index.lookup_all(required_terms.iter().map(String::as_str)))
             }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    fn range_overlap_lookup(&self, column: usize, range: &SqlRange) -> Result<Vec<IndexPointer>> {
+        match self {
+            Self::GistRange {
+                column_index,
+                index,
+                ..
+            } if *column_index == column => index.overlap_scan(range),
             _ => Ok(Vec::new()),
         }
     }
@@ -957,6 +1054,19 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .text_index_scan(index, column, query, cancellation),
+            PhysicalPlan::RangeOverlapScan {
+                table,
+                index,
+                column,
+                range,
+                ..
+            } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .range_overlap_scan(index, column, range),
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -1327,6 +1437,11 @@ impl MemoryExecutor {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
             }
         }
+        if let Some((column, range)) = indexable_range_overlap(predicate) {
+            if let Some(batch) = table.try_range_overlap_scan(column, range)? {
+                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            }
+        }
         if let Some(range) = indexable_range(predicate) {
             if let Some(batch) = table.try_index_range_scan(
                 range.column,
@@ -1570,8 +1685,42 @@ fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
     }
 }
 
+fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
+    let Expr::Binary { left, op, right } = predicate else {
+        return None;
+    };
+    if op != "&&" {
+        return None;
+    }
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), range @ Expr::Range { .. }) => Some((column.as_str(), range)),
+        (range @ Expr::Range { .. }, Expr::Identifier(column)) => Some((column.as_str(), range)),
+        _ => None,
+    }
+}
+
 fn is_index_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Integer(_) | Expr::String(_))
+}
+
+fn range_from_literal_expr(expr: &Expr) -> Result<SqlRange> {
+    let Expr::Range {
+        lower,
+        upper,
+        bounds,
+    } = expr
+    else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported range index query: {expr}"),
+        ));
+    };
+    let SqlValue::Range(range) =
+        range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive)?
+    else {
+        unreachable!("range literal conversion returns a range value")
+    };
+    Ok(range)
 }
 
 fn update_rows(
@@ -2592,6 +2741,7 @@ fn eval_binary_expr(
         "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
         "+" | "-" | "*" | "/" | "%" => eval_arithmetic_expr(columns, row, left, op, right),
         "||" => eval_text_concat_expr(columns, row, left, right),
+        "&&" => eval_range_overlap_expr(columns, row, left, right),
         "=" | "<>" | "!=" => {
             let left = eval_expr(columns, row, left)?;
             let right = eval_expr(columns, row, right)?;
@@ -2631,6 +2781,31 @@ fn eval_binary_expr(
         other => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {other}"),
+        )),
+    }
+}
+
+fn eval_range_overlap_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    match (
+        eval_expr(columns, row, left)?,
+        eval_expr(columns, row, right)?,
+    ) {
+        (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Bool(false)),
+        (SqlValue::Range(left), SqlValue::Range(right)) => {
+            Ok(SqlValue::Bool(left.overlaps(&right)?))
+        }
+        (left, right) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "range overlap operator && requires RANGE operands, got {:?} and {:?}",
+                left.data_type(),
+                right.data_type()
+            ),
         )),
     }
 }
@@ -3086,7 +3261,7 @@ fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bo
 fn boolean_operator(op: &str) -> bool {
     matches!(
         op,
-        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "AND" | "OR"
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@@" | "&&" | "AND" | "OR"
     )
 }
 

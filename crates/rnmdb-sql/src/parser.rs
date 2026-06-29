@@ -193,6 +193,7 @@ impl Parser {
             "btree" => Ok(IndexMethod::BTree),
             "hash" => Ok(IndexMethod::Hash),
             "gin" | "inverted" => Ok(IndexMethod::Gin),
+            "gist" => Ok(IndexMethod::Gist),
             unknown => Err(self.error(format!("unsupported index method {unknown}"))),
         }
     }

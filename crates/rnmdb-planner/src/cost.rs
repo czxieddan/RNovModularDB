@@ -377,6 +377,20 @@ impl CostModel {
             rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.05,
         )
     }
+
+    pub fn estimate_range_overlap_scan(&self, relation_id: RelationId) -> PlanCost {
+        let stats = self.statistics.table(relation_id);
+        let rows = (stats.row_count() * DEFAULT_INDEX_RANGE_SELECTIVITY)
+            .max(1.0)
+            .min(stats.row_count());
+        let descent_cost = stats.row_count().max(2.0).log2() * self.parameters.cpu_operator_cost;
+        PlanCost::new(
+            rows,
+            stats.row_width_bytes(),
+            descent_cost + rows * self.parameters.cpu_tuple_cost,
+            rows.max(1.0).ceil() * self.parameters.seq_page_cost * 0.2,
+        )
+    }
 }
 
 impl Default for CostModel {

@@ -56,6 +56,7 @@ pub enum IndexMethod {
     BTree,
     Hash,
     Gin,
+    Gist,
 }
 
 impl IndexMethod {
@@ -64,6 +65,7 @@ impl IndexMethod {
             Self::BTree => "btree",
             Self::Hash => "hash",
             Self::Gin => "gin",
+            Self::Gist => "gist",
         }
     }
 }
@@ -1250,6 +1252,7 @@ fn encode_index_method(method: IndexMethod) -> u8 {
         IndexMethod::BTree => 0,
         IndexMethod::Hash => 1,
         IndexMethod::Gin => 2,
+        IndexMethod::Gist => 3,
     }
 }
 
@@ -1258,6 +1261,7 @@ fn decode_index_method(raw: u8) -> Result<IndexMethod> {
         0 => Ok(IndexMethod::BTree),
         1 => Ok(IndexMethod::Hash),
         2 => Ok(IndexMethod::Gin),
+        3 => Ok(IndexMethod::Gist),
         unknown => Err(RnovError::new(
             ErrorKind::Corruption,
             format!("unknown index method tag {unknown}"),
