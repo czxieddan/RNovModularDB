@@ -584,6 +584,14 @@ impl Parser {
                 let grouping_sets = self.parse_grouping_sets()?;
                 let group_by = grouping_sets_union(&grouping_sets);
                 (group_by, grouping_sets)
+            } else if self.consume_if(&TokenKind::Rollup) {
+                let group_by = self.parse_parenthesized_expr_list()?;
+                let grouping_sets = rollup_grouping_sets(&group_by);
+                (group_by, grouping_sets)
+            } else if self.consume_if(&TokenKind::Cube) {
+                let group_by = self.parse_parenthesized_expr_list()?;
+                let grouping_sets = cube_grouping_sets(&group_by)?;
+                (group_by, grouping_sets)
             } else {
                 (self.parse_expr_list()?, Vec::new())
             }
@@ -740,6 +748,13 @@ impl Parser {
             return Err(self.error("GROUPING SETS requires at least one grouping set"));
         }
         Ok(grouping_sets)
+    }
+
+    fn parse_parenthesized_expr_list(&mut self) -> Result<Vec<Expr>> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let expressions = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(expressions)
     }
 
     fn parse_assignment_list(&mut self) -> Result<Vec<Assignment>> {
@@ -1515,6 +1530,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Group, TokenKind::Group)
             | (TokenKind::Grouping, TokenKind::Grouping)
             | (TokenKind::Sets, TokenKind::Sets)
+            | (TokenKind::Rollup, TokenKind::Rollup)
+            | (TokenKind::Cube, TokenKind::Cube)
             | (TokenKind::Having, TokenKind::Having)
             | (TokenKind::Order, TokenKind::Order)
             | (TokenKind::By, TokenKind::By)
@@ -1669,6 +1686,41 @@ fn grouping_sets_union(grouping_sets: &[Vec<Expr>]) -> Vec<Expr> {
         }
     }
     group_by
+}
+
+fn rollup_grouping_sets(group_by: &[Expr]) -> Vec<Vec<Expr>> {
+    (0..=group_by.len())
+        .rev()
+        .map(|count| group_by[..count].to_vec())
+        .collect()
+}
+
+fn cube_grouping_sets(group_by: &[Expr]) -> Result<Vec<Vec<Expr>>> {
+    let bits = usize::BITS as usize;
+    if group_by.len() >= bits {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "CUBE has too many grouping expressions",
+        ));
+    }
+    let set_count = 1usize << group_by.len();
+    Ok((0..set_count)
+        .rev()
+        .map(|mask| {
+            group_by
+                .iter()
+                .enumerate()
+                .filter_map(|(index, expr)| {
+                    let bit = 1usize << (group_by.len() - index - 1);
+                    if mask & bit == 0 {
+                        None
+                    } else {
+                        Some(expr.clone())
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
 }
 
 fn sort_direction_with_nulls(direction: SortDirection, nulls_first: bool) -> SortDirection {
