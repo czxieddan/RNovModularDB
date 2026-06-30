@@ -943,6 +943,40 @@ impl<'a> Binder<'a> {
                     });
                     columns.push(column);
                 }
+                SelectItem::Expr {
+                    expr: Expr::RowNumberOver { order_by },
+                    alias,
+                } => {
+                    let order_by = order_by
+                        .iter()
+                        .map(|order_by| {
+                            Ok(OrderByExpr {
+                                expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
+                                direction: order_by.direction,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if order_by.is_empty() {
+                        return Err(RnovError::new(
+                            ErrorKind::InvalidInput,
+                            "row_number() OVER requires ORDER BY",
+                        ));
+                    }
+                    for order_by in &order_by {
+                        let Some(data_type) = self.infer_expr_type(table, &order_by.expr)? else {
+                            continue;
+                        };
+                        self.ensure_sortable_type(&data_type)?;
+                    }
+                    let column =
+                        aggregate_bound_column(&columns, "row_number", SqlType::Int64, false);
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::RowNumberOver { order_by },
+                    });
+                    columns.push(column);
+                }
                 SelectItem::Expr { expr, alias } => {
                     let expr = self.rewrite_table_qualified_expr(table, expr)?;
                     let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
@@ -1622,6 +1656,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "GROUP BY does not support aggregate expressions",
             )),
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support window expressions",
+            )),
             Expr::Call { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "GROUP BY does not support function calls yet",
@@ -1727,6 +1765,10 @@ impl<'a> Binder<'a> {
             | Expr::Max(_) => {
                 self.rewrite_having_aggregate_expr(table, projection, hidden_aggregates, expr)
             }
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support window expressions",
+            )),
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
                 left: Box::new(self.rewrite_grouped_having_expr(
                     table,
@@ -2251,6 +2293,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "HAVING only supports projected aggregate output columns yet",
             )),
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support window expressions",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -2735,6 +2781,16 @@ impl<'a> Binder<'a> {
             Expr::Max(expr) => Ok(Expr::Max(Box::new(
                 self.rewrite_qualified_expr(expr, resolver)?,
             ))),
+            Expr::RowNumberOver { order_by } => order_by
+                .iter()
+                .map(|order_by| {
+                    Ok(OrderByExpr {
+                        expr: self.rewrite_qualified_expr(&order_by.expr, resolver)?,
+                        direction: order_by.direction,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|order_by| Expr::RowNumberOver { order_by }),
             Expr::Array(values) => values
                 .iter()
                 .map(|value| self.rewrite_qualified_expr(value, resolver))
@@ -2948,6 +3004,10 @@ impl<'a> Binder<'a> {
             Expr::Max(_) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "MAX(expr) is only supported as a SELECT projection",
+            )),
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "window expressions are only supported as SELECT projections",
             )),
             Expr::Array(values) => {
                 let mut element_type = None;
@@ -3234,6 +3294,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "MAX(expr) is only supported as a SELECT projection",
             )),
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "window expressions are only supported as SELECT projections",
+            )),
             Expr::Array(values) => {
                 let mut element_type = None;
                 for value in values {
@@ -3471,6 +3535,19 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "aggregate expressions are only supported as SELECT projections",
+            )),
+            Expr::RowNumberOver { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "window expressions are only supported as SELECT projections",
+            )),
             Expr::Binary { left, right, .. } => {
                 let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
                     return Ok(None);

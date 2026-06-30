@@ -1042,6 +1042,21 @@ impl Parser {
                         self.expect_keyword(TokenKind::RightParen)?;
                         args
                     };
+                    if name.schema().is_none() && name.object() == "row_number" {
+                        if !args.is_empty() {
+                            return Err(self.error("row_number() does not accept arguments"));
+                        }
+                        self.expect_keyword(TokenKind::Over)?;
+                        self.expect_keyword(TokenKind::LeftParen)?;
+                        self.expect_keyword(TokenKind::Order)?;
+                        self.expect_keyword(TokenKind::By)?;
+                        let order_by = self.parse_order_by_list()?;
+                        self.expect_keyword(TokenKind::RightParen)?;
+                        if order_by.is_empty() {
+                            return Err(self.error("row_number() OVER requires ORDER BY"));
+                        }
+                        return Ok(Expr::RowNumberOver { order_by });
+                    }
                     if name.schema().is_none() && name.object() == "count" {
                         let mut args = args;
                         return Ok(Expr::Count(Box::new(
@@ -1532,6 +1547,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Sets, TokenKind::Sets)
             | (TokenKind::Rollup, TokenKind::Rollup)
             | (TokenKind::Cube, TokenKind::Cube)
+            | (TokenKind::Over, TokenKind::Over)
             | (TokenKind::Having, TokenKind::Having)
             | (TokenKind::Order, TokenKind::Order)
             | (TokenKind::By, TokenKind::By)

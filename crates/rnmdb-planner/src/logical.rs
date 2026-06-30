@@ -38,6 +38,10 @@ pub enum LogicalPlan {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
     },
+    Window {
+        items: Vec<WindowItem>,
+        input: Box<LogicalPlan>,
+    },
     Aggregate {
         items: Vec<AggregateItem>,
         input: Box<LogicalPlan>,
@@ -194,6 +198,17 @@ pub enum LogicalPlan {
 pub struct ProjectionItem {
     pub name: String,
     pub expr: Expr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowItem {
+    pub name: String,
+    pub function: WindowFunction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowFunction {
+    RowNumber { order_by: Vec<OrderByExpr> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,13 +459,20 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                     }
                 } else {
+                    let window_items = select_window_items(select);
+                    if !window_items.is_empty() {
+                        plan = LogicalPlan::Window {
+                            items: window_items,
+                            input: Box::new(plan),
+                        };
+                    }
                     LogicalPlan::Project {
                         items: select
                             .projection
                             .iter()
                             .map(|item| ProjectionItem {
                                 name: item.column.name.clone(),
-                                expr: item.expr.clone(),
+                                expr: projection_expr_after_windows(item),
                             })
                             .collect(),
                         input: Box::new(plan),
@@ -647,6 +669,15 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("{prefix}Project {columns}\n"));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Window { items, input } => {
+            let functions = items
+                .iter()
+                .map(|item| format!("{} := {}", item.name, window_function_name(&item.function)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("{prefix}Window {functions}\n"));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Aggregate { items, input } => {
@@ -1020,6 +1051,7 @@ fn write_plan_with_costs(
     match plan {
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::GroupedAggregate { input, .. }
         | LogicalPlan::GroupingSetsAggregate { input, .. }
@@ -1189,6 +1221,36 @@ fn select_aggregate_functions(
     Some(functions)
 }
 
+fn select_window_items(select: &rnmdb_sql::ast::BoundSelect) -> Vec<WindowItem> {
+    select
+        .projection
+        .iter()
+        .filter_map(|item| {
+            Some(WindowItem {
+                name: item.column.name.clone(),
+                function: window_function(&item.expr)?,
+            })
+        })
+        .collect()
+}
+
+fn projection_expr_after_windows(item: &rnmdb_sql::ast::BoundSelectItem) -> Expr {
+    if window_function(&item.expr).is_some() {
+        Expr::Identifier(Ident::new(item.column.name.as_str()))
+    } else {
+        item.expr.clone()
+    }
+}
+
+fn window_function(expr: &Expr) -> Option<WindowFunction> {
+    match expr {
+        Expr::RowNumberOver { order_by } => Some(WindowFunction::RowNumber {
+            order_by: order_by.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn grouped_aggregate_item_kind(expr: &Expr) -> GroupedAggregateItemKind {
     match aggregate_function(expr) {
         Some(function) => GroupedAggregateItemKind::Aggregate(function),
@@ -1283,6 +1345,19 @@ fn aggregate_function_name(function: &AggregateFunction) -> String {
         AggregateFunction::Sum(expr) => format!("sum({expr})"),
         AggregateFunction::Min(expr) => format!("min({expr})"),
         AggregateFunction::Max(expr) => format!("max({expr})"),
+    }
+}
+
+fn window_function_name(function: &WindowFunction) -> String {
+    match function {
+        WindowFunction::RowNumber { order_by } => {
+            let order_by = order_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("row_number() OVER (ORDER BY {order_by})")
+        }
     }
 }
 

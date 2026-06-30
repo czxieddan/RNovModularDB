@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::{
     cost::{CostModel, PlanCost},
-    logical::{AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem},
+    logical::{
+        AggregateItem, GroupedAggregateItem, LogicalPlan, ParallelPlanHint, ProjectionItem,
+        WindowItem,
+    },
 };
 use rnmdb_catalog::{IndexKey, IndexMethod};
 use rnmdb_common::ids::RelationId;
@@ -116,6 +119,11 @@ pub enum PhysicalPlan {
     },
     Projection {
         items: Vec<ProjectionItem>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
+    Window {
+        items: Vec<WindowItem>,
         input: Box<PhysicalPlan>,
         cost: PlanCost,
     },
@@ -538,6 +546,11 @@ impl PhysicalPlanner {
                 input: Box::new(self.plan(input)),
                 cost,
             },
+            LogicalPlan::Window { items, input } => PhysicalPlan::Window {
+                items: items.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
             LogicalPlan::Aggregate { items, input } => PhysicalPlan::Aggregate {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
@@ -708,6 +721,7 @@ impl PhysicalPlan {
             | PhysicalPlan::SidewaysIndexLookup { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
+            | PhysicalPlan::Window { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
             | PhysicalPlan::GroupedAggregate { cost, .. }
             | PhysicalPlan::GroupingSetsAggregate { cost, .. }
@@ -915,6 +929,14 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             out.push_str(&format!(
                 "{prefix}Projection {columns}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::Window { items, input, cost } => {
+            out.push_str(&format!(
+                "{prefix}Window items={}{}\n",
+                items.len(),
                 cost_suffix(*cost)
             ));
             write_physical_plan(input, indent + 1, out);

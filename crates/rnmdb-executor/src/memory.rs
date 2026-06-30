@@ -22,7 +22,7 @@ use rnmdb_planner::{
     cost::{TableStatistics, TextLexemeStatistics},
     logical::{
         AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
-        LogicalPlan,
+        LogicalPlan, WindowFunction, WindowItem,
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
@@ -1477,6 +1477,10 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            LogicalPlan::Window { items, input } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_window_cancellable(batch, items, cancellation)
+            }
             LogicalPlan::Aggregate { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_aggregate_cancellable(batch, items, cancellation)
@@ -1738,6 +1742,10 @@ impl MemoryExecutor {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
             }
+            PhysicalPlan::Window { items, input, .. } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_window_cancellable(batch, items, cancellation)
+            }
             PhysicalPlan::Aggregate { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_aggregate_cancellable(batch, items, cancellation)
@@ -1976,6 +1984,10 @@ impl MemoryExecutor {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
+            }
+            LogicalPlan::Window { items, input } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_window_cancellable(batch, items, cancellation)
             }
             LogicalPlan::Aggregate { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -2995,6 +3007,83 @@ fn apply_projection_cancellable(
     VectorBatch::new(columns, rows)
 }
 
+fn apply_window_cancellable(
+    batch: VectorBatch,
+    items: &[WindowItem],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    if items.is_empty() {
+        return Ok(batch);
+    }
+
+    let mut columns = batch.columns().to_vec();
+    let mut item_values = Vec::with_capacity(items.len());
+    for item in items {
+        cancellation.check()?;
+        columns.push(window_column_schema(item));
+        item_values.push(window_values(&batch, &item.function, cancellation)?);
+    }
+
+    let mut rows = Vec::with_capacity(batch.rows().len());
+    for row_index in 0..batch.rows().len() {
+        cancellation.check()?;
+        let mut values = batch.rows()[row_index].values().to_vec();
+        for values_by_item in &item_values {
+            values.push(values_by_item[row_index].clone());
+        }
+        rows.push(Row::new(values));
+    }
+
+    cancellation.check()?;
+    VectorBatch::new(columns, rows)
+}
+
+fn window_column_schema(item: &WindowItem) -> ColumnSchema {
+    match item.function {
+        WindowFunction::RowNumber { .. } => {
+            ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null()
+        }
+    }
+}
+
+fn window_values(
+    batch: &VectorBatch,
+    function: &WindowFunction,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SqlValue>> {
+    match function {
+        WindowFunction::RowNumber { order_by } => {
+            row_number_window_values(batch, order_by, cancellation)
+        }
+    }
+}
+
+fn row_number_window_values(
+    batch: &VectorBatch,
+    order_by: &[OrderByExpr],
+    cancellation: &CancellationToken,
+) -> Result<Vec<SqlValue>> {
+    if order_by.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "row_number() OVER requires ORDER BY",
+        ));
+    }
+
+    let mut rows = sort_rows(batch, order_by, cancellation)?;
+    rows.sort_by(|left, right| compare_sort_rows(left, right, order_by));
+
+    let mut values = vec![SqlValue::Null; batch.rows().len()];
+    for (ordinal, row) in rows.iter().enumerate() {
+        cancellation.check()?;
+        let row_number = i64::try_from(ordinal + 1).map_err(|_| {
+            RnovError::new(ErrorKind::InvalidInput, "row_number() result exceeds int64")
+        })?;
+        values[row.original_index] = SqlValue::Int64(row_number);
+    }
+    Ok(values)
+}
+
 fn joined_columns(outer: &[ColumnSchema], inner: &[ColumnSchema]) -> Result<Vec<ColumnSchema>> {
     let mut columns = outer.to_vec();
     for column in inner {
@@ -3497,6 +3586,20 @@ fn apply_sort_cancellable(
         return Ok(batch);
     }
 
+    let mut rows = sort_rows(&batch, keys, cancellation)?;
+    rows.sort_by(|left, right| compare_sort_rows(left, right, keys));
+    cancellation.check()?;
+    VectorBatch::new(
+        batch.columns().to_vec(),
+        rows.into_iter().map(|row| row.row).collect(),
+    )
+}
+
+fn sort_rows(
+    batch: &VectorBatch,
+    keys: &[OrderByExpr],
+    cancellation: &CancellationToken,
+) -> Result<Vec<SortRow>> {
     let mut rows = Vec::with_capacity(batch.rows().len());
     for (original_index, row) in batch.rows().iter().enumerate() {
         cancellation.check()?;
@@ -3511,13 +3614,7 @@ fn apply_sort_cancellable(
         });
     }
     validate_sort_key_types(&rows, keys.len())?;
-
-    rows.sort_by(|left, right| compare_sort_rows(left, right, keys));
-    cancellation.check()?;
-    VectorBatch::new(
-        batch.columns().to_vec(),
-        rows.into_iter().map(|row| row.row).collect(),
-    )
+    Ok(rows)
 }
 
 fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
@@ -3663,6 +3760,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Max(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "MAX(expr) requires aggregate execution",
+        )),
+        Expr::RowNumberOver { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "row_number() OVER requires window execution",
         )),
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
@@ -3977,6 +4078,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Max(_) => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "MAX(expr) requires aggregate execution",
+        )),
+        Expr::RowNumberOver { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "row_number() OVER requires window execution",
         )),
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Unary { op, expr } => eval_unary_arithmetic_expr(columns, row, op, expr),

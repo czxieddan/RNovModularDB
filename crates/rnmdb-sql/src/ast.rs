@@ -111,6 +111,9 @@ pub enum Expr {
     Sum(Box<Expr>),
     Min(Box<Expr>),
     Max(Box<Expr>),
+    RowNumberOver {
+        order_by: Vec<OrderByExpr>,
+    },
     Array(Vec<Expr>),
     HStore(Vec<(String, Option<String>)>),
     Range {
@@ -244,6 +247,16 @@ impl fmt::Display for Expr {
             Self::Sum(expr) => write!(f, "sum({expr})"),
             Self::Min(expr) => write!(f, "min({expr})"),
             Self::Max(expr) => write!(f, "max({expr})"),
+            Self::RowNumberOver { order_by } => {
+                f.write_str("row_number() OVER (ORDER BY ")?;
+                for (index, order_by) in order_by.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{order_by}")?;
+                }
+                f.write_str(")")
+            }
             Self::Array(values) => {
                 f.write_str("ARRAY[")?;
                 for (index, value) in values.iter().enumerate() {
@@ -450,6 +463,23 @@ pub enum SortDirection {
 pub struct OrderByExpr {
     pub expr: Expr,
     pub direction: SortDirection,
+}
+
+impl fmt::Display for OrderByExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.expr, sort_direction_name(self.direction))
+    }
+}
+
+fn sort_direction_name(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Asc => "ASC",
+        SortDirection::Desc => "DESC",
+        SortDirection::AscNullsFirst => "ASC NULLS FIRST",
+        SortDirection::AscNullsLast => "ASC NULLS LAST",
+        SortDirection::DescNullsFirst => "DESC NULLS FIRST",
+        SortDirection::DescNullsLast => "DESC NULLS LAST",
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

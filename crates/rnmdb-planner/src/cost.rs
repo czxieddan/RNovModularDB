@@ -272,6 +272,15 @@ impl CostModel {
                 let input = self.estimate(input);
                 input.add_cpu(input.rows * self.parameters.cpu_operator_cost * items.len() as f64)
             }
+            LogicalPlan::Window { items, input } => {
+                let input = self.estimate(input);
+                let log_rows = input.rows.max(2.0).log2();
+                input.add_cpu(
+                    input.rows
+                        * (log_rows * self.parameters.sort_row_cost
+                            + self.parameters.cpu_operator_cost * items.len().max(1) as f64),
+                )
+            }
             LogicalPlan::Aggregate { items, input } => {
                 let input = self.estimate(input);
                 PlanCost::new(
