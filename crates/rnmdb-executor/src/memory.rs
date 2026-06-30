@@ -3040,7 +3040,9 @@ fn apply_window_cancellable(
 
 fn window_column_schema(item: &WindowItem) -> ColumnSchema {
     match item.function {
-        WindowFunction::RowNumber { .. } => {
+        WindowFunction::RowNumber { .. }
+        | WindowFunction::Rank { .. }
+        | WindowFunction::DenseRank { .. } => {
             ColumnSchema::new(item.name.as_str(), SqlType::Int64).not_null()
         }
     }
@@ -3054,6 +3056,12 @@ fn window_values(
     match function {
         WindowFunction::RowNumber { order_by } => {
             row_number_window_values(batch, order_by, cancellation)
+        }
+        WindowFunction::Rank { order_by } => {
+            ranking_window_values(batch, order_by, RankingMode::Rank, cancellation)
+        }
+        WindowFunction::DenseRank { order_by } => {
+            ranking_window_values(batch, order_by, RankingMode::DenseRank, cancellation)
         }
     }
 }
@@ -3080,6 +3088,52 @@ fn row_number_window_values(
             RnovError::new(ErrorKind::InvalidInput, "row_number() result exceeds int64")
         })?;
         values[row.original_index] = SqlValue::Int64(row_number);
+    }
+    Ok(values)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RankingMode {
+    Rank,
+    DenseRank,
+}
+
+fn ranking_window_values(
+    batch: &VectorBatch,
+    order_by: &[OrderByExpr],
+    mode: RankingMode,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SqlValue>> {
+    if order_by.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "ranking window functions require ORDER BY",
+        ));
+    }
+
+    let mut rows = sort_rows(batch, order_by, cancellation)?;
+    rows.sort_by(|left, right| compare_sort_rows(left, right, order_by));
+
+    let mut values = vec![SqlValue::Null; batch.rows().len()];
+    let mut current_rank = 0_i64;
+    let mut dense_rank = 0_i64;
+    for index in 0..rows.len() {
+        cancellation.check()?;
+        if index == 0
+            || compare_sort_row_keys(&rows[index - 1], &rows[index], order_by) != Ordering::Equal
+        {
+            current_rank = i64::try_from(index + 1).map_err(|_| {
+                RnovError::new(ErrorKind::InvalidInput, "rank() result exceeds int64")
+            })?;
+            dense_rank = dense_rank.checked_add(1).ok_or_else(|| {
+                RnovError::new(ErrorKind::InvalidInput, "dense_rank() result exceeds int64")
+            })?;
+        }
+        let value = match mode {
+            RankingMode::Rank => current_rank,
+            RankingMode::DenseRank => dense_rank,
+        };
+        values[rows[index].original_index] = SqlValue::Int64(value);
     }
     Ok(values)
 }
@@ -3647,13 +3701,21 @@ fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
 }
 
 fn compare_sort_rows(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
+    let ordering = compare_sort_row_keys(left, right, keys);
+    if ordering != Ordering::Equal {
+        return ordering;
+    }
+    left.original_index.cmp(&right.original_index)
+}
+
+fn compare_sort_row_keys(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
     for (index, key) in keys.iter().enumerate() {
         let ordering = compare_sort_values(&left.keys[index], &right.keys[index], key.direction);
         if ordering != Ordering::Equal {
             return ordering;
         }
     }
-    left.original_index.cmp(&right.original_index)
+    Ordering::Equal
 }
 
 fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirection) -> Ordering {
@@ -3761,10 +3823,12 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "MAX(expr) requires aggregate execution",
         )),
-        Expr::RowNumberOver { .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "row_number() OVER requires window execution",
-        )),
+        Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "window expressions require window execution",
+            ))
+        }
         Expr::Array(values) => Ok(array_literal_value(values)?.data_type()),
         Expr::HStore(entries) => Ok(hstore_literal_value(entries)?.data_type()),
         Expr::Range {
@@ -4079,10 +4143,12 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             ErrorKind::InvalidInput,
             "MAX(expr) requires aggregate execution",
         )),
-        Expr::RowNumberOver { .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "row_number() OVER requires window execution",
-        )),
+        Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "window expressions require window execution",
+            ))
+        }
         Expr::Binary { left, op, right } => eval_binary_expr(columns, row, left, op, right),
         Expr::Unary { op, expr } => eval_unary_arithmetic_expr(columns, row, op, expr),
         Expr::Not(expr) => eval_not_expr(columns, row, expr),

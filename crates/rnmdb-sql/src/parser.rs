@@ -1042,20 +1042,16 @@ impl Parser {
                         self.expect_keyword(TokenKind::RightParen)?;
                         args
                     };
-                    if name.schema().is_none() && name.object() == "row_number" {
+                    if name.schema().is_none() && ranking_window_function(name.object()).is_some() {
                         if !args.is_empty() {
-                            return Err(self.error("row_number() does not accept arguments"));
+                            return Err(self
+                                .error(format!("{}() does not accept arguments", name.object())));
                         }
-                        self.expect_keyword(TokenKind::Over)?;
-                        self.expect_keyword(TokenKind::LeftParen)?;
-                        self.expect_keyword(TokenKind::Order)?;
-                        self.expect_keyword(TokenKind::By)?;
-                        let order_by = self.parse_order_by_list()?;
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        if order_by.is_empty() {
-                            return Err(self.error("row_number() OVER requires ORDER BY"));
-                        }
-                        return Ok(Expr::RowNumberOver { order_by });
+                        let order_by = self.parse_window_order_by(name.object())?;
+                        return Ok(ranking_window_function(name.object())
+                            .expect("checked ranking window function")(
+                            order_by
+                        ));
                     }
                     if name.schema().is_none() && name.object() == "count" {
                         let mut args = args;
@@ -1296,6 +1292,19 @@ impl Parser {
             break;
         }
         Ok(expressions)
+    }
+
+    fn parse_window_order_by(&mut self, function_name: &str) -> Result<Vec<OrderByExpr>> {
+        self.expect_keyword(TokenKind::Over)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        self.expect_keyword(TokenKind::Order)?;
+        self.expect_keyword(TokenKind::By)?;
+        let order_by = self.parse_order_by_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        if order_by.is_empty() {
+            return Err(self.error(format!("{function_name}() OVER requires ORDER BY")));
+        }
+        Ok(order_by)
     }
 
     fn parse_query_tail(&mut self) -> Result<QueryTail> {
@@ -1737,6 +1746,15 @@ fn cube_grouping_sets(group_by: &[Expr]) -> Result<Vec<Vec<Expr>>> {
                 .collect::<Vec<_>>()
         })
         .collect())
+}
+
+fn ranking_window_function(name: &str) -> Option<fn(Vec<OrderByExpr>) -> Expr> {
+    match name {
+        "row_number" => Some(|order_by| Expr::RowNumberOver { order_by }),
+        "rank" => Some(|order_by| Expr::RankOver { order_by }),
+        "dense_rank" => Some(|order_by| Expr::DenseRankOver { order_by }),
+        _ => None,
+    }
 }
 
 fn sort_direction_with_nulls(direction: SortDirection, nulls_first: bool) -> SortDirection {

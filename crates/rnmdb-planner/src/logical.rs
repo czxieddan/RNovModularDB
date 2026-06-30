@@ -209,6 +209,8 @@ pub struct WindowItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WindowFunction {
     RowNumber { order_by: Vec<OrderByExpr> },
+    Rank { order_by: Vec<OrderByExpr> },
+    DenseRank { order_by: Vec<OrderByExpr> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1247,6 +1249,12 @@ fn window_function(expr: &Expr) -> Option<WindowFunction> {
         Expr::RowNumberOver { order_by } => Some(WindowFunction::RowNumber {
             order_by: order_by.clone(),
         }),
+        Expr::RankOver { order_by } => Some(WindowFunction::Rank {
+            order_by: order_by.clone(),
+        }),
+        Expr::DenseRankOver { order_by } => Some(WindowFunction::DenseRank {
+            order_by: order_by.clone(),
+        }),
         _ => None,
     }
 }
@@ -1357,6 +1365,22 @@ fn window_function_name(function: &WindowFunction) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("row_number() OVER (ORDER BY {order_by})")
+        }
+        WindowFunction::Rank { order_by } => {
+            let order_by = order_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("rank() OVER (ORDER BY {order_by})")
+        }
+        WindowFunction::DenseRank { order_by } => {
+            let order_by = order_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("dense_rank() OVER (ORDER BY {order_by})")
         }
     }
 }

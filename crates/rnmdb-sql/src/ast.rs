@@ -114,6 +114,12 @@ pub enum Expr {
     RowNumberOver {
         order_by: Vec<OrderByExpr>,
     },
+    RankOver {
+        order_by: Vec<OrderByExpr>,
+    },
+    DenseRankOver {
+        order_by: Vec<OrderByExpr>,
+    },
     Array(Vec<Expr>),
     HStore(Vec<(String, Option<String>)>),
     Range {
@@ -247,16 +253,9 @@ impl fmt::Display for Expr {
             Self::Sum(expr) => write!(f, "sum({expr})"),
             Self::Min(expr) => write!(f, "min({expr})"),
             Self::Max(expr) => write!(f, "max({expr})"),
-            Self::RowNumberOver { order_by } => {
-                f.write_str("row_number() OVER (ORDER BY ")?;
-                for (index, order_by) in order_by.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{order_by}")?;
-                }
-                f.write_str(")")
-            }
+            Self::RowNumberOver { order_by } => write_window_function(f, "row_number", order_by),
+            Self::RankOver { order_by } => write_window_function(f, "rank", order_by),
+            Self::DenseRankOver { order_by } => write_window_function(f, "dense_rank", order_by),
             Self::Array(values) => {
                 f.write_str("ARRAY[")?;
                 for (index, value) in values.iter().enumerate() {
@@ -432,6 +431,21 @@ impl fmt::Display for SelectItem {
             }
         }
     }
+}
+
+fn write_window_function(
+    f: &mut fmt::Formatter<'_>,
+    name: &str,
+    order_by: &[OrderByExpr],
+) -> fmt::Result {
+    write!(f, "{name}() OVER (ORDER BY ")?;
+    for (index, order_by) in order_by.iter().enumerate() {
+        if index > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{order_by}")?;
+    }
+    f.write_str(")")
 }
 
 fn format_sql_type(data_type: &SqlType) -> String {
