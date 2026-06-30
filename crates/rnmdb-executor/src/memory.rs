@@ -1489,6 +1489,21 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
             }
+            LogicalPlan::GroupingSetsAggregate {
+                group_by,
+                grouping_sets,
+                items,
+                input,
+            } => {
+                let batch = self.execute_cancellable(input, cancellation)?;
+                apply_grouping_sets_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    grouping_sets,
+                    items,
+                    cancellation,
+                )
+            }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
@@ -1736,6 +1751,22 @@ impl MemoryExecutor {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
             }
+            PhysicalPlan::GroupingSetsAggregate {
+                group_by,
+                grouping_sets,
+                items,
+                input,
+                ..
+            } => {
+                let batch = self.execute_physical_cancellable(input, cancellation)?;
+                apply_grouping_sets_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    grouping_sets,
+                    items,
+                    cancellation,
+                )
+            }
             PhysicalPlan::Distinct { input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
@@ -1957,6 +1988,21 @@ impl MemoryExecutor {
             } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+            }
+            LogicalPlan::GroupingSetsAggregate {
+                group_by,
+                grouping_sets,
+                items,
+                input,
+            } => {
+                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                apply_grouping_sets_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    grouping_sets,
+                    items,
+                    cancellation,
+                )
             }
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -3036,6 +3082,68 @@ fn apply_grouped_aggregate_cancellable(
     VectorBatch::new(columns, rows)
 }
 
+fn apply_grouping_sets_aggregate_cancellable(
+    batch: VectorBatch,
+    group_by: &[Expr],
+    grouping_sets: &[Vec<Expr>],
+    items: &[GroupedAggregateItem],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    let columns = items
+        .iter()
+        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .collect::<Result<Vec<_>>>()?;
+    let mut rows = Vec::new();
+    for grouping_set in grouping_sets {
+        cancellation.check()?;
+        let groups = grouping_set_states(&batch, grouping_set, cancellation)?;
+        for group in groups {
+            cancellation.check()?;
+            let group_batch = VectorBatch::new(batch.columns().to_vec(), group.rows)?;
+            let values = items
+                .iter()
+                .map(|item| {
+                    grouping_set_aggregate_value(&group_batch, group_by, grouping_set, item)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(Row::new(values));
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(columns, rows)
+}
+
+fn grouping_set_states(
+    batch: &VectorBatch,
+    grouping_set: &[Expr],
+    cancellation: &CancellationToken,
+) -> Result<Vec<GroupState>> {
+    let mut groups: Vec<GroupState> = Vec::new();
+    for row in batch.rows() {
+        cancellation.check()?;
+        let key = grouping_set
+            .iter()
+            .map(|expr| eval_expr(batch.columns(), row, expr))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.rows.push(row.clone());
+        } else {
+            groups.push(GroupState {
+                key,
+                rows: vec![row.clone()],
+            });
+        }
+    }
+    if groups.is_empty() && grouping_set.is_empty() {
+        groups.push(GroupState {
+            key: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
+    Ok(groups)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GroupState {
     key: Vec<SqlValue>,
@@ -3070,6 +3178,23 @@ fn grouped_aggregate_value(batch: &VectorBatch, item: &GroupedAggregateItem) -> 
             eval_expr(batch.columns(), row, expr)
         }
         GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function),
+    }
+}
+
+fn grouping_set_aggregate_value(
+    batch: &VectorBatch,
+    group_by: &[Expr],
+    grouping_set: &[Expr],
+    item: &GroupedAggregateItem,
+) -> Result<SqlValue> {
+    match &item.kind {
+        GroupedAggregateItemKind::GroupKey(expr)
+            if group_by.iter().any(|group_expr| group_expr == expr)
+                && !grouping_set.iter().any(|group_expr| group_expr == expr) =>
+        {
+            Ok(SqlValue::Null)
+        }
+        _ => grouped_aggregate_value(batch, item),
     }
 }
 

@@ -205,8 +205,18 @@ impl<'a> Binder<'a> {
                 limit,
                 offset,
             } => self.bind_select(
-                *distinct, projection, from, None, selection, group_by, having, order_by, *limit,
-                *offset, role_id,
+                *distinct,
+                projection,
+                from,
+                None,
+                selection,
+                group_by,
+                &[],
+                having,
+                order_by,
+                *limit,
+                *offset,
+                role_id,
             ),
             Statement::SelectLateral {
                 distinct,
@@ -226,6 +236,32 @@ impl<'a> Binder<'a> {
                 Some(lateral_join),
                 selection,
                 group_by,
+                &[],
+                having,
+                order_by,
+                *limit,
+                *offset,
+                role_id,
+            ),
+            Statement::SelectGroupingSets {
+                distinct,
+                projection,
+                from,
+                selection,
+                group_by,
+                grouping_sets,
+                having,
+                order_by,
+                limit,
+                offset,
+            } => self.bind_select(
+                *distinct,
+                projection,
+                from,
+                None,
+                selection,
+                group_by,
+                grouping_sets,
                 having,
                 order_by,
                 *limit,
@@ -713,6 +749,7 @@ impl<'a> Binder<'a> {
         lateral_join: Option<&LateralJoin>,
         selection: &Option<Expr>,
         group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
         having: &Option<Expr>,
         order_by: &[crate::ast::OrderByExpr],
         limit: Option<usize>,
@@ -935,19 +972,31 @@ impl<'a> Binder<'a> {
             .filter(|item| is_aggregate_expr(&item.expr))
             .count();
         let bound_group_by = self.bind_group_by_exprs(&projection, group_by)?;
+        let bound_grouping_sets = self.bind_grouping_sets(&projection, grouping_sets)?;
         if !bound_group_by.is_empty() {
             self.validate_group_by_exprs(table, &bound_group_by)?;
         }
+        for grouping_set in &bound_grouping_sets {
+            self.validate_group_by_exprs(table, grouping_set)?;
+        }
+        if !bound_grouping_sets.is_empty() {
+            mark_grouping_set_projection_columns_nullable(
+                &mut projection,
+                &mut columns,
+                &bound_group_by,
+            );
+        }
+        let grouped = !bound_group_by.is_empty() || !bound_grouping_sets.is_empty();
         if aggregate_count > 0 && aggregate_count != projection.len() {
             self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
-        if aggregate_count == 0 && !bound_group_by.is_empty() {
+        if aggregate_count == 0 && grouped {
             self.validate_grouped_projection(&projection, &bound_group_by)?;
         }
         let mut hidden_group_keys = Vec::new();
         let mut hidden_aggregates = Vec::new();
         let having = if let Some(having) = having {
-            if bound_group_by.is_empty() && aggregate_count == 0 {
+            if !grouped && aggregate_count == 0 {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "HAVING requires GROUP BY or aggregate projection in this SQL slice",
@@ -983,7 +1032,7 @@ impl<'a> Binder<'a> {
                 expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
                 direction: order_by.direction,
             };
-            if group_by.is_empty() {
+            if !grouped {
                 if aggregate_count > 0 {
                     bound_order_by.push(self.bind_grouped_sort_expr(
                         table,
@@ -1021,6 +1070,7 @@ impl<'a> Binder<'a> {
             columns,
             selection,
             group_by: bound_group_by,
+            grouping_sets: bound_grouping_sets,
             having,
             order_by: bound_order_by,
             limit,
@@ -1156,6 +1206,7 @@ impl<'a> Binder<'a> {
             columns,
             selection,
             group_by: Vec::new(),
+            grouping_sets: Vec::new(),
             having: None,
             order_by: bound_order_by,
             limit,
@@ -1422,6 +1473,17 @@ impl<'a> Binder<'a> {
                     .unwrap_or_else(|| expr.clone())),
                 _ => Ok(expr.clone()),
             })
+            .collect()
+    }
+
+    fn bind_grouping_sets(
+        &self,
+        projection: &[BoundSelectItem],
+        grouping_sets: &[Vec<Expr>],
+    ) -> Result<Vec<Vec<Expr>>> {
+        grouping_sets
+            .iter()
+            .map(|grouping_set| self.bind_group_by_exprs(projection, grouping_set))
             .collect()
     }
 
@@ -3954,6 +4016,19 @@ fn hidden_group_key_nullable(table: &Table, expr: &Expr) -> bool {
         Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) => false,
         Expr::Null => true,
         _ => true,
+    }
+}
+
+fn mark_grouping_set_projection_columns_nullable(
+    projection: &mut [BoundSelectItem],
+    columns: &mut [BoundColumn],
+    group_by: &[Expr],
+) {
+    for (item, column) in projection.iter_mut().zip(columns.iter_mut()) {
+        if group_by.iter().any(|expr| expr == &item.expr) {
+            item.column.nullable = true;
+            column.nullable = true;
+        }
     }
 }
 

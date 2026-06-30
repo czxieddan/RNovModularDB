@@ -577,17 +577,41 @@ impl Parser {
         } else {
             None
         };
-        let group_by = if self.consume_if(&TokenKind::Group) {
+        let (group_by, grouping_sets) = if self.consume_if(&TokenKind::Group) {
             self.expect_keyword(TokenKind::By)?;
-            self.parse_expr_list()?
+            if self.consume_if(&TokenKind::Grouping) {
+                self.expect_keyword(TokenKind::Sets)?;
+                let grouping_sets = self.parse_grouping_sets()?;
+                let group_by = grouping_sets_union(&grouping_sets);
+                (group_by, grouping_sets)
+            } else {
+                (self.parse_expr_list()?, Vec::new())
+            }
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let having = if self.consume_if(&TokenKind::Having) {
             Some(self.parse_expr()?)
         } else {
             None
         };
+        if lateral_join.is_some() && !grouping_sets.is_empty() {
+            return Err(self.error("JOIN LATERAL does not support GROUPING SETS yet"));
+        }
+        if !grouping_sets.is_empty() {
+            return Ok(Statement::SelectGroupingSets {
+                distinct,
+                projection,
+                from,
+                selection,
+                group_by,
+                grouping_sets,
+                having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            });
+        }
         if let Some(lateral_join) = lateral_join {
             Ok(Statement::SelectLateral {
                 distinct,
@@ -691,6 +715,31 @@ impl Parser {
             break;
         }
         Ok(expressions)
+    }
+
+    fn parse_grouping_sets(&mut self) -> Result<Vec<Vec<Expr>>> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let mut grouping_sets = Vec::new();
+        loop {
+            self.expect_keyword(TokenKind::LeftParen)?;
+            let grouping_set = if self.consume_if(&TokenKind::RightParen) {
+                Vec::new()
+            } else {
+                let expressions = self.parse_expr_list()?;
+                self.expect_keyword(TokenKind::RightParen)?;
+                expressions
+            };
+            grouping_sets.push(grouping_set);
+            if self.consume_if(&TokenKind::Comma) {
+                continue;
+            }
+            break;
+        }
+        self.expect_keyword(TokenKind::RightParen)?;
+        if grouping_sets.is_empty() {
+            return Err(self.error("GROUPING SETS requires at least one grouping set"));
+        }
+        Ok(grouping_sets)
     }
 
     fn parse_assignment_list(&mut self) -> Result<Vec<Assignment>> {
@@ -1464,6 +1513,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Lateral, TokenKind::Lateral)
             | (TokenKind::Where, TokenKind::Where)
             | (TokenKind::Group, TokenKind::Group)
+            | (TokenKind::Grouping, TokenKind::Grouping)
+            | (TokenKind::Sets, TokenKind::Sets)
             | (TokenKind::Having, TokenKind::Having)
             | (TokenKind::Order, TokenKind::Order)
             | (TokenKind::By, TokenKind::By)
@@ -1578,6 +1629,27 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             limit: tail.limit,
             offset: tail.offset,
         },
+        Statement::SelectGroupingSets {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            grouping_sets,
+            having,
+            ..
+        } => Statement::SelectGroupingSets {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            grouping_sets,
+            having,
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
         other => Statement::Query {
             input: Box::new(other),
             order_by: tail.order_by,
@@ -1585,6 +1657,18 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             offset: tail.offset,
         },
     }
+}
+
+fn grouping_sets_union(grouping_sets: &[Vec<Expr>]) -> Vec<Expr> {
+    let mut group_by = Vec::new();
+    for grouping_set in grouping_sets {
+        for expr in grouping_set {
+            if !group_by.iter().any(|existing| existing == expr) {
+                group_by.push(expr.clone());
+            }
+        }
+    }
+    group_by
 }
 
 fn sort_direction_with_nulls(direction: SortDirection, nulls_first: bool) -> SortDirection {

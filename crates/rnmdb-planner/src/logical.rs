@@ -47,6 +47,12 @@ pub enum LogicalPlan {
         items: Vec<GroupedAggregateItem>,
         input: Box<LogicalPlan>,
     },
+    GroupingSetsAggregate {
+        group_by: Vec<Expr>,
+        grouping_sets: Vec<Vec<Expr>>,
+        items: Vec<GroupedAggregateItem>,
+        input: Box<LogicalPlan>,
+    },
     Distinct {
         input: Box<LogicalPlan>,
     },
@@ -384,7 +390,8 @@ impl LogicalPlanner {
                 if let Some(predicate) = &select.selection {
                     plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
                 }
-                let grouped = !select.group_by.is_empty();
+                let grouping_sets = !select.grouping_sets.is_empty();
+                let grouped = !select.group_by.is_empty() || grouping_sets;
                 let aggregate_functions = select_aggregate_functions(select);
                 let mut order_by = select.order_by.clone();
                 let mut project_internal_outputs =
@@ -408,10 +415,19 @@ impl LogicalPlanner {
                         .collect::<Vec<_>>();
                     project_internal_outputs |=
                         add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
-                    LogicalPlan::GroupedAggregate {
-                        group_by: select.group_by.clone(),
-                        items,
-                        input: Box::new(plan),
+                    if grouping_sets {
+                        LogicalPlan::GroupingSetsAggregate {
+                            group_by: select.group_by.clone(),
+                            grouping_sets: select.grouping_sets.clone(),
+                            items,
+                            input: Box::new(plan),
+                        }
+                    } else {
+                        LogicalPlan::GroupedAggregate {
+                            group_by: select.group_by.clone(),
+                            items,
+                            input: Box::new(plan),
+                        }
                     }
                 } else if let Some(functions) = select_aggregate_functions(select) {
                     LogicalPlan::Aggregate {
@@ -672,6 +688,52 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             out.push_str(&format!(
                 "{prefix}GroupedAggregate group_by={group_by} {items}\n"
+            ));
+            write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
+            items,
+            input,
+        } => {
+            let group_by = group_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let grouping_sets = grouping_sets
+                .iter()
+                .map(|grouping_set| {
+                    if grouping_set.is_empty() {
+                        "()".to_string()
+                    } else {
+                        format!(
+                            "({})",
+                            grouping_set
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let items = items
+                .iter()
+                .map(|item| match &item.kind {
+                    GroupedAggregateItemKind::GroupKey(expr) => {
+                        format!("{} := {}", item.name, expr)
+                    }
+                    GroupedAggregateItemKind::Aggregate(function) => {
+                        format!("{} := {}", item.name, aggregate_function_name(function))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{prefix}GroupingSetsAggregate group_by={group_by} sets={grouping_sets} {items}\n"
             ));
             write_plan(input, indent + 1, out);
         }
@@ -960,6 +1022,7 @@ fn write_plan_with_costs(
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::GroupedAggregate { input, .. }
+        | LogicalPlan::GroupingSetsAggregate { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }

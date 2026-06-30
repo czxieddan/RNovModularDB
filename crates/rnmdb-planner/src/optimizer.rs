@@ -58,6 +58,17 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             items,
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
+            items,
+            input,
+        } => LogicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
+            items,
+            input: Box::new(optimize_plan(*input)),
+        },
         LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
             input: Box::new(optimize_plan(*input)),
         },
@@ -134,6 +145,17 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             input,
         } => LogicalPlan::GroupedAggregate {
             group_by,
+            items,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
+            items,
+            input,
+        } => LogicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
             items,
             input: Box::new(annotate_parallel(*input, workers)),
         },

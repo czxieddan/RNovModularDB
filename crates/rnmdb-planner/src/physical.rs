@@ -130,6 +130,13 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         cost: PlanCost,
     },
+    GroupingSetsAggregate {
+        group_by: Vec<Expr>,
+        grouping_sets: Vec<Vec<Expr>>,
+        items: Vec<GroupedAggregateItem>,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
     Distinct {
         input: Box<PhysicalPlan>,
         cost: PlanCost,
@@ -546,6 +553,18 @@ impl PhysicalPlanner {
                 input: Box::new(self.plan(input)),
                 cost,
             },
+            LogicalPlan::GroupingSetsAggregate {
+                group_by,
+                grouping_sets,
+                items,
+                input,
+            } => PhysicalPlan::GroupingSetsAggregate {
+                group_by: group_by.clone(),
+                grouping_sets: grouping_sets.clone(),
+                items: items.clone(),
+                input: Box::new(self.plan(input)),
+                cost,
+            },
             LogicalPlan::Distinct { input } => PhysicalPlan::Distinct {
                 input: Box::new(self.plan(input)),
                 cost,
@@ -691,6 +710,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
             | PhysicalPlan::GroupedAggregate { cost, .. }
+            | PhysicalPlan::GroupingSetsAggregate { cost, .. }
             | PhysicalPlan::Distinct { cost, .. }
             | PhysicalPlan::Sort { cost, .. }
             | PhysicalPlan::Limit { cost, .. }
@@ -916,6 +936,22 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!(
                 "{prefix}GroupedAggregate groups={} items={}{}\n",
                 group_by.len(),
+                items.len(),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::GroupingSetsAggregate {
+            group_by,
+            grouping_sets,
+            items,
+            input,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}GroupingSetsAggregate groups={} sets={} items={}{}\n",
+                group_by.len(),
+                grouping_sets.len(),
                 items.len(),
                 cost_suffix(*cost)
             ));

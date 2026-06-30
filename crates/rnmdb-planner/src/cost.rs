@@ -284,7 +284,8 @@ impl CostModel {
                     input.io,
                 )
             }
-            LogicalPlan::GroupedAggregate { items, input, .. } => {
+            LogicalPlan::GroupedAggregate { items, input, .. }
+            | LogicalPlan::GroupingSetsAggregate { items, input, .. } => {
                 let input = self.estimate(input);
                 PlanCost::new(
                     (input.rows * DEFAULT_GROUP_SELECTIVITY).max(1.0),
