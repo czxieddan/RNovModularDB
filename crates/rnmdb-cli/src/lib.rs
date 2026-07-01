@@ -42,6 +42,7 @@ pub struct LocalSession {
     planner: LogicalPlanner,
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
+    procedure_call_stack: Vec<String>,
 }
 
 impl LocalSession {
@@ -65,6 +66,7 @@ impl LocalSession {
             planner: LogicalPlanner::new(),
             optimizer: RuleOptimizer::new(),
             execution,
+            procedure_call_stack: Vec::new(),
         })
     }
 
@@ -201,9 +203,8 @@ impl LocalSession {
                 )?;
                 Ok(CommandOutput::SchemaChanged)
             }
-            BoundStatement::CallProcedure { body, args, .. } => {
-                let expanded = expand_procedure_body(body, args)?;
-                self.execute(expanded.as_str())
+            BoundStatement::CallProcedure { name, body, args } => {
+                self.execute_procedure_call(name.as_str(), body, args)
             }
             BoundStatement::CreateOperator { signature } => {
                 self.catalog.register_operator(signature.clone())?;
@@ -292,6 +293,34 @@ impl LocalSession {
             .create_table(schema, name.object(), columns)?
             .relation_id();
         self.grant_local_table_privileges(relation_id)
+    }
+
+    fn execute_procedure_call(
+        &mut self,
+        name: &str,
+        body: &str,
+        args: &[rnmdb_sql::ast::Expr],
+    ) -> Result<CommandOutput> {
+        if self
+            .procedure_call_stack
+            .iter()
+            .any(|active| active.eq_ignore_ascii_case(name))
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("recursive procedure call is not allowed: {name}"),
+            ));
+        }
+
+        self.procedure_call_stack.push(name.to_string());
+        let result = (|| {
+            let expanded = expand_procedure_body(body, args)?;
+            self.execute(expanded.as_str())
+        })();
+        self.procedure_call_stack
+            .pop()
+            .expect("procedure stack must contain active call");
+        result
     }
 
     fn apply_catalog_create_index(
