@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditEventKind {
     Authentication,
     Authorization,
@@ -736,6 +736,115 @@ impl ColumnRef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEvent {
+    role_id: Option<RoleId>,
+    kind: AuditEventKind,
+    message: String,
+}
+
+impl AuditEvent {
+    pub fn authentication(
+        username: impl Into<String>,
+        role_id: Option<RoleId>,
+        success: bool,
+    ) -> Result<Self> {
+        let username = username.into();
+        validate_audit_field("username", &username)?;
+        let outcome = if success { "success" } else { "failure" };
+        Ok(Self {
+            role_id,
+            kind: AuditEventKind::Authentication,
+            message: format!("authentication username={username} outcome={outcome}"),
+        })
+    }
+
+    pub fn privilege_change(
+        actor_role_id: RoleId,
+        target_role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+        granted: bool,
+    ) -> Result<Self> {
+        let action = if granted { "grant" } else { "revoke" };
+        Ok(Self {
+            role_id: Some(actor_role_id),
+            kind: AuditEventKind::PrivilegeChange,
+            message: format!(
+                "privilege_change action={action} target_role={target_role_id} relation={relation_id} privilege={privilege:?}"
+            ),
+        })
+    }
+
+    pub fn policy_change(
+        actor_role_id: RoleId,
+        relation_id: RelationId,
+        policy_name: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Result<Self> {
+        let policy_name = policy_name.into();
+        let action = action.into();
+        validate_audit_field("policy", &policy_name)?;
+        validate_audit_field("action", &action)?;
+        Ok(Self {
+            role_id: Some(actor_role_id),
+            kind: AuditEventKind::PolicyChange,
+            message: format!(
+                "policy_change action={action} relation={relation_id} policy={policy_name}"
+            ),
+        })
+    }
+
+    pub fn key_event(
+        actor_role_id: RoleId,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        key_id: ColumnKeyId,
+        action: impl Into<String>,
+    ) -> Result<Self> {
+        let column_name = column_name.into();
+        let action = action.into();
+        validate_column_name(&column_name)?;
+        validate_audit_field("action", &action)?;
+        Ok(Self {
+            role_id: Some(actor_role_id),
+            kind: AuditEventKind::KeyEvent,
+            message: format!(
+                "key_event action={action} relation={relation_id} column={column_name} key={key_id}"
+            ),
+        })
+    }
+
+    pub fn denied_access(
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+        reason: impl Into<String>,
+    ) -> Result<Self> {
+        let reason = reason.into();
+        validate_audit_field("reason", &reason)?;
+        Ok(Self {
+            role_id: Some(role_id),
+            kind: AuditEventKind::DeniedAccess,
+            message: format!(
+                "denied_access relation={relation_id} privilege={privilege:?} reason={reason}"
+            ),
+        })
+    }
+
+    pub fn role_id(&self) -> Option<RoleId> {
+        self.role_id
+    }
+
+    pub fn kind(&self) -> AuditEventKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditRecord {
     instance_id: InstanceId,
     role_id: Option<RoleId>,
@@ -863,6 +972,18 @@ impl AuditRecord {
     pub fn instance_id(&self) -> InstanceId {
         self.instance_id
     }
+
+    pub fn role_id(&self) -> Option<RoleId> {
+        self.role_id
+    }
+
+    pub fn kind(&self) -> AuditEventKind {
+        self.kind
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -900,6 +1021,10 @@ impl AuditChain {
         )?;
         self.records.push(record.clone());
         Ok(record)
+    }
+
+    pub fn append_event(&mut self, event: AuditEvent) -> Result<AuditRecord> {
+        self.append(event.role_id, event.kind, event.message)
     }
 
     pub fn records(&self) -> &[AuditRecord] {
@@ -1182,6 +1307,16 @@ fn validate_column_name(column_name: &str) -> Result<()> {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             "column name cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_audit_field(field: &'static str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("audit {field} cannot be empty"),
         ));
     }
     Ok(())
