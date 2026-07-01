@@ -296,11 +296,12 @@ impl PageCrypto {
         let key = key.to_key();
         let nonce = nonce.to_nonce();
         let cipher = ChaCha20Poly1305::new(&key);
+        let encoded_page = PageCodec::encode(page)?;
         cipher
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: page.payload(),
+                    msg: &encoded_page,
                     aad: &page_associated_data(page.id()),
                 },
             )
@@ -316,7 +317,7 @@ impl PageCrypto {
         let key = key.to_key();
         let nonce = nonce.to_nonce();
         let cipher = ChaCha20Poly1305::new(&key);
-        let payload = cipher
+        let encoded_page = cipher
             .decrypt(
                 &nonce,
                 Payload {
@@ -330,7 +331,14 @@ impl PageCrypto {
                     "page authentication failed during decryption",
                 )
             })?;
-        Page::new(page_id, payload)
+        let page = PageCodec::decode(&encoded_page)?;
+        if page.id() != page_id {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "encrypted page metadata does not match requested page id",
+            ));
+        }
+        Ok(page)
     }
 }
 
@@ -593,6 +601,7 @@ impl HybridSyncStatus {
 pub struct HybridBackend {
     memory: MemoryBackend,
     disk: Arc<dyn StorageBackend>,
+    active_target: Arc<RwLock<HybridSyncTarget>>,
     dirty_pages: Arc<RwLock<BTreeSet<PageId>>>,
     mirrored_pages: Arc<RwLock<BTreeSet<PageId>>>,
     lsn_status: Arc<RwLock<HybridLsnStatus>>,
@@ -620,10 +629,34 @@ impl HybridBackend {
         Ok(Self {
             memory,
             disk,
+            active_target: Arc::new(RwLock::new(HybridSyncTarget::Memory)),
             dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
             mirrored_pages: Arc::new(RwLock::new(BTreeSet::new())),
             lsn_status: Arc::new(RwLock::new(HybridLsnStatus::default())),
         })
+    }
+
+    pub fn active_target(&self) -> Result<HybridSyncTarget> {
+        self.read_active_target()
+    }
+
+    pub fn switch_active_target(&self, target: HybridSyncTarget) -> Result<SwitchDataMovement> {
+        let status = self.sync_status()?;
+        let movement = status.switch_data_movement(target);
+        if matches!(movement, SwitchDataMovement::FullDataMovement) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "hybrid switch to {target:?} requires full data movement: dirty {} bytes, estimated flush {} bytes, memory LSN {}, disk LSN {}",
+                    status.dirty_bytes(),
+                    status.estimated_flush_bytes(),
+                    status.memory_lsn(),
+                    status.disk_lsn()
+                ),
+            ));
+        }
+        *self.write_active_target()? = target;
+        Ok(movement)
     }
 
     pub fn sync_status(&self) -> Result<HybridSyncStatus> {
@@ -631,6 +664,7 @@ impl HybridBackend {
         let mirrored_pages = self.read_mirrored_pages()?.len();
         let dirty_bytes = dirty_pages.saturating_mul(self.memory.page_size().bytes());
         let lsn_status = self.read_lsn_status()?;
+        let active_target = self.read_active_target()?;
         let state = if dirty_pages == 0 {
             HybridState::HybridReady
         } else {
@@ -638,7 +672,7 @@ impl HybridBackend {
         };
         Ok(HybridSyncStatus::new(
             state,
-            HybridSyncTarget::Memory,
+            active_target,
             dirty_pages,
             dirty_bytes,
             mirrored_pages,
@@ -654,6 +688,27 @@ impl HybridBackend {
             RnovError::new(
                 ErrorKind::Internal,
                 "hybrid backend dirty page set lock poisoned",
+            )
+        })
+    }
+
+    fn read_active_target(&self) -> Result<HybridSyncTarget> {
+        self.active_target
+            .read()
+            .map(|target| *target)
+            .map_err(|_| {
+                RnovError::new(
+                    ErrorKind::Internal,
+                    "hybrid backend active target lock poisoned",
+                )
+            })
+    }
+
+    fn write_active_target(&self) -> Result<std::sync::RwLockWriteGuard<'_, HybridSyncTarget>> {
+        self.active_target.write().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend active target lock poisoned",
             )
         })
     }
@@ -701,17 +756,40 @@ impl HybridBackend {
 
 impl StorageBackend for HybridBackend {
     fn read_page(&self, id: PageId) -> Result<Option<Page>> {
-        if let Some(page) = self.memory.read_page(id)? {
-            return Ok(Some(page));
+        match self.read_active_target()? {
+            HybridSyncTarget::Memory => {
+                if let Some(page) = self.memory.read_page(id)? {
+                    return Ok(Some(page));
+                }
+                self.disk.read_page(id)
+            }
+            HybridSyncTarget::Disk => {
+                if let Some(page) = self.disk.read_page(id)? {
+                    return Ok(Some(page));
+                }
+                self.memory.read_page(id)
+            }
         }
-        self.disk.read_page(id)
     }
 
     fn write_page(&self, page: Page) -> Result<()> {
         let page_id = page.id();
         let page_lsn = page.header().lsn();
-        self.memory.write_page(page)?;
-        self.write_dirty_pages()?.insert(page_id);
+        match self.read_active_target()? {
+            HybridSyncTarget::Memory => {
+                self.memory.write_page(page)?;
+                self.write_dirty_pages()?.insert(page_id);
+            }
+            HybridSyncTarget::Disk => {
+                self.disk.write_page(page.clone())?;
+                self.memory.write_page(page)?;
+                self.memory.mark_clean(page_id)?;
+                self.write_mirrored_pages()?.insert(page_id);
+                let mut lsn_status = self.write_lsn_status()?;
+                lsn_status.disk_lsn = lsn_status.disk_lsn.max(page_lsn);
+                lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(page_lsn);
+            }
+        }
         let mut lsn_status = self.write_lsn_status()?;
         lsn_status.memory_lsn = lsn_status.memory_lsn.max(page_lsn);
         Ok(())
@@ -1117,7 +1195,11 @@ impl SingleFileBackend {
     }
 
     fn page_record_size(&self) -> u64 {
-        (Self::PAGE_RECORD_HEADER_LEN + self.page_size.bytes() + 16) as u64
+        (Self::PAGE_RECORD_HEADER_LEN + self.max_page_ciphertext_len()) as u64
+    }
+
+    fn max_page_ciphertext_len(&self) -> usize {
+        PageCodec::HEADER_LEN + self.page_size.bytes() + 16
     }
 
     fn page_offset(&self, page_id: PageId) -> Result<u64> {
@@ -1185,7 +1267,7 @@ impl StorageBackend for SingleFileBackend {
 
         let counter = u32::from_be_bytes(read_fixed::<4>(&header, 8)?);
         let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as usize;
-        if ciphertext_len > self.page_size.bytes() + 16 {
+        if ciphertext_len > self.max_page_ciphertext_len() {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "encrypted page record length is too large",
@@ -1454,8 +1536,9 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
     let (page_size, superblock_generation) = read_single_file_header(&mut file)?;
     let data_start_bytes =
         (SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN * 2) as u64;
+    let max_page_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
     let page_record_size_bytes =
-        (SingleFileBackend::PAGE_RECORD_HEADER_LEN + page_size.bytes() + 16) as u64;
+        (SingleFileBackend::PAGE_RECORD_HEADER_LEN + max_page_ciphertext_len) as u64;
     let page_record_slots = if file_len_bytes <= data_start_bytes {
         0
     } else {
@@ -1506,7 +1589,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
         }
 
         let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as u64;
-        if ciphertext_len > page_size.bytes() as u64 + 16 {
+        if ciphertext_len > max_page_ciphertext_len as u64 {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "encrypted page record length is too large",
