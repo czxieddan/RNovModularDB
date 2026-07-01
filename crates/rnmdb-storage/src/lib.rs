@@ -397,6 +397,108 @@ struct MemoryPageEntry {
     pin_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemorySnapshot {
+    page_size: PageSize,
+    pages: Vec<Page>,
+}
+
+impl MemorySnapshot {
+    pub fn new(page_size: PageSize, pages: Vec<Page>) -> Self {
+        Self { page_size, pages }
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn pages(&self) -> &[Page] {
+        &self.pages
+    }
+
+    pub fn export_to_single_file(
+        &self,
+        destination: impl AsRef<Path>,
+        options: SingleFileOptions,
+    ) -> Result<MemoryCheckpointReport> {
+        if options.page_key().is_none() {
+            return Err(RnovError::new(
+                ErrorKind::Security,
+                "memory checkpoint export requires a page encryption key",
+            ));
+        }
+        if options.page_size() != self.page_size {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory checkpoint page size must match the destination page size",
+            ));
+        }
+
+        let destination = destination.as_ref();
+        let backend = SingleFileBackend::create(destination, options)?;
+        for page in &self.pages {
+            backend.write_page(page.clone())?;
+        }
+        backend.sync()?;
+        let verification = backend.verify_with_key()?;
+
+        Ok(MemoryCheckpointReport {
+            destination_path: destination.to_path_buf(),
+            pages_exported: self.pages.len(),
+            bytes_written: verification.file_len_bytes(),
+            page_size: self.page_size,
+            superblock_generation: backend.superblock_generation(),
+            page_record_slots: verification.page_record_slots(),
+            present_page_records: verification.present_page_records(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryCheckpointReport {
+    destination_path: PathBuf,
+    pages_exported: usize,
+    bytes_written: u64,
+    page_size: PageSize,
+    superblock_generation: u64,
+    page_record_slots: u64,
+    present_page_records: u64,
+}
+
+impl MemoryCheckpointReport {
+    pub fn destination_path(&self) -> &Path {
+        &self.destination_path
+    }
+
+    pub fn pages_exported(&self) -> usize {
+        self.pages_exported
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn present_page_records(&self) -> u64 {
+        self.present_page_records
+    }
+}
+
 impl MemoryBackend {
     pub fn new(page_size: PageSize) -> Self {
         Self {
@@ -429,8 +531,15 @@ impl MemoryBackend {
     }
 
     pub fn snapshot_pages(&self) -> Result<Vec<Page>> {
+        Ok(self.snapshot()?.pages)
+    }
+
+    pub fn snapshot(&self) -> Result<MemorySnapshot> {
         let pages = self.read_pages()?;
-        Ok(pages.values().map(|entry| entry.page.clone()).collect())
+        Ok(MemorySnapshot::new(
+            self.page_size,
+            pages.values().map(|entry| entry.page.clone()).collect(),
+        ))
     }
 
     pub fn pin_page(&self, id: PageId) -> Result<Option<PinnedPage>> {
