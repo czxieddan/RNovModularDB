@@ -1,8 +1,8 @@
 use std::io::{self, Read};
 
 use rnmdb_cli::{
-    CommandOutput, LocalSession, backup_storage, inspect_storage, restore_storage_dry_run,
-    verify_storage,
+    CommandOutput, LocalSession, backup_storage, inspect_storage, page_key_from_hex,
+    restore_storage_dry_run, verify_storage, verify_storage_with_key,
 };
 use rnmdb_storage::{
     SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
@@ -33,6 +33,16 @@ fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
         }
         [command, path] if command == "verify" => {
             println!("{}", format_verification(&verify_storage(path)?));
+            Ok(())
+        }
+        [command, key_flag, key_hex, path]
+            if command == "verify" && key_flag == "--page-key-hex" =>
+        {
+            let key = page_key_from_hex(key_hex)?;
+            println!(
+                "{}",
+                format_verification(&verify_storage_with_key(path, key)?)
+            );
             Ok(())
         }
         [command, source, destination] if command == "backup" => {

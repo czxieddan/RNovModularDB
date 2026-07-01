@@ -21,9 +21,9 @@ use rnmdb_sql::{
     parser::parse_statement,
 };
 use rnmdb_storage::{
-    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
+    PageCryptoKey, SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
     SingleFileVerificationReport, backup_single_file, inspect_single_file,
-    restore_single_file_dry_run, verify_single_file,
+    restore_single_file_dry_run, verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_types::SqlType;
 
@@ -855,6 +855,41 @@ pub fn backup_storage(
 
 pub fn verify_storage(path: impl AsRef<std::path::Path>) -> Result<SingleFileVerificationReport> {
     verify_single_file(path)
+}
+
+pub fn verify_storage_with_key(
+    path: impl AsRef<std::path::Path>,
+    key: PageCryptoKey,
+) -> Result<SingleFileVerificationReport> {
+    verify_single_file_with_key(path, key)
+}
+
+pub fn page_key_from_hex(hex: &str) -> Result<PageCryptoKey> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() != 64 {
+        return Err(rnmdb_common::RnovError::new(
+            rnmdb_common::ErrorKind::InvalidInput,
+            "page key hex must contain exactly 64 hexadecimal characters",
+        ));
+    }
+
+    let mut bytes = [0_u8; 32];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+    }
+    Ok(PageCryptoKey::from_bytes(bytes))
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(rnmdb_common::RnovError::new(
+            rnmdb_common::ErrorKind::InvalidInput,
+            "page key hex contains a non-hexadecimal character",
+        )),
+    }
 }
 
 pub fn restore_storage_dry_run(
