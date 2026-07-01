@@ -201,12 +201,92 @@ pub enum FunctionKind {
     SqlProcedure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FunctionClass {
+    Scalar,
+    Aggregate,
+    TableValued,
+    Window,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TableFunctionColumn {
+    name: String,
+    data_type: SqlType,
+    nullable: bool,
+}
+
+impl TableFunctionColumn {
+    pub fn new(name: impl Into<String>, data_type: SqlType, nullable: bool) -> Result<Self> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "table function column name cannot be empty",
+            ));
+        }
+
+        Ok(Self {
+            name,
+            data_type,
+            nullable,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn data_type(&self) -> &SqlType {
+        &self.data_type
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UdfOutput {
+    Scalar(SqlType),
+    Aggregate(SqlType),
+    Table(Vec<TableFunctionColumn>),
+    Window(SqlType),
+}
+
+impl UdfOutput {
+    pub fn class(&self) -> FunctionClass {
+        match self {
+            Self::Scalar(_) => FunctionClass::Scalar,
+            Self::Aggregate(_) => FunctionClass::Aggregate,
+            Self::Table(_) => FunctionClass::TableValued,
+            Self::Window(_) => FunctionClass::Window,
+        }
+    }
+
+    pub fn return_type(&self) -> Option<&SqlType> {
+        match self {
+            Self::Scalar(return_type)
+            | Self::Aggregate(return_type)
+            | Self::Window(return_type) => Some(return_type),
+            Self::Table(_) => None,
+        }
+    }
+
+    pub fn table_columns(&self) -> &[TableFunctionColumn] {
+        match self {
+            Self::Table(columns) => columns,
+            _ => &[],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UdfDefinition {
     function_id: FunctionId,
     name: String,
     argument_types: Vec<SqlType>,
-    return_type: SqlType,
+    output: UdfOutput,
     kind: FunctionKind,
     sandbox_policy: UdfSandboxPolicy,
     wasm_module: Option<WasmModuleDefinition>,
@@ -232,11 +312,66 @@ impl UdfDefinition {
             function_id: FunctionId::new(0),
             name,
             argument_types,
-            return_type,
+            output: UdfOutput::Scalar(return_type),
             kind,
             sandbox_policy,
             wasm_module: None,
         })
+    }
+
+    pub fn new_aggregate(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+        kind: FunctionKind,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        Self::new_with_output(
+            name,
+            argument_types,
+            UdfOutput::Aggregate(return_type),
+            kind,
+            sandbox_policy,
+        )
+    }
+
+    pub fn new_table(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        columns: Vec<TableFunctionColumn>,
+        kind: FunctionKind,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        if columns.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "table-valued function must expose at least one column",
+            ));
+        }
+
+        Self::new_with_output(
+            name,
+            argument_types,
+            UdfOutput::Table(columns),
+            kind,
+            sandbox_policy,
+        )
+    }
+
+    pub fn new_window(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+        kind: FunctionKind,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        Self::new_with_output(
+            name,
+            argument_types,
+            UdfOutput::Window(return_type),
+            kind,
+            sandbox_policy,
+        )
     }
 
     pub fn new_wasm(
@@ -258,6 +393,32 @@ impl UdfDefinition {
         Ok(definition)
     }
 
+    fn new_with_output(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        output: UdfOutput,
+        kind: FunctionKind,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "function name cannot be empty",
+            ));
+        }
+
+        Ok(Self {
+            function_id: FunctionId::new(0),
+            name,
+            argument_types,
+            output,
+            kind,
+            sandbox_policy,
+            wasm_module: None,
+        })
+    }
+
     pub fn function_id(&self) -> FunctionId {
         self.function_id
     }
@@ -270,8 +431,20 @@ impl UdfDefinition {
         &self.argument_types
     }
 
-    pub fn return_type(&self) -> &SqlType {
-        &self.return_type
+    pub fn return_type(&self) -> Option<&SqlType> {
+        self.output.return_type()
+    }
+
+    pub fn class(&self) -> FunctionClass {
+        self.output.class()
+    }
+
+    pub fn output(&self) -> &UdfOutput {
+        &self.output
+    }
+
+    pub fn table_columns(&self) -> &[TableFunctionColumn] {
+        self.output.table_columns()
     }
 
     pub fn kind(&self) -> FunctionKind {
@@ -327,6 +500,19 @@ impl UdfRegistry {
         self.functions
             .iter()
             .find(|function| function.name == name && function.argument_types == argument_types)
+    }
+
+    pub fn resolve_class(
+        &self,
+        name: &str,
+        argument_types: &[SqlType],
+        class: FunctionClass,
+    ) -> Option<&UdfDefinition> {
+        self.functions.iter().find(|function| {
+            function.name == name
+                && function.argument_types == argument_types
+                && function.class() == class
+        })
     }
 
     pub fn functions(&self) -> &[UdfDefinition] {
