@@ -173,6 +173,7 @@ pub struct Catalog {
     next_policy_id: u64,
     schemas: BTreeMap<String, Schema>,
     functions: Vec<Function>,
+    procedures: Vec<Procedure>,
     operators: Vec<Operator>,
     indexes: Vec<Index>,
     roles: BTreeMap<String, Role>,
@@ -191,6 +192,7 @@ impl Catalog {
             next_policy_id: 1,
             schemas: BTreeMap::new(),
             functions: Vec::new(),
+            procedures: Vec::new(),
             operators: Vec::new(),
             indexes: Vec::new(),
             roles: BTreeMap::new(),
@@ -207,10 +209,20 @@ impl Catalog {
         &self.functions
     }
 
+    pub fn procedures(&self) -> &[Procedure] {
+        &self.procedures
+    }
+
     pub fn get_function(&self, name: &str, argument_types: &[SqlType]) -> Option<&Function> {
         self.functions
             .iter()
             .find(|function| function.name == name && function.argument_types == argument_types)
+    }
+
+    pub fn get_procedure(&self, name: &str, argument_types: &[SqlType]) -> Option<&Procedure> {
+        self.procedures
+            .iter()
+            .find(|procedure| procedure.name == name && procedure.argument_types == argument_types)
     }
 
     pub fn drop_function(
@@ -236,6 +248,20 @@ impl Catalog {
             ));
         }
         Ok(Some(self.functions.remove(position)))
+    }
+
+    pub fn drop_procedure(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+    ) -> Result<Option<Procedure>> {
+        validate_identifier("procedure", name)?;
+        let Some(position) = self.procedures.iter().position(|procedure| {
+            procedure.name == name && procedure.argument_types == argument_types
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(self.procedures.remove(position)))
     }
 
     pub fn operators(&self) -> &[Operator] {
@@ -457,6 +483,36 @@ impl Catalog {
         self.next_function_id += 1;
         self.functions.push(function.clone());
         Ok(function)
+    }
+
+    pub fn register_procedure(
+        &mut self,
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        body: impl Into<String>,
+    ) -> Result<Procedure> {
+        let name = name.into();
+        validate_identifier("procedure", &name)?;
+        if self
+            .procedures
+            .iter()
+            .any(|procedure| procedure.name == name && procedure.argument_types == argument_types)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("procedure already exists: {name}"),
+            ));
+        }
+
+        let procedure = Procedure {
+            procedure_id: FunctionId::new(self.next_function_id),
+            name,
+            argument_types,
+            body: body.into(),
+        };
+        self.next_function_id += 1;
+        self.procedures.push(procedure.clone());
+        Ok(procedure)
     }
 
     pub fn register_operator(&mut self, signature: OperatorSignature) -> Result<Operator> {
@@ -734,6 +790,32 @@ impl Function {
 
     pub fn return_type(&self) -> &SqlType {
         &self.return_type
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Procedure {
+    procedure_id: FunctionId,
+    name: String,
+    argument_types: Vec<SqlType>,
+    body: String,
+}
+
+impl Procedure {
+    pub fn procedure_id(&self) -> FunctionId {
+        self.procedure_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn argument_types(&self) -> &[SqlType] {
+        &self.argument_types
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -1017,7 +1099,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 5;
+    const VERSION: u16 = 6;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1066,6 +1148,17 @@ impl CatalogCodec {
                 encode_sql_type(&mut out, argument_type);
             }
             encode_sql_type(&mut out, &function.return_type);
+        }
+
+        write_u32(&mut out, catalog.procedures.len() as u32);
+        for procedure in &catalog.procedures {
+            write_u64(&mut out, procedure.procedure_id.get());
+            write_string(&mut out, &procedure.name)?;
+            write_u32(&mut out, procedure.argument_types.len() as u32);
+            for argument_type in &procedure.argument_types {
+                encode_sql_type(&mut out, argument_type);
+            }
+            write_string(&mut out, &procedure.body)?;
         }
 
         write_u32(&mut out, catalog.operators.len() as u32);
@@ -1154,6 +1247,7 @@ impl CatalogCodec {
             next_policy_id: reader.read_u64("next policy id")?,
             schemas: BTreeMap::new(),
             functions: Vec::new(),
+            procedures: Vec::new(),
             operators: Vec::new(),
             indexes: Vec::new(),
             roles: BTreeMap::new(),
@@ -1228,6 +1322,24 @@ impl CatalogCodec {
                 name,
                 argument_types,
                 return_type,
+            });
+        }
+
+        let procedure_count = reader.read_u32("procedure count")? as usize;
+        for _ in 0..procedure_count {
+            let procedure_id = FunctionId::new(reader.read_u64("procedure id")?);
+            let name = reader.read_string("procedure name")?;
+            let argument_count = reader.read_u32("procedure argument count")? as usize;
+            let mut argument_types = Vec::with_capacity(argument_count);
+            for _ in 0..argument_count {
+                argument_types.push(decode_sql_type(&mut reader)?);
+            }
+            let body = reader.read_string("procedure body")?;
+            catalog.procedures.push(Procedure {
+                procedure_id,
+                name,
+                argument_types,
+                body,
             });
         }
 

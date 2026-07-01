@@ -148,6 +148,11 @@ pub enum LogicalPlan {
         argument_types: Vec<SqlType>,
         if_exists: bool,
     },
+    DropProcedure {
+        name: String,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
     DropOperator {
         symbol: String,
         left_type: SqlType,
@@ -167,6 +172,12 @@ pub enum LogicalPlan {
         name: String,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
+    },
+    CreateProcedure {
+        name: String,
+        argument_types: Vec<SqlType>,
+        body: String,
         if_not_exists: bool,
     },
     CreateOperator {
@@ -349,6 +360,15 @@ impl LogicalPlanner {
                 argument_types: argument_types.clone(),
                 if_exists: *if_exists,
             }),
+            BoundStatement::DropProcedure {
+                name,
+                argument_types,
+                if_exists,
+            } => Ok(LogicalPlan::DropProcedure {
+                name: name.as_str().to_string(),
+                argument_types: argument_types.clone(),
+                if_exists: *if_exists,
+            }),
             BoundStatement::DropOperator {
                 symbol,
                 left_type,
@@ -473,6 +493,17 @@ impl LogicalPlanner {
                 name: name.as_str().to_string(),
                 argument_types: argument_types.clone(),
                 return_type: return_type.clone(),
+                if_not_exists: *if_not_exists,
+            }),
+            BoundStatement::CreateProcedure {
+                name,
+                argument_types,
+                body,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateProcedure {
+                name: name.as_str().to_string(),
+                argument_types: argument_types.clone(),
+                body: body.clone(),
                 if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreateOperator { signature } => Ok(LogicalPlan::CreateOperator {
@@ -1011,6 +1042,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 sql_type_list(argument_types)
             ));
         }
+        LogicalPlan::DropProcedure {
+            name,
+            argument_types,
+            if_exists,
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropProcedure name={name} args={} if_exists={if_exists}\n",
+                sql_type_list(argument_types)
+            ));
+        }
         LogicalPlan::DropOperator {
             symbol,
             left_type,
@@ -1048,6 +1089,23 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             };
             out.push_str(&format!(
                 "{prefix}CreateFunction name={name} args={} returns={return_type:?}{}\n",
+                sql_type_list(argument_types),
+                exists
+            ));
+        }
+        LogicalPlan::CreateProcedure {
+            name,
+            argument_types,
+            if_not_exists,
+            ..
+        } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{prefix}CreateProcedure name={name} args={}{}\n",
                 sql_type_list(argument_types),
                 exists
             ));

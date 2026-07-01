@@ -76,6 +76,11 @@ impl<'a> Binder<'a> {
                 argument_types,
                 if_exists,
             } => self.bind_drop_function(name, argument_types, *if_exists),
+            Statement::DropProcedure {
+                name,
+                argument_types,
+                if_exists,
+            } => self.bind_drop_procedure(name, argument_types, *if_exists),
             Statement::DropOperator {
                 symbol,
                 left_type,
@@ -108,6 +113,30 @@ impl<'a> Binder<'a> {
                     name: name.clone(),
                     argument_types: argument_types.clone(),
                     return_type: return_type.clone(),
+                    if_not_exists: *if_not_exists,
+                })
+            }
+            Statement::CreateProcedure {
+                name,
+                argument_types,
+                body,
+                if_not_exists,
+            } => {
+                if self
+                    .catalog
+                    .get_procedure(name.as_str(), argument_types)
+                    .is_some()
+                    && !if_not_exists
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!("procedure already exists: {}", name.as_str()),
+                    ));
+                }
+                Ok(BoundStatement::CreateProcedure {
+                    name: name.clone(),
+                    argument_types: argument_types.clone(),
+                    body: body.clone(),
                     if_not_exists: *if_not_exists,
                 })
             }
@@ -348,6 +377,30 @@ impl<'a> Binder<'a> {
             ));
         }
         Ok(BoundStatement::DropFunction {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            if_exists,
+        })
+    }
+
+    fn bind_drop_procedure(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        if self
+            .catalog
+            .get_procedure(name.as_str(), argument_types)
+            .is_none()
+            && !if_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("procedure does not exist: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::DropProcedure {
             name: name.clone(),
             argument_types: argument_types.to_vec(),
             if_exists,

@@ -579,6 +579,11 @@ pub enum Statement {
         argument_types: Vec<SqlType>,
         if_exists: bool,
     },
+    DropProcedure {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
     DropOperator {
         symbol: String,
         left_type: SqlType,
@@ -598,6 +603,12 @@ pub enum Statement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
+    },
+    CreateProcedure {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        body: String,
         if_not_exists: bool,
     },
     CreateOperator {
@@ -877,6 +888,11 @@ pub enum BoundStatement {
         argument_types: Vec<SqlType>,
         if_exists: bool,
     },
+    DropProcedure {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        if_exists: bool,
+    },
     DropOperator {
         symbol: String,
         left_type: SqlType,
@@ -896,6 +912,12 @@ pub enum BoundStatement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        if_not_exists: bool,
+    },
+    CreateProcedure {
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        body: String,
         if_not_exists: bool,
     },
     CreateOperator {

@@ -117,6 +117,14 @@ impl LocalSession {
                 self.apply_catalog_drop_function(name.as_str(), argument_types, *if_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::DropProcedure {
+                name,
+                argument_types,
+                if_exists,
+            } => {
+                self.apply_catalog_drop_procedure(name.as_str(), argument_types, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             BoundStatement::DropOperator {
                 symbol,
                 left_type,
@@ -165,6 +173,20 @@ impl LocalSession {
                     name.as_str(),
                     argument_types,
                     return_type,
+                    *if_not_exists,
+                )?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::CreateProcedure {
+                name,
+                argument_types,
+                body,
+                if_not_exists,
+            } => {
+                self.apply_catalog_create_procedure(
+                    name.as_str(),
+                    argument_types,
+                    body,
                     *if_not_exists,
                 )?;
                 Ok(CommandOutput::SchemaChanged)
@@ -321,6 +343,22 @@ impl LocalSession {
         }
     }
 
+    fn apply_catalog_drop_procedure(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_procedure(name, argument_types)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::NotFound,
+                format!("procedure does not exist: {name}"),
+            )),
+        }
+    }
+
     fn apply_catalog_drop_operator(
         &mut self,
         symbol: &str,
@@ -414,6 +452,21 @@ impl LocalSession {
         }
         self.catalog
             .register_function(name, argument_types.to_vec(), return_type.clone())?;
+        Ok(())
+    }
+
+    fn apply_catalog_create_procedure(
+        &mut self,
+        name: &str,
+        argument_types: &[SqlType],
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self.catalog.get_procedure(name, argument_types).is_some() && if_not_exists {
+            return Ok(());
+        }
+        self.catalog
+            .register_procedure(name, argument_types.to_vec(), body)?;
         Ok(())
     }
 

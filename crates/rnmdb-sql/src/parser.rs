@@ -119,6 +119,7 @@ impl Parser {
             Some(TokenKind::Index) => self.parse_create_index_tail(unique),
             Some(TokenKind::Table) => self.parse_create_table_tail(),
             Some(TokenKind::Function) => self.parse_create_function_tail(),
+            Some(TokenKind::Procedure) => self.parse_create_procedure_tail(),
             Some(TokenKind::OperatorKeyword) => self.parse_create_operator_tail(),
             Some(TokenKind::Role) => self.parse_create_role_tail(),
             Some(TokenKind::Policy) => self.parse_create_policy_tail(),
@@ -246,6 +247,7 @@ impl Parser {
             Some(TokenKind::Index) => self.parse_drop_index_tail(),
             Some(TokenKind::Table) => self.parse_drop_table_tail(),
             Some(TokenKind::Function) => self.parse_drop_function_tail(),
+            Some(TokenKind::Procedure) => self.parse_drop_procedure_tail(),
             Some(TokenKind::OperatorKeyword) => self.parse_drop_operator_tail(),
             Some(TokenKind::Role) => self.parse_drop_role_tail(),
             Some(TokenKind::Policy) => self.parse_drop_policy_tail(),
@@ -280,6 +282,25 @@ impl Parser {
             types
         };
         Ok(Statement::DropFunction {
+            name,
+            argument_types,
+            if_exists,
+        })
+    }
+
+    fn parse_drop_procedure_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Procedure)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = if self.consume_if(&TokenKind::RightParen) {
+            Vec::new()
+        } else {
+            let types = self.parse_type_list()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            types
+        };
+        Ok(Statement::DropProcedure {
             name,
             argument_types,
             if_exists,
@@ -396,6 +417,28 @@ impl Parser {
             name,
             argument_types,
             return_type,
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_procedure_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Procedure)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = if self.consume_if(&TokenKind::RightParen) {
+            Vec::new()
+        } else {
+            let types = self.parse_type_list()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            types
+        };
+        self.expect_keyword(TokenKind::As)?;
+        let body = self.parse_string_literal("procedure body")?;
+        Ok(Statement::CreateProcedure {
+            name,
+            argument_types,
+            body,
             if_not_exists,
         })
     }
@@ -1605,6 +1648,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Rows, TokenKind::Rows)
             | (TokenKind::Only, TokenKind::Only)
             | (TokenKind::Function, TokenKind::Function)
+            | (TokenKind::Procedure, TokenKind::Procedure)
             | (TokenKind::Returns, TokenKind::Returns)
             | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)
             | (TokenKind::Role, TokenKind::Role)
