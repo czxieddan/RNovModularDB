@@ -60,6 +60,7 @@ impl Parser {
             Some(TokenKind::Alter) => self.parse_alter(),
             Some(TokenKind::Drop) => self.parse_drop(),
             Some(TokenKind::Grant) => self.parse_grant(),
+            Some(TokenKind::Call) => self.parse_call_procedure(),
             Some(TokenKind::Insert) => self.parse_insert(),
             Some(TokenKind::Update) => self.parse_update(),
             Some(TokenKind::Delete) => self.parse_delete(),
@@ -551,6 +552,14 @@ impl Parser {
             table,
             role,
         })
+    }
+
+    fn parse_call_procedure(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Call)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::CallProcedure { name })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -1687,6 +1696,7 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Policy, TokenKind::Policy)
             | (TokenKind::Using, TokenKind::Using)
             | (TokenKind::Execute, TokenKind::Execute)
+            | (TokenKind::Call, TokenKind::Call)
             | (TokenKind::Begin, TokenKind::Begin)
             | (TokenKind::Commit, TokenKind::Commit)
             | (TokenKind::Rollback, TokenKind::Rollback)

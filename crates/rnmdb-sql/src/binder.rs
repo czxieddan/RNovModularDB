@@ -217,6 +217,7 @@ impl<'a> Binder<'a> {
                     privilege: *privilege,
                 })
             }
+            Statement::CallProcedure { name } => self.bind_call_procedure(name),
             Statement::Insert {
                 table,
                 columns,
@@ -633,6 +634,22 @@ impl<'a> Binder<'a> {
                 result_type.clone(),
                 function.function_id(),
             ),
+        })
+    }
+
+    fn bind_call_procedure(&self, name: &Ident) -> Result<BoundStatement> {
+        let procedure = self
+            .catalog
+            .get_procedure(name.as_str(), &[])
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("procedure does not exist: {}", name.as_str()),
+                )
+            })?;
+        Ok(BoundStatement::CallProcedure {
+            name: name.clone(),
+            body: procedure.body().to_string(),
         })
     }
 

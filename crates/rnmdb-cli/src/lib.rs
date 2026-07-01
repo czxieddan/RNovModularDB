@@ -201,6 +201,7 @@ impl LocalSession {
                 )?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::CallProcedure { body, .. } => self.execute(body.as_str()),
             BoundStatement::CreateOperator { signature } => {
                 self.catalog.register_operator(signature.clone())?;
                 Ok(CommandOutput::SchemaChanged)

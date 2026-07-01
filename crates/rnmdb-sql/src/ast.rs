@@ -638,6 +638,9 @@ pub enum Statement {
         table: ObjectName,
         role: Ident,
     },
+    CallProcedure {
+        name: Ident,
+    },
     Insert {
         table: ObjectName,
         columns: Vec<Ident>,
@@ -948,6 +951,10 @@ pub enum BoundStatement {
         role_id: RoleId,
         relation_id: RelationId,
         privilege: Privilege,
+    },
+    CallProcedure {
+        name: Ident,
+        body: String,
     },
     Insert {
         table: ObjectName,

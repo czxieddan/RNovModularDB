@@ -1536,6 +1536,7 @@ fn ddl_description(plan: &LogicalPlan) -> String {
         LogicalPlan::GrantTablePrivilege { relation_id, .. } => {
             format!("GrantTablePrivilege relation={relation_id}")
         }
+        LogicalPlan::CallProcedure { name, .. } => format!("CallProcedure name={name}"),
         _ => "Unsupported".to_string(),
     }
 }
