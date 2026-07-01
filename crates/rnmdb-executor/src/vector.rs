@@ -32,6 +32,11 @@ impl ColumnSchema {
         self
     }
 
+    pub fn with_encrypted(mut self, encrypted: bool) -> Self {
+        self.encrypted = encrypted;
+        self
+    }
+
     pub fn with_generated(mut self, generated: GeneratedColumn) -> Self {
         self.generated = Some(generated);
         self

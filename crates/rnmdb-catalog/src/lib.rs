@@ -455,6 +455,41 @@ impl Catalog {
         Ok(table)
     }
 
+    pub fn set_column_encrypted(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        encrypted: bool,
+    ) -> Result<&Table> {
+        validate_identifier("column", column_name)?;
+        let table = self
+            .schemas
+            .get_mut(schema_name)
+            .and_then(|schema| schema.tables.get_mut(table_name))
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table does not exist: {schema_name}.{table_name}"),
+                )
+            })?;
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| column.name.eq_ignore_ascii_case(column_name))
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {column_name}"),
+                )
+            })?;
+        if column.encrypted != encrypted {
+            column.encrypted = encrypted;
+            table.version += 1;
+        }
+        Ok(table)
+    }
+
     pub fn register_function(
         &mut self,
         name: impl Into<String>,

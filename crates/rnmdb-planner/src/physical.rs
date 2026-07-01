@@ -1518,6 +1518,9 @@ fn ddl_description(plan: &LogicalPlan) -> String {
         LogicalPlan::AlterTableAddColumn { table, column, .. } => {
             format!("AlterTableAddColumn table={table} column={}", column.name)
         }
+        LogicalPlan::AlterColumnEncryption { table, column, .. } => {
+            format!("AlterColumnEncryption table={table} column={column}")
+        }
         LogicalPlan::DropTable { table, .. } => format!("DropTable table={table}"),
         LogicalPlan::DropIndex { name, .. } => format!("DropIndex name={name}"),
         LogicalPlan::DropFunction { name, .. } => format!("DropFunction name={name}"),

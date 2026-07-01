@@ -69,6 +69,11 @@ impl<'a> Binder<'a> {
                     if_not_exists: *if_not_exists,
                 })
             }
+            Statement::AlterColumnEncryption {
+                table,
+                column,
+                encrypted,
+            } => self.bind_alter_column_encryption(table, column, *encrypted),
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
             Statement::DropIndex { name, if_exists } => self.bind_drop_index(name, *if_exists),
             Statement::DropFunction {
@@ -380,6 +385,31 @@ impl<'a> Binder<'a> {
             name: name.clone(),
             argument_types: argument_types.to_vec(),
             if_exists,
+        })
+    }
+
+    fn bind_alter_column_encryption(
+        &self,
+        table: &ObjectName,
+        column: &Ident,
+        encrypted: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        if !resolved
+            .columns()
+            .iter()
+            .any(|existing| existing.name().eq_ignore_ascii_case(column.as_str()))
+        {
+            return Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("column does not exist: {}", column.as_str()),
+            ));
+        }
+        Ok(BoundStatement::AlterColumnEncryption {
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            column: column.clone(),
+            encrypted,
         })
     }
 

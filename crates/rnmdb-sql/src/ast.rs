@@ -566,6 +566,11 @@ pub enum Statement {
         column: ColumnDef,
         if_not_exists: bool,
     },
+    AlterColumnEncryption {
+        table: ObjectName,
+        column: Ident,
+        encrypted: bool,
+    },
     DropTable {
         name: ObjectName,
         if_exists: bool,
@@ -873,6 +878,12 @@ pub enum BoundStatement {
         table: ObjectName,
         column: ColumnDef,
         if_not_exists: bool,
+    },
+    AlterColumnEncryption {
+        relation_id: RelationId,
+        table: ObjectName,
+        column: Ident,
+        encrypted: bool,
     },
     DropTable {
         relation_id: Option<RelationId>,

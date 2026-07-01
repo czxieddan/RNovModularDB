@@ -134,6 +134,12 @@ pub enum LogicalPlan {
         column: ColumnDef,
         if_not_exists: bool,
     },
+    AlterColumnEncryption {
+        relation_id: RelationId,
+        table: String,
+        column: String,
+        encrypted: bool,
+    },
     DropTable {
         relation_id: Option<RelationId>,
         table: String,
@@ -337,6 +343,17 @@ impl LogicalPlanner {
                 table: object_name(table),
                 column: column.clone(),
                 if_not_exists: *if_not_exists,
+            }),
+            BoundStatement::AlterColumnEncryption {
+                relation_id,
+                table,
+                column,
+                encrypted,
+            } => Ok(LogicalPlan::AlterColumnEncryption {
+                relation_id: *relation_id,
+                table: object_name(table),
+                column: column.as_str().to_string(),
+                encrypted: *encrypted,
             }),
             BoundStatement::DropTable {
                 relation_id,
@@ -1018,6 +1035,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!(
                 "{prefix}AlterTableAddColumn table={table} column={}{}\n",
                 column.name, exists
+            ));
+        }
+        LogicalPlan::AlterColumnEncryption {
+            table,
+            column,
+            encrypted,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}AlterColumnEncryption table={table} column={column} encrypted={encrypted}\n"
             ));
         }
         LogicalPlan::DropTable {

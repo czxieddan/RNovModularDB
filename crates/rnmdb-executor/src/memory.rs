@@ -582,6 +582,15 @@ impl MemoryTable {
         Ok(())
     }
 
+    fn set_column_encrypted(&mut self, column: &str, encrypted: bool) -> Result<()> {
+        let mut columns = self.columns.clone();
+        let column_index = column_index(&columns, column)?;
+        columns[column_index] = columns[column_index].clone().with_encrypted(encrypted);
+        let _ = VectorBatch::new(columns.clone(), self.rows.clone())?;
+        self.columns = columns;
+        Ok(())
+    }
+
     fn create_index(
         &mut self,
         name: &str,
@@ -2219,6 +2228,18 @@ impl MemoryExecutor {
                     return Ok(ExecutionResult::SchemaChanged);
                 }
                 table.add_column(column_schema_from_def(column))?;
+                Ok(ExecutionResult::SchemaChanged)
+            }
+            LogicalPlan::AlterColumnEncryption {
+                table,
+                column,
+                encrypted,
+                ..
+            } => {
+                let table = self.tables.get_mut(table).ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?;
+                table.set_column_encrypted(column, *encrypted)?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropTable {

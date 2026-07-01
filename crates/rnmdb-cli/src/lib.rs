@@ -156,6 +156,16 @@ impl LocalSession {
                 let plan = self.planner.plan(&bound)?;
                 self.executor.execute_mut(&plan).map(CommandOutput::from)
             }
+            BoundStatement::AlterColumnEncryption {
+                table,
+                column,
+                encrypted,
+                ..
+            } => {
+                self.apply_catalog_set_column_encrypted(table, column.as_str(), *encrypted)?;
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan).map(CommandOutput::from)
+            }
             BoundStatement::DropTable {
                 name, if_exists, ..
             } => {
@@ -425,6 +435,18 @@ impl LocalSession {
         }
         self.catalog
             .add_column(schema, table.object(), column.to_catalog_column())?;
+        Ok(())
+    }
+
+    fn apply_catalog_set_column_encrypted(
+        &mut self,
+        table: &ObjectName,
+        column: &str,
+        encrypted: bool,
+    ) -> Result<()> {
+        let schema = table.schema().unwrap_or("public");
+        self.catalog
+            .set_column_encrypted(schema, table.object(), column, encrypted)?;
         Ok(())
     }
 

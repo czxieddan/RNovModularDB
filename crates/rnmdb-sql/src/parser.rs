@@ -224,6 +224,15 @@ impl Parser {
         self.expect_keyword(TokenKind::Alter)?;
         self.expect_keyword(TokenKind::Table)?;
         let table = self.parse_object_name()?;
+        match self.peek_kind() {
+            Some(TokenKind::Add) => self.parse_alter_add_column_tail(table),
+            Some(TokenKind::Alter) => self.parse_alter_column_encryption_tail(table),
+            Some(kind) => Err(self.error(format!("unexpected ALTER TABLE action {kind:?}"))),
+            None => Err(self.error("expected ALTER TABLE action")),
+        }
+    }
+
+    fn parse_alter_add_column_tail(&mut self, table: ObjectName) -> Result<Statement> {
         self.expect_keyword(TokenKind::Add)?;
         self.expect_keyword(TokenKind::Column)?;
         let if_not_exists = if self.consume_if(&TokenKind::If) {
@@ -238,6 +247,26 @@ impl Parser {
             table,
             column,
             if_not_exists,
+        })
+    }
+
+    fn parse_alter_column_encryption_tail(&mut self, table: ObjectName) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Alter)?;
+        self.expect_keyword(TokenKind::Column)?;
+        let column = self.parse_ident()?;
+        let encrypted = if self.consume_if(&TokenKind::Set) {
+            self.expect_keyword(TokenKind::Encrypted)?;
+            true
+        } else if self.consume_if(&TokenKind::Drop) {
+            self.expect_keyword(TokenKind::Encrypted)?;
+            false
+        } else {
+            return Err(self.error("expected SET ENCRYPTED or DROP ENCRYPTED"));
+        };
+        Ok(Statement::AlterColumnEncryption {
+            table,
+            column,
+            encrypted,
         })
     }
 
