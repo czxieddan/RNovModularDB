@@ -211,6 +211,7 @@ pub enum LogicalPlan {
     CallProcedure {
         name: String,
         body: String,
+        args: Vec<Expr>,
     },
     Transaction {
         action: String,
@@ -561,9 +562,10 @@ impl LogicalPlanner {
                 relation_id: *relation_id,
                 privilege: format!("{privilege:?}"),
             }),
-            BoundStatement::CallProcedure { name, body } => Ok(LogicalPlan::CallProcedure {
+            BoundStatement::CallProcedure { name, body, args } => Ok(LogicalPlan::CallProcedure {
                 name: name.as_str().to_string(),
                 body: body.clone(),
+                args: args.clone(),
             }),
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
@@ -1191,8 +1193,11 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}GrantTablePrivilege role={role_id} relation={relation_id} privilege={privilege}\n"
             ));
         }
-        LogicalPlan::CallProcedure { name, .. } => {
-            out.push_str(&format!("{prefix}CallProcedure name={name}\n"));
+        LogicalPlan::CallProcedure { name, args, .. } => {
+            out.push_str(&format!(
+                "{prefix}CallProcedure name={name} args={}\n",
+                args.len()
+            ));
         }
         LogicalPlan::Transaction { action } => {
             out.push_str(&format!("{prefix}Transaction action={action}\n"));

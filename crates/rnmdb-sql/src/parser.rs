@@ -558,8 +558,14 @@ impl Parser {
         self.expect_keyword(TokenKind::Call)?;
         let name = self.parse_ident()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        self.expect_keyword(TokenKind::RightParen)?;
-        Ok(Statement::CallProcedure { name })
+        let args = if self.consume_if(&TokenKind::RightParen) {
+            Vec::new()
+        } else {
+            let args = self.parse_expr_list()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            args
+        };
+        Ok(Statement::CallProcedure { name, args })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {

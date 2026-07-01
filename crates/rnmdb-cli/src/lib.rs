@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use rnmdb_catalog::{Catalog, IndexKey, OperatorSignature, Privilege, RowPolicy};
 use rnmdb_common::{
-    Result,
+    ErrorKind, Result, RnovError,
     ids::{DatabaseId, RelationId, RoleId},
 };
 use rnmdb_executor::{
@@ -201,7 +201,10 @@ impl LocalSession {
                 )?;
                 Ok(CommandOutput::SchemaChanged)
             }
-            BoundStatement::CallProcedure { body, .. } => self.execute(body.as_str()),
+            BoundStatement::CallProcedure { body, args, .. } => {
+                let expanded = expand_procedure_body(body, args)?;
+                self.execute(expanded.as_str())
+            }
             BoundStatement::CreateOperator { signature } => {
                 self.catalog.register_operator(signature.clone())?;
                 Ok(CommandOutput::SchemaChanged)
@@ -690,6 +693,65 @@ impl Default for LocalExecutionConfig {
             worker_threads: 1,
             min_parallel_rows: 1024,
         }
+    }
+}
+
+fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<String> {
+    let mut expanded = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            expanded.push(ch);
+            while let Some(inner) = chars.next() {
+                expanded.push(inner);
+                if inner == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        expanded.push(chars.next().expect("peeked quote must be present"));
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch != '$' || !chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            expanded.push(ch);
+            continue;
+        }
+
+        let mut raw_index = String::new();
+        while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            raw_index.push(chars.next().expect("peeked digit must be present"));
+        }
+        let index = raw_index.parse::<usize>().map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("procedure parameter ${raw_index} is out of range"),
+            )
+        })?;
+        if index == 0 || index > args.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("procedure parameter ${index} has no argument"),
+            ));
+        }
+        expanded.push_str(procedure_argument_sql_literal(&args[index - 1])?.as_str());
+    }
+    Ok(expanded)
+}
+
+fn procedure_argument_sql_literal(expr: &rnmdb_sql::ast::Expr) -> Result<String> {
+    match expr {
+        rnmdb_sql::ast::Expr::Integer(value) => Ok(value.to_string()),
+        rnmdb_sql::ast::Expr::String(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+        rnmdb_sql::ast::Expr::Bool(true) => Ok("TRUE".to_string()),
+        rnmdb_sql::ast::Expr::Bool(false) => Ok("FALSE".to_string()),
+        rnmdb_sql::ast::Expr::Null => Ok("NULL".to_string()),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "procedure arguments must be literal values",
+        )),
     }
 }
 

@@ -640,6 +640,7 @@ pub enum Statement {
     },
     CallProcedure {
         name: Ident,
+        args: Vec<Expr>,
     },
     Insert {
         table: ObjectName,
@@ -955,6 +956,7 @@ pub enum BoundStatement {
     CallProcedure {
         name: Ident,
         body: String,
+        args: Vec<Expr>,
     },
     Insert {
         table: ObjectName,

@@ -218,7 +218,7 @@ impl<'a> Binder<'a> {
                     privilege: *privilege,
                 })
             }
-            Statement::CallProcedure { name } => self.bind_call_procedure(name),
+            Statement::CallProcedure { name, args } => self.bind_call_procedure(name, args),
             Statement::Insert {
                 table,
                 columns,
@@ -638,10 +638,14 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn bind_call_procedure(&self, name: &Ident) -> Result<BoundStatement> {
+    fn bind_call_procedure(&self, name: &Ident, args: &[Expr]) -> Result<BoundStatement> {
+        let argument_types = args
+            .iter()
+            .map(procedure_argument_type)
+            .collect::<Result<Vec<_>>>()?;
         let procedure = self
             .catalog
-            .get_procedure(name.as_str(), &[])
+            .get_procedure(name.as_str(), &argument_types)
             .ok_or_else(|| {
                 RnovError::new(
                     ErrorKind::NotFound,
@@ -652,6 +656,7 @@ impl<'a> Binder<'a> {
         Ok(BoundStatement::CallProcedure {
             name: name.clone(),
             body: procedure.body().to_string(),
+            args: args.to_vec(),
         })
     }
 
@@ -4911,7 +4916,7 @@ fn unique_column_name(existing_columns: &[BoundColumn], base_name: &str) -> Stri
 
 fn validate_sql_procedure_body(body: &str) -> Result<()> {
     if matches!(
-        parse_statement(body)?,
+        parse_statement(procedure_body_parse_probe(body).as_str())?,
         Statement::Transaction {
             action: TransactionAction::Begin
                 | TransactionAction::Commit
@@ -4924,4 +4929,33 @@ fn validate_sql_procedure_body(body: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn procedure_argument_type(expr: &Expr) -> Result<SqlType> {
+    match expr {
+        Expr::Integer(_) => Ok(SqlType::Int64),
+        Expr::String(_) => Ok(SqlType::Text),
+        Expr::Bool(_) => Ok(SqlType::Bool),
+        Expr::Null => Ok(SqlType::Null),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "procedure arguments must be literal values",
+        )),
+    }
+}
+
+fn procedure_body_parse_probe(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' || !chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            out.push(ch);
+            continue;
+        }
+        while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+            let _ = chars.next();
+        }
+        out.push_str("NULL");
+    }
+    out
 }
