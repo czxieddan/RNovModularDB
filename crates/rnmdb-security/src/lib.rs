@@ -1,15 +1,22 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
+use chacha20poly1305::{
+    ChaCha20Poly1305, Key, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
+use hmac::{Hmac, Mac};
 use rand_core::OsRng;
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{InstanceId, RelationId, RoleId},
 };
 use sha2::{Digest, Sha256};
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuditEventKind {
@@ -30,6 +37,7 @@ pub enum ObjectPrivilege {
     Update,
     Delete,
     Execute,
+    Decrypt,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +185,13 @@ struct RelationGrant {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ColumnDecryptGrant {
+    role_id: RoleId,
+    relation_id: RelationId,
+    column_name: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct DefaultPrivilegeRule {
     schema_name: String,
     role_id: RoleId,
@@ -307,6 +322,416 @@ impl AccessControl {
             self.grant_relation_privilege(rule.role_id, relation_id, rule.privilege);
         }
         Ok(rules)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnKeyId(u64);
+
+impl ColumnKeyId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ColumnKeyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "colkey:{}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ColumnKeyMaterial([u8; 32]);
+
+impl ColumnKeyMaterial {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    fn to_key(self) -> Key {
+        Key::try_from(&self.0[..]).expect("ColumnKeyMaterial is always 32 bytes")
+    }
+}
+
+impl std::fmt::Debug for ColumnKeyMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ColumnKeyMaterial")
+            .field(&"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedColumnKey {
+    key_id: ColumnKeyId,
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    authentication_tag: [u8; 32],
+}
+
+impl WrappedColumnKey {
+    pub fn key_id(&self) -> ColumnKeyId {
+        self.key_id
+    }
+
+    pub fn nonce(&self) -> [u8; 12] {
+        self.nonce
+    }
+
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+
+    pub fn authentication_tag(&self) -> [u8; 32] {
+        self.authentication_tag
+    }
+
+    pub fn verify_authentication_tag(&self, key_encryption_key: &ColumnKeyMaterial) -> bool {
+        wrapped_key_authentication_tag(
+            key_encryption_key,
+            self.key_id,
+            &self.nonce,
+            &self.ciphertext,
+        ) == self.authentication_tag
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnEncryptionMetadata {
+    instance_id: InstanceId,
+    relation_id: RelationId,
+    column_name: String,
+    version: u64,
+    active_key_id: ColumnKeyId,
+    previous_key_id: Option<ColumnKeyId>,
+    created_by: RoleId,
+    rotated_by: Option<RoleId>,
+    wrapped_key: WrappedColumnKey,
+}
+
+impl ColumnEncryptionMetadata {
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    pub fn relation_id(&self) -> RelationId {
+        self.relation_id
+    }
+
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn active_key_id(&self) -> ColumnKeyId {
+        self.active_key_id
+    }
+
+    pub fn previous_key_id(&self) -> Option<ColumnKeyId> {
+        self.previous_key_id
+    }
+
+    pub fn created_by(&self) -> RoleId {
+        self.created_by
+    }
+
+    pub fn rotated_by(&self) -> Option<RoleId> {
+        self.rotated_by
+    }
+
+    pub fn wrapped_key(&self) -> &WrappedColumnKey {
+        &self.wrapped_key
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnDecryptionRequest {
+    role_id: RoleId,
+    relation_id: RelationId,
+    column_name: String,
+}
+
+impl ColumnDecryptionRequest {
+    pub fn new(role_id: RoleId, relation_id: RelationId, column_name: impl Into<String>) -> Self {
+        Self {
+            role_id,
+            relation_id,
+            column_name: column_name.into(),
+        }
+    }
+
+    pub fn role_id(&self) -> RoleId {
+        self.role_id
+    }
+
+    pub fn relation_id(&self) -> RelationId {
+        self.relation_id
+    }
+
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnEncryptionCatalog {
+    instance_id: InstanceId,
+    access: AccessControl,
+    metadata: BTreeMap<ColumnRef, ColumnEncryptionMetadata>,
+    column_decrypt_grants: BTreeSet<ColumnDecryptGrant>,
+    next_key_id: u64,
+}
+
+impl ColumnEncryptionCatalog {
+    pub fn new(instance_id: InstanceId) -> Self {
+        Self {
+            instance_id,
+            access: AccessControl::new(),
+            metadata: BTreeMap::new(),
+            column_decrypt_grants: BTreeSet::new(),
+            next_key_id: 1,
+        }
+    }
+
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
+    }
+
+    pub fn create_column_key(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        owner_role_id: RoleId,
+        data_encryption_key: ColumnKeyMaterial,
+        key_encryption_key: &ColumnKeyMaterial,
+    ) -> Result<ColumnEncryptionMetadata> {
+        let column_ref = ColumnRef::new(relation_id, column_name)?;
+        if self.metadata.contains_key(&column_ref) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "column encryption key already exists: {}.{}",
+                    relation_id, column_ref.column_name
+                ),
+            ));
+        }
+
+        let key_id = self.allocate_key_id();
+        let wrapped_key = wrap_column_key(
+            self.instance_id,
+            relation_id,
+            &column_ref.column_name,
+            1,
+            key_id,
+            data_encryption_key,
+            key_encryption_key,
+        )?;
+        let metadata = ColumnEncryptionMetadata {
+            instance_id: self.instance_id,
+            relation_id,
+            column_name: column_ref.column_name.clone(),
+            version: 1,
+            active_key_id: key_id,
+            previous_key_id: None,
+            created_by: owner_role_id,
+            rotated_by: None,
+            wrapped_key,
+        };
+        self.metadata.insert(column_ref, metadata.clone());
+        self.column_decrypt_grants.insert(ColumnDecryptGrant {
+            role_id: owner_role_id,
+            relation_id,
+            column_name: metadata.column_name.clone(),
+        });
+        Ok(metadata)
+    }
+
+    pub fn rotate_column_key(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        rotated_by: RoleId,
+        data_encryption_key: ColumnKeyMaterial,
+        key_encryption_key: &ColumnKeyMaterial,
+    ) -> Result<ColumnEncryptionMetadata> {
+        let column_ref = ColumnRef::new(relation_id, column_name)?;
+        let (version, previous_key_id) = {
+            let metadata = self.column_metadata_by_ref(&column_ref)?;
+            (metadata.version + 1, metadata.active_key_id)
+        };
+        let key_id = self.allocate_key_id();
+        let wrapped_key = wrap_column_key(
+            self.instance_id,
+            relation_id,
+            &column_ref.column_name,
+            version,
+            key_id,
+            data_encryption_key,
+            key_encryption_key,
+        )?;
+        let metadata = self.column_metadata_by_ref_mut(&column_ref)?;
+        metadata.version = version;
+        metadata.previous_key_id = Some(previous_key_id);
+        metadata.active_key_id = key_id;
+        metadata.rotated_by = Some(rotated_by);
+        metadata.wrapped_key = wrapped_key;
+        Ok(metadata.clone())
+    }
+
+    pub fn column_metadata(
+        &self,
+        relation_id: RelationId,
+        column_name: &str,
+    ) -> Option<&ColumnEncryptionMetadata> {
+        let Ok(column_ref) = ColumnRef::new(relation_id, column_name) else {
+            return None;
+        };
+        self.metadata.get(&column_ref)
+    }
+
+    pub fn metadata(&self) -> impl Iterator<Item = &ColumnEncryptionMetadata> {
+        self.metadata.values()
+    }
+
+    pub fn grant_column_decrypt(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        role_id: RoleId,
+    ) -> Result<bool> {
+        let column_ref = ColumnRef::new(relation_id, column_name)?;
+        self.column_metadata_by_ref(&column_ref)?;
+        Ok(self.column_decrypt_grants.insert(ColumnDecryptGrant {
+            role_id,
+            relation_id,
+            column_name: column_ref.column_name,
+        }))
+    }
+
+    pub fn revoke_column_decrypt(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        role_id: RoleId,
+    ) -> Result<bool> {
+        let column_ref = ColumnRef::new(relation_id, column_name)?;
+        self.column_metadata_by_ref(&column_ref)?;
+        Ok(self.column_decrypt_grants.remove(&ColumnDecryptGrant {
+            role_id,
+            relation_id,
+            column_name: column_ref.column_name,
+        }))
+    }
+
+    pub fn grant_relation_privilege(
+        &mut self,
+        role_id: RoleId,
+        relation_id: RelationId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        if privilege == ObjectPrivilege::Decrypt {
+            return false;
+        }
+        self.access
+            .grant_relation_privilege(role_id, relation_id, privilege)
+    }
+
+    pub fn authorize_decrypt(&self, request: ColumnDecryptionRequest) -> bool {
+        let Ok(column_ref) = ColumnRef::new(request.relation_id, request.column_name) else {
+            return false;
+        };
+        self.metadata.contains_key(&column_ref)
+            && self.column_decrypt_grants.contains(&ColumnDecryptGrant {
+                role_id: request.role_id,
+                relation_id: request.relation_id,
+                column_name: column_ref.column_name,
+            })
+    }
+
+    pub fn unwrap_column_key(
+        &self,
+        relation_id: RelationId,
+        column_name: &str,
+        role_id: RoleId,
+        key_encryption_key: &ColumnKeyMaterial,
+    ) -> Result<ColumnKeyMaterial> {
+        let column_ref = ColumnRef::new(relation_id, column_name)?;
+        if !self.authorize_decrypt(ColumnDecryptionRequest::new(
+            role_id,
+            relation_id,
+            column_ref.column_name.as_str(),
+        )) {
+            return Err(RnovError::new(
+                ErrorKind::Security,
+                format!(
+                    "role {role_id} is not authorized to decrypt column {relation_id}.{column_name}"
+                ),
+            ));
+        }
+
+        let metadata = self.column_metadata_by_ref(&column_ref)?;
+        unwrap_column_key(metadata, key_encryption_key)
+    }
+
+    fn allocate_key_id(&mut self) -> ColumnKeyId {
+        let key_id = ColumnKeyId::new(self.next_key_id);
+        self.next_key_id += 1;
+        key_id
+    }
+
+    fn column_metadata_by_ref(&self, column_ref: &ColumnRef) -> Result<&ColumnEncryptionMetadata> {
+        self.metadata.get(column_ref).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!(
+                    "column encryption metadata not found: {}.{}",
+                    column_ref.relation_id, column_ref.column_name
+                ),
+            )
+        })
+    }
+
+    fn column_metadata_by_ref_mut(
+        &mut self,
+        column_ref: &ColumnRef,
+    ) -> Result<&mut ColumnEncryptionMetadata> {
+        self.metadata.get_mut(column_ref).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!(
+                    "column encryption metadata not found: {}.{}",
+                    column_ref.relation_id, column_ref.column_name
+                ),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ColumnRef {
+    relation_id: RelationId,
+    column_name: String,
+}
+
+impl ColumnRef {
+    fn new(relation_id: RelationId, column_name: impl Into<String>) -> Result<Self> {
+        let column_name = column_name.into();
+        validate_column_name(&column_name)?;
+        Ok(Self {
+            relation_id,
+            column_name,
+        })
     }
 }
 
@@ -752,6 +1177,16 @@ fn validate_schema_name(schema_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_column_name(column_name: &str) -> Result<()> {
+    if column_name.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "column name cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
 fn grant_relation_owner_privileges(
     access: &mut AccessControl,
     owner_role_id: RoleId,
@@ -769,6 +1204,148 @@ fn relation_owner_privileges() -> [ObjectPrivilege; 4] {
         ObjectPrivilege::Update,
         ObjectPrivilege::Delete,
     ]
+}
+
+fn wrap_column_key(
+    instance_id: InstanceId,
+    relation_id: RelationId,
+    column_name: &str,
+    version: u64,
+    key_id: ColumnKeyId,
+    data_encryption_key: ColumnKeyMaterial,
+    key_encryption_key: &ColumnKeyMaterial,
+) -> Result<WrappedColumnKey> {
+    let nonce = column_key_nonce(instance_id, relation_id, version, key_id);
+    let aad = column_key_associated_data(instance_id, relation_id, column_name, version, key_id);
+    let key = key_encryption_key.to_key();
+    let nonce_value = Nonce::try_from(&nonce[..]).expect("column key nonce is always 12 bytes");
+    let cipher = ChaCha20Poly1305::new(&key);
+    let ciphertext = cipher
+        .encrypt(
+            &nonce_value,
+            Payload {
+                msg: &data_encryption_key.as_bytes(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| RnovError::new(ErrorKind::Security, "column key wrapping failed"))?;
+    let authentication_tag =
+        wrapped_key_authentication_tag(key_encryption_key, key_id, &nonce, &ciphertext);
+    Ok(WrappedColumnKey {
+        key_id,
+        nonce,
+        ciphertext,
+        authentication_tag,
+    })
+}
+
+fn unwrap_column_key(
+    metadata: &ColumnEncryptionMetadata,
+    key_encryption_key: &ColumnKeyMaterial,
+) -> Result<ColumnKeyMaterial> {
+    if !metadata
+        .wrapped_key
+        .verify_authentication_tag(key_encryption_key)
+    {
+        return Err(RnovError::new(
+            ErrorKind::Security,
+            "column key authentication failed",
+        ));
+    }
+
+    let aad = column_key_associated_data(
+        metadata.instance_id,
+        metadata.relation_id,
+        &metadata.column_name,
+        metadata.version,
+        metadata.active_key_id,
+    );
+    let key = key_encryption_key.to_key();
+    let nonce = Nonce::try_from(&metadata.wrapped_key.nonce[..])
+        .expect("column key nonce is always 12 bytes");
+    let cipher = ChaCha20Poly1305::new(&key);
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: &metadata.wrapped_key.ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| {
+            RnovError::new(
+                ErrorKind::Security,
+                "column key authentication failed during unwrap",
+            )
+        })?;
+    let bytes: [u8; 32] = plaintext.try_into().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "column key plaintext length is invalid",
+        )
+    })?;
+    Ok(ColumnKeyMaterial::from_bytes(bytes))
+}
+
+fn column_key_nonce(
+    instance_id: InstanceId,
+    relation_id: RelationId,
+    version: u64,
+    key_id: ColumnKeyId,
+) -> [u8; 12] {
+    let digest = column_key_nonce_digest(instance_id, relation_id, version, key_id);
+    let mut nonce = [0_u8; 12];
+    nonce.copy_from_slice(&digest[..12]);
+    nonce
+}
+
+fn column_key_nonce_digest(
+    instance_id: InstanceId,
+    relation_id: RelationId,
+    version: u64,
+    key_id: ColumnKeyId,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"RNOVDB-COLUMN-KEY-NONCE-V1");
+    hasher.update(instance_id.get().to_be_bytes());
+    hasher.update(relation_id.get().to_be_bytes());
+    hasher.update(version.to_be_bytes());
+    hasher.update(key_id.get().to_be_bytes());
+    hasher.finalize().into()
+}
+
+fn column_key_associated_data(
+    instance_id: InstanceId,
+    relation_id: RelationId,
+    column_name: &str,
+    version: u64,
+    key_id: ColumnKeyId,
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(64 + column_name.len());
+    aad.extend_from_slice(b"RNOVDB-COLUMN-KEY-WRAP-V1");
+    aad.extend_from_slice(&instance_id.get().to_be_bytes());
+    aad.extend_from_slice(&relation_id.get().to_be_bytes());
+    aad.extend_from_slice(&version.to_be_bytes());
+    aad.extend_from_slice(&key_id.get().to_be_bytes());
+    aad.extend_from_slice(&(column_name.len() as u64).to_be_bytes());
+    aad.extend_from_slice(column_name.as_bytes());
+    aad
+}
+
+fn wrapped_key_authentication_tag(
+    key_encryption_key: &ColumnKeyMaterial,
+    key_id: ColumnKeyId,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(&key_encryption_key.as_bytes())
+        .expect("HMAC-SHA256 accepts 32-byte column key material");
+    mac.update(b"RNOVDB-COLUMN-KEY-AUTH-V1");
+    mac.update(&key_id.get().to_be_bytes());
+    mac.update(nonce);
+    mac.update(&(ciphertext.len() as u64).to_be_bytes());
+    mac.update(ciphertext);
+    mac.finalize().into_bytes().into()
 }
 
 fn hash_password(password: &str) -> Result<String> {
