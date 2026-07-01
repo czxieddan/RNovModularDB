@@ -482,25 +482,53 @@ pub enum HybridState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HybridSyncTarget {
+    Memory,
+    Disk,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwitchDataMovement {
+    MetadataOnly,
+    PreSynchronized,
+    FullDataMovement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HybridSyncStatus {
     state: HybridState,
+    active_target: HybridSyncTarget,
     dirty_pages: usize,
+    dirty_bytes: usize,
     mirrored_pages: usize,
     estimated_flush_bytes: usize,
+    memory_lsn: u64,
+    disk_lsn: u64,
+    last_mirrored_lsn: u64,
 }
 
 impl HybridSyncStatus {
     pub const fn new(
         state: HybridState,
+        active_target: HybridSyncTarget,
         dirty_pages: usize,
+        dirty_bytes: usize,
         mirrored_pages: usize,
         estimated_flush_bytes: usize,
+        memory_lsn: u64,
+        disk_lsn: u64,
+        last_mirrored_lsn: u64,
     ) -> Self {
         Self {
             state,
+            active_target,
             dirty_pages,
+            dirty_bytes,
             mirrored_pages,
             estimated_flush_bytes,
+            memory_lsn,
+            disk_lsn,
+            last_mirrored_lsn,
         }
     }
 
@@ -512,6 +540,10 @@ impl HybridSyncStatus {
         self.dirty_pages
     }
 
+    pub const fn dirty_bytes(self) -> usize {
+        self.dirty_bytes
+    }
+
     pub const fn mirrored_pages(self) -> usize {
         self.mirrored_pages
     }
@@ -520,8 +552,40 @@ impl HybridSyncStatus {
         self.estimated_flush_bytes
     }
 
+    pub const fn memory_lsn(self) -> u64 {
+        self.memory_lsn
+    }
+
+    pub const fn disk_lsn(self) -> u64 {
+        self.disk_lsn
+    }
+
+    pub const fn last_mirrored_lsn(self) -> u64 {
+        self.last_mirrored_lsn
+    }
+
     pub const fn can_switch_to_disk_in_millis(self) -> bool {
-        matches!(self.state, HybridState::HybridReady) && self.dirty_pages == 0
+        matches!(
+            self.switch_data_movement(HybridSyncTarget::Disk),
+            SwitchDataMovement::MetadataOnly | SwitchDataMovement::PreSynchronized
+        )
+    }
+
+    pub const fn switch_data_movement(self, target: HybridSyncTarget) -> SwitchDataMovement {
+        if matches!(
+            (self.active_target, target),
+            (HybridSyncTarget::Memory, HybridSyncTarget::Memory)
+                | (HybridSyncTarget::Disk, HybridSyncTarget::Disk)
+        ) {
+            return SwitchDataMovement::MetadataOnly;
+        }
+        if matches!(self.state, HybridState::HybridReady)
+            && self.dirty_pages == 0
+            && self.memory_lsn == self.disk_lsn
+        {
+            return SwitchDataMovement::PreSynchronized;
+        }
+        SwitchDataMovement::FullDataMovement
     }
 }
 
@@ -531,6 +595,14 @@ pub struct HybridBackend {
     disk: Arc<dyn StorageBackend>,
     dirty_pages: Arc<RwLock<BTreeSet<PageId>>>,
     mirrored_pages: Arc<RwLock<BTreeSet<PageId>>>,
+    lsn_status: Arc<RwLock<HybridLsnStatus>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HybridLsnStatus {
+    memory_lsn: u64,
+    disk_lsn: u64,
+    last_mirrored_lsn: u64,
 }
 
 impl HybridBackend {
@@ -550,12 +622,15 @@ impl HybridBackend {
             disk,
             dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
             mirrored_pages: Arc::new(RwLock::new(BTreeSet::new())),
+            lsn_status: Arc::new(RwLock::new(HybridLsnStatus::default())),
         })
     }
 
     pub fn sync_status(&self) -> Result<HybridSyncStatus> {
         let dirty_pages = self.read_dirty_pages()?.len();
         let mirrored_pages = self.read_mirrored_pages()?.len();
+        let dirty_bytes = dirty_pages.saturating_mul(self.memory.page_size().bytes());
+        let lsn_status = self.read_lsn_status()?;
         let state = if dirty_pages == 0 {
             HybridState::HybridReady
         } else {
@@ -563,9 +638,14 @@ impl HybridBackend {
         };
         Ok(HybridSyncStatus::new(
             state,
+            HybridSyncTarget::Memory,
             dirty_pages,
+            dirty_bytes,
             mirrored_pages,
-            dirty_pages.saturating_mul(self.memory.page_size().bytes()),
+            dirty_bytes,
+            lsn_status.memory_lsn,
+            lsn_status.disk_lsn,
+            lsn_status.last_mirrored_lsn,
         ))
     }
 
@@ -604,6 +684,19 @@ impl HybridBackend {
             )
         })
     }
+
+    fn read_lsn_status(&self) -> Result<HybridLsnStatus> {
+        self.lsn_status
+            .read()
+            .map(|status| *status)
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "hybrid backend LSN lock poisoned"))
+    }
+
+    fn write_lsn_status(&self) -> Result<std::sync::RwLockWriteGuard<'_, HybridLsnStatus>> {
+        self.lsn_status
+            .write()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "hybrid backend LSN lock poisoned"))
+    }
 }
 
 impl StorageBackend for HybridBackend {
@@ -616,8 +709,11 @@ impl StorageBackend for HybridBackend {
 
     fn write_page(&self, page: Page) -> Result<()> {
         let page_id = page.id();
+        let page_lsn = page.header().lsn();
         self.memory.write_page(page)?;
         self.write_dirty_pages()?.insert(page_id);
+        let mut lsn_status = self.write_lsn_status()?;
+        lsn_status.memory_lsn = lsn_status.memory_lsn.max(page_lsn);
         Ok(())
     }
 
@@ -639,6 +735,11 @@ impl StorageBackend for HybridBackend {
                 mirrored_pages.insert(*page_id);
                 self.memory.mark_clean(*page_id)?;
             }
+        }
+        {
+            let mut lsn_status = self.write_lsn_status()?;
+            lsn_status.disk_lsn = lsn_status.memory_lsn;
+            lsn_status.last_mirrored_lsn = lsn_status.memory_lsn;
         }
 
         Ok(SyncStatus::new(
