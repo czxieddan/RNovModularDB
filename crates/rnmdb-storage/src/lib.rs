@@ -544,6 +544,10 @@ impl HybridSyncStatus {
         self.state
     }
 
+    pub const fn active_target(self) -> HybridSyncTarget {
+        self.active_target
+    }
+
     pub const fn dirty_pages(self) -> usize {
         self.dirty_pages
     }
@@ -594,6 +598,46 @@ impl HybridSyncStatus {
             return SwitchDataMovement::PreSynchronized;
         }
         SwitchDataMovement::FullDataMovement
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridWarmupReport {
+    requested_pages: usize,
+    warmed_pages: usize,
+    missing_pages: usize,
+    memory_resident_pages: usize,
+}
+
+impl HybridWarmupReport {
+    pub const fn new(
+        requested_pages: usize,
+        warmed_pages: usize,
+        missing_pages: usize,
+        memory_resident_pages: usize,
+    ) -> Self {
+        Self {
+            requested_pages,
+            warmed_pages,
+            missing_pages,
+            memory_resident_pages,
+        }
+    }
+
+    pub const fn requested_pages(self) -> usize {
+        self.requested_pages
+    }
+
+    pub const fn warmed_pages(self) -> usize {
+        self.warmed_pages
+    }
+
+    pub const fn missing_pages(self) -> usize {
+        self.missing_pages
+    }
+
+    pub const fn memory_resident_pages(self) -> usize {
+        self.memory_resident_pages
     }
 }
 
@@ -657,6 +701,67 @@ impl HybridBackend {
         }
         *self.write_active_target()? = target;
         Ok(movement)
+    }
+
+    pub fn warmup_pages<I>(&self, page_ids: I) -> Result<HybridWarmupReport>
+    where
+        I: IntoIterator<Item = PageId>,
+    {
+        let requested_pages = page_ids.into_iter().collect::<BTreeSet<_>>();
+
+        {
+            let dirty_pages = self.read_dirty_pages()?;
+            if let Some(page_id) = requested_pages
+                .iter()
+                .find(|page_id| dirty_pages.contains(page_id))
+            {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot warm up dirty page {}", page_id.get()),
+                ));
+            }
+        }
+
+        let mut warmed_pages = 0_usize;
+        let mut missing_pages = 0_usize;
+        let mut max_warmed_lsn = 0_u64;
+
+        for page_id in &requested_pages {
+            let Some(page) = self.disk.read_page(*page_id)? else {
+                missing_pages += 1;
+                continue;
+            };
+            let page_lsn = page.header().lsn();
+            self.memory.write_page(page)?;
+            self.memory.mark_clean(*page_id)?;
+            self.write_dirty_pages()?.remove(page_id);
+            self.write_mirrored_pages()?.insert(*page_id);
+            max_warmed_lsn = max_warmed_lsn.max(page_lsn);
+            warmed_pages += 1;
+        }
+
+        if warmed_pages > 0 {
+            let mut lsn_status = self.write_lsn_status()?;
+            lsn_status.memory_lsn = lsn_status.memory_lsn.max(max_warmed_lsn);
+            lsn_status.disk_lsn = lsn_status.disk_lsn.max(max_warmed_lsn);
+            lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(max_warmed_lsn);
+        }
+
+        Ok(HybridWarmupReport::new(
+            requested_pages.len(),
+            warmed_pages,
+            missing_pages,
+            self.read_mirrored_pages()?.len(),
+        ))
+    }
+
+    pub fn promote_working_set_to_memory<I>(&self, page_ids: I) -> Result<HybridWarmupReport>
+    where
+        I: IntoIterator<Item = PageId>,
+    {
+        let report = self.warmup_pages(page_ids)?;
+        self.switch_active_target(HybridSyncTarget::Memory)?;
+        Ok(report)
     }
 
     pub fn sync_status(&self) -> Result<HybridSyncStatus> {
