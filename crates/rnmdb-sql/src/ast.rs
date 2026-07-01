@@ -622,6 +622,10 @@ pub enum Statement {
         right_type: SqlType,
         result_type: SqlType,
         function: Ident,
+        precedence: Option<u8>,
+        commutator: Option<String>,
+        negator: Option<String>,
+        selectivity: Option<Ident>,
     },
     CreateRole {
         name: Ident,

@@ -192,6 +192,10 @@ pub enum LogicalPlan {
         right_type: SqlType,
         result_type: SqlType,
         function_id: FunctionId,
+        precedence: Option<u8>,
+        commutator: Option<String>,
+        negator: Option<String>,
+        selectivity_function_id: Option<FunctionId>,
     },
     CreateRole {
         name: String,
@@ -534,6 +538,10 @@ impl LogicalPlanner {
                 right_type: signature.right_type().clone(),
                 result_type: signature.result_type().clone(),
                 function_id: signature.function_id(),
+                precedence: signature.precedence(),
+                commutator: signature.commutator().map(str::to_string),
+                negator: signature.negator().map(str::to_string),
+                selectivity_function_id: signature.selectivity_function_id(),
             }),
             BoundStatement::CreateRole {
                 name,
@@ -1153,9 +1161,27 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             right_type,
             result_type,
             function_id,
+            precedence,
+            commutator,
+            negator,
+            selectivity_function_id,
         } => {
+            let precedence = precedence
+                .map(|value| format!(" precedence={value}"))
+                .unwrap_or_default();
+            let commutator = commutator
+                .as_ref()
+                .map(|value| format!(" commutator={value}"))
+                .unwrap_or_default();
+            let negator = negator
+                .as_ref()
+                .map(|value| format!(" negator={value}"))
+                .unwrap_or_default();
+            let selectivity = selectivity_function_id
+                .map(|value| format!(" selectivity={value}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}\n"
+                "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}{precedence}{commutator}{negator}{selectivity}\n"
             ));
         }
         LogicalPlan::CreateRole {

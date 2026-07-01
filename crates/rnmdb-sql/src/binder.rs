@@ -152,12 +152,20 @@ impl<'a> Binder<'a> {
                 right_type,
                 result_type,
                 function,
+                precedence,
+                commutator,
+                negator,
+                selectivity,
             } => self.bind_create_operator(
                 symbol,
                 left_type,
                 right_type,
                 result_type,
                 function.as_str(),
+                *precedence,
+                commutator.as_deref(),
+                negator.as_deref(),
+                selectivity.as_ref().map(Ident::as_str),
             ),
             Statement::CreateRole {
                 name,
@@ -609,6 +617,10 @@ impl<'a> Binder<'a> {
         right_type: &SqlType,
         result_type: &SqlType,
         function_name: &str,
+        precedence: Option<u8>,
+        commutator: Option<&str>,
+        negator: Option<&str>,
+        selectivity: Option<&str>,
     ) -> Result<BoundStatement> {
         let argument_types = [left_type.clone(), right_type.clone()];
         let function = self
@@ -626,14 +638,41 @@ impl<'a> Binder<'a> {
                     format!("function does not exist for operator {symbol}: {function_name}"),
                 )
             })?;
+        let selectivity_function_id = if let Some(selectivity) = selectivity {
+            Some(
+                self.catalog
+                    .functions()
+                    .iter()
+                    .find(|function| {
+                        function.name() == selectivity
+                            && function.argument_types() == argument_types
+                            && function.return_type() == &SqlType::Int64
+                    })
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::NotFound,
+                            format!(
+                                "selectivity function does not exist for operator {symbol}: {selectivity}"
+                            ),
+                        )
+                    })?
+                    .function_id(),
+            )
+        } else {
+            None
+        };
 
         Ok(BoundStatement::CreateOperator {
-            signature: OperatorSignature::new(
+            signature: operator_signature_with_metadata(
                 symbol,
                 left_type.clone(),
                 right_type.clone(),
                 result_type.clone(),
                 function.function_id(),
+                precedence,
+                commutator,
+                negator,
+                selectivity_function_id,
             ),
         })
     }
@@ -4632,6 +4671,34 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
     } else {
         None
     }
+}
+
+fn operator_signature_with_metadata(
+    symbol: &str,
+    left_type: SqlType,
+    right_type: SqlType,
+    result_type: SqlType,
+    function_id: rnmdb_common::ids::FunctionId,
+    precedence: Option<u8>,
+    commutator: Option<&str>,
+    negator: Option<&str>,
+    selectivity_function_id: Option<rnmdb_common::ids::FunctionId>,
+) -> OperatorSignature {
+    let mut signature =
+        OperatorSignature::new(symbol, left_type, right_type, result_type, function_id);
+    if let Some(precedence) = precedence {
+        signature = signature.with_precedence(precedence);
+    }
+    if let Some(commutator) = commutator {
+        signature = signature.with_commutator(commutator);
+    }
+    if let Some(negator) = negator {
+        signature = signature.with_negator(negator);
+    }
+    if let Some(selectivity_function_id) = selectivity_function_id {
+        signature = signature.with_selectivity_function(selectivity_function_id);
+    }
+    signature
 }
 
 fn is_boolean_connector(op: &str) -> bool {

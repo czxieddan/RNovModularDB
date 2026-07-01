@@ -492,6 +492,28 @@ impl Parser {
         self.expect_keyword(TokenKind::Function)?;
         self.expect_operator("=")?;
         let function = self.parse_ident()?;
+        let mut precedence = None;
+        let mut commutator = None;
+        let mut negator = None;
+        let mut selectivity = None;
+        while self.consume_if(&TokenKind::Comma) {
+            let option = self.parse_ident()?;
+            self.expect_operator("=")?;
+            match option.as_str() {
+                "precedence" => {
+                    let value = self.parse_row_count("PRECEDENCE")?;
+                    precedence = Some(u8::try_from(value).map_err(|_| {
+                        self.error("operator precedence must fit in an unsigned byte")
+                    })?);
+                }
+                "commutator" => commutator = Some(self.parse_operator_symbol()?),
+                "negator" => negator = Some(self.parse_operator_symbol()?),
+                "selectivity" => selectivity = Some(self.parse_ident()?),
+                unknown => {
+                    return Err(self.error(format!("unknown operator option {unknown}")));
+                }
+            }
+        }
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(Statement::CreateOperator {
             symbol,
@@ -499,6 +521,10 @@ impl Parser {
             right_type,
             result_type,
             function,
+            precedence,
+            commutator,
+            negator,
+            selectivity,
         })
     }
 

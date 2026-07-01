@@ -861,6 +861,10 @@ pub struct OperatorSignature {
     right_type: SqlType,
     result_type: SqlType,
     function_id: FunctionId,
+    precedence: Option<u8>,
+    commutator: Option<String>,
+    negator: Option<String>,
+    selectivity_function_id: Option<FunctionId>,
 }
 
 impl OperatorSignature {
@@ -877,7 +881,31 @@ impl OperatorSignature {
             right_type,
             result_type,
             function_id,
+            precedence: None,
+            commutator: None,
+            negator: None,
+            selectivity_function_id: None,
         }
+    }
+
+    pub fn with_precedence(mut self, precedence: u8) -> Self {
+        self.precedence = Some(precedence);
+        self
+    }
+
+    pub fn with_commutator(mut self, commutator: impl Into<String>) -> Self {
+        self.commutator = Some(commutator.into());
+        self
+    }
+
+    pub fn with_negator(mut self, negator: impl Into<String>) -> Self {
+        self.negator = Some(negator.into());
+        self
+    }
+
+    pub fn with_selectivity_function(mut self, function_id: FunctionId) -> Self {
+        self.selectivity_function_id = Some(function_id);
+        self
     }
 
     pub fn symbol(&self) -> &str {
@@ -898,6 +926,22 @@ impl OperatorSignature {
 
     pub fn function_id(&self) -> FunctionId {
         self.function_id
+    }
+
+    pub fn precedence(&self) -> Option<u8> {
+        self.precedence
+    }
+
+    pub fn commutator(&self) -> Option<&str> {
+        self.commutator.as_deref()
+    }
+
+    pub fn negator(&self) -> Option<&str> {
+        self.negator.as_deref()
+    }
+
+    pub fn selectivity_function_id(&self) -> Option<FunctionId> {
+        self.selectivity_function_id
     }
 }
 
@@ -1134,7 +1178,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 6;
+    const VERSION: u16 = 7;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1204,6 +1248,22 @@ impl CatalogCodec {
             encode_sql_type(&mut out, &operator.signature.right_type);
             encode_sql_type(&mut out, &operator.signature.result_type);
             write_u64(&mut out, operator.signature.function_id.get());
+            match operator.signature.precedence {
+                Some(precedence) => {
+                    out.push(1);
+                    out.push(precedence);
+                }
+                None => out.push(0),
+            }
+            write_optional_string(&mut out, operator.signature.commutator.as_deref())?;
+            write_optional_string(&mut out, operator.signature.negator.as_deref())?;
+            match operator.signature.selectivity_function_id {
+                Some(function_id) => {
+                    out.push(1);
+                    write_u64(&mut out, function_id.get());
+                }
+                None => out.push(0),
+            }
         }
 
         write_u32(&mut out, catalog.indexes.len() as u32);
@@ -1386,6 +1446,21 @@ impl CatalogCodec {
             let right_type = decode_sql_type(&mut reader)?;
             let result_type = decode_sql_type(&mut reader)?;
             let function_id = FunctionId::new(reader.read_u64("operator function id")?);
+            let precedence = if reader.read_bool("operator precedence present")? {
+                Some(reader.read_u8("operator precedence")?)
+            } else {
+                None
+            };
+            let commutator = reader.read_optional_string("operator commutator")?;
+            let negator = reader.read_optional_string("operator negator")?;
+            let selectivity_function_id =
+                if reader.read_bool("operator selectivity function present")? {
+                    Some(FunctionId::new(
+                        reader.read_u64("operator selectivity function id")?,
+                    ))
+                } else {
+                    None
+                };
             catalog.operators.push(Operator {
                 operator_id,
                 signature: OperatorSignature {
@@ -1394,6 +1469,10 @@ impl CatalogCodec {
                     right_type,
                     result_type,
                     function_id,
+                    precedence,
+                    commutator,
+                    negator,
+                    selectivity_function_id,
                 },
             });
         }
@@ -1499,6 +1578,17 @@ fn write_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
         .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "catalog string is too large"))?;
     write_u32(out, len);
     out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_optional_string(out: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => {
+            out.push(1);
+            write_string(out, value)?;
+        }
+        None => out.push(0),
+    }
     Ok(())
 }
 
@@ -1633,6 +1723,14 @@ impl<'a> CatalogReader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| {
             RnovError::new(ErrorKind::Corruption, format!("{name} is not valid utf-8"))
         })
+    }
+
+    fn read_optional_string(&mut self, name: &'static str) -> Result<Option<String>> {
+        if self.read_bool(name)? {
+            self.read_string(name).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn read_fixed<const N: usize>(&mut self, name: &'static str) -> Result<[u8; N]> {
