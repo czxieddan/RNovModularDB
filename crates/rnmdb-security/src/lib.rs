@@ -1,5 +1,10 @@
 use std::collections::BTreeSet;
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
+use rand_core::OsRng;
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{InstanceId, RelationId, RoleId},
@@ -25,6 +30,143 @@ pub enum ObjectPrivilege {
     Update,
     Delete,
     Execute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPrincipal {
+    username: String,
+    role_id: Option<RoleId>,
+}
+
+impl AuthenticatedPrincipal {
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn role_id(&self) -> Option<RoleId> {
+        self.role_id
+    }
+}
+
+pub trait AuthenticationProvider {
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<AuthenticatedPrincipal>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalCredential {
+    username: String,
+    password_hash: String,
+    role_id: Option<RoleId>,
+    enabled: bool,
+}
+
+impl LocalCredential {
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn password_hash(&self) -> &str {
+        &self.password_hash
+    }
+
+    pub fn role_id(&self) -> Option<RoleId> {
+        self.role_id
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalCredentialStore {
+    credentials: std::collections::BTreeMap<String, LocalCredential>,
+}
+
+impl LocalCredentialStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_user(
+        &mut self,
+        username: impl Into<String>,
+        password: &str,
+        role_id: Option<RoleId>,
+    ) -> Result<()> {
+        let username = username.into();
+        validate_username(&username)?;
+        validate_password(password)?;
+        if self.credentials.contains_key(&username) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("user already exists: {username}"),
+            ));
+        }
+
+        let password_hash = hash_password(password)?;
+        self.credentials.insert(
+            username.clone(),
+            LocalCredential {
+                username,
+                password_hash,
+                role_id,
+                enabled: true,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn credential(&self, username: &str) -> Option<&LocalCredential> {
+        self.credentials.get(username)
+    }
+
+    pub fn credentials(&self) -> impl Iterator<Item = &LocalCredential> {
+        self.credentials.values()
+    }
+
+    pub fn disable_user(&mut self, username: &str) -> bool {
+        self.set_user_enabled(username, false)
+    }
+
+    pub fn enable_user(&mut self, username: &str) -> bool {
+        self.set_user_enabled(username, true)
+    }
+
+    fn set_user_enabled(&mut self, username: &str, enabled: bool) -> bool {
+        let Some(credential) = self.credentials.get_mut(username) else {
+            return false;
+        };
+        credential.enabled = enabled;
+        true
+    }
+}
+
+impl AuthenticationProvider for LocalCredentialStore {
+    fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<AuthenticatedPrincipal>> {
+        let Some(credential) = self.credentials.get(username) else {
+            return Ok(None);
+        };
+        if !credential.enabled {
+            return Ok(None);
+        }
+        if !verify_password(password, &credential.password_hash)? {
+            return Ok(None);
+        }
+
+        Ok(Some(AuthenticatedPrincipal {
+            username: credential.username.clone(),
+            role_id: credential.role_id,
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -494,6 +636,50 @@ fn audit_digest(
     hasher.update(message);
     hasher.update(previous_digest.as_bytes());
     AuditDigest::from_bytes(hasher.finalize().into())
+}
+
+fn validate_username(username: &str) -> Result<()> {
+    if username.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "user name cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_password(password: &str) -> Result<()> {
+    if password.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "password cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(password_hash_error)
+}
+
+fn verify_password(password: &str, password_hash: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(password_hash).map_err(password_hash_error)?;
+    match Argon2::default().verify_password(password.as_bytes(), &parsed) {
+        Ok(()) => Ok(true),
+        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(error) => Err(password_hash_error(error)),
+    }
+}
+
+fn password_hash_error(error: argon2::password_hash::Error) -> RnovError {
+    RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("credential password hash error: {error}"),
+    )
 }
 
 fn audit_kind_tag(kind: &AuditEventKind) -> u8 {
