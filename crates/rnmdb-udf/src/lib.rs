@@ -69,6 +69,98 @@ pub struct UdfSandboxPolicy {
     budget: UdfBudget,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WasmImportCapability {
+    DeterministicHostCall,
+    NondeterministicHostCall,
+    Filesystem,
+    Network,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmModuleDefinition {
+    module_bytes: Vec<u8>,
+    initial_memory_bytes: usize,
+    imports: Vec<WasmImportCapability>,
+}
+
+impl WasmModuleDefinition {
+    pub fn new(
+        module_bytes: Vec<u8>,
+        initial_memory_bytes: usize,
+        imports: Vec<WasmImportCapability>,
+    ) -> Result<Self> {
+        if module_bytes.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm module cannot be empty",
+            ));
+        }
+        if initial_memory_bytes == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm module initial memory must be greater than zero",
+            ));
+        }
+
+        Ok(Self {
+            module_bytes,
+            initial_memory_bytes,
+            imports,
+        })
+    }
+
+    pub fn module_bytes(&self) -> &[u8] {
+        &self.module_bytes
+    }
+
+    pub fn initial_memory_bytes(&self) -> usize {
+        self.initial_memory_bytes
+    }
+
+    pub fn imports(&self) -> &[WasmImportCapability] {
+        &self.imports
+    }
+
+    pub fn validate(&self, policy: &UdfSandboxPolicy) -> Result<()> {
+        let budget = policy.budget();
+        if self.initial_memory_bytes > budget.max_memory_bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm module initial memory exceeds udf memory budget",
+            ));
+        }
+
+        for capability in &self.imports {
+            match capability {
+                WasmImportCapability::Filesystem if !policy.filesystem_allowed() => {
+                    return Err(RnovError::new(
+                        ErrorKind::Security,
+                        "wasm module filesystem imports are not allowed",
+                    ));
+                }
+                WasmImportCapability::Network if !policy.network_allowed() => {
+                    return Err(RnovError::new(
+                        ErrorKind::Security,
+                        "wasm module network imports are not allowed",
+                    ));
+                }
+                WasmImportCapability::NondeterministicHostCall
+                    if policy.deterministic_host_calls() =>
+                {
+                    return Err(RnovError::new(
+                        ErrorKind::Security,
+                        "wasm module imports must be deterministic under this policy",
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl UdfSandboxPolicy {
     pub fn locked_down(budget: UdfBudget) -> Self {
         Self {
@@ -117,6 +209,7 @@ pub struct UdfDefinition {
     return_type: SqlType,
     kind: FunctionKind,
     sandbox_policy: UdfSandboxPolicy,
+    wasm_module: Option<WasmModuleDefinition>,
 }
 
 impl UdfDefinition {
@@ -142,7 +235,27 @@ impl UdfDefinition {
             return_type,
             kind,
             sandbox_policy,
+            wasm_module: None,
         })
+    }
+
+    pub fn new_wasm(
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+        wasm_module: WasmModuleDefinition,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<Self> {
+        wasm_module.validate(&sandbox_policy)?;
+        let mut definition = Self::new(
+            name,
+            argument_types,
+            return_type,
+            FunctionKind::WasmSandbox,
+            sandbox_policy,
+        )?;
+        definition.wasm_module = Some(wasm_module);
+        Ok(definition)
     }
 
     pub fn function_id(&self) -> FunctionId {
@@ -167,6 +280,10 @@ impl UdfDefinition {
 
     pub fn sandbox_policy(&self) -> &UdfSandboxPolicy {
         &self.sandbox_policy
+    }
+
+    pub fn wasm_module(&self) -> Option<&WasmModuleDefinition> {
+        self.wasm_module.as_ref()
     }
 
     fn with_function_id(mut self, function_id: FunctionId) -> Self {
