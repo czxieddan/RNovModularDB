@@ -13,6 +13,8 @@ use crate::ast::{
 };
 use crate::parser::{parse_expr, parse_statement};
 
+const RLS_DENY_DEFAULT_POLICY: &str = "rnmdb_rls_deny_default";
+
 pub struct Binder<'a> {
     catalog: &'a Catalog,
 }
@@ -3551,15 +3553,21 @@ impl<'a> Binder<'a> {
     }
 
     fn applied_row_policy_names(&self, relation_id: RelationId) -> Vec<String> {
-        self.catalog
+        let mut names: Vec<String> = self
+            .catalog
             .row_policies(relation_id)
             .iter()
             .map(|policy| policy.name().to_string())
-            .collect()
+            .collect();
+        if names.is_empty() && self.catalog.row_security_deny_by_default(relation_id) {
+            names.push(RLS_DENY_DEFAULT_POLICY.to_string());
+        }
+        names
     }
 
     fn bind_row_policies(&self, table: &Table) -> Result<Vec<BoundRowPolicy>> {
-        self.catalog
+        let mut policies: Vec<BoundRowPolicy> = self
+            .catalog
             .row_policies(table.relation_id())
             .iter()
             .map(|policy| {
@@ -3570,7 +3578,18 @@ impl<'a> Binder<'a> {
                     predicate,
                 })
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        if policies.is_empty()
+            && self
+                .catalog
+                .row_security_deny_by_default(table.relation_id())
+        {
+            policies.push(BoundRowPolicy {
+                name: RLS_DENY_DEFAULT_POLICY.to_string(),
+                predicate: deny_default_row_policy_predicate(),
+            });
+        }
+        Ok(policies)
     }
 
     fn validate_policy_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
@@ -4671,6 +4690,10 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
     } else {
         None
     }
+}
+
+fn deny_default_row_policy_predicate() -> Expr {
+    Expr::Bool(false)
 }
 
 fn operator_signature_with_metadata(

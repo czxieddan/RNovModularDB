@@ -179,6 +179,7 @@ pub struct Catalog {
     roles: BTreeMap<String, Role>,
     grants: Vec<TableGrant>,
     row_policies: BTreeMap<RelationId, Vec<RowPolicy>>,
+    row_security: BTreeMap<RelationId, RowSecurityMode>,
 }
 
 impl Catalog {
@@ -198,6 +199,7 @@ impl Catalog {
             roles: BTreeMap::new(),
             grants: Vec::new(),
             row_policies: BTreeMap::new(),
+            row_security: BTreeMap::new(),
         }
     }
 
@@ -418,6 +420,7 @@ impl Catalog {
         self.grants
             .retain(|grant| grant.relation_id != table.relation_id);
         self.row_policies.remove(&table.relation_id);
+        self.row_security.remove(&table.relation_id);
         Ok(Some(table))
     }
 
@@ -777,6 +780,33 @@ impl Catalog {
         Ok(Some(policy))
     }
 
+    pub fn enable_row_security(
+        &mut self,
+        relation_id: RelationId,
+        deny_by_default: bool,
+    ) -> Result<()> {
+        self.ensure_relation_exists(relation_id)?;
+        self.row_security
+            .insert(relation_id, RowSecurityMode { deny_by_default });
+        Ok(())
+    }
+
+    pub fn disable_row_security(&mut self, relation_id: RelationId) -> Result<()> {
+        self.ensure_relation_exists(relation_id)?;
+        self.row_security.remove(&relation_id);
+        Ok(())
+    }
+
+    pub fn row_security_enabled(&self, relation_id: RelationId) -> bool {
+        self.row_security.contains_key(&relation_id)
+    }
+
+    pub fn row_security_deny_by_default(&self, relation_id: RelationId) -> bool {
+        self.row_security
+            .get(&relation_id)
+            .is_some_and(|mode| mode.deny_by_default)
+    }
+
     fn ensure_role_exists(&self, role_id: RoleId) -> Result<()> {
         if self.roles.values().any(|role| role.role_id == role_id) {
             return Ok(());
@@ -1043,6 +1073,11 @@ struct TableGrant {
     privilege: Privilege,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RowSecurityMode {
+    deny_by_default: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RowPolicy {
     policy_id: PolicyId,
@@ -1178,7 +1213,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 7;
+    const VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1313,6 +1348,12 @@ impl CatalogCodec {
             }
         }
 
+        write_u32(&mut out, catalog.row_security.len() as u32);
+        for (relation_id, mode) in &catalog.row_security {
+            write_u64(&mut out, relation_id.get());
+            out.push(u8::from(mode.deny_by_default));
+        }
+
         Ok(out)
     }
 
@@ -1348,6 +1389,7 @@ impl CatalogCodec {
             roles: BTreeMap::new(),
             grants: Vec::new(),
             row_policies: BTreeMap::new(),
+            row_security: BTreeMap::new(),
         };
 
         let schema_count = reader.read_u32("schema count")? as usize;
@@ -1547,6 +1589,16 @@ impl CatalogCodec {
                 .entry(policy.relation_id)
                 .or_default()
                 .push(policy);
+        }
+
+        let row_security_count = reader.read_u32("row security count")? as usize;
+        for _ in 0..row_security_count {
+            let relation_id = RelationId::new(reader.read_u64("row security relation id")?);
+            let deny_by_default = reader.read_bool("row security deny by default")?;
+            catalog.ensure_relation_exists(relation_id)?;
+            catalog
+                .row_security
+                .insert(relation_id, RowSecurityMode { deny_by_default });
         }
 
         if !reader.is_complete() {
