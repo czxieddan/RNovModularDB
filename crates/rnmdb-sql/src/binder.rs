@@ -9,9 +9,9 @@ use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
     BoundIntersect, BoundLateralJoin, BoundQuery, BoundRecursiveCte, BoundRowPolicy, BoundSelect,
     BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident,
-    IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement,
+    IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement, TransactionAction,
 };
-use crate::parser::parse_expr;
+use crate::parser::{parse_expr, parse_statement};
 
 pub struct Binder<'a> {
     catalog: &'a Catalog,
@@ -127,6 +127,7 @@ impl<'a> Binder<'a> {
                 body,
                 if_not_exists,
             } => {
+                validate_sql_procedure_body(body)?;
                 if self
                     .catalog
                     .get_procedure(name.as_str(), argument_types)
@@ -647,6 +648,7 @@ impl<'a> Binder<'a> {
                     format!("procedure does not exist: {}", name.as_str()),
                 )
             })?;
+        validate_sql_procedure_body(procedure.body())?;
         Ok(BoundStatement::CallProcedure {
             name: name.clone(),
             body: procedure.body().to_string(),
@@ -4905,4 +4907,21 @@ fn unique_column_name(existing_columns: &[BoundColumn], base_name: &str) -> Stri
         }
     }
     unreachable!("unbounded suffix search must find a unique aggregate column name")
+}
+
+fn validate_sql_procedure_body(body: &str) -> Result<()> {
+    if matches!(
+        parse_statement(body)?,
+        Statement::Transaction {
+            action: TransactionAction::Begin
+                | TransactionAction::Commit
+                | TransactionAction::Rollback
+        }
+    ) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "transaction control is not allowed in SQL procedure bodies",
+        ));
+    }
+    Ok(())
 }
