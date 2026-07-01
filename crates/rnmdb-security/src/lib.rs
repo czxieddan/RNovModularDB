@@ -176,9 +176,45 @@ struct RelationGrant {
     privilege: ObjectPrivilege,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DefaultPrivilegeRule {
+    schema_name: String,
+    role_id: RoleId,
+    privilege: ObjectPrivilege,
+}
+
+impl DefaultPrivilegeRule {
+    pub fn new(
+        schema_name: impl Into<String>,
+        role_id: RoleId,
+        privilege: ObjectPrivilege,
+    ) -> Result<Self> {
+        let schema_name = schema_name.into();
+        validate_schema_name(&schema_name)?;
+        Ok(Self {
+            schema_name,
+            role_id,
+            privilege,
+        })
+    }
+
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    pub fn role_id(&self) -> RoleId {
+        self.role_id
+    }
+
+    pub fn privilege(&self) -> ObjectPrivilege {
+        self.privilege
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AccessControl {
     relation_grants: BTreeSet<RelationGrant>,
+    default_relation_privileges: BTreeSet<DefaultPrivilegeRule>,
 }
 
 impl AccessControl {
@@ -223,6 +259,54 @@ impl AccessControl {
             relation_id,
             privilege,
         })
+    }
+
+    pub fn add_default_relation_privilege(
+        &mut self,
+        schema_name: impl Into<String>,
+        role_id: RoleId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        let Ok(rule) = DefaultPrivilegeRule::new(schema_name, role_id, privilege) else {
+            return false;
+        };
+        self.default_relation_privileges.insert(rule)
+    }
+
+    pub fn revoke_default_relation_privilege(
+        &mut self,
+        schema_name: impl Into<String>,
+        role_id: RoleId,
+        privilege: ObjectPrivilege,
+    ) -> bool {
+        let Ok(rule) = DefaultPrivilegeRule::new(schema_name, role_id, privilege) else {
+            return false;
+        };
+        self.default_relation_privileges.remove(&rule)
+    }
+
+    pub fn default_relation_privileges(&self, schema_name: &str) -> Vec<DefaultPrivilegeRule> {
+        self.default_relation_privileges
+            .iter()
+            .filter(|rule| rule.schema_name == schema_name)
+            .cloned()
+            .collect()
+    }
+
+    pub fn apply_default_relation_privileges(
+        &mut self,
+        schema_name: &str,
+        relation_id: RelationId,
+        owner_role_id: RoleId,
+    ) -> Result<Vec<DefaultPrivilegeRule>> {
+        validate_schema_name(schema_name)?;
+        grant_relation_owner_privileges(self, owner_role_id, relation_id);
+
+        let rules = self.default_relation_privileges(schema_name);
+        for rule in &rules {
+            self.grant_relation_privilege(rule.role_id, relation_id, rule.privilege);
+        }
+        Ok(rules)
     }
 }
 
@@ -656,6 +740,35 @@ fn validate_password(password: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_schema_name(schema_name: &str) -> Result<()> {
+    if schema_name.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "schema name cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn grant_relation_owner_privileges(
+    access: &mut AccessControl,
+    owner_role_id: RoleId,
+    relation_id: RelationId,
+) {
+    for privilege in relation_owner_privileges() {
+        access.grant_relation_privilege(owner_role_id, relation_id, privilege);
+    }
+}
+
+fn relation_owner_privileges() -> [ObjectPrivilege; 4] {
+    [
+        ObjectPrivilege::Select,
+        ObjectPrivilege::Insert,
+        ObjectPrivilege::Update,
+        ObjectPrivilege::Delete,
+    ]
 }
 
 fn hash_password(password: &str) -> Result<String> {
