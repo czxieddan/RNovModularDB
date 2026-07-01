@@ -22,8 +22,9 @@ use rnmdb_sql::{
 };
 use rnmdb_storage::{
     PageCryptoKey, SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
-    SingleFileVerificationReport, backup_single_file, inspect_single_file,
-    restore_single_file_dry_run, verify_single_file, verify_single_file_with_key,
+    SingleFileRestoreReport, SingleFileVerificationReport, backup_single_file, inspect_single_file,
+    restore_single_file, restore_single_file_dry_run, verify_single_file,
+    verify_single_file_with_key,
 };
 use rnmdb_types::SqlType;
 
@@ -897,4 +898,11 @@ pub fn restore_storage_dry_run(
     target: impl AsRef<std::path::Path>,
 ) -> Result<SingleFileRestoreDryRun> {
     restore_single_file_dry_run(backup, target)
+}
+
+pub fn restore_storage(
+    backup: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> Result<SingleFileRestoreReport> {
+    restore_single_file(backup, target)
 }

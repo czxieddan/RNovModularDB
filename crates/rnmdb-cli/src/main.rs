@@ -2,10 +2,10 @@ use std::io::{self, Read};
 
 use rnmdb_cli::{
     CommandOutput, LocalSession, backup_storage, inspect_storage, page_key_from_hex,
-    restore_storage_dry_run, verify_storage, verify_storage_with_key,
+    restore_storage, restore_storage_dry_run, verify_storage, verify_storage_with_key,
 };
 use rnmdb_storage::{
-    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
+    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun, SingleFileRestoreReport,
     SingleFileVerificationReport,
 };
 
@@ -56,6 +56,13 @@ fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
             println!(
                 "{}",
                 format_restore_dry_run(&restore_storage_dry_run(backup, target)?)
+            );
+            Ok(())
+        }
+        [command, backup, target] if command == "restore" => {
+            println!(
+                "{}",
+                format_restore_report(&restore_storage(backup, target)?)
             );
             Ok(())
         }
@@ -147,6 +154,17 @@ fn format_restore_dry_run(report: &SingleFileRestoreDryRun) -> String {
         format!("target_exists: {}", report.target_exists()),
         format!("backup_valid: {}", report.backup_valid()),
         format!("bytes_to_restore: {}", report.bytes_to_restore()),
+        format!("page_record_slots: {}", report.page_record_slots()),
+        format!("present_page_records: {}", report.present_page_records()),
+    ]
+    .join("\n")
+}
+
+fn format_restore_report(report: &SingleFileRestoreReport) -> String {
+    [
+        format!("backup: {}", report.backup_path().display()),
+        format!("target: {}", report.target_path().display()),
+        format!("bytes_restored: {}", report.bytes_restored()),
         format!("page_record_slots: {}", report.page_record_slots()),
         format!("present_page_records: {}", report.present_page_records()),
     ]

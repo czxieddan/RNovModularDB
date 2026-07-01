@@ -1191,6 +1191,15 @@ pub struct SingleFileRestoreDryRun {
     present_page_records: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileRestoreReport {
+    backup_path: PathBuf,
+    target_path: PathBuf,
+    bytes_restored: u64,
+    page_record_slots: u64,
+    present_page_records: u64,
+}
+
 impl SingleFileRestoreDryRun {
     pub fn backup_path(&self) -> &Path {
         &self.backup_path
@@ -1210,6 +1219,28 @@ impl SingleFileRestoreDryRun {
 
     pub fn bytes_to_restore(&self) -> u64 {
         self.bytes_to_restore
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn present_page_records(&self) -> u64 {
+        self.present_page_records
+    }
+}
+
+impl SingleFileRestoreReport {
+    pub fn backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
+    pub fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
+    pub fn bytes_restored(&self) -> u64 {
+        self.bytes_restored
     }
 
     pub fn page_record_slots(&self) -> u64 {
@@ -1745,6 +1776,64 @@ pub fn restore_single_file_dry_run(
         bytes_to_restore: verification.file_len_bytes(),
         page_record_slots: verification.page_record_slots(),
         present_page_records: verification.present_page_records(),
+    })
+}
+
+pub fn restore_single_file(
+    backup: impl AsRef<Path>,
+    target: impl AsRef<Path>,
+) -> Result<SingleFileRestoreReport> {
+    let backup = backup.as_ref();
+    let target = target.as_ref();
+    if backup == target {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "restore backup and target must be different paths",
+        ));
+    }
+    if target.exists() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "restore target already exists",
+        ));
+    }
+
+    let source_inspection = inspect_single_file(backup)?;
+    let mut source = OpenOptions::new().read(true).open(backup).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to open restore backup: {err}"),
+        )
+    })?;
+    let mut destination = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(target)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to create restore target: {err}"),
+            )
+        })?;
+    let bytes_restored = copy(&mut source, &mut destination)
+        .map_err(|err| RnovError::new(ErrorKind::Io, format!("failed to restore bytes: {err}")))?;
+    destination.sync_all().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to sync restore target: {err}"),
+        )
+    })?;
+    drop(destination);
+
+    let target_inspection = inspect_single_file(target)?;
+    validate_backup_copy(&source_inspection, &target_inspection)?;
+
+    Ok(SingleFileRestoreReport {
+        backup_path: backup.to_path_buf(),
+        target_path: target.to_path_buf(),
+        bytes_restored,
+        page_record_slots: target_inspection.page_record_slots(),
+        present_page_records: target_inspection.present_page_records(),
     })
 }
 
