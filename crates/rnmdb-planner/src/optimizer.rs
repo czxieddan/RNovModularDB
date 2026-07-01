@@ -91,6 +91,19 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             left: Box::new(optimize_plan(*left)),
             right: Box::new(optimize_plan(*right)),
         },
+        LogicalPlan::RecursiveCte {
+            name,
+            columns,
+            seed,
+            recursive,
+            query,
+        } => LogicalPlan::RecursiveCte {
+            name,
+            columns,
+            seed: Box::new(optimize_plan(*seed)),
+            recursive: Box::new(optimize_plan(*recursive)),
+            query: Box::new(optimize_plan(*query)),
+        },
         LogicalPlan::Sort { keys, input } => LogicalPlan::Sort {
             keys,
             input: Box::new(optimize_plan(*input)),
@@ -184,6 +197,19 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             all,
             left: Box::new(annotate_parallel(*left, workers)),
             right: Box::new(annotate_parallel(*right, workers)),
+        },
+        LogicalPlan::RecursiveCte {
+            name,
+            columns,
+            seed,
+            recursive,
+            query,
+        } => LogicalPlan::RecursiveCte {
+            name,
+            columns,
+            seed: Box::new(annotate_parallel(*seed, workers)),
+            recursive,
+            query,
         },
         LogicalPlan::Sort { keys, input } => LogicalPlan::Sort {
             keys,

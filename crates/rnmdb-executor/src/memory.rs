@@ -36,6 +36,7 @@ use crate::vector::{ColumnSchema, Row, VectorBatch};
 
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
+const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 
 #[derive(Clone, Debug)]
 pub struct MemoryTable {
@@ -1436,6 +1437,14 @@ impl MemoryExecutor {
                 .ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 }),
+            LogicalPlan::RecursiveScan { name, .. } => {
+                self.tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("recursive CTE is not active: {name}"),
+                    )
+                })
+            }
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(predicate, input, cancellation)?
@@ -1527,6 +1536,20 @@ impl MemoryExecutor {
                 let right = self.execute_cancellable(right, cancellation)?;
                 apply_except_cancellable(left, right, *all, cancellation)
             }
+            LogicalPlan::RecursiveCte {
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+            } => self.execute_recursive_cte_cancellable(
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+                cancellation,
+            ),
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -1545,6 +1568,54 @@ impl MemoryExecutor {
                 "memory executor does not support this logical plan",
             )),
         }
+    }
+
+    fn execute_recursive_cte_cancellable(
+        &self,
+        name: &str,
+        columns: &[String],
+        seed: &LogicalPlan,
+        recursive: &LogicalPlan,
+        query: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let seed = self.execute_cancellable(seed, cancellation)?;
+        let mut accumulated = rename_batch_columns(seed, columns)?;
+        let mut working = accumulated.clone();
+
+        for iteration in 0..RECURSIVE_CTE_MAX_ITERATIONS {
+            cancellation.check()?;
+            if working.rows().is_empty() {
+                break;
+            }
+            let executor = self.with_recursive_table(name, &working)?;
+            let next = executor.execute_cancellable(recursive, cancellation)?;
+            let next = rename_batch_columns(next, columns)?;
+            if next.rows().is_empty() {
+                break;
+            }
+            accumulated = append_batches(accumulated, &next, cancellation)?;
+            working = next;
+            if iteration + 1 == RECURSIVE_CTE_MAX_ITERATIONS {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "recursive CTE {name} exceeded {RECURSIVE_CTE_MAX_ITERATIONS} iterations"
+                    ),
+                ));
+            }
+        }
+
+        let executor = self.with_recursive_table(name, &accumulated)?;
+        executor.execute_cancellable(query, cancellation)
+    }
+
+    fn with_recursive_table(&self, name: &str, batch: &VectorBatch) -> Result<Self> {
+        let mut executor = self.clone();
+        executor
+            .tables
+            .insert(name.to_string(), memory_table_from_batch(batch)?);
+        Ok(executor)
     }
 
     pub fn execute_physical(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
@@ -1944,6 +2015,16 @@ impl MemoryExecutor {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?
                 .scan_parallel_cancellable(config, cancellation),
+            LogicalPlan::RecursiveScan { name, .. } => self
+                .tables
+                .get(name)
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("recursive CTE is not active: {name}"),
+                    )
+                })?
+                .scan_parallel_cancellable(config, cancellation),
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(predicate, input, cancellation)?
@@ -2035,6 +2116,20 @@ impl MemoryExecutor {
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
                 apply_except_cancellable(left, right, *all, cancellation)
             }
+            LogicalPlan::RecursiveCte {
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+            } => self.execute_recursive_cte_cancellable(
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+                cancellation,
+            ),
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_sort_cancellable(batch, keys, cancellation)
@@ -3787,6 +3882,82 @@ fn apply_offset_cancellable(
     let rows = batch.rows().iter().skip(count).cloned().collect();
     cancellation.check()?;
     VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+fn rename_batch_columns(batch: VectorBatch, names: &[String]) -> Result<VectorBatch> {
+    if batch.columns().len() != names.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "recursive CTE column count mismatch: expected {}, got {}",
+                names.len(),
+                batch.columns().len()
+            ),
+        ));
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(names.iter())
+        .map(|(column, name)| renamed_column_schema(column, name))
+        .collect::<Vec<_>>();
+    VectorBatch::new(columns, batch.rows().to_vec())
+}
+
+fn renamed_column_schema(column: &ColumnSchema, name: &str) -> ColumnSchema {
+    let mut renamed = ColumnSchema::new(name, column.data_type().clone());
+    if !column.nullable() {
+        renamed = renamed.not_null();
+    }
+    if column.is_encrypted() {
+        renamed = renamed.encrypted();
+    }
+    if let Some(generated) = column.generated() {
+        renamed = renamed.with_generated(generated.clone());
+    }
+    renamed
+}
+
+fn append_batches(
+    left: VectorBatch,
+    right: &VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    ensure_same_batch_schema(&left, right)?;
+    let mut rows = left.rows().to_vec();
+    rows.reserve(right.rows().len());
+    for row in right.rows() {
+        cancellation.check()?;
+        rows.push(row.clone());
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn ensure_same_batch_schema(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
+    if left.columns().len() != right.columns().len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE batch width changed between iterations",
+        ));
+    }
+    for (left, right) in left.columns().iter().zip(right.columns().iter()) {
+        if left.name() != right.name() || left.data_type() != right.data_type() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE batch schema changed between iterations",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn memory_table_from_batch(batch: &VectorBatch) -> Result<MemoryTable> {
+    let mut table = MemoryTable::new(batch.columns().to_vec())?;
+    for row in batch.rows() {
+        table.insert(row.clone())?;
+    }
+    Ok(table)
 }
 
 fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {

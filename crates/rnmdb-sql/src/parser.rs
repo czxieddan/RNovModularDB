@@ -64,6 +64,7 @@ impl Parser {
             Some(TokenKind::Update) => self.parse_update(),
             Some(TokenKind::Delete) => self.parse_delete(),
             Some(TokenKind::Select) => self.parse_query(),
+            Some(TokenKind::With) => self.parse_recursive_cte(),
             Some(TokenKind::Begin) => self.parse_transaction(TransactionAction::Begin),
             Some(TokenKind::Commit) => self.parse_transaction(TransactionAction::Commit),
             Some(TokenKind::Rollback) => self.parse_transaction(TransactionAction::Rollback),
@@ -685,6 +686,35 @@ impl Parser {
         }
         let tail = self.parse_query_tail()?;
         Ok(apply_query_tail(statement, tail, set_operation))
+    }
+
+    fn parse_recursive_cte(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::With)?;
+        self.expect_keyword(TokenKind::Recursive)?;
+        let name = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let columns = self.parse_ident_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.expect_keyword(TokenKind::As)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let seed = self.parse_select_core()?;
+        self.expect_keyword(TokenKind::Union)?;
+        if !self.consume_if(&TokenKind::All) {
+            return Err(self.error("recursive CTE requires UNION ALL"));
+        }
+        let recursive = self.parse_select_core()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        if columns.is_empty() {
+            return Err(self.error("recursive CTE requires at least one output column"));
+        }
+        let query = self.parse_query()?;
+        Ok(Statement::RecursiveCte {
+            name,
+            columns,
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query: Box::new(query),
+        })
     }
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
@@ -1528,6 +1558,8 @@ fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
             | (TokenKind::Union, TokenKind::Union)
             | (TokenKind::Intersect, TokenKind::Intersect)
             | (TokenKind::Except, TokenKind::Except)
+            | (TokenKind::With, TokenKind::With)
+            | (TokenKind::Recursive, TokenKind::Recursive)
             | (TokenKind::Distinct, TokenKind::Distinct)
             | (TokenKind::All, TokenKind::All)
             | (TokenKind::As, TokenKind::As)

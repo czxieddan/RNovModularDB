@@ -16,6 +16,10 @@ pub enum LogicalPlan {
         relation_id: RelationId,
         table: String,
     },
+    RecursiveScan {
+        name: String,
+        columns: Vec<String>,
+    },
     Filter {
         predicate: Expr,
         input: Box<LogicalPlan>,
@@ -74,6 +78,13 @@ pub enum LogicalPlan {
         all: bool,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
+    },
+    RecursiveCte {
+        name: String,
+        columns: Vec<String>,
+        seed: Box<LogicalPlan>,
+        recursive: Box<LogicalPlan>,
+        query: Box<LogicalPlan>,
     },
     Sort {
         keys: Vec<OrderByExpr>,
@@ -387,151 +398,11 @@ impl LogicalPlanner {
                 selection: delete.selection.clone(),
             }),
             BoundStatement::Select(select) => {
-                let mut plan = LogicalPlan::Scan {
+                let input = LogicalPlan::Scan {
                     relation_id: select.relation_id,
                     table: object_name(&select.table),
                 };
-                for policy in &select.row_policy_predicates {
-                    plan =
-                        plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
-                }
-                if let Some(lateral_join) = &select.lateral_join {
-                    plan = LogicalPlan::SidewaysLookup {
-                        outer: Box::new(plan),
-                        inner_relation_id: lateral_join.inner_relation_id,
-                        inner_table: object_name(&lateral_join.inner_table),
-                        inner_column: lateral_join.inner_column.clone(),
-                        outer_column: lateral_join.outer_column.clone(),
-                    };
-                }
-                if let Some(predicate) = &select.selection {
-                    plan = plan_selection(select.relation_id, &select.table, predicate, plan)?;
-                }
-                let grouping_sets = !select.grouping_sets.is_empty();
-                let grouped = !select.group_by.is_empty() || grouping_sets;
-                let aggregate_functions = select_aggregate_functions(select);
-                let mut order_by = select.order_by.clone();
-                let mut project_internal_outputs =
-                    !select.hidden_group_keys.is_empty() || !select.hidden_aggregates.is_empty();
-                if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
-                    plan = LogicalPlan::Sort {
-                        keys: order_by.clone(),
-                        input: Box::new(plan),
-                    };
-                }
-                let mut plan = if grouped {
-                    let mut items = select
-                        .projection
-                        .iter()
-                        .chain(select.hidden_group_keys.iter())
-                        .chain(select.hidden_aggregates.iter())
-                        .map(|item| GroupedAggregateItem {
-                            name: item.column.name.clone(),
-                            kind: grouped_aggregate_item_kind(&item.expr),
-                        })
-                        .collect::<Vec<_>>();
-                    project_internal_outputs |=
-                        add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
-                    if grouping_sets {
-                        LogicalPlan::GroupingSetsAggregate {
-                            group_by: select.group_by.clone(),
-                            grouping_sets: select.grouping_sets.clone(),
-                            items,
-                            input: Box::new(plan),
-                        }
-                    } else {
-                        LogicalPlan::GroupedAggregate {
-                            group_by: select.group_by.clone(),
-                            items,
-                            input: Box::new(plan),
-                        }
-                    }
-                } else if let Some(functions) = select_aggregate_functions(select) {
-                    LogicalPlan::Aggregate {
-                        items: select
-                            .projection
-                            .iter()
-                            .chain(select.hidden_aggregates.iter())
-                            .zip(functions)
-                            .map(|(item, function)| AggregateItem {
-                                name: item.column.name.clone(),
-                                function,
-                            })
-                            .collect(),
-                        input: Box::new(plan),
-                    }
-                } else {
-                    let window_items = select_window_items(select);
-                    if !window_items.is_empty() {
-                        plan = LogicalPlan::Window {
-                            items: window_items,
-                            input: Box::new(plan),
-                        };
-                    }
-                    LogicalPlan::Project {
-                        items: select
-                            .projection
-                            .iter()
-                            .map(|item| ProjectionItem {
-                                name: item.column.name.clone(),
-                                expr: projection_expr_after_windows(item),
-                            })
-                            .collect(),
-                        input: Box::new(plan),
-                    }
-                };
-                if let Some(predicate) = &select.having {
-                    plan = LogicalPlan::Filter {
-                        predicate: predicate.clone(),
-                        input: Box::new(plan),
-                    };
-                }
-                if !grouped && aggregate_functions.is_some() && !order_by.is_empty() {
-                    plan = LogicalPlan::Sort {
-                        keys: order_by.clone(),
-                        input: Box::new(plan),
-                    };
-                }
-                if grouped && !order_by.is_empty() {
-                    plan = LogicalPlan::Sort {
-                        keys: order_by.clone(),
-                        input: Box::new(plan),
-                    };
-                }
-                if project_internal_outputs {
-                    plan = LogicalPlan::Project {
-                        items: select
-                            .projection
-                            .iter()
-                            .map(|item| ProjectionItem {
-                                name: item.column.name.clone(),
-                                expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
-                            })
-                            .collect(),
-                        input: Box::new(plan),
-                    };
-                }
-                if select.distinct {
-                    plan = LogicalPlan::Distinct {
-                        input: Box::new(plan),
-                    };
-                }
-                let plan = if let Some(count) = select.offset {
-                    LogicalPlan::Offset {
-                        count,
-                        input: Box::new(plan),
-                    }
-                } else {
-                    plan
-                };
-                if let Some(count) = select.limit {
-                    Ok(LogicalPlan::Limit {
-                        count,
-                        input: Box::new(plan),
-                    })
-                } else {
-                    Ok(plan)
-                }
+                self.plan_select_with_input(select, input, true)
             }
             BoundStatement::Union(union) => Ok(LogicalPlan::Union {
                 all: union.all,
@@ -548,6 +419,42 @@ impl LogicalPlanner {
                 left: Box::new(self.plan(&except.left)?),
                 right: Box::new(self.plan(&except.right)?),
             }),
+            BoundStatement::RecursiveCte(cte) => {
+                let seed = self.plan(&cte.seed)?;
+                let recursive_input = LogicalPlan::RecursiveScan {
+                    name: object_name(&cte.name),
+                    columns: cte
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                };
+                let recursive = self.plan_select_with_input(
+                    bound_select_from_statement(&cte.recursive)?,
+                    recursive_input,
+                    false,
+                )?;
+                let query_input = LogicalPlan::RecursiveScan {
+                    name: object_name(&cte.name),
+                    columns: cte
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                };
+                let query = self.plan_select_with_input(&cte.query, query_input, false)?;
+                Ok(LogicalPlan::RecursiveCte {
+                    name: object_name(&cte.name),
+                    columns: cte
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    seed: Box::new(seed),
+                    recursive: Box::new(recursive),
+                    query: Box::new(query),
+                })
+            }
             BoundStatement::Query(query) => {
                 let plan = self.plan(&query.input)?;
                 Ok(apply_query_tail(
@@ -616,6 +523,161 @@ impl LogicalPlanner {
             }),
         }
     }
+
+    fn plan_select_with_input(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        mut plan: LogicalPlan,
+        include_table_dependent_rewrites: bool,
+    ) -> Result<LogicalPlan> {
+        if include_table_dependent_rewrites {
+            for policy in &select.row_policy_predicates {
+                plan = plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
+            }
+            if let Some(lateral_join) = &select.lateral_join {
+                plan = LogicalPlan::SidewaysLookup {
+                    outer: Box::new(plan),
+                    inner_relation_id: lateral_join.inner_relation_id,
+                    inner_table: object_name(&lateral_join.inner_table),
+                    inner_column: lateral_join.inner_column.clone(),
+                    outer_column: lateral_join.outer_column.clone(),
+                };
+            }
+        }
+        if let Some(predicate) = &select.selection {
+            plan = if include_table_dependent_rewrites {
+                plan_selection(select.relation_id, &select.table, predicate, plan)?
+            } else {
+                LogicalPlan::Filter {
+                    predicate: predicate.clone(),
+                    input: Box::new(plan),
+                }
+            };
+        }
+        let grouping_sets = !select.grouping_sets.is_empty();
+        let grouped = !select.group_by.is_empty() || grouping_sets;
+        let aggregate_functions = select_aggregate_functions(select);
+        let mut order_by = select.order_by.clone();
+        let mut project_internal_outputs =
+            !select.hidden_group_keys.is_empty() || !select.hidden_aggregates.is_empty();
+        if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
+            plan = LogicalPlan::Sort {
+                keys: order_by.clone(),
+                input: Box::new(plan),
+            };
+        }
+        let mut plan = if grouped {
+            let mut items = select
+                .projection
+                .iter()
+                .chain(select.hidden_group_keys.iter())
+                .chain(select.hidden_aggregates.iter())
+                .map(|item| GroupedAggregateItem {
+                    name: item.column.name.clone(),
+                    kind: grouped_aggregate_item_kind(&item.expr),
+                })
+                .collect::<Vec<_>>();
+            project_internal_outputs |=
+                add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
+            if grouping_sets {
+                LogicalPlan::GroupingSetsAggregate {
+                    group_by: select.group_by.clone(),
+                    grouping_sets: select.grouping_sets.clone(),
+                    items,
+                    input: Box::new(plan),
+                }
+            } else {
+                LogicalPlan::GroupedAggregate {
+                    group_by: select.group_by.clone(),
+                    items,
+                    input: Box::new(plan),
+                }
+            }
+        } else if let Some(functions) = select_aggregate_functions(select) {
+            LogicalPlan::Aggregate {
+                items: select
+                    .projection
+                    .iter()
+                    .chain(select.hidden_aggregates.iter())
+                    .zip(functions)
+                    .map(|(item, function)| AggregateItem {
+                        name: item.column.name.clone(),
+                        function,
+                    })
+                    .collect(),
+                input: Box::new(plan),
+            }
+        } else {
+            let window_items = select_window_items(select);
+            if !window_items.is_empty() {
+                plan = LogicalPlan::Window {
+                    items: window_items,
+                    input: Box::new(plan),
+                };
+            }
+            LogicalPlan::Project {
+                items: select
+                    .projection
+                    .iter()
+                    .map(|item| ProjectionItem {
+                        name: item.column.name.clone(),
+                        expr: projection_expr_after_windows(item),
+                    })
+                    .collect(),
+                input: Box::new(plan),
+            }
+        };
+        if let Some(predicate) = &select.having {
+            plan = LogicalPlan::Filter {
+                predicate: predicate.clone(),
+                input: Box::new(plan),
+            };
+        }
+        if !grouped && aggregate_functions.is_some() && !order_by.is_empty() {
+            plan = LogicalPlan::Sort {
+                keys: order_by.clone(),
+                input: Box::new(plan),
+            };
+        }
+        if grouped && !order_by.is_empty() {
+            plan = LogicalPlan::Sort {
+                keys: order_by.clone(),
+                input: Box::new(plan),
+            };
+        }
+        if project_internal_outputs {
+            plan = LogicalPlan::Project {
+                items: select
+                    .projection
+                    .iter()
+                    .map(|item| ProjectionItem {
+                        name: item.column.name.clone(),
+                        expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
+                    })
+                    .collect(),
+                input: Box::new(plan),
+            };
+        }
+        if select.distinct {
+            plan = LogicalPlan::Distinct {
+                input: Box::new(plan),
+            };
+        }
+        if let Some(count) = select.offset {
+            plan = LogicalPlan::Offset {
+                count,
+                input: Box::new(plan),
+            };
+        }
+        if let Some(count) = select.limit {
+            Ok(LogicalPlan::Limit {
+                count,
+                input: Box::new(plan),
+            })
+        } else {
+            Ok(plan)
+        }
+    }
 }
 
 impl LogicalPlan {
@@ -637,6 +699,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
     match plan {
         LogicalPlan::Scan { table, .. } => {
             out.push_str(&format!("{prefix}Scan table={table}\n"));
+        }
+        LogicalPlan::RecursiveScan { name, columns } => {
+            out.push_str(&format!(
+                "{prefix}RecursiveScan {name}({})\n",
+                columns.join(", ")
+            ));
         }
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
@@ -791,6 +859,25 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{prefix}Except {mode}\n"));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
+        }
+        LogicalPlan::RecursiveCte {
+            name,
+            columns,
+            seed,
+            recursive,
+            query,
+        } => {
+            out.push_str(&format!(
+                "{prefix}RecursiveCte {name}({})\n",
+                columns.join(", ")
+            ));
+            out.push_str(&format!("{prefix}  Seed\n"));
+            write_plan(seed, indent + 2, out);
+            out.push_str(&format!("{prefix}  Recursive\n"));
+            write_recursive_step_summary(recursive, indent + 2, out);
+            write_plan(recursive, indent + 2, out);
+            out.push_str(&format!("{prefix}  Query\n"));
+            write_plan(query, indent + 2, out);
         }
         LogicalPlan::Sort { keys, input } => {
             let keys = keys
@@ -1085,6 +1172,47 @@ fn truncate_child_lines(out: &mut String, keep_len: usize) {
     out.truncate(keep_len);
 }
 
+fn write_recursive_step_summary(plan: &LogicalPlan, indent: usize, out: &mut String) {
+    let prefix = "  ".repeat(indent);
+    if let Some(items) = first_project_items(plan) {
+        let columns = items
+            .iter()
+            .map(|item| format!("{} := {}", item.name, item.expr))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("{prefix}RecursiveStep {columns}\n"));
+    }
+    if let Some(predicate) = first_filter_predicate(plan) {
+        out.push_str(&format!("{prefix}RecursiveFilter {predicate}\n"));
+    }
+}
+
+fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
+    match plan {
+        LogicalPlan::Project { items, .. } => Some(items),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Parallel { input, .. } => first_project_items(input),
+        _ => None,
+    }
+}
+
+fn first_filter_predicate(plan: &LogicalPlan) -> Option<&Expr> {
+    match plan {
+        LogicalPlan::Filter { predicate, .. } => Some(predicate),
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Parallel { input, .. } => first_filter_predicate(input),
+        _ => None,
+    }
+}
+
 fn format_plan_cost(cost: PlanCost) -> String {
     format!(
         " rows={:.0} width={:.0} cost={:.2}",
@@ -1157,6 +1285,16 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
     };
 
     Some((column.as_str(), query.as_str()))
+}
+
+fn bound_select_from_statement(statement: &BoundStatement) -> Result<&rnmdb_sql::ast::BoundSelect> {
+    match statement {
+        BoundStatement::Select(select) => Ok(select),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE term must be a SELECT query",
+        )),
+    }
 }
 
 fn object_name(name: &ObjectName) -> String {

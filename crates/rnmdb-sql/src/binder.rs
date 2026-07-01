@@ -7,9 +7,9 @@ use rnmdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
-    BoundIntersect, BoundLateralJoin, BoundQuery, BoundRowPolicy, BoundSelect, BoundSelectItem,
-    BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef,
-    LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement,
+    BoundIntersect, BoundLateralJoin, BoundQuery, BoundRecursiveCte, BoundRowPolicy, BoundSelect,
+    BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident,
+    IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement,
 };
 use crate::parser::parse_expr;
 
@@ -273,6 +273,13 @@ impl<'a> Binder<'a> {
                 self.bind_intersect(*all, left, right, role_id)
             }
             Statement::Except { all, left, right } => self.bind_except(*all, left, right, role_id),
+            Statement::RecursiveCte {
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+            } => self.bind_recursive_cte(name, columns, seed, recursive, query, role_id),
             Statement::Query {
                 input,
                 order_by,
@@ -723,6 +730,78 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn bind_recursive_cte(
+        &self,
+        name: &ObjectName,
+        column_names: &[Ident],
+        seed: &Statement,
+        recursive: &Statement,
+        query: &Statement,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        if name.schema().is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE name must be unqualified",
+            ));
+        }
+        let seed = self.bind_for_role(seed, role_id)?;
+        let seed_columns = query_output_columns(&seed)?;
+        if seed_columns.len() != column_names.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "recursive CTE column count mismatch: declared {}, seed returns {}",
+                    column_names.len(),
+                    seed_columns.len()
+                ),
+            ));
+        }
+        let cte_columns = seed_columns
+            .iter()
+            .zip(column_names.iter())
+            .map(|(column, name)| BoundColumn {
+                name: name.as_str().to_string(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                encrypted: false,
+                generated: None,
+            })
+            .collect::<Vec<_>>();
+        let recursive = self.bind_recursive_cte_step(name, &cte_columns, recursive)?;
+        let recursive_columns = query_output_columns(&recursive)?;
+        validate_recursive_cte_columns(&cte_columns, recursive_columns)?;
+        let query = self.bind_recursive_cte_query(name, &cte_columns, query)?;
+
+        Ok(BoundStatement::RecursiveCte(BoundRecursiveCte {
+            name: name.clone(),
+            columns: cte_columns,
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query,
+        }))
+    }
+
+    fn bind_recursive_cte_step(
+        &self,
+        name: &ObjectName,
+        cte_columns: &[BoundColumn],
+        statement: &Statement,
+    ) -> Result<BoundStatement> {
+        let mut select = self.bind_select_from_columns(statement, name, cte_columns)?;
+        rename_select_output_columns(&mut select, cte_columns);
+        Ok(BoundStatement::Select(select))
+    }
+
+    fn bind_recursive_cte_query(
+        &self,
+        name: &ObjectName,
+        cte_columns: &[BoundColumn],
+        statement: &Statement,
+    ) -> Result<BoundSelect> {
+        self.bind_select_from_columns(statement, name, cte_columns)
+    }
+
     fn bind_intersect(
         &self,
         all: bool,
@@ -1122,6 +1201,161 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn bind_select_from_columns(
+        &self,
+        statement: &Statement,
+        source: &ObjectName,
+        available_columns: &[BoundColumn],
+    ) -> Result<BoundSelect> {
+        let Statement::Select {
+            distinct,
+            projection,
+            from,
+            selection,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        } = statement
+        else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE clauses currently support SELECT queries only",
+            ));
+        };
+        if !object_names_equal(from, source) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("recursive CTE SELECT must read from {source}, got {from}"),
+            ));
+        }
+        if !group_by.is_empty() || having.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE SELECT does not support GROUP BY or HAVING yet",
+            ));
+        }
+
+        let (projection, columns) = self.bind_cte_projection(projection, available_columns)?;
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_cte_expr(available_columns, selection))
+            .transpose()?;
+        if let Some(selection) = &selection {
+            self.validate_predicate_from_columns(available_columns, selection)?;
+        }
+        let order_by = order_by
+            .iter()
+            .map(|order_by| {
+                let expr = self.rewrite_cte_expr(available_columns, &order_by.expr)?;
+                self.validate_sort_expr_from_columns(available_columns, &expr)?;
+                Ok(OrderByExpr {
+                    expr,
+                    direction: order_by.direction,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(BoundSelect {
+            relation_id: recursive_cte_relation_id(source),
+            table: from.clone(),
+            lateral_join: None,
+            distinct: *distinct,
+            projection,
+            hidden_group_keys: Vec::new(),
+            hidden_aggregates: Vec::new(),
+            columns,
+            selection,
+            group_by: Vec::new(),
+            grouping_sets: Vec::new(),
+            having: None,
+            order_by,
+            limit: *limit,
+            offset: *offset,
+            applied_row_policies: Vec::new(),
+            row_policy_predicates: Vec::new(),
+        })
+    }
+
+    fn bind_cte_projection(
+        &self,
+        select_items: &[SelectItem],
+        available_columns: &[BoundColumn],
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
+        let mut projection = Vec::new();
+        let mut columns = Vec::new();
+        for item in select_items {
+            match item {
+                SelectItem::Wildcard => {
+                    for column in available_columns {
+                        projection.push(BoundSelectItem {
+                            column: column.clone(),
+                            expr: Expr::Identifier(Ident::new(column.name.as_str())),
+                        });
+                        columns.push(column.clone());
+                    }
+                }
+                SelectItem::Expr {
+                    expr: Expr::Identifier(identifier),
+                    alias,
+                } => {
+                    let column = self.resolve_column_from_bound(available_columns, identifier)?;
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Identifier(identifier.clone()),
+                    });
+                    columns.push(column);
+                }
+                SelectItem::Expr {
+                    expr: qualified @ Expr::QualifiedIdentifier { .. },
+                    alias,
+                } => {
+                    let expr = self.rewrite_cte_expr(available_columns, qualified)?;
+                    let Expr::Identifier(name) = expr else {
+                        return Err(RnovError::new(
+                            ErrorKind::Internal,
+                            "qualified recursive CTE column did not rewrite to identifier",
+                        ));
+                    };
+                    let column = self.resolve_column_from_bound(available_columns, &name)?;
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr: Expr::Identifier(name),
+                    });
+                    columns.push(column);
+                }
+                SelectItem::Expr { expr, alias } => {
+                    let expr = self.rewrite_cte_expr(available_columns, expr)?;
+                    let data_type = self
+                        .infer_expr_type_from_columns(available_columns, &expr)?
+                        .ok_or_else(|| {
+                            RnovError::new(
+                                ErrorKind::InvalidInput,
+                                format!("cannot infer recursive CTE expression type: {expr}"),
+                            )
+                        })?;
+                    let column = BoundColumn {
+                        name: format!("expr{}", columns.len() + 1),
+                        data_type,
+                        nullable: true,
+                        encrypted: false,
+                        generated: None,
+                    };
+                    let column = aliased_bound_column(column, alias);
+                    projection.push(BoundSelectItem {
+                        column: column.clone(),
+                        expr,
+                    });
+                    columns.push(column);
+                }
+            }
+        }
+        Ok((projection, columns))
+    }
+
     fn bind_lateral_select(
         &self,
         distinct: bool,
@@ -1333,6 +1567,24 @@ impl<'a> Binder<'a> {
 
     fn validate_sort_expr(&self, table: &Table, expr: &Expr) -> Result<()> {
         match self.infer_expr_type(table, expr)? {
+            Some(
+                SqlType::Null
+                | SqlType::Bool
+                | SqlType::Int64
+                | SqlType::UInt64
+                | SqlType::Text
+                | SqlType::Bytes,
+            ) => Ok(()),
+            Some(other) => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("ORDER BY expression type is not sortable: {other:?}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn validate_sort_expr_from_columns(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
+        match self.infer_expr_type_from_columns(columns, expr)? {
             Some(
                 SqlType::Null
                 | SqlType::Bool
@@ -2661,6 +2913,23 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn resolve_column_from_bound(
+        &self,
+        columns: &[BoundColumn],
+        column_name: &Ident,
+    ) -> Result<BoundColumn> {
+        columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(column_name.as_str()))
+            .cloned()
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {}", column_name.as_str()),
+                )
+            })
+    }
+
     fn ensure_table_qualifier(&self, table: &Table, qualifier: &Ident) -> Result<()> {
         if qualifier.as_str().eq_ignore_ascii_case(table.name())
             || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
@@ -2707,6 +2976,119 @@ impl<'a> Binder<'a> {
                 )),
             }
         })
+    }
+
+    fn rewrite_cte_expr(&self, columns: &[BoundColumn], expr: &Expr) -> Result<Expr> {
+        let rewritten = self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            if qualifier.as_str().eq_ignore_ascii_case("__cte") {
+                let _ = self.resolve_column_from_bound(columns, name)?;
+                Ok(Expr::Identifier(name.clone()))
+            } else {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("recursive CTE column reference uses unknown qualifier {qualifier}"),
+                ))
+            }
+        })?;
+        self.validate_cte_identifiers(columns, &rewritten)?;
+        Ok(rewritten)
+    }
+
+    fn validate_cte_identifiers(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
+        match expr {
+            Expr::Identifier(identifier) => {
+                let _ = self.resolve_column_from_bound(columns, identifier)?;
+                Ok(())
+            }
+            Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "bound recursive CTE expression must not contain qualified column references",
+            )),
+            Expr::Binary { left, right, .. } => {
+                self.validate_cte_identifiers(columns, left)?;
+                self.validate_cte_identifiers(columns, right)
+            }
+            Expr::Unary { expr, .. }
+            | Expr::Not(expr)
+            | Expr::Count(expr)
+            | Expr::CountDistinct(expr)
+            | Expr::Sum(expr)
+            | Expr::Min(expr)
+            | Expr::Max(expr)
+            | Expr::Cast { expr, .. } => self.validate_cte_identifiers(columns, expr),
+            Expr::IsNull { expr, .. }
+            | Expr::IsTruth { expr, .. }
+            | Expr::IsUnknown { expr, .. } => self.validate_cte_identifiers(columns, expr),
+            Expr::IsDistinctFrom { left, right, .. } | Expr::NullIf { left, right } => {
+                self.validate_cte_identifiers(columns, left)?;
+                self.validate_cte_identifiers(columns, right)
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                self.validate_cte_identifiers(columns, expr)?;
+                self.validate_cte_identifiers(columns, low)?;
+                self.validate_cte_identifiers(columns, high)
+            }
+            Expr::InList { expr, values, .. } => {
+                self.validate_cte_identifiers(columns, expr)?;
+                for value in values {
+                    self.validate_cte_identifiers(columns, value)?;
+                }
+                Ok(())
+            }
+            Expr::Like { expr, pattern, .. } => {
+                self.validate_cte_identifiers(columns, expr)?;
+                self.validate_cte_identifiers(columns, pattern)
+            }
+            Expr::Coalesce(values) | Expr::Array(values) => {
+                for value in values {
+                    self.validate_cte_identifiers(columns, value)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                if let Some(operand) = operand {
+                    self.validate_cte_identifiers(columns, operand)?;
+                }
+                for arm in whens {
+                    self.validate_cte_identifiers(columns, &arm.condition)?;
+                    self.validate_cte_identifiers(columns, &arm.result)?;
+                }
+                if let Some(else_expr) = else_expr {
+                    self.validate_cte_identifiers(columns, else_expr)?;
+                }
+                Ok(())
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.validate_cte_identifiers(columns, arg)?;
+                }
+                Ok(())
+            }
+            Expr::RowNumberOver { order_by }
+            | Expr::RankOver { order_by }
+            | Expr::DenseRankOver { order_by } => {
+                for order_by in order_by {
+                    self.validate_cte_identifiers(columns, &order_by.expr)?;
+                }
+                Ok(())
+            }
+            Expr::Range { lower, upper, .. } => {
+                self.validate_cte_identifiers(columns, lower)?;
+                self.validate_cte_identifiers(columns, upper)
+            }
+            Expr::Integer(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::CountStar
+            | Expr::HStore(_) => Ok(()),
+        }
     }
 
     fn rewrite_qualified_expr<F>(&self, expr: &Expr, resolver: &mut F) -> Result<Expr>
@@ -4206,12 +4588,69 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
         BoundStatement::Union(union) => Ok(&union.columns),
         BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
         BoundStatement::Except(except) => Ok(&except.columns),
+        BoundStatement::RecursiveCte(cte) => Ok(&cte.query.columns),
         BoundStatement::Query(query) => Ok(&query.columns),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "set operation operands must be SELECT queries",
         )),
     }
+}
+
+fn validate_recursive_cte_columns(expected: &[BoundColumn], actual: &[BoundColumn]) -> Result<()> {
+    if expected.len() != actual.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "recursive CTE column count mismatch: seed returns {}, recursive term returns {}",
+                expected.len(),
+                actual.len()
+            ),
+        ));
+    }
+    for (index, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+        if expected.data_type != actual.data_type {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "recursive CTE column {} type mismatch: seed is {:?}, recursive term is {:?}",
+                    index + 1,
+                    expected.data_type,
+                    actual.data_type
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rename_select_output_columns(select: &mut BoundSelect, names: &[BoundColumn]) {
+    for (item, name) in select.projection.iter_mut().zip(names.iter()) {
+        item.column.name = name.name.clone();
+    }
+    for (column, name) in select.columns.iter_mut().zip(names.iter()) {
+        column.name = name.name.clone();
+    }
+}
+
+fn recursive_cte_relation_id(name: &ObjectName) -> RelationId {
+    let mut value = 0xcbf2_9ce4_8422_2325u64;
+    for byte in name.object().bytes() {
+        value ^= u64::from(byte);
+        value = value.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    RelationId::new(value)
+}
+
+fn object_names_equal(left: &ObjectName, right: &ObjectName) -> bool {
+    left.schema()
+        .map(|schema| {
+            right
+                .schema()
+                .is_some_and(|other| schema.eq_ignore_ascii_case(other))
+        })
+        .unwrap_or_else(|| right.schema().is_none())
+        && left.object().eq_ignore_ascii_case(right.object())
 }
 
 fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {

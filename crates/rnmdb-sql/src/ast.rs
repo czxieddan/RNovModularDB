@@ -509,6 +509,15 @@ pub struct LateralJoin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecursiveCte {
+    pub name: ObjectName,
+    pub columns: Vec<Ident>,
+    pub seed: Box<Statement>,
+    pub recursive: Box<Statement>,
+    pub query: Box<Statement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IndexKeyDef {
     Column(Ident),
     Expression(Expr),
@@ -677,6 +686,13 @@ pub enum Statement {
         left: Box<Statement>,
         right: Box<Statement>,
     },
+    RecursiveCte {
+        name: ObjectName,
+        columns: Vec<Ident>,
+        seed: Box<Statement>,
+        recursive: Box<Statement>,
+        query: Box<Statement>,
+    },
     Query {
         input: Box<Statement>,
         order_by: Vec<OrderByExpr>,
@@ -777,6 +793,15 @@ pub struct BoundQuery {
     pub order_by: Vec<OrderByExpr>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundRecursiveCte {
+    pub name: ObjectName,
+    pub columns: Vec<BoundColumn>,
+    pub seed: Box<BoundStatement>,
+    pub recursive: Box<BoundStatement>,
+    pub query: BoundSelect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -902,6 +927,7 @@ pub enum BoundStatement {
     Union(BoundUnion),
     Intersect(BoundIntersect),
     Except(BoundExcept),
+    RecursiveCte(BoundRecursiveCte),
     Query(BoundQuery),
     Transaction {
         action: TransactionAction,

@@ -529,6 +529,7 @@ impl LocalSession {
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::GroupedAggregate { input, .. }
+            | LogicalPlan::GroupingSetsAggregate { input, .. }
             | LogicalPlan::Distinct { input }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
@@ -543,6 +544,16 @@ impl LocalSession {
                 self.collect_plan_statistics(left, statistics);
                 self.collect_plan_statistics(right, statistics);
             }
+            LogicalPlan::RecursiveCte {
+                seed,
+                recursive,
+                query,
+                ..
+            } => {
+                self.collect_plan_statistics(seed, statistics);
+                self.collect_plan_statistics(recursive, statistics);
+                self.collect_plan_statistics(query, statistics);
+            }
             _ => {}
         }
     }
@@ -555,6 +566,7 @@ fn is_read_query(statement: &BoundStatement) -> bool {
             | BoundStatement::Union(_)
             | BoundStatement::Intersect(_)
             | BoundStatement::Except(_)
+            | BoundStatement::RecursiveCte(_)
             | BoundStatement::Query(_)
     )
 }

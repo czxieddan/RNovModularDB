@@ -221,6 +221,12 @@ impl CostModel {
                     pages * self.parameters.seq_page_cost,
                 )
             }
+            LogicalPlan::RecursiveScan { .. } => PlanCost::new(
+                DEFAULT_SCAN_ROWS,
+                DEFAULT_ROW_WIDTH_BYTES,
+                DEFAULT_SCAN_ROWS * self.parameters.cpu_tuple_cost,
+                0.0,
+            ),
             LogicalPlan::TextSearch {
                 relation_id,
                 column,
@@ -368,6 +374,22 @@ impl CostModel {
                         + right.cpu
                         + (left.rows + right.rows) * self.parameters.cpu_operator_cost,
                     left.io + right.io,
+                )
+            }
+            LogicalPlan::RecursiveCte {
+                seed,
+                recursive,
+                query,
+                ..
+            } => {
+                let seed = self.estimate(seed);
+                let recursive = self.estimate(recursive);
+                let query = self.estimate(query);
+                PlanCost::new(
+                    (seed.rows + recursive.rows).max(query.rows),
+                    seed.row_width_bytes.max(query.row_width_bytes),
+                    seed.cpu + recursive.cpu * 4.0 + query.cpu,
+                    seed.io + recursive.io + query.io,
                 )
             }
             LogicalPlan::Parallel { hint, input } => {
