@@ -420,6 +420,54 @@ impl Default for InstanceSwitchPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstanceSwitchDecision {
+    target: InstanceSyncTarget,
+    movement: SwitchDataMovement,
+    dirty_bytes: usize,
+    estimated_flush_bytes: usize,
+}
+
+impl InstanceSwitchDecision {
+    pub fn new(
+        target: InstanceSyncTarget,
+        movement: SwitchDataMovement,
+        dirty_bytes: usize,
+        estimated_flush_bytes: usize,
+    ) -> Self {
+        Self {
+            target,
+            movement,
+            dirty_bytes,
+            estimated_flush_bytes,
+        }
+    }
+
+    pub fn target(self) -> InstanceSyncTarget {
+        self.target
+    }
+
+    pub fn movement(self) -> SwitchDataMovement {
+        self.movement
+    }
+
+    pub fn dirty_bytes(self) -> usize {
+        self.dirty_bytes
+    }
+
+    pub fn estimated_flush_bytes(self) -> usize {
+        self.estimated_flush_bytes
+    }
+
+    pub fn can_execute_immediately(self) -> bool {
+        !self.requires_full_data_movement()
+    }
+
+    pub fn requires_full_data_movement(self) -> bool {
+        matches!(self.movement, SwitchDataMovement::FullDataMovement)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceSyncChannel {
     source_instance: InstanceId,
@@ -456,6 +504,20 @@ impl InstanceSyncChannel {
 
     pub fn switch_policy(&self) -> InstanceSwitchPolicy {
         self.switch_policy
+    }
+
+    pub fn plan_switch(
+        &self,
+        status: InstanceSyncStatus,
+        target: InstanceSyncTarget,
+    ) -> Result<InstanceSwitchDecision> {
+        let movement = self.switch_policy.validate_switch(status, target)?;
+        Ok(InstanceSwitchDecision::new(
+            target,
+            movement,
+            status.dirty_bytes(),
+            status.estimated_flush_bytes(),
+        ))
     }
 }
 
