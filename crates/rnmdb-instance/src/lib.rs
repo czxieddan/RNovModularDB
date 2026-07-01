@@ -3,7 +3,31 @@ use std::{collections::BTreeMap, time::Duration};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{DatabaseId, InstanceId},
+    metrics::MetricsRegistry,
 };
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UdfBudget {
+    max_invocations: usize,
+    max_memory_bytes: usize,
+}
+
+impl UdfBudget {
+    pub fn new(max_invocations: usize, max_memory_bytes: usize) -> Self {
+        Self {
+            max_invocations,
+            max_memory_bytes,
+        }
+    }
+
+    pub fn max_invocations(self) -> usize {
+        self.max_invocations
+    }
+
+    pub fn max_memory_bytes(self) -> usize {
+        self.max_memory_bytes
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceLimits {
@@ -11,6 +35,7 @@ pub struct ResourceLimits {
     max_worker_threads: usize,
     max_temp_bytes: usize,
     statement_timeout: Duration,
+    udf_budget: UdfBudget,
 }
 
 impl ResourceLimits {
@@ -44,7 +69,13 @@ impl ResourceLimits {
             max_worker_threads,
             max_temp_bytes,
             statement_timeout,
+            udf_budget: UdfBudget::default(),
         })
+    }
+
+    pub fn with_udf_budget(mut self, udf_budget: UdfBudget) -> Self {
+        self.udf_budget = udf_budget;
+        self
     }
 
     pub fn max_memory_bytes(&self) -> usize {
@@ -62,6 +93,10 @@ impl ResourceLimits {
     pub fn statement_timeout(&self) -> Duration {
         self.statement_timeout
     }
+
+    pub fn udf_budget(&self) -> UdfBudget {
+        self.udf_budget
+    }
 }
 
 impl Default for ResourceLimits {
@@ -71,6 +106,7 @@ impl Default for ResourceLimits {
             max_worker_threads: 1,
             max_temp_bytes: 0,
             statement_timeout: Duration::from_secs(30),
+            udf_budget: UdfBudget::default(),
         }
     }
 }
@@ -80,6 +116,8 @@ pub struct ResourceUsage {
     memory_bytes: usize,
     temp_bytes: usize,
     worker_threads: usize,
+    udf_invocations: usize,
+    udf_memory_bytes: usize,
 }
 
 impl ResourceUsage {
@@ -88,6 +126,24 @@ impl ResourceUsage {
             memory_bytes,
             temp_bytes,
             worker_threads,
+            udf_invocations: 0,
+            udf_memory_bytes: 0,
+        }
+    }
+
+    pub fn with_udf_usage(
+        memory_bytes: usize,
+        temp_bytes: usize,
+        worker_threads: usize,
+        udf_invocations: usize,
+        udf_memory_bytes: usize,
+    ) -> Self {
+        Self {
+            memory_bytes,
+            temp_bytes,
+            worker_threads,
+            udf_invocations,
+            udf_memory_bytes,
         }
     }
 
@@ -101,6 +157,14 @@ impl ResourceUsage {
 
     pub fn worker_threads(&self) -> usize {
         self.worker_threads
+    }
+
+    pub fn udf_invocations(&self) -> usize {
+        self.udf_invocations
+    }
+
+    pub fn udf_memory_bytes(&self) -> usize {
+        self.udf_memory_bytes
     }
 }
 
@@ -173,6 +237,26 @@ impl InstanceConfig {
                 ),
             ));
         }
+        if usage.udf_invocations() > self.limits.udf_budget.max_invocations() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance UDF invocation request exceeds limit: requested {}, limit {}",
+                    usage.udf_invocations(),
+                    self.limits.udf_budget.max_invocations()
+                ),
+            ));
+        }
+        if usage.udf_memory_bytes() > self.limits.udf_budget.max_memory_bytes() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance UDF memory request exceeds limit: requested {} bytes, limit {} bytes",
+                    usage.udf_memory_bytes(),
+                    self.limits.udf_budget.max_memory_bytes()
+                ),
+            ));
+        }
         Ok(())
     }
 }
@@ -181,8 +265,11 @@ impl InstanceConfig {
 pub struct InstanceIsolation {
     catalog_namespace: String,
     key_namespace: String,
+    buffer_namespace: String,
+    transaction_namespace: String,
     temp_namespace: String,
     audit_namespace: String,
+    metrics_namespace: String,
     background_worker_group: String,
 }
 
@@ -192,8 +279,11 @@ impl InstanceIsolation {
         Self {
             catalog_namespace: format!("catalog:{suffix}"),
             key_namespace: format!("keys:{suffix}"),
+            buffer_namespace: format!("buffers:{suffix}"),
+            transaction_namespace: format!("transactions:{suffix}"),
             temp_namespace: format!("temp:{suffix}"),
             audit_namespace: format!("audit:{suffix}"),
+            metrics_namespace: format!("metrics:{suffix}"),
             background_worker_group: format!("workers:{suffix}"),
         }
     }
@@ -206,6 +296,14 @@ impl InstanceIsolation {
         &self.key_namespace
     }
 
+    pub fn buffer_namespace(&self) -> &str {
+        &self.buffer_namespace
+    }
+
+    pub fn transaction_namespace(&self) -> &str {
+        &self.transaction_namespace
+    }
+
     pub fn temp_namespace(&self) -> &str {
         &self.temp_namespace
     }
@@ -214,8 +312,55 @@ impl InstanceIsolation {
         &self.audit_namespace
     }
 
+    pub fn metrics_namespace(&self) -> &str {
+        &self.metrics_namespace
+    }
+
     pub fn background_worker_group(&self) -> &str {
         &self.background_worker_group
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstanceRuntimeContext {
+    config: InstanceConfig,
+    metrics: MetricsRegistry,
+}
+
+impl InstanceRuntimeContext {
+    pub fn new(config: InstanceConfig) -> Self {
+        Self {
+            config,
+            metrics: MetricsRegistry::new(),
+        }
+    }
+
+    pub fn config(&self) -> &InstanceConfig {
+        &self.config
+    }
+
+    pub fn instance_id(&self) -> InstanceId {
+        self.config.instance_id()
+    }
+
+    pub fn database_id(&self) -> DatabaseId {
+        self.config.database_id()
+    }
+
+    pub fn limits(&self) -> &ResourceLimits {
+        self.config.limits()
+    }
+
+    pub fn isolation(&self) -> &InstanceIsolation {
+        self.config.isolation()
+    }
+
+    pub fn metrics(&self) -> &MetricsRegistry {
+        &self.metrics
+    }
+
+    pub fn check_resource_usage(&self, usage: &ResourceUsage) -> Result<()> {
+        self.config.check_resource_usage(usage)
     }
 }
 
@@ -521,9 +666,9 @@ impl InstanceSyncChannel {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct InstanceManager {
-    instances: BTreeMap<InstanceId, InstanceConfig>,
+    instances: BTreeMap<InstanceId, InstanceRuntimeContext>,
     sync_channels: BTreeMap<(InstanceId, InstanceId), InstanceSyncChannel>,
 }
 
@@ -533,25 +678,36 @@ impl InstanceManager {
     }
 
     pub fn register(&mut self, config: InstanceConfig) -> Result<()> {
-        let instance_id = config.instance_id();
+        self.register_context(InstanceRuntimeContext::new(config))
+    }
+
+    pub fn register_context(&mut self, context: InstanceRuntimeContext) -> Result<()> {
+        let instance_id = context.instance_id();
         if self.instances.contains_key(&instance_id) {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("instance already exists: {instance_id}"),
             ));
         }
-        self.instances.insert(instance_id, config);
+        self.instances.insert(instance_id, context);
         Ok(())
     }
 
     pub fn get(&self, instance_id: InstanceId) -> Option<&InstanceConfig> {
+        self.context(instance_id)
+            .map(InstanceRuntimeContext::config)
+    }
+
+    pub fn context(&self, instance_id: InstanceId) -> Option<&InstanceRuntimeContext> {
         self.instances.get(&instance_id)
     }
 
     pub fn remove(&mut self, instance_id: InstanceId) -> Option<InstanceConfig> {
         self.sync_channels
             .retain(|(source, target), _| *source != instance_id && *target != instance_id);
-        self.instances.remove(&instance_id)
+        self.instances
+            .remove(&instance_id)
+            .map(|context| context.config)
     }
 
     pub fn register_sync_channel(&mut self, channel: InstanceSyncChannel) -> Result<()> {

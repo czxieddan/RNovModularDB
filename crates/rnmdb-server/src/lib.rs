@@ -53,7 +53,7 @@ impl EmbeddedRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct EmbeddedRuntime {
     config: EmbeddedRuntimeConfig,
     instances: InstanceManager,
