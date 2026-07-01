@@ -4,6 +4,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write, copy},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    thread,
 };
 
 use chacha20poly1305::{
@@ -427,6 +428,11 @@ impl MemoryBackend {
         Ok(true)
     }
 
+    pub fn snapshot_pages(&self) -> Result<Vec<Page>> {
+        let pages = self.read_pages()?;
+        Ok(pages.values().map(|entry| entry.page.clone()).collect())
+    }
+
     pub fn pin_page(&self, id: PageId) -> Result<Option<PinnedPage>> {
         let mut pages = self.write_pages()?;
         let Some(entry) = pages.get_mut(&id) else {
@@ -641,6 +647,21 @@ impl HybridWarmupReport {
     }
 }
 
+pub struct HybridMirrorHandle {
+    handle: thread::JoinHandle<Result<SyncStatus>>,
+}
+
+impl HybridMirrorHandle {
+    pub fn join(self) -> Result<SyncStatus> {
+        self.handle.join().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "hybrid backend background mirror thread panicked",
+            )
+        })?
+    }
+}
+
 #[derive(Clone)]
 pub struct HybridBackend {
     memory: MemoryBackend,
@@ -678,6 +699,37 @@ impl HybridBackend {
             mirrored_pages: Arc::new(RwLock::new(BTreeSet::new())),
             lsn_status: Arc::new(RwLock::new(HybridLsnStatus::default())),
         })
+    }
+
+    pub fn attach_memory_to_disk(
+        memory: MemoryBackend,
+        disk: Arc<dyn StorageBackend>,
+    ) -> Result<(Self, HybridMirrorHandle)> {
+        let backend = Self::new(memory, disk)?;
+        let memory_pages = backend.memory.snapshot_pages()?;
+        let mut max_memory_lsn = 0_u64;
+
+        {
+            let mut dirty_pages = backend.write_dirty_pages()?;
+            for page in &memory_pages {
+                dirty_pages.insert(page.id());
+                max_memory_lsn = max_memory_lsn.max(page.header().lsn());
+            }
+        }
+        if !memory_pages.is_empty() {
+            let mut lsn_status = backend.write_lsn_status()?;
+            lsn_status.memory_lsn = max_memory_lsn;
+        }
+
+        let mirror = backend.start_background_mirror();
+        Ok((backend, mirror))
+    }
+
+    pub fn start_background_mirror(&self) -> HybridMirrorHandle {
+        let backend = self.clone();
+        HybridMirrorHandle {
+            handle: thread::spawn(move || backend.sync()),
+        }
     }
 
     pub fn active_target(&self) -> Result<HybridSyncTarget> {
