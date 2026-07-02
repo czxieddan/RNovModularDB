@@ -1,8 +1,9 @@
 use std::io::{self, Read};
 
 use rnmdb_cli::{
-    CommandOutput, LocalSession, backup_storage, inspect_storage, page_key_from_hex,
-    restore_storage, restore_storage_dry_run, verify_storage, verify_storage_with_key,
+    CommandOutput, LocalSession, backup_storage, inspect_storage, inspect_storage_with_key,
+    page_key_from_hex, restore_storage, restore_storage_dry_run, verify_storage,
+    verify_storage_with_key,
 };
 use rnmdb_storage::{
     SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun, SingleFileRestoreReport,
@@ -29,6 +30,16 @@ fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
     match args {
         [command, path] if command == "inspect" => {
             println!("{}", format_inspection(&inspect_storage(path)?));
+            Ok(())
+        }
+        [command, key_flag, key_hex, path]
+            if command == "inspect" && key_flag == "--page-key-hex" =>
+        {
+            let key = page_key_from_hex(key_hex)?;
+            println!(
+                "{}",
+                format_inspection(&inspect_storage_with_key(path, key)?)
+            );
             Ok(())
         }
         [command, path] if command == "verify" => {
@@ -117,6 +128,18 @@ fn format_inspection(inspection: &SingleFileInspection) -> String {
             inspection.present_page_records()
         ),
         format!("empty_page_slots: {}", inspection.empty_page_slots()),
+        format!(
+            "authenticated_page_records: {}",
+            inspection.authenticated_page_records()
+        ),
+        format!(
+            "checksum_verified_page_records: {}",
+            inspection.checksum_verified_page_records()
+        ),
+        format!(
+            "superblock_checksum_verified: {}",
+            inspection.superblock_checksum_verified()
+        ),
         format!("free_space_bytes: {}", inspection.free_space_bytes()),
         format!("encrypted_pages: {}", inspection.encrypted_pages()),
         format!(
@@ -124,7 +147,35 @@ fn format_inspection(inspection: &SingleFileInspection) -> String {
             inspection.capabilities().names().join(",")
         ),
     ]
+    .into_iter()
+    .chain(inspection.page_records().iter().map(|record| {
+        format!(
+            "page_record[{}]: page_id={} offset_bytes={} present={} encrypted={} authenticated={} checksum_verified={} counter={} encrypted_payload_bytes={}",
+            record.slot_index(),
+            record.page_id().get(),
+            record.offset_bytes(),
+            record.is_present(),
+            record.encrypted_payload_bytes().is_some(),
+            record.encryption_authenticated(),
+            record.page_checksum_verified(),
+            optional_u32(record.encryption_counter()),
+            optional_u64(record.encrypted_payload_bytes()),
+        )
+    }))
+    .collect::<Vec<_>>()
     .join("\n")
+}
+
+fn optional_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn format_verification(report: &SingleFileVerificationReport) -> String {

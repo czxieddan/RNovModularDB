@@ -1152,10 +1152,26 @@ pub struct SingleFileInspection {
     page_size: PageSize,
     page_record_size_bytes: u64,
     superblock_generation: u64,
+    superblock_checksum_verified: bool,
     page_record_slots: u64,
     present_page_records: u64,
     empty_page_slots: u64,
+    authenticated_page_records: u64,
+    checksum_verified_page_records: u64,
+    page_records: Vec<SingleFilePageRecordInspection>,
     capabilities: StorageCapability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFilePageRecordInspection {
+    slot_index: u64,
+    page_id: PageId,
+    offset_bytes: u64,
+    present: bool,
+    encryption_counter: Option<u32>,
+    encrypted_payload_bytes: Option<u64>,
+    encryption_authenticated: bool,
+    page_checksum_verified: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1317,6 +1333,77 @@ impl SingleFileBackupReport {
     }
 }
 
+impl SingleFilePageRecordInspection {
+    fn empty(slot_index: u64, page_id: PageId, offset_bytes: u64) -> Self {
+        Self {
+            slot_index,
+            page_id,
+            offset_bytes,
+            present: false,
+            encryption_counter: None,
+            encrypted_payload_bytes: None,
+            encryption_authenticated: false,
+            page_checksum_verified: false,
+        }
+    }
+
+    fn encrypted(
+        slot_index: u64,
+        page_id: PageId,
+        offset_bytes: u64,
+        encryption_counter: u32,
+        encrypted_payload_bytes: u64,
+    ) -> Self {
+        Self {
+            slot_index,
+            page_id,
+            offset_bytes,
+            present: true,
+            encryption_counter: Some(encryption_counter),
+            encrypted_payload_bytes: Some(encrypted_payload_bytes),
+            encryption_authenticated: false,
+            page_checksum_verified: false,
+        }
+    }
+
+    fn mark_authenticated(&mut self) {
+        self.encryption_authenticated = true;
+        self.page_checksum_verified = true;
+    }
+
+    pub fn slot_index(&self) -> u64 {
+        self.slot_index
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn offset_bytes(&self) -> u64 {
+        self.offset_bytes
+    }
+
+    pub fn is_present(&self) -> bool {
+        self.present
+    }
+
+    pub fn encryption_counter(&self) -> Option<u32> {
+        self.encryption_counter
+    }
+
+    pub fn encrypted_payload_bytes(&self) -> Option<u64> {
+        self.encrypted_payload_bytes
+    }
+
+    pub fn encryption_authenticated(&self) -> bool {
+        self.encryption_authenticated
+    }
+
+    pub fn page_checksum_verified(&self) -> bool {
+        self.page_checksum_verified
+    }
+}
+
 impl SingleFileInspection {
     pub fn path(&self) -> &Path {
         &self.path
@@ -1342,6 +1429,10 @@ impl SingleFileInspection {
         self.superblock_generation
     }
 
+    pub fn superblock_checksum_verified(&self) -> bool {
+        self.superblock_checksum_verified
+    }
+
     pub fn page_record_slots(&self) -> u64 {
         self.page_record_slots
     }
@@ -1352,6 +1443,18 @@ impl SingleFileInspection {
 
     pub fn empty_page_slots(&self) -> u64 {
         self.empty_page_slots
+    }
+
+    pub fn authenticated_page_records(&self) -> u64 {
+        self.authenticated_page_records
+    }
+
+    pub fn checksum_verified_page_records(&self) -> u64 {
+        self.checksum_verified_page_records
+    }
+
+    pub fn page_records(&self) -> &[SingleFilePageRecordInspection] {
+        &self.page_records
     }
 
     pub fn free_space_bytes(&self) -> u64 {
@@ -1684,15 +1787,7 @@ pub fn verify_single_file_with_key(
     path: impl AsRef<Path>,
     key: PageCryptoKey,
 ) -> Result<SingleFileVerificationReport> {
-    let inspection = inspect_single_file(path.as_ref())?;
-    let backend = SingleFileBackend::open_with_key(path.as_ref(), key)?;
-    let mut authenticated_page_records = 0_u64;
-
-    for page_number in 1..=inspection.page_record_slots() {
-        if backend.read_page(PageId::new(page_number))?.is_some() {
-            authenticated_page_records += 1;
-        }
-    }
+    let inspection = inspect_single_file_with_key(path.as_ref(), key)?;
 
     Ok(SingleFileVerificationReport {
         path: inspection.path().to_path_buf(),
@@ -1700,9 +1795,42 @@ pub fn verify_single_file_with_key(
         page_record_slots: inspection.page_record_slots(),
         present_page_records: inspection.present_page_records(),
         empty_page_slots: inspection.empty_page_slots(),
-        authenticated_page_records,
+        authenticated_page_records: inspection.authenticated_page_records(),
         encryption_authenticated: true,
     })
+}
+
+pub fn inspect_single_file_with_key(
+    path: impl AsRef<Path>,
+    key: PageCryptoKey,
+) -> Result<SingleFileInspection> {
+    let path = path.as_ref();
+    let mut inspection = inspect_single_file(path)?;
+    let backend = SingleFileBackend::open_with_key(path, key)?;
+    let mut authenticated_page_records = 0_u64;
+    let mut checksum_verified_page_records = 0_u64;
+
+    for record in &mut inspection.page_records {
+        if !record.is_present() {
+            continue;
+        }
+        if backend.read_page(record.page_id())?.is_none() {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!(
+                    "page record {} disappeared during authenticated inspection",
+                    record.page_id().get()
+                ),
+            ));
+        }
+        record.mark_authenticated();
+        authenticated_page_records += 1;
+        checksum_verified_page_records += 1;
+    }
+
+    inspection.authenticated_page_records = authenticated_page_records;
+    inspection.checksum_verified_page_records = checksum_verified_page_records;
+    Ok(inspection)
 }
 
 pub fn backup_single_file(
@@ -1901,9 +2029,11 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
     };
     let mut present_page_records = 0_u64;
     let mut empty_page_slots = 0_u64;
+    let mut page_records = Vec::new();
 
     for slot in 0..page_record_slots {
         let offset = data_start_bytes + slot * page_record_size_bytes;
+        let page_id = PageId::new(slot + 1);
         let Some(header_end) = offset.checked_add(SingleFileBackend::PAGE_RECORD_HEADER_LEN as u64)
         else {
             return Err(RnovError::new(
@@ -1934,6 +2064,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
 
         if header[..8].iter().all(|byte| *byte == 0) {
             empty_page_slots += 1;
+            page_records.push(SingleFilePageRecordInspection::empty(slot, page_id, offset));
             continue;
         }
         if header[..8] != SingleFileBackend::PAGE_RECORD_MAGIC {
@@ -1943,6 +2074,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
             ));
         }
 
+        let counter = u32::from_be_bytes(read_fixed::<4>(&header, 8)?);
         let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as u64;
         if ciphertext_len > max_page_ciphertext_len as u64 {
             return Err(RnovError::new(
@@ -1963,6 +2095,13 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
             ));
         }
         present_page_records += 1;
+        page_records.push(SingleFilePageRecordInspection::encrypted(
+            slot,
+            page_id,
+            offset,
+            counter,
+            ciphertext_len,
+        ));
     }
 
     Ok(SingleFileInspection {
@@ -1972,9 +2111,13 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
         page_size,
         page_record_size_bytes,
         superblock_generation,
+        superblock_checksum_verified: true,
         page_record_slots,
         present_page_records,
         empty_page_slots,
+        authenticated_page_records: 0,
+        checksum_verified_page_records: 0,
+        page_records,
         capabilities: StorageCapability::WRITES_TO_DISK
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED,
