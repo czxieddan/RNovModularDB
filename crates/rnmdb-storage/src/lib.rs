@@ -2331,9 +2331,21 @@ fn read_single_file_header(file: &mut File) -> Result<(u16, PageSize, u64)> {
     let page_size = PageSize::new(u64::from_be_bytes(read_fixed::<8>(&header, 12)?) as usize);
     let primary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 20)?);
     let secondary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 28)?);
-    let primary = read_superblock(file, primary_offset)?;
-    let secondary = read_superblock(file, secondary_offset)?;
-    let generation = primary.0.max(secondary.0);
+    let primary = read_superblock(file, primary_offset);
+    let secondary = read_superblock(file, secondary_offset);
+    let generation = match (primary, secondary) {
+        (Ok(primary), Ok(secondary)) => primary.0.max(secondary.0),
+        (Ok(primary), Err(_)) => primary.0,
+        (Err(_), Ok(secondary)) => secondary.0,
+        (Err(primary), Err(secondary)) => {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!(
+                    "database superblocks are invalid: primary: {primary}; secondary: {secondary}"
+                ),
+            ));
+        }
+    };
 
     Ok((format_version, page_size, generation))
 }
