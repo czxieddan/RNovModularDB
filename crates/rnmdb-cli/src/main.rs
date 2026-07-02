@@ -112,6 +112,7 @@ fn format_inspection(inspection: &SingleFileInspection) -> String {
         format!("path: {}", inspection.path().display()),
         format!("mode: {:?}", inspection.mode()),
         format!("page_size_bytes: {}", inspection.page_size().bytes()),
+        format!("format_version: {}", inspection.format_version()),
         format!(
             "superblock_generation: {}",
             inspection.superblock_generation()

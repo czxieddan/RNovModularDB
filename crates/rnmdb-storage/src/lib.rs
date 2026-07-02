@@ -18,6 +18,8 @@ use rnmdb_common::{
 
 pub use rnmdb_common::config::PageSize;
 
+pub const SINGLE_FILE_FORMAT_VERSION: u16 = 1;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
     MemoryOnly,
@@ -1151,6 +1153,7 @@ pub struct SingleFileInspection {
     data_start_bytes: u64,
     page_size: PageSize,
     page_record_size_bytes: u64,
+    format_version: u16,
     superblock_generation: u64,
     superblock_checksum_verified: bool,
     page_record_slots: u64,
@@ -1425,6 +1428,10 @@ impl SingleFileInspection {
         self.page_record_size_bytes
     }
 
+    pub fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
     pub fn superblock_generation(&self) -> u64 {
         self.superblock_generation
     }
@@ -1488,7 +1495,7 @@ impl std::fmt::Debug for SingleFileBackend {
 
 impl SingleFileBackend {
     const MAGIC: [u8; 8] = *b"RNOVDB01";
-    const FORMAT_VERSION: u16 = 1;
+    const FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
     const HEADER_LEN: usize = 8 + 2 + 2 + 8 + 8 + 8;
     const SUPERBLOCK_LEN: usize = 8 + 8 + 8 + 8;
     const PAGE_RECORD_MAGIC: [u8; 8] = *b"RNOVPGR1";
@@ -2110,6 +2117,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
         data_start_bytes,
         page_size,
         page_record_size_bytes,
+        format_version: SINGLE_FILE_FORMAT_VERSION,
         superblock_generation,
         superblock_checksum_verified: true,
         page_record_slots,
