@@ -183,6 +183,16 @@ fn format_verification(report: &SingleFileVerificationReport) -> String {
     [
         format!("path: {}", report.path().display()),
         format!("valid: {}", report.is_valid()),
+        format!("format_version: {}", report.format_version()),
+        format!(
+            "format_compatibility: {}",
+            report.format_compatibility().as_str()
+        ),
+        format!(
+            "supported_format_versions: {}..={}",
+            report.min_supported_format_version(),
+            report.max_supported_format_version()
+        ),
         format!("file_len_bytes: {}", report.file_len_bytes()),
         format!("page_record_slots: {}", report.page_record_slots()),
         format!("present_page_records: {}", report.present_page_records()),

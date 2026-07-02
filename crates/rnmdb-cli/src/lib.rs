@@ -21,8 +21,9 @@ use rnmdb_sql::{
     parser::parse_statement,
 };
 use rnmdb_storage::{
-    PageCryptoKey, SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun,
-    SingleFileRestoreReport, SingleFileVerificationReport, backup_single_file, inspect_single_file,
+    PageCryptoKey, SingleFileBackupReport, SingleFileFormatCompatibility, SingleFileInspection,
+    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileVerificationReport,
+    backup_single_file, check_single_file_format_compatibility, inspect_single_file,
     inspect_single_file_with_key, restore_single_file, restore_single_file_dry_run,
     verify_single_file, verify_single_file_with_key,
 };
@@ -917,6 +918,12 @@ pub fn backup_storage(
 
 pub fn verify_storage(path: impl AsRef<std::path::Path>) -> Result<SingleFileVerificationReport> {
     verify_single_file(path)
+}
+
+pub fn check_storage_format_compatibility(
+    path: impl AsRef<std::path::Path>,
+) -> Result<SingleFileFormatCompatibility> {
+    check_single_file_format_compatibility(path)
 }
 
 pub fn verify_storage_with_key(

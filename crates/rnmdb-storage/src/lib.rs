@@ -19,6 +19,8 @@ use rnmdb_common::{
 pub use rnmdb_common::config::PageSize;
 
 pub const SINGLE_FILE_FORMAT_VERSION: u16 = 1;
+pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
+pub const SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
@@ -1146,6 +1148,32 @@ pub struct SingleFileBackend {
     page_key: Option<PageCryptoKey>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SingleFileFormatCompatibilityStatus {
+    Supported,
+    UnsupportedOlder,
+    UnsupportedNewer,
+}
+
+impl SingleFileFormatCompatibilityStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::UnsupportedOlder => "unsupported_older",
+            Self::UnsupportedNewer => "unsupported_newer",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileFormatCompatibility {
+    path: PathBuf,
+    format_version: u16,
+    min_supported_format_version: u16,
+    max_supported_format_version: u16,
+    status: SingleFileFormatCompatibilityStatus,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SingleFileInspection {
     path: PathBuf,
@@ -1191,6 +1219,10 @@ pub struct SingleFileBackupReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SingleFileVerificationReport {
     path: PathBuf,
+    format_version: u16,
+    min_supported_format_version: u16,
+    max_supported_format_version: u16,
+    format_compatibility: SingleFileFormatCompatibilityStatus,
     file_len_bytes: u64,
     page_record_slots: u64,
     present_page_records: u64,
@@ -1217,6 +1249,68 @@ pub struct SingleFileRestoreReport {
     bytes_restored: u64,
     page_record_slots: u64,
     present_page_records: u64,
+}
+
+impl SingleFileFormatCompatibility {
+    fn new(path: PathBuf, format_version: u16) -> Self {
+        Self {
+            path,
+            format_version,
+            min_supported_format_version: SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
+            max_supported_format_version: SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION,
+            status: single_file_format_compatibility_status(format_version),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    pub fn min_supported_format_version(&self) -> u16 {
+        self.min_supported_format_version
+    }
+
+    pub fn max_supported_format_version(&self) -> u16 {
+        self.max_supported_format_version
+    }
+
+    pub fn status(&self) -> SingleFileFormatCompatibilityStatus {
+        self.status
+    }
+
+    pub fn is_supported(&self) -> bool {
+        matches!(self.status, SingleFileFormatCompatibilityStatus::Supported)
+    }
+
+    pub fn migration_required(&self) -> bool {
+        matches!(
+            self.status,
+            SingleFileFormatCompatibilityStatus::UnsupportedOlder
+        )
+    }
+
+    pub fn requires_newer_engine(&self) -> bool {
+        matches!(
+            self.status,
+            SingleFileFormatCompatibilityStatus::UnsupportedNewer
+        )
+    }
+}
+
+const fn single_file_format_compatibility_status(
+    format_version: u16,
+) -> SingleFileFormatCompatibilityStatus {
+    if format_version < SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION {
+        SingleFileFormatCompatibilityStatus::UnsupportedOlder
+    } else if format_version > SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION {
+        SingleFileFormatCompatibilityStatus::UnsupportedNewer
+    } else {
+        SingleFileFormatCompatibilityStatus::Supported
+    }
 }
 
 impl SingleFileRestoreDryRun {
@@ -1276,6 +1370,29 @@ impl SingleFileVerificationReport {
         &self.path
     }
 
+    pub fn format_version(&self) -> u16 {
+        self.format_version
+    }
+
+    pub fn min_supported_format_version(&self) -> u16 {
+        self.min_supported_format_version
+    }
+
+    pub fn max_supported_format_version(&self) -> u16 {
+        self.max_supported_format_version
+    }
+
+    pub fn format_compatibility(&self) -> SingleFileFormatCompatibilityStatus {
+        self.format_compatibility
+    }
+
+    pub fn format_supported(&self) -> bool {
+        matches!(
+            self.format_compatibility,
+            SingleFileFormatCompatibilityStatus::Supported
+        )
+    }
+
     pub fn file_len_bytes(&self) -> u64 {
         self.file_len_bytes
     }
@@ -1301,8 +1418,9 @@ impl SingleFileVerificationReport {
     }
 
     pub fn is_valid(&self) -> bool {
-        !self.encryption_authenticated
-            || self.authenticated_page_records == self.present_page_records
+        self.format_supported()
+            && (!self.encryption_authenticated
+                || self.authenticated_page_records == self.present_page_records)
     }
 }
 
@@ -1574,7 +1692,8 @@ impl SingleFileBackend {
                     format!("failed to open database file: {err}"),
                 )
             })?;
-        let (page_size, superblock_generation) = read_single_file_header(&mut file)?;
+        let (_format_version, page_size, superblock_generation) =
+            read_single_file_header(&mut file)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1777,10 +1896,31 @@ impl StorageBackend for SingleFileBackend {
     }
 }
 
+pub fn check_single_file_format_compatibility(
+    path: impl AsRef<Path>,
+) -> Result<SingleFileFormatCompatibility> {
+    let path = path.as_ref();
+    let mut file = OpenOptions::new().read(true).open(path).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to inspect database file compatibility: {err}"),
+        )
+    })?;
+    let format_version = read_single_file_format_version(&mut file)?;
+    Ok(SingleFileFormatCompatibility::new(
+        path.to_path_buf(),
+        format_version,
+    ))
+}
+
 pub fn verify_single_file(path: impl AsRef<Path>) -> Result<SingleFileVerificationReport> {
     let inspection = inspect_single_file(path)?;
     Ok(SingleFileVerificationReport {
         path: inspection.path().to_path_buf(),
+        format_version: inspection.format_version(),
+        min_supported_format_version: SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
+        max_supported_format_version: SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION,
+        format_compatibility: single_file_format_compatibility_status(inspection.format_version()),
         file_len_bytes: inspection.file_len_bytes(),
         page_record_slots: inspection.page_record_slots(),
         present_page_records: inspection.present_page_records(),
@@ -1798,6 +1938,10 @@ pub fn verify_single_file_with_key(
 
     Ok(SingleFileVerificationReport {
         path: inspection.path().to_path_buf(),
+        format_version: inspection.format_version(),
+        min_supported_format_version: SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
+        max_supported_format_version: SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION,
+        format_compatibility: single_file_format_compatibility_status(inspection.format_version()),
         file_len_bytes: inspection.file_len_bytes(),
         page_record_slots: inspection.page_record_slots(),
         present_page_records: inspection.present_page_records(),
@@ -2023,7 +2167,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
             )
         })?
         .len();
-    let (page_size, superblock_generation) = read_single_file_header(&mut file)?;
+    let (format_version, page_size, superblock_generation) = read_single_file_header(&mut file)?;
     let data_start_bytes =
         (SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN * 2) as u64;
     let max_page_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
@@ -2117,7 +2261,7 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
         data_start_bytes,
         page_size,
         page_record_size_bytes,
-        format_version: SINGLE_FILE_FORMAT_VERSION,
+        format_version,
         superblock_generation,
         superblock_checksum_verified: true,
         page_record_slots,
@@ -2178,7 +2322,27 @@ fn write_single_file_header(
     Ok(())
 }
 
-fn read_single_file_header(file: &mut File) -> Result<(PageSize, u64)> {
+fn read_single_file_header(file: &mut File) -> Result<(u16, PageSize, u64)> {
+    let header = read_single_file_header_bytes(file)?;
+    let format_version = read_single_file_format_version_from_header(&header);
+    ensure_single_file_format_supported(format_version)?;
+
+    let page_size = PageSize::new(u64::from_be_bytes(read_fixed::<8>(&header, 12)?) as usize);
+    let primary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 20)?);
+    let secondary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 28)?);
+    let primary = read_superblock(file, primary_offset)?;
+    let secondary = read_superblock(file, secondary_offset)?;
+    let generation = primary.0.max(secondary.0);
+
+    Ok((format_version, page_size, generation))
+}
+
+fn read_single_file_format_version(file: &mut File) -> Result<u16> {
+    let header = read_single_file_header_bytes(file)?;
+    Ok(read_single_file_format_version_from_header(&header))
+}
+
+fn read_single_file_header_bytes(file: &mut File) -> Result<[u8; SingleFileBackend::HEADER_LEN]> {
     file.seek(SeekFrom::Start(0)).map_err(|err| {
         RnovError::new(
             ErrorKind::Io,
@@ -2194,29 +2358,40 @@ fn read_single_file_header(file: &mut File) -> Result<(PageSize, u64)> {
         )
     })?;
 
+    validate_single_file_magic(&header)?;
+    Ok(header)
+}
+
+fn validate_single_file_magic(header: &[u8; SingleFileBackend::HEADER_LEN]) -> Result<()> {
     if header[..8] != SingleFileBackend::MAGIC {
         return Err(RnovError::new(
             ErrorKind::Corruption,
             "invalid database file magic",
         ));
     }
+    Ok(())
+}
 
-    let format_version = u16::from_be_bytes([header[8], header[9]]);
-    if format_version != SingleFileBackend::FORMAT_VERSION {
-        return Err(RnovError::new(
-            ErrorKind::Corruption,
-            format!("unsupported database format version {format_version}"),
-        ));
+fn read_single_file_format_version_from_header(
+    header: &[u8; SingleFileBackend::HEADER_LEN],
+) -> u16 {
+    u16::from_be_bytes([header[8], header[9]])
+}
+
+fn ensure_single_file_format_supported(format_version: u16) -> Result<()> {
+    if matches!(
+        single_file_format_compatibility_status(format_version),
+        SingleFileFormatCompatibilityStatus::Supported
+    ) {
+        return Ok(());
     }
-
-    let page_size = PageSize::new(u64::from_be_bytes(read_fixed::<8>(&header, 12)?) as usize);
-    let primary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 20)?);
-    let secondary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 28)?);
-    let primary = read_superblock(file, primary_offset)?;
-    let secondary = read_superblock(file, secondary_offset)?;
-    let generation = primary.0.max(secondary.0);
-
-    Ok((page_size, generation))
+    Err(RnovError::new(
+        ErrorKind::Corruption,
+        format!(
+            "unsupported database format version {format_version}; supported versions are {}..={}",
+            SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION, SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION
+        ),
+    ))
 }
 
 fn encode_superblock(generation: u64, catalog_root: u64, free_map_root: u64) -> [u8; 32] {
