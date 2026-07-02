@@ -85,6 +85,9 @@ impl MemoryBTreeIndex {
     ) -> Vec<IndexPointer> {
         let lower = cloned_bound(lower);
         let upper = cloned_bound(upper);
+        if range_bounds_are_empty(&lower, &upper) {
+            return Vec::new();
+        }
         self.entries
             .range((lower, upper))
             .flat_map(|(_, pointers)| pointers.iter().copied())
@@ -98,6 +101,29 @@ impl MemoryBTreeIndex {
             entries: BTreeMap::new(),
         }
     }
+}
+
+fn range_bounds_are_empty(lower: &Bound<IndexKey>, upper: &Bound<IndexKey>) -> bool {
+    let (Some(lower_key), Some(upper_key)) = (bound_key(lower), bound_key(upper)) else {
+        return false;
+    };
+
+    match lower_key.cmp(upper_key) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => excludes_equal_value(lower) || excludes_equal_value(upper),
+        std::cmp::Ordering::Less => false,
+    }
+}
+
+fn bound_key(bound: &Bound<IndexKey>) -> Option<&IndexKey> {
+    match bound {
+        Bound::Included(key) | Bound::Excluded(key) => Some(key),
+        Bound::Unbounded => None,
+    }
+}
+
+fn excludes_equal_value(bound: &Bound<IndexKey>) -> bool {
+    matches!(bound, Bound::Excluded(_))
 }
 
 fn cloned_bound(bound: Bound<&IndexKey>) -> Bound<IndexKey> {
