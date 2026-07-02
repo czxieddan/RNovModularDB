@@ -106,7 +106,7 @@ impl VectorBatch {
         validate_columns(&columns)?;
         let batch = Self { columns, rows };
         for row in &batch.rows {
-            batch.validate_row(row)?;
+            validate_row_against_columns(&batch.columns, row)?;
         }
         Ok(batch)
     }
@@ -143,43 +143,6 @@ impl VectorBatch {
         Self::new(self.columns.clone(), rows)
     }
 
-    pub(crate) fn validate_row(&self, row: &Row) -> Result<()> {
-        if row.values.len() != self.columns.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "row width {} does not match column width {}",
-                    row.values.len(),
-                    self.columns.len()
-                ),
-            ));
-        }
-
-        for (column, value) in self.columns.iter().zip(row.values()) {
-            if value.is_null() {
-                if column.nullable() {
-                    continue;
-                }
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("null value for not-null column {}", column.name()),
-                ));
-            }
-            if value.data_type() != *column.data_type() {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "type mismatch for column {}: expected {:?}, got {:?}",
-                        column.name(),
-                        column.data_type(),
-                        value.data_type()
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn column_index(&self, name: &str) -> Result<usize> {
         self.columns
             .iter()
@@ -214,5 +177,42 @@ fn validate_columns(columns: &[ColumnSchema]) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn validate_row_against_columns(columns: &[ColumnSchema], row: &Row) -> Result<()> {
+    if row.values.len() != columns.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "row width {} does not match column width {}",
+                row.values.len(),
+                columns.len()
+            ),
+        ));
+    }
+
+    for (column, value) in columns.iter().zip(row.values()) {
+        if value.is_null() {
+            if column.nullable() {
+                continue;
+            }
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("null value for not-null column {}", column.name()),
+            ));
+        }
+        if value.data_type() != *column.data_type() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "type mismatch for column {}: expected {:?}, got {:?}",
+                    column.name(),
+                    column.data_type(),
+                    value.data_type()
+                ),
+            ));
+        }
+    }
     Ok(())
 }

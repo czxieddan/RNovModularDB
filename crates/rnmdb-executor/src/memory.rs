@@ -32,7 +32,7 @@ use rnmdb_types::{
     TextVector, Truth,
 };
 
-use crate::vector::{ColumnSchema, Row, VectorBatch};
+use crate::vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns};
 
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
@@ -60,8 +60,7 @@ impl MemoryTable {
     }
 
     pub fn insert(&mut self, row: Row) -> Result<()> {
-        let batch = VectorBatch::new(self.columns.clone(), vec![row.clone()])?;
-        let row = batch.rows().first().expect("validated row").clone();
+        validate_row_against_columns(&self.columns, &row)?;
         let pointer = pointer_for_slot(self.rows.len())?;
         let mut indexes = self.indexes.clone();
         for index in indexes.values_mut() {
@@ -3340,7 +3339,7 @@ fn update_rows(
                 updated.set_value(*index, eval_expr(&columns, row, expr)?);
             }
             recompute_generated_values(&columns, &mut updated)?;
-            VectorBatch::new(columns.clone(), vec![updated.clone()])?;
+            validate_row_against_columns(&columns, &updated)?;
             *row = updated;
             affected += 1;
         }
