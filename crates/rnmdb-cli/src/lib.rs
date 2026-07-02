@@ -275,6 +275,10 @@ impl LocalSession {
         }
     }
 
+    pub async fn execute_async(&mut self, sql: &str) -> Result<CommandOutput> {
+        self.execute(sql)
+    }
+
     fn apply_catalog_create_table(
         &mut self,
         name: &ObjectName,
@@ -666,6 +670,56 @@ impl LocalSession {
             _ => {}
         }
     }
+}
+
+#[cfg(feature = "tokio-runtime")]
+pub struct TokioLocalSession {
+    runtime: tokio::runtime::Runtime,
+    session: LocalSession,
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl TokioLocalSession {
+    pub fn memory() -> Result<Self> {
+        Self::memory_with_execution(LocalExecutionConfig::default())
+    }
+
+    pub fn memory_parallel(worker_threads: usize) -> Result<Self> {
+        Self::memory_with_execution(LocalExecutionConfig::parallel(worker_threads)?)
+    }
+
+    pub fn memory_with_execution(execution: LocalExecutionConfig) -> Result<Self> {
+        Ok(Self {
+            runtime: build_tokio_runtime()?,
+            session: LocalSession::memory_with_execution(execution)?,
+        })
+    }
+
+    pub fn session(&self) -> &LocalSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut LocalSession {
+        &mut self.session
+    }
+
+    pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
+        let runtime = &self.runtime;
+        let session = &mut self.session;
+        runtime.block_on(session.execute_async(sql))
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+fn build_tokio_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Internal,
+                format!("failed to build Tokio runtime: {err}"),
+            )
+        })
 }
 
 fn is_read_query(statement: &BoundStatement) -> bool {

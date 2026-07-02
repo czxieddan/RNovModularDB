@@ -39,3 +39,4 @@ rnmdb-security = { path = "crates/rnmdb-security" }
 rnmdb-instance = { path = "crates/rnmdb-instance" }
 rnmdb-server = { path = "crates/rnmdb-server" }
 rnmdb-cli = { path = "crates/rnmdb-cli" }
+tokio = { version = "1", features = ["rt"] }

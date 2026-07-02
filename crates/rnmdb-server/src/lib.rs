@@ -53,6 +53,71 @@ impl EmbeddedRuntimeConfig {
     }
 }
 
+#[cfg(feature = "tokio-runtime")]
+#[derive(Debug)]
+pub struct TokioEmbeddedRuntime {
+    runtime: tokio::runtime::Runtime,
+    embedded: EmbeddedRuntime,
+}
+
+#[cfg(feature = "tokio-runtime")]
+impl TokioEmbeddedRuntime {
+    pub fn temporary_memory(instance_id: InstanceId, database_id: DatabaseId) -> Result<Self> {
+        Self::new(EmbeddedRuntimeConfig::temporary_memory(
+            instance_id,
+            database_id,
+        ))
+    }
+
+    pub fn temporary_memory_with_limits(
+        instance_id: InstanceId,
+        database_id: DatabaseId,
+        limits: ResourceLimits,
+    ) -> Result<Self> {
+        Self::new(EmbeddedRuntimeConfig::temporary_memory_with_limits(
+            instance_id,
+            database_id,
+            limits,
+        ))
+    }
+
+    pub fn new(config: EmbeddedRuntimeConfig) -> Result<Self> {
+        Ok(Self {
+            runtime: build_tokio_runtime()?,
+            embedded: EmbeddedRuntime::new(config)?,
+        })
+    }
+
+    pub fn embedded(&self) -> &EmbeddedRuntime {
+        &self.embedded
+    }
+
+    pub fn runtime(&self) -> &tokio::runtime::Runtime {
+        &self.runtime
+    }
+
+    pub fn open_session(&self) -> Result<LocalSession> {
+        self.runtime.block_on(self.embedded.open_session_async())
+    }
+
+    pub fn open_session_with_usage(&self, usage: ResourceUsage) -> Result<LocalSession> {
+        self.runtime
+            .block_on(self.embedded.open_session_with_usage_async(usage))
+    }
+}
+
+#[cfg(feature = "tokio-runtime")]
+fn build_tokio_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Internal,
+                format!("failed to build Tokio runtime: {err}"),
+            )
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct EmbeddedRuntime {
     config: EmbeddedRuntimeConfig,

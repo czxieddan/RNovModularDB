@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+tokio-runtime = ["dep:tokio"]
+
 [dependencies]
 rnmdb-catalog.workspace = true
 rnmdb-common.workspace = true
@@ -13,6 +17,7 @@ rnmdb-planner.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-storage.workspace = true
 rnmdb-types.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3.23.0"
