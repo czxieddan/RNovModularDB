@@ -2201,6 +2201,7 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_sideways_index_lookup_parallel(
         &self,
         outer: &PhysicalPlan,
@@ -2700,6 +2701,7 @@ impl MemoryExecutor {
         table.create_index(name, keys, method, unique)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_index_parallel(
         &mut self,
         name: &str,
@@ -2736,10 +2738,10 @@ impl MemoryExecutor {
         let table = self.tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
-        if let Some((expr, value)) = indexable_expression_equality(predicate) {
-            if let Some(batch) = table.try_expression_index_scan(expr, value)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
-            }
+        if let Some((expr, value)) = indexable_expression_equality(predicate)
+            && let Some(batch) = table.try_expression_index_scan(expr, value)?
+        {
+            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
         }
         if let Some((column, value)) = indexable_equality(predicate) {
             if let Some(batch) = table.try_index_scan(column, value)? {
@@ -2749,20 +2751,20 @@ impl MemoryExecutor {
                 return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
             }
         }
-        if let Some((column, range)) = indexable_range_overlap(predicate) {
-            if let Some(batch) = table.try_range_overlap_scan(column, range)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
-            }
+        if let Some((column, range)) = indexable_range_overlap(predicate)
+            && let Some(batch) = table.try_range_overlap_scan(column, range)?
+        {
+            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
         }
-        if let Some((column, bounds)) = indexable_bounds_overlap(predicate) {
-            if let Some(batch) = table.try_bounds_overlap_scan(column, bounds)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
-            }
+        if let Some((column, bounds)) = indexable_bounds_overlap(predicate)
+            && let Some(batch) = table.try_bounds_overlap_scan(column, bounds)?
+        {
+            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
         }
-        if let Some((column, query)) = indexable_inverted_value(predicate) {
-            if let Some(batch) = table.try_inverted_value_scan(column, &query)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
-            }
+        if let Some((column, query)) = indexable_inverted_value(predicate)
+            && let Some(batch) = table.try_inverted_value_scan(column, &query)?
+        {
+            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
         }
         if let Some(range) = indexable_range(predicate) {
             if let Some(batch) = table.try_block_summary_scan(
@@ -3077,19 +3079,17 @@ fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
         high,
         negated: false,
     } = predicate
+        && let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
+        && is_index_literal(low)
+        && is_index_literal(high)
     {
-        if let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
-        {
-            if is_index_literal(low) && is_index_literal(high) {
-                return Some(IndexableRange {
-                    column: column.as_str(),
-                    lower: Some(low),
-                    lower_inclusive: true,
-                    upper: Some(high),
-                    upper_inclusive: true,
-                });
-            }
-        }
+        return Some(IndexableRange {
+            column: column.as_str(),
+            lower: Some(low),
+            lower_inclusive: true,
+            upper: Some(high),
+            upper_inclusive: true,
+        });
     }
     let Expr::Binary { left, op, right } = predicate else {
         return None;

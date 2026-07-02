@@ -1556,13 +1556,12 @@ fn add_grouped_sort_keys(
 }
 
 fn grouped_output_column_name(items: &[GroupedAggregateItem], expr: &Expr) -> Option<String> {
-    if let Expr::Identifier(identifier) = expr {
-        if let Some(item) = items
+    if let Expr::Identifier(identifier) = expr
+        && let Some(item) = items
             .iter()
             .find(|item| item.name.eq_ignore_ascii_case(identifier.as_str()))
-        {
-            return Some(item.name.clone());
-        }
+    {
+        return Some(item.name.clone());
     }
     items.iter().find_map(|item| match &item.kind {
         GroupedAggregateItemKind::GroupKey(group_expr) if group_expr == expr => {
@@ -1573,13 +1572,12 @@ fn grouped_output_column_name(items: &[GroupedAggregateItem], expr: &Expr) -> Op
 }
 
 fn grouped_sort_key_name(items: &[GroupedAggregateItem], expr: &Expr, index: usize) -> String {
-    if let Expr::Identifier(identifier) = expr {
-        if items
+    if let Expr::Identifier(identifier) = expr
+        && items
             .iter()
             .all(|item| !item.name.eq_ignore_ascii_case(identifier.as_str()))
-        {
-            return identifier.as_str().to_string();
-        }
+    {
+        return identifier.as_str().to_string();
     }
     unique_grouped_sort_key_name(items, index + 1)
 }

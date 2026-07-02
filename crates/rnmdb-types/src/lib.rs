@@ -336,7 +336,7 @@ impl TextLexeme {
         if term.is_empty() {
             return Err(RnovError::new(ErrorKind::InvalidInput, "empty lexeme term"));
         }
-        if positions.iter().any(|position| *position == 0) {
+        if positions.contains(&0) {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "lexeme position must be greater than zero",
@@ -429,6 +429,10 @@ impl ArrayDimension {
 
     pub fn len(self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
     }
 
     fn contains(self, index: i64) -> bool {
@@ -912,13 +916,13 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
 }
 
 fn validate_range_bound_type(element_type: &SqlType, bound: &RangeBound) -> Result<()> {
-    if let Some(value) = bound.value() {
-        if value.is_null() || value.data_type() != *element_type {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "range bound type does not match declared element type",
-            ));
-        }
+    if let Some(value) = bound.value()
+        && (value.is_null() || value.data_type() != *element_type)
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range bound type does not match declared element type",
+        ));
     }
     Ok(())
 }

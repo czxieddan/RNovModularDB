@@ -679,20 +679,20 @@ impl PhysicalPlan {
             return self;
         };
 
-        if !required_terms.is_empty() {
-            if let Some(index) = indexes.best_text_search_for(relation_id, &column) {
-                let index_cost =
-                    cost_model.estimate_inverted_text_scan(relation_id, &column, required_terms);
-                if index_cost.total() <= cost.total() {
-                    return PhysicalPlan::InvertedTextScan {
-                        relation_id: scan_relation_id,
-                        table,
-                        index: index.name.clone(),
-                        column,
-                        query,
-                        cost: index_cost,
-                    };
-                }
+        if !required_terms.is_empty()
+            && let Some(index) = indexes.best_text_search_for(relation_id, &column)
+        {
+            let index_cost =
+                cost_model.estimate_inverted_text_scan(relation_id, &column, required_terms);
+            if index_cost.total() <= cost.total() {
+                return PhysicalPlan::InvertedTextScan {
+                    relation_id: scan_relation_id,
+                    table,
+                    index: index.name.clone(),
+                    column,
+                    query,
+                    cost: index_cost,
+                };
             }
         }
 
@@ -1117,21 +1117,21 @@ impl PhysicalPlanner {
         let LogicalPlan::Scan { relation_id, table } = input else {
             return None;
         };
-        if let Some((expr, value)) = indexable_expression_equality(predicate) {
-            if let Some(index) = self.indexes.best_for_expression(*relation_id, expr) {
-                let cost = self
-                    .cost_model
-                    .estimate_index_scan(*relation_id, index.unique);
-                if cost.total() <= sequential_cost.total() {
-                    return Some(PhysicalPlan::ExpressionIndexScan {
-                        relation_id: *relation_id,
-                        table: table.clone(),
-                        index: index.name.clone(),
-                        expr: expr.clone(),
-                        value: value.clone(),
-                        cost,
-                    });
-                }
+        if let Some((expr, value)) = indexable_expression_equality(predicate)
+            && let Some(index) = self.indexes.best_for_expression(*relation_id, expr)
+        {
+            let cost = self
+                .cost_model
+                .estimate_index_scan(*relation_id, index.unique);
+            if cost.total() <= sequential_cost.total() {
+                return Some(PhysicalPlan::ExpressionIndexScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    expr: expr.clone(),
+                    value: value.clone(),
+                    cost,
+                });
             }
         }
         if let Some((column, value)) = indexable_equality(predicate) {
@@ -1165,61 +1165,60 @@ impl PhysicalPlanner {
             }
         }
 
-        if let Some((column, range)) = indexable_range_overlap(predicate) {
-            if let Some(index) = self.indexes.best_range_overlap_for(*relation_id, column) {
-                let cost = self.cost_model.estimate_range_overlap_scan(*relation_id);
-                if cost.total() <= sequential_cost.total() {
-                    return Some(PhysicalPlan::RangeOverlapScan {
-                        relation_id: *relation_id,
-                        table: table.clone(),
-                        index: index.name.clone(),
-                        column: column.to_string(),
-                        range: range.clone(),
-                        cost,
-                    });
-                }
+        if let Some((column, range)) = indexable_range_overlap(predicate)
+            && let Some(index) = self.indexes.best_range_overlap_for(*relation_id, column)
+        {
+            let cost = self.cost_model.estimate_range_overlap_scan(*relation_id);
+            if cost.total() <= sequential_cost.total() {
+                return Some(PhysicalPlan::RangeOverlapScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    column: column.to_string(),
+                    range: range.clone(),
+                    cost,
+                });
             }
         }
 
-        if let Some((column, bounds)) = indexable_bounds_overlap(predicate) {
-            if let Some(index) = self.indexes.best_bounds_overlap_for(*relation_id, column) {
-                let axes = match bounds {
-                    Expr::Array(values) => values.len(),
-                    _ => 1,
-                };
-                let cost = self
-                    .cost_model
-                    .estimate_bounds_overlap_scan(*relation_id, axes);
-                if cost.total() <= sequential_cost.total() {
-                    return Some(PhysicalPlan::BoundsOverlapScan {
-                        relation_id: *relation_id,
-                        table: table.clone(),
-                        index: index.name.clone(),
-                        column: column.to_string(),
-                        bounds: bounds.clone(),
-                        cost,
-                    });
-                }
+        if let Some((column, bounds)) = indexable_bounds_overlap(predicate)
+            && let Some(index) = self.indexes.best_bounds_overlap_for(*relation_id, column)
+        {
+            let axes = match bounds {
+                Expr::Array(values) => values.len(),
+                _ => 1,
+            };
+            let cost = self
+                .cost_model
+                .estimate_bounds_overlap_scan(*relation_id, axes);
+            if cost.total() <= sequential_cost.total() {
+                return Some(PhysicalPlan::BoundsOverlapScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    column: column.to_string(),
+                    bounds: bounds.clone(),
+                    cost,
+                });
             }
         }
 
-        if let Some((column, query)) = indexable_inverted_value(predicate) {
-            if !query.is_empty() {
-                if let Some(index) = self.indexes.best_inverted_value_for(*relation_id, column) {
-                    let cost = self
-                        .cost_model
-                        .estimate_inverted_value_scan(*relation_id, query.token_count());
-                    if cost.total() <= sequential_cost.total() {
-                        return Some(PhysicalPlan::InvertedValueScan {
-                            relation_id: *relation_id,
-                            table: table.clone(),
-                            index: index.name.clone(),
-                            column: column.to_string(),
-                            query,
-                            cost,
-                        });
-                    }
-                }
+        if let Some((column, query)) = indexable_inverted_value(predicate)
+            && !query.is_empty()
+            && let Some(index) = self.indexes.best_inverted_value_for(*relation_id, column)
+        {
+            let cost = self
+                .cost_model
+                .estimate_inverted_value_scan(*relation_id, query.token_count());
+            if cost.total() <= sequential_cost.total() {
+                return Some(PhysicalPlan::InvertedValueScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    column: column.to_string(),
+                    query,
+                    cost,
+                });
             }
         }
 
@@ -1227,22 +1226,21 @@ impl PhysicalPlanner {
         if let Some(index) = self
             .indexes
             .best_block_summary_for(*relation_id, range.column)
+            && let (Some(lower), Some(upper)) = (range.lower, range.upper)
         {
-            if let (Some(lower), Some(upper)) = (range.lower, range.upper) {
-                let cost = self.cost_model.estimate_block_summary_scan(*relation_id);
-                if cost.total() <= sequential_cost.total() {
-                    return Some(PhysicalPlan::BlockSummaryScan {
-                        relation_id: *relation_id,
-                        table: table.clone(),
-                        index: index.name.clone(),
-                        column: range.column.to_string(),
-                        lower: lower.clone(),
-                        lower_inclusive: range.lower_inclusive,
-                        upper: upper.clone(),
-                        upper_inclusive: range.upper_inclusive,
-                        cost,
-                    });
-                }
+            let cost = self.cost_model.estimate_block_summary_scan(*relation_id);
+            if cost.total() <= sequential_cost.total() {
+                return Some(PhysicalPlan::BlockSummaryScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    column: range.column.to_string(),
+                    lower: lower.clone(),
+                    lower_inclusive: range.lower_inclusive,
+                    upper: upper.clone(),
+                    upper_inclusive: range.upper_inclusive,
+                    cost,
+                });
             }
         }
         if let Some(index) = self
@@ -1329,19 +1327,17 @@ fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
         high,
         negated: false,
     } = predicate
+        && let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
+        && is_index_literal(low)
+        && is_index_literal(high)
     {
-        if let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
-        {
-            if is_index_literal(low) && is_index_literal(high) {
-                return Some(IndexableRange {
-                    column: column.as_str(),
-                    lower: Some(low),
-                    lower_inclusive: true,
-                    upper: Some(high),
-                    upper_inclusive: true,
-                });
-            }
-        }
+        return Some(IndexableRange {
+            column: column.as_str(),
+            lower: Some(low),
+            lower_inclusive: true,
+            upper: Some(high),
+            upper_inclusive: true,
+        });
     }
     let Expr::Binary { left, op, right } = predicate else {
         return None;

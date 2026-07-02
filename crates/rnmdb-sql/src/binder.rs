@@ -612,6 +612,7 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_create_operator(
         &self,
         symbol: &str,
@@ -968,6 +969,7 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_select(
         &self,
         distinct: bool,
@@ -1504,6 +1506,7 @@ impl<'a> Binder<'a> {
         Ok((projection, columns))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_lateral_select(
         &self,
         distinct: bool,
@@ -1662,6 +1665,7 @@ impl<'a> Binder<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bind_ranking_window_projection(
         &self,
         table: &Table,
@@ -2135,13 +2139,12 @@ impl<'a> Binder<'a> {
         group_by: &[Expr],
         expr: &Expr,
     ) -> Result<()> {
-        if let Expr::Identifier(identifier) = expr {
-            if let Some(column) = projection
+        if let Expr::Identifier(identifier) = expr
+            && let Some(column) = projection
                 .iter()
                 .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
-            {
-                return self.ensure_sortable_type(&column.column.data_type);
-            }
+        {
+            return self.ensure_sortable_type(&column.column.data_type);
         }
         if group_by.iter().any(|group| group == expr) {
             return match self.infer_expr_type(table, expr)? {
@@ -4696,6 +4699,7 @@ fn deny_default_row_policy_predicate() -> Expr {
     Expr::Bool(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn operator_signature_with_metadata(
     symbol: &str,
     left_type: SqlType,

@@ -1123,14 +1123,14 @@ impl Parser {
     }
 
     fn parse_unary_arithmetic_expr(&mut self) -> Result<Expr> {
-        if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
-            if matches!(op.as_str(), "+" | "-") {
-                self.bump();
-                return Ok(Expr::Unary {
-                    op,
-                    expr: Box::new(self.parse_unary_arithmetic_expr()?),
-                });
-            }
+        if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned()
+            && matches!(op.as_str(), "+" | "-")
+        {
+            self.bump();
+            return Ok(Expr::Unary {
+                op,
+                expr: Box::new(self.parse_unary_arithmetic_expr()?),
+            });
         }
         self.parse_primary_expr()
     }

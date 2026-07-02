@@ -81,10 +81,10 @@ where
         W: AsRef<str>,
     {
         for word in stop_words {
-            if let Ok(normalized) = normalize_term_with_stemmer(word.as_ref(), &self.stemmer) {
-                if !normalized.is_empty() {
-                    self.stop_words.insert(normalized);
-                }
+            if let Ok(normalized) = normalize_term_with_stemmer(word.as_ref(), &self.stemmer)
+                && !normalized.is_empty()
+            {
+                self.stop_words.insert(normalized);
             }
         }
         self

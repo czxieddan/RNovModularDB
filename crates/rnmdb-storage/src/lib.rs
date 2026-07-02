@@ -635,6 +635,7 @@ pub struct HybridSyncStatus {
 }
 
 impl HybridSyncStatus {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         state: HybridState,
         active_target: HybridSyncTarget,
