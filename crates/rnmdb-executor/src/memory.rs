@@ -5047,7 +5047,7 @@ fn eval_binary_expr(
             };
             let query = TextQuery::parse(&query)?;
             let builder = TextVectorBuilder::new(SimpleTokenizer::new());
-            Ok(SqlValue::Bool(text_value_matches(left, &query, &builder)?))
+            Ok(SqlValue::Bool(text_value_matches(&left, &query, &builder)?))
         }
         other => Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -5641,7 +5641,7 @@ fn apply_text_search_cancellable(
 
     for row in batch.rows() {
         cancellation.check()?;
-        if text_value_matches(row.values()[index].clone(), &query, &builder)? {
+        if text_value_matches(&row.values()[index], &query, &builder)? {
             rows.push(row.clone());
         }
     }
@@ -5651,14 +5651,14 @@ fn apply_text_search_cancellable(
 }
 
 fn text_value_matches(
-    value: SqlValue,
+    value: &SqlValue,
     query: &TextQuery,
     builder: &TextVectorBuilder<SimpleTokenizer>,
 ) -> Result<bool> {
     match value {
         SqlValue::Null => Ok(false),
-        SqlValue::Text(text) => Ok(query.matches(&builder.build(&text)?)),
-        SqlValue::TextVector(vector) => Ok(query.matches(&vector)),
+        SqlValue::Text(text) => Ok(query.matches(&builder.build(text)?)),
+        SqlValue::TextVector(vector) => Ok(query.matches(vector)),
         other => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!(
