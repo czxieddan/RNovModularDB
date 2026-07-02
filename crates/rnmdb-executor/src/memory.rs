@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread,
@@ -598,6 +598,40 @@ impl MemoryTable {
         method: IndexMethod,
         unique: bool,
     ) -> Result<()> {
+        let cancellation = CancellationToken::default();
+        self.create_index_with_config(
+            name,
+            keys,
+            method,
+            unique,
+            ParallelQueryConfig::default(),
+            &cancellation,
+        )
+    }
+
+    fn create_index_parallel(
+        &mut self,
+        name: &str,
+        keys: &[IndexKeyDef],
+        method: IndexMethod,
+        unique: bool,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.create_index_with_config(name, keys, method, unique, config, cancellation)
+    }
+
+    fn create_index_with_config(
+        &mut self,
+        name: &str,
+        keys: &[IndexKeyDef],
+        method: IndexMethod,
+        unique: bool,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        config.validate()?;
+        cancellation.check()?;
         if self.indexes.contains_key(name) {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -605,11 +639,66 @@ impl MemoryTable {
             ));
         }
         let mut index = MemoryTableIndex::new(name, &self.columns, keys, method, unique)?;
-        for (slot, row) in self.rows.iter().enumerate() {
-            index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
+        if self.rows.is_empty()
+            || config.worker_threads() == 1
+            || self.rows.len() < config.min_parallel_rows()
+        {
+            for (slot, row) in self.rows.iter().enumerate() {
+                cancellation.check()?;
+                index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
+            }
+        } else {
+            index = self.build_index_parallel(index, config, cancellation)?;
         }
+        cancellation.check()?;
         self.indexes.insert(name.to_string(), index);
         Ok(())
+    }
+
+    fn build_index_parallel(
+        &self,
+        index: MemoryTableIndex,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<MemoryTableIndex> {
+        let worker_count = config.worker_threads().min(self.rows.len());
+        let chunk_size = self.rows.len().div_ceil(worker_count);
+        let index = Mutex::new(index);
+
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for (chunk_index, chunk) in self.rows.chunks(chunk_size).enumerate() {
+                let columns = &self.columns;
+                let index = &index;
+                let cancellation = cancellation.clone();
+                let start_slot = chunk_index * chunk_size;
+                handles.push(scope.spawn(move || {
+                    for (offset, row) in chunk.iter().enumerate() {
+                        cancellation.check()?;
+                        let pointer = pointer_for_slot(start_slot + offset)?;
+                        let mut index = index.lock().map_err(|_| {
+                            RnovError::new(
+                                ErrorKind::Internal,
+                                "parallel index build lock poisoned",
+                            )
+                        })?;
+                        index.insert_row(columns, row, pointer)?;
+                    }
+                    cancellation.check()
+                }));
+            }
+
+            for handle in handles {
+                handle.join().map_err(|_| {
+                    RnovError::new(ErrorKind::Internal, "parallel index build worker panicked")
+                })??;
+            }
+            Ok::<(), RnovError>(())
+        })?;
+
+        index
+            .into_inner()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "parallel index build lock poisoned"))
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
@@ -1631,6 +1720,14 @@ impl MemoryExecutor {
         self.execute_physical_cancellable(plan, &CancellationToken::default())
     }
 
+    pub fn execute_physical_parallel(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+    ) -> Result<VectorBatch> {
+        self.execute_physical_parallel_cancellable(plan, config, &CancellationToken::default())
+    }
+
     pub fn execute_physical_cancellable(
         &self,
         plan: &PhysicalPlan,
@@ -1902,6 +1999,158 @@ impl MemoryExecutor {
         }
     }
 
+    pub fn execute_physical_parallel_cancellable(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        config.validate()?;
+        cancellation.check()?;
+        match plan {
+            PhysicalPlan::SeqScan { table, .. } => self
+                .tables
+                .get(table)
+                .ok_or_else(|| {
+                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                })?
+                .scan_parallel_cancellable(config, cancellation),
+            PhysicalPlan::TextSearchScan {
+                table,
+                column,
+                query,
+                ..
+            } => {
+                let batch = self
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?
+                    .scan_parallel_cancellable(config, cancellation)?;
+                apply_text_search_cancellable(batch, column, query, cancellation)
+            }
+            PhysicalPlan::SidewaysIndexLookup {
+                outer,
+                inner_table,
+                inner_index,
+                inner_column,
+                outer_column,
+                ..
+            } => self.execute_sideways_index_lookup_parallel(
+                outer,
+                inner_table,
+                inner_index,
+                inner_column,
+                outer_column,
+                config,
+                cancellation,
+            ),
+            PhysicalPlan::Filter {
+                predicate, input, ..
+            } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_filter_cancellable(batch, predicate, cancellation)
+            }
+            PhysicalPlan::Projection { items, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_projection_cancellable(batch, items, cancellation)
+            }
+            PhysicalPlan::Window { items, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_window_cancellable(batch, items, cancellation)
+            }
+            PhysicalPlan::Aggregate { items, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_aggregate_cancellable(batch, items, cancellation)
+            }
+            PhysicalPlan::GroupedAggregate {
+                group_by,
+                items,
+                input,
+                ..
+            } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_grouped_aggregate_parallel_cancellable(
+                    batch,
+                    group_by,
+                    items,
+                    config,
+                    cancellation,
+                )
+            }
+            PhysicalPlan::GroupingSetsAggregate {
+                group_by,
+                grouping_sets,
+                items,
+                input,
+                ..
+            } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_grouping_sets_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    grouping_sets,
+                    items,
+                    cancellation,
+                )
+            }
+            PhysicalPlan::Distinct { input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_distinct_cancellable(batch, cancellation)
+            }
+            PhysicalPlan::Sort { keys, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_sort_cancellable(batch, keys, cancellation)
+            }
+            PhysicalPlan::Limit { count, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_limit_cancellable(batch, *count, cancellation)
+            }
+            PhysicalPlan::Offset { count, input, .. } => {
+                let batch =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                apply_offset_cancellable(batch, *count, cancellation)
+            }
+            PhysicalPlan::SetOperation {
+                kind,
+                all,
+                left,
+                right,
+                ..
+            } => {
+                let left =
+                    self.execute_physical_parallel_cancellable(left, config, cancellation)?;
+                let right =
+                    self.execute_physical_parallel_cancellable(right, config, cancellation)?;
+                match kind {
+                    SetOperationKind::Union => {
+                        apply_union_cancellable(left, right, *all, cancellation)
+                    }
+                    SetOperationKind::Intersect => {
+                        apply_intersect_cancellable(left, right, *all, cancellation)
+                    }
+                    SetOperationKind::Except => {
+                        apply_except_cancellable(left, right, *all, cancellation)
+                    }
+                }
+            }
+            PhysicalPlan::Parallel { input, .. } => {
+                self.execute_physical_parallel_cancellable(input, config, cancellation)
+            }
+            _ => self.execute_physical_cancellable(plan, cancellation),
+        }
+    }
+
     pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
         self.execute(plan)
     }
@@ -1948,6 +2197,76 @@ impl MemoryExecutor {
                 rows.push(Row::new(values));
             }
         }
+
+        cancellation.check()?;
+        VectorBatch::new(columns, rows)
+    }
+
+    fn execute_sideways_index_lookup_parallel(
+        &self,
+        outer: &PhysicalPlan,
+        inner_table: &str,
+        inner_index: &str,
+        inner_column: &str,
+        outer_column: &str,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let outer_batch =
+            self.execute_physical_parallel_cancellable(outer, config, cancellation)?;
+        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
+        let inner = self.tables.get(inner_table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {inner_table}"),
+            )
+        })?;
+        let columns = joined_columns(outer_batch.columns(), inner.columns())?;
+        if outer_batch.rows().is_empty()
+            || config.worker_threads() == 1
+            || outer_batch.rows().len() < config.min_parallel_rows()
+        {
+            return join_sideways_lookup_rows(
+                outer_batch.rows(),
+                outer_column_index,
+                inner,
+                inner_index,
+                inner_column,
+                columns,
+                cancellation,
+            );
+        }
+
+        let worker_count = config.worker_threads().min(outer_batch.rows().len());
+        let chunk_size = outer_batch.rows().len().div_ceil(worker_count);
+        let mut rows = Vec::new();
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            for chunk in outer_batch.rows().chunks(chunk_size) {
+                let cancellation = cancellation.clone();
+                handles.push(scope.spawn(move || {
+                    join_sideways_lookup_chunk(
+                        chunk,
+                        outer_column_index,
+                        inner,
+                        inner_index,
+                        inner_column,
+                        &cancellation,
+                    )
+                }));
+            }
+
+            for handle in handles {
+                let mut chunk_rows = handle.join().map_err(|_| {
+                    RnovError::new(
+                        ErrorKind::Internal,
+                        "parallel sideways lookup worker panicked",
+                    )
+                })??;
+                rows.append(&mut chunk_rows);
+            }
+            Ok::<(), RnovError>(())
+        })?;
 
         cancellation.check()?;
         VectorBatch::new(columns, rows)
@@ -2293,6 +2612,56 @@ impl MemoryExecutor {
         self.execute_mut(plan)
     }
 
+    pub fn execute_mut_parallel(
+        &mut self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+    ) -> Result<ExecutionResult> {
+        self.execute_mut_parallel_cancellable(plan, config, &CancellationToken::default())
+    }
+
+    pub fn execute_mut_parallel_cancellable(
+        &mut self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<ExecutionResult> {
+        config.validate()?;
+        cancellation.check()?;
+        match plan {
+            LogicalPlan::CreateIndex {
+                name,
+                table,
+                keys,
+                method,
+                unique,
+                if_not_exists,
+                ..
+            } => {
+                self.create_index_parallel(
+                    name,
+                    table,
+                    keys,
+                    *method,
+                    *unique,
+                    *if_not_exists,
+                    config,
+                    cancellation,
+                )?;
+                Ok(ExecutionResult::SchemaChanged)
+            }
+            _ => self.execute_mut(plan),
+        }
+    }
+
+    pub async fn execute_mut_parallel_async(
+        &mut self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+    ) -> Result<ExecutionResult> {
+        self.execute_mut_parallel(plan, config)
+    }
+
     fn create_table(
         &mut self,
         name: &str,
@@ -2330,6 +2699,26 @@ impl MemoryExecutor {
             return Ok(());
         }
         table.create_index(name, keys, method, unique)
+    }
+
+    fn create_index_parallel(
+        &mut self,
+        name: &str,
+        table: &str,
+        keys: &[IndexKeyDef],
+        method: IndexMethod,
+        unique: bool,
+        if_not_exists: bool,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let table = self.tables.get_mut(table).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+        })?;
+        if table.indexes.contains_key(name) && if_not_exists {
+            return Ok(());
+        }
+        table.create_index_parallel(name, keys, method, unique, config, cancellation)
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
@@ -3062,6 +3451,53 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
     table.insert(row)
 }
 
+fn join_sideways_lookup_rows(
+    outer_rows: &[Row],
+    outer_column_index: usize,
+    inner: &MemoryTable,
+    inner_index: &str,
+    inner_column: &str,
+    columns: Vec<ColumnSchema>,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let rows = join_sideways_lookup_chunk(
+        outer_rows,
+        outer_column_index,
+        inner,
+        inner_index,
+        inner_column,
+        cancellation,
+    )?;
+    VectorBatch::new(columns, rows)
+}
+
+fn join_sideways_lookup_chunk(
+    outer_rows: &[Row],
+    outer_column_index: usize,
+    inner: &MemoryTable,
+    inner_index: &str,
+    inner_column: &str,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    for outer_row in outer_rows {
+        cancellation.check()?;
+        let lookup_value = &outer_row.values()[outer_column_index];
+        let inner_batch =
+            inner.index_point_lookup_value(inner_index, inner_column, lookup_value)?;
+        for inner_row in inner_batch.rows() {
+            cancellation.check()?;
+            let mut values =
+                Vec::with_capacity(outer_row.values().len() + inner_row.values().len());
+            values.extend_from_slice(outer_row.values());
+            values.extend_from_slice(inner_row.values());
+            rows.push(Row::new(values));
+        }
+    }
+    cancellation.check()?;
+    Ok(rows)
+}
+
 fn recompute_generated_values(columns: &[ColumnSchema], row: &mut Row) -> Result<()> {
     for (index, column) in columns.iter().enumerate() {
         let Some(generated) = column.generated() else {
@@ -3310,12 +3746,72 @@ fn apply_grouped_aggregate_cancellable(
         .iter()
         .map(|item| grouped_aggregate_column_schema(&batch, item))
         .collect::<Result<Vec<_>>>()?;
+    let groups = group_states_from_rows(batch.columns(), batch.rows(), group_by, cancellation)?;
+    grouped_aggregate_batch(batch.columns(), columns, groups, items, cancellation)
+}
+
+fn apply_grouped_aggregate_parallel_cancellable(
+    batch: VectorBatch,
+    group_by: &[Expr],
+    items: &[GroupedAggregateItem],
+    config: ParallelQueryConfig,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    config.validate()?;
+    cancellation.check()?;
+    if batch.rows().is_empty()
+        || config.worker_threads() == 1
+        || batch.rows().len() < config.min_parallel_rows()
+    {
+        return apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation);
+    }
+
+    let output_columns = items
+        .iter()
+        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .collect::<Result<Vec<_>>>()?;
+    let input_columns = batch.columns();
+    let input_rows = batch.rows();
+    let worker_count = config.worker_threads().min(input_rows.len());
+    let chunk_size = input_rows.len().div_ceil(worker_count);
     let mut groups: Vec<GroupState> = Vec::new();
-    for row in batch.rows() {
+
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        for chunk in input_rows.chunks(chunk_size) {
+            let cancellation = cancellation.clone();
+            handles.push(scope.spawn(move || {
+                group_states_from_rows(input_columns, chunk, group_by, &cancellation)
+            }));
+        }
+
+        for handle in handles {
+            let local_groups = handle.join().map_err(|_| {
+                RnovError::new(
+                    ErrorKind::Internal,
+                    "parallel grouped aggregate worker panicked",
+                )
+            })??;
+            merge_group_states(&mut groups, local_groups);
+        }
+        Ok::<(), RnovError>(())
+    })?;
+
+    grouped_aggregate_batch(input_columns, output_columns, groups, items, cancellation)
+}
+
+fn group_states_from_rows(
+    columns: &[ColumnSchema],
+    rows: &[Row],
+    group_by: &[Expr],
+    cancellation: &CancellationToken,
+) -> Result<Vec<GroupState>> {
+    let mut groups: Vec<GroupState> = Vec::new();
+    for row in rows {
         cancellation.check()?;
         let key = group_by
             .iter()
-            .map(|expr| eval_expr(batch.columns(), row, expr))
+            .map(|expr| eval_expr(columns, row, expr))
             .collect::<Result<Vec<_>>>()?;
         if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
             group.rows.push(row.clone());
@@ -3326,11 +3822,30 @@ fn apply_grouped_aggregate_cancellable(
             });
         }
     }
+    Ok(groups)
+}
 
+fn merge_group_states(groups: &mut Vec<GroupState>, local_groups: Vec<GroupState>) {
+    for local_group in local_groups {
+        if let Some(group) = groups.iter_mut().find(|group| group.key == local_group.key) {
+            group.rows.extend(local_group.rows);
+        } else {
+            groups.push(local_group);
+        }
+    }
+}
+
+fn grouped_aggregate_batch(
+    input_columns: &[ColumnSchema],
+    output_columns: Vec<ColumnSchema>,
+    groups: Vec<GroupState>,
+    items: &[GroupedAggregateItem],
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
     let mut rows = Vec::with_capacity(groups.len());
     for group in groups {
         cancellation.check()?;
-        let group_batch = VectorBatch::new(batch.columns().to_vec(), group.rows)?;
+        let group_batch = VectorBatch::new(input_columns.to_vec(), group.rows)?;
         let values = items
             .iter()
             .map(|item| grouped_aggregate_value(&group_batch, item))
@@ -3338,7 +3853,7 @@ fn apply_grouped_aggregate_cancellable(
         rows.push(Row::new(values));
     }
     cancellation.check()?;
-    VectorBatch::new(columns, rows)
+    VectorBatch::new(output_columns, rows)
 }
 
 fn apply_grouping_sets_aggregate_cancellable(
