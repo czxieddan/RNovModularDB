@@ -134,6 +134,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,6 +401,7 @@ version = "0.1.0"
 name = "rnmdb-executor"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "rnmdb-catalog",
  "rnmdb-common",
  "rnmdb-fts",
@@ -393,7 +409,6 @@ dependencies = [
  "rnmdb-planner",
  "rnmdb-sql",
  "rnmdb-types",
- "sha2",
 ]
 
 [[package]]
@@ -467,9 +482,9 @@ name = "rnmdb-storage"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "crc",
  "rand_core 0.9.5",
  "rnmdb-common",
- "sha2",
  "tempfile",
 ]
 

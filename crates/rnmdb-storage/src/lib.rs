@@ -11,17 +11,19 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
+use crc::{CRC_64_ECMA_182, Crc};
 use rnmdb_common::{
     error::{ErrorKind, Result, RnovError},
     ids::PageId,
 };
-use sha2::{Digest, Sha256};
 
 pub use rnmdb_common::config::PageSize;
 
-pub const SINGLE_FILE_FORMAT_VERSION: u16 = 1;
+pub const SINGLE_FILE_FORMAT_VERSION: u16 = 2;
 pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
 pub const SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
+
+const PAGE_CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
@@ -80,26 +82,17 @@ fn read_header_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8;
 }
 
 fn checksum_page(header: &PageHeader, payload: &[u8]) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(&header.page_id().get().to_be_bytes());
-    hasher.update(&header.lsn().to_be_bytes());
-    hasher.update(&(header.page_size().bytes() as u64).to_be_bytes());
-    hasher.update(&[header.format_version()]);
-    hasher.update(payload);
-    checksum_from_sha256(hasher)
+    let mut digest = PAGE_CRC64.digest();
+    digest.update(&header.page_id().get().to_be_bytes());
+    digest.update(&header.lsn().to_be_bytes());
+    digest.update(&(header.page_size().bytes() as u64).to_be_bytes());
+    digest.update(&[header.format_version()]);
+    digest.update(payload);
+    digest.finalize()
 }
 
 fn checksum_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    checksum_from_sha256(hasher)
-}
-
-fn checksum_from_sha256(hasher: Sha256) -> u64 {
-    let digest = hasher.finalize();
-    let mut checksum = [0_u8; 8];
-    checksum.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(checksum)
+    PAGE_CRC64.checksum(bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,7 +195,7 @@ impl PageHeader {
 pub struct PageCodec;
 
 impl PageCodec {
-    pub const FORMAT_VERSION: u8 = 1;
+    pub const FORMAT_VERSION: u8 = 2;
     const MAGIC: [u8; 8] = *b"RNOVPAGE";
     const HEADER_LEN: usize = 8 + 1 + 8 + 8 + 8 + 8;
 

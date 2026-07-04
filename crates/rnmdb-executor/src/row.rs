@@ -1,15 +1,17 @@
+use crc::{CRC_32_ISCSI, Crc};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlValue;
-use sha2::{Digest, Sha256};
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
+
+const ROW_CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 #[derive(Clone, Debug, Default)]
 pub struct RowCodec;
 
 impl RowCodec {
     const VERSION: u8 = 2;
-    const CHECKSUM_LEN: usize = 32;
+    const CHECKSUM_LEN: usize = 4;
 
     pub fn encode(columns: &[ColumnSchema], row: &Row) -> Result<Vec<u8>> {
         let _ = VectorBatch::new(columns.to_vec(), vec![row.clone()])?;
@@ -20,7 +22,7 @@ impl RowCodec {
             encoded.extend_from_slice(&checked_len(value_bytes.len(), "row value payload")?);
             encoded.extend_from_slice(&value_bytes);
         }
-        encoded.extend_from_slice(&checksum(&encoded));
+        encoded.extend_from_slice(&checksum(&encoded).to_be_bytes());
         Ok(encoded)
     }
 
@@ -43,7 +45,8 @@ impl RowCodec {
 
         let checksum_offset = bytes.len() - Self::CHECKSUM_LEN;
         let (payload, stored_checksum) = bytes.split_at(checksum_offset);
-        if checksum(payload).as_slice() != stored_checksum {
+        let expected_checksum = checksum(payload).to_be_bytes();
+        if expected_checksum.as_slice() != stored_checksum {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "row checksum mismatch",
@@ -90,11 +93,8 @@ fn checked_len(len: usize, name: &'static str) -> Result<[u8; 4]> {
     Ok(len.to_be_bytes())
 }
 
-fn checksum(bytes: &[u8]) -> [u8; RowCodec::CHECKSUM_LEN] {
-    let digest = Sha256::digest(bytes);
-    let mut checksum = [0_u8; RowCodec::CHECKSUM_LEN];
-    checksum.copy_from_slice(&digest);
-    checksum
+fn checksum(bytes: &[u8]) -> u32 {
+    ROW_CRC32C.checksum(bytes)
 }
 
 struct Cursor<'a> {

@@ -3575,9 +3575,14 @@ impl<'a> Binder<'a> {
         {
             Ok(())
         } else {
+            let procedure_name = self
+                .catalog
+                .procedure_by_id(procedure_id)
+                .map(format_procedure_name)
+                .unwrap_or_else(|| format!("procedure {procedure_id}"));
             Err(RnovError::new(
                 ErrorKind::Security,
-                format!("missing {privilege:?} privilege on procedure {procedure_id}"),
+                format!("missing {privilege} privilege on {procedure_name}"),
             ))
         }
     }
@@ -5079,4 +5084,29 @@ fn procedure_body_parse_probe(body: &str) -> String {
         out.push_str("NULL");
     }
     out
+}
+
+fn format_procedure_name(procedure: &rnmdb_catalog::Procedure) -> String {
+    let arguments = procedure
+        .argument_types()
+        .iter()
+        .map(format_sql_type)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("procedure {}({arguments})", procedure.name())
+}
+
+fn format_sql_type(data_type: &SqlType) -> String {
+    match data_type {
+        SqlType::Null => "NULL".to_string(),
+        SqlType::Bool => "BOOL".to_string(),
+        SqlType::Int64 => "INT64".to_string(),
+        SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Text => "TEXT".to_string(),
+        SqlType::Bytes => "BYTES".to_string(),
+        SqlType::HStore => "HSTORE".to_string(),
+        SqlType::TextVector => "TEXTVECTOR".to_string(),
+        SqlType::Array(element) => format!("ARRAY<{}>", format_sql_type(element)),
+        SqlType::Range(element) => format!("RANGE<{}>", format_sql_type(element)),
+    }
 }

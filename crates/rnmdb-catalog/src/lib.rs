@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
 use rnmdb_common::{
     error::{ErrorKind, Result, RnovError},
@@ -227,6 +227,12 @@ impl Catalog {
         self.procedures
             .iter()
             .find(|procedure| procedure.name == name && procedure.argument_types == argument_types)
+    }
+
+    pub fn procedure_by_id(&self, procedure_id: FunctionId) -> Option<&Procedure> {
+        self.procedures
+            .iter()
+            .find(|procedure| procedure.procedure_id == procedure_id)
     }
 
     pub fn drop_function(
@@ -751,12 +757,11 @@ impl Catalog {
         privilege: Privilege,
     ) -> bool {
         privilege == Privilege::Execute
-            && (role_id == RoleId::new(0)
-                || self.procedure_grants.contains(&ProcedureGrant {
-                    role_id,
-                    procedure_id,
-                    privilege,
-                }))
+            && self.procedure_grants.contains(&ProcedureGrant {
+                role_id,
+                procedure_id,
+                privilege,
+            })
     }
 
     pub fn add_row_policy(&mut self, policy: RowPolicy) -> Result<RowPolicy> {
@@ -1127,6 +1132,18 @@ pub enum Privilege {
     Execute,
 }
 
+impl fmt::Display for Privilege {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+            Self::Execute => "EXECUTE",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TableGrant {
     role_id: RoleId,
@@ -1282,6 +1299,7 @@ pub struct CatalogCodec;
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
     const VERSION: u16 = 9;
+    const MIN_READ_VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1441,7 +1459,7 @@ impl CatalogCodec {
             ));
         }
         let version = reader.read_u16("catalog version")?;
-        if version != Self::VERSION {
+        if !(Self::MIN_READ_VERSION..=Self::VERSION).contains(&version) {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 format!("unsupported catalog version {version}"),
@@ -1652,22 +1670,24 @@ impl CatalogCodec {
             });
         }
 
-        let procedure_grant_count = reader.read_u32("procedure grant count")? as usize;
-        for _ in 0..procedure_grant_count {
-            let grant = ProcedureGrant {
-                role_id: RoleId::new(reader.read_u64("procedure grant role id")?),
-                procedure_id: FunctionId::new(reader.read_u64("procedure grant procedure id")?),
-                privilege: decode_privilege(reader.read_u8("procedure grant privilege")?)?,
-            };
-            if grant.privilege != Privilege::Execute {
-                return Err(RnovError::new(
-                    ErrorKind::Corruption,
-                    "procedure grant uses non-Execute privilege",
-                ));
+        if version >= 9 {
+            let procedure_grant_count = reader.read_u32("procedure grant count")? as usize;
+            for _ in 0..procedure_grant_count {
+                let grant = ProcedureGrant {
+                    role_id: RoleId::new(reader.read_u64("procedure grant role id")?),
+                    procedure_id: FunctionId::new(reader.read_u64("procedure grant procedure id")?),
+                    privilege: decode_privilege(reader.read_u8("procedure grant privilege")?)?,
+                };
+                if grant.privilege != Privilege::Execute {
+                    return Err(RnovError::new(
+                        ErrorKind::Corruption,
+                        "procedure grant uses non-Execute privilege",
+                    ));
+                }
+                catalog.ensure_role_exists(grant.role_id)?;
+                catalog.ensure_procedure_exists(grant.procedure_id)?;
+                catalog.procedure_grants.push(grant);
             }
-            catalog.ensure_role_exists(grant.role_id)?;
-            catalog.ensure_procedure_exists(grant.procedure_id)?;
-            catalog.procedure_grants.push(grant);
         }
 
         let policy_count = reader.read_u32("policy count")? as usize;
