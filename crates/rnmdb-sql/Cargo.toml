@@ -9,6 +9,7 @@ rust-version.workspace = true
 rnmdb-common.workspace = true
 rnmdb-types.workspace = true
 rnmdb-catalog.workspace = true
+phf = { version = "0.11", features = ["macros"] }
 
 [lib]
 path = "src/lib.rs"
