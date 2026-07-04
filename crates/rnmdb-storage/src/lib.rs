@@ -15,6 +15,7 @@ use rnmdb_common::{
     error::{ErrorKind, Result, RnovError},
     ids::PageId,
 };
+use sha2::{Digest, Sha256};
 
 pub use rnmdb_common::config::PageSize;
 
@@ -79,23 +80,26 @@ fn read_header_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8;
 }
 
 fn checksum_page(header: &PageHeader, payload: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    hash = fnv1a(hash, &header.page_id().get().to_be_bytes());
-    hash = fnv1a(hash, &header.lsn().to_be_bytes());
-    hash = fnv1a(hash, &(header.page_size().bytes() as u64).to_be_bytes());
-    hash = fnv1a(hash, &[header.format_version()]);
-    fnv1a(hash, payload)
+    let mut hasher = Sha256::new();
+    hasher.update(&header.page_id().get().to_be_bytes());
+    hasher.update(&header.lsn().to_be_bytes());
+    hasher.update(&(header.page_size().bytes() as u64).to_be_bytes());
+    hasher.update(&[header.format_version()]);
+    hasher.update(payload);
+    checksum_from_sha256(hasher)
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+fn checksum_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    checksum_from_sha256(hasher)
+}
 
-fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+fn checksum_from_sha256(hasher: Sha256) -> u64 {
+    let digest = hasher.finalize();
+    let mut checksum = [0_u8; 8];
+    checksum.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(checksum)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2412,7 +2416,7 @@ fn encode_superblock(generation: u64, catalog_root: u64, free_map_root: u64) -> 
     block[0..8].copy_from_slice(&generation.to_be_bytes());
     block[8..16].copy_from_slice(&catalog_root.to_be_bytes());
     block[16..24].copy_from_slice(&free_map_root.to_be_bytes());
-    let checksum = fnv1a(FNV_OFFSET, &block[0..24]);
+    let checksum = checksum_bytes(&block[0..24]);
     block[24..32].copy_from_slice(&checksum.to_be_bytes());
     block
 }
@@ -2432,7 +2436,7 @@ fn read_superblock(file: &mut File, offset: u64) -> Result<(u64, u64, u64)> {
         )
     })?;
     let checksum = u64::from_be_bytes(read_fixed::<8>(&block, 24)?);
-    let expected = fnv1a(FNV_OFFSET, &block[0..24]);
+    let expected = checksum_bytes(&block[0..24]);
     if checksum != expected {
         return Err(RnovError::new(
             ErrorKind::Corruption,
