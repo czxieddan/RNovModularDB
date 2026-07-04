@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Bound,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread,
@@ -657,48 +657,41 @@ impl MemoryTable {
 
     fn build_index_parallel(
         &self,
-        index: MemoryTableIndex,
+        mut index: MemoryTableIndex,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<MemoryTableIndex> {
         let worker_count = config.worker_threads().min(self.rows.len());
         let chunk_size = self.rows.len().div_ceil(worker_count);
-        let index = Mutex::new(index);
 
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for (chunk_index, chunk) in self.rows.chunks(chunk_size).enumerate() {
                 let columns = &self.columns;
-                let index = &index;
+                let mut local_index = index.empty_clone();
                 let cancellation = cancellation.clone();
                 let start_slot = chunk_index * chunk_size;
                 handles.push(scope.spawn(move || {
                     for (offset, row) in chunk.iter().enumerate() {
                         cancellation.check()?;
                         let pointer = pointer_for_slot(start_slot + offset)?;
-                        let mut index = index.lock().map_err(|_| {
-                            RnovError::new(
-                                ErrorKind::Internal,
-                                "parallel index build lock poisoned",
-                            )
-                        })?;
-                        index.insert_row(columns, row, pointer)?;
+                        local_index.insert_row(columns, row, pointer)?;
                     }
-                    cancellation.check()
+                    cancellation.check()?;
+                    Ok::<MemoryTableIndex, RnovError>(local_index)
                 }));
             }
 
             for handle in handles {
-                handle.join().map_err(|_| {
+                let local_index = handle.join().map_err(|_| {
                     RnovError::new(ErrorKind::Internal, "parallel index build worker panicked")
                 })??;
+                index.merge_from(local_index)?;
             }
             Ok::<(), RnovError>(())
         })?;
 
-        index
-            .into_inner()
-            .map_err(|_| RnovError::new(ErrorKind::Internal, "parallel index build lock poisoned"))
+        Ok(index)
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
@@ -1050,6 +1043,120 @@ impl MemoryTableIndex {
                     MemoryCompositeIndex::non_unique(name)
                 };
             }
+        }
+    }
+
+    fn empty_clone(&self) -> Self {
+        let mut index = self.clone();
+        index.clear();
+        index
+    }
+
+    fn merge_from(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (
+                Self::BTree {
+                    column_index,
+                    index,
+                },
+                Self::BTree {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::ExpressionBTree { expr, index },
+                Self::ExpressionBTree {
+                    expr: other_expr,
+                    index: other_index,
+                },
+            ) if *expr == other_expr => index.merge_from(other_index),
+            (
+                Self::Hash {
+                    column_index,
+                    index,
+                },
+                Self::Hash {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::ExpressionHash { expr, index },
+                Self::ExpressionHash {
+                    expr: other_expr,
+                    index: other_index,
+                },
+            ) if *expr == other_expr => index.merge_from(other_index),
+            (
+                Self::GinText {
+                    column_index,
+                    index,
+                },
+                Self::GinText {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GinValue {
+                    column_index,
+                    index,
+                },
+                Self::GinValue {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GistRange {
+                    column_index,
+                    index,
+                },
+                Self::GistRange {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GistBounds {
+                    column_index,
+                    index,
+                },
+                Self::GistBounds {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::BrinSummary {
+                    column_index,
+                    index,
+                    entries,
+                },
+                Self::BrinSummary {
+                    column_index: other_column_index,
+                    entries: other_entries,
+                    ..
+                },
+            ) if *column_index == other_column_index => {
+                entries.extend(other_entries);
+                rebuild_block_summary_index(index, entries)
+            }
+            (
+                Self::Composite {
+                    column_indexes,
+                    index,
+                },
+                Self::Composite {
+                    column_indexes: other_column_indexes,
+                    index: other_index,
+                },
+            ) if *column_indexes == other_column_indexes => index.merge_from(other_index),
+            _ => Err(RnovError::new(
+                ErrorKind::Internal,
+                "cannot merge incompatible memory table indexes",
+            )),
         }
     }
 
