@@ -1,11 +1,15 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    future::Future,
     ops::Bound,
+    panic::{self, AssertUnwindSafe},
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
+    task::{Context, Poll, Waker},
     thread,
 };
 
@@ -37,6 +41,102 @@ use crate::vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
+
+struct BlockingResultState<T> {
+    result: Option<Result<T>>,
+    waker: Option<Waker>,
+}
+
+struct BlockingResultTask<T> {
+    state: Arc<Mutex<BlockingResultState<T>>>,
+    job: Option<Box<dyn FnOnce() -> Result<T> + Send + 'static>>,
+}
+
+impl<T> BlockingResultTask<T> {
+    fn new(job: impl FnOnce() -> Result<T> + Send + 'static) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(BlockingResultState {
+                result: None,
+                waker: None,
+            })),
+            job: Some(Box::new(job)),
+        }
+    }
+}
+
+impl<T> Unpin for BlockingResultTask<T> {}
+
+impl<T: Send + 'static> Future for BlockingResultTask<T> {
+    type Output = Result<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let task = self.get_mut();
+        let state = Arc::clone(&task.state);
+        let job = {
+            let mut state = match state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Poll::Ready(Err(RnovError::new(
+                        ErrorKind::Internal,
+                        "async memory executor state lock poisoned",
+                    )));
+                }
+            };
+            if let Some(result) = state.result.take() {
+                return Poll::Ready(result);
+            }
+            state.waker = Some(cx.waker().clone());
+            task.job.take()
+        };
+
+        if let Some(job) = job {
+            let state = Arc::clone(&task.state);
+            thread::spawn(move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| {
+                    Err(RnovError::new(
+                        ErrorKind::Internal,
+                        "async memory executor worker panicked",
+                    ))
+                });
+                let waker = match state.lock() {
+                    Ok(mut state) => {
+                        state.result = Some(result);
+                        state.waker.take()
+                    }
+                    Err(_) => None,
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+        }
+
+        Poll::Pending
+    }
+}
+
+struct BlockingMutationTask<'a> {
+    executor: &'a mut MemoryExecutor,
+    inner: BlockingResultTask<(MemoryExecutor, Result<ExecutionResult>)>,
+}
+
+impl Unpin for BlockingMutationTask<'_> {}
+
+impl Future for BlockingMutationTask<'_> {
+    type Output = Result<ExecutionResult>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let task = self.get_mut();
+        match Pin::new(&mut task.inner).poll(cx) {
+            Poll::Ready(Ok((executor, result))) => {
+                *task.executor = executor;
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct MemoryTable {
@@ -533,40 +633,11 @@ impl MemoryTable {
     ) -> Result<VectorBatch> {
         config.validate()?;
         cancellation.check()?;
-        if self.rows.is_empty()
-            || config.worker_threads() == 1
-            || self.rows.len() < config.min_parallel_rows()
-        {
-            cancellation.check()?;
-            return Ok(self.scan());
-        }
-
-        let worker_count = config.worker_threads().min(self.rows.len());
-        let chunk_size = self.rows.len().div_ceil(worker_count);
-        let mut rows = Vec::with_capacity(self.rows.len());
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for chunk in self.rows.chunks(chunk_size) {
-                let cancellation = cancellation.clone();
-                handles.push(scope.spawn(move || {
-                    cancellation.check()?;
-                    let rows = chunk.to_vec();
-                    cancellation.check()?;
-                    Ok::<Vec<Row>, RnovError>(rows)
-                }));
-            }
-
-            for handle in handles {
-                let mut chunk = handle.join().map_err(|_| {
-                    RnovError::new(ErrorKind::Internal, "parallel memory scan worker panicked")
-                })??;
-                rows.append(&mut chunk);
-            }
-            Ok::<(), RnovError>(())
-        })?;
-
+        // A plain memory scan only clones rows; later operators decide whether real
+        // per-row work is worth parallelizing.
+        let batch = self.scan();
         cancellation.check()?;
-        VectorBatch::new(self.columns.clone(), rows)
+        Ok(batch)
     }
 
     fn add_column(&mut self, column: ColumnSchema) -> Result<()> {
@@ -2261,16 +2332,24 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
-        self.execute(plan)
+    pub fn execute_async(
+        &self,
+        plan: &LogicalPlan,
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        BlockingResultTask::new(move || executor.execute(&plan))
     }
 
-    pub async fn execute_cancellable_async(
+    pub fn execute_cancellable_async(
         &self,
         plan: &LogicalPlan,
         cancellation: &CancellationToken,
-    ) -> Result<VectorBatch> {
-        self.execute_cancellable(plan, cancellation)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        let cancellation = cancellation.clone();
+        BlockingResultTask::new(move || executor.execute_cancellable(&plan, &cancellation))
     }
 
     fn execute_sideways_index_lookup(
@@ -2519,7 +2598,13 @@ impl MemoryExecutor {
                 input,
             } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+                apply_grouped_aggregate_parallel_cancellable(
+                    batch,
+                    group_by,
+                    items,
+                    config,
+                    cancellation,
+                )
             }
             LogicalPlan::GroupingSetsAggregate {
                 group_by,
@@ -2581,8 +2666,10 @@ impl MemoryExecutor {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_offset_cancellable(batch, *count, cancellation)
             }
-            LogicalPlan::Parallel { input, .. } => {
-                self.execute_parallel_cancellable(input, config, cancellation)
+            LogicalPlan::Parallel { hint, input } => {
+                let hinted_config =
+                    ParallelQueryConfig::new(hint.workers, config.min_parallel_rows());
+                self.execute_parallel_cancellable(input, hinted_config, cancellation)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -2591,21 +2678,28 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_parallel_async(
+    pub fn execute_parallel_async(
         &self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
-    ) -> Result<VectorBatch> {
-        self.execute_parallel(plan, config)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        BlockingResultTask::new(move || executor.execute_parallel(&plan, config))
     }
 
-    pub async fn execute_parallel_cancellable_async(
+    pub fn execute_parallel_cancellable_async(
         &self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
-    ) -> Result<VectorBatch> {
-        self.execute_parallel_cancellable(plan, config, cancellation)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        let cancellation = cancellation.clone();
+        BlockingResultTask::new(move || {
+            executor.execute_parallel_cancellable(&plan, config, &cancellation)
+        })
     }
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
@@ -2719,8 +2813,19 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_mut_async(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
-        self.execute_mut(plan)
+    pub fn execute_mut_async<'a>(
+        &'a mut self,
+        plan: &LogicalPlan,
+    ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
+        let mut executor = self.clone();
+        let plan = plan.clone();
+        BlockingMutationTask {
+            executor: self,
+            inner: BlockingResultTask::new(move || {
+                let result = executor.execute_mut(&plan);
+                Ok((executor, result))
+            }),
+        }
     }
 
     pub fn execute_mut_parallel(
@@ -2765,12 +2870,20 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_mut_parallel_async(
-        &mut self,
+    pub fn execute_mut_parallel_async<'a>(
+        &'a mut self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
-    ) -> Result<ExecutionResult> {
-        self.execute_mut_parallel(plan, config)
+    ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
+        let mut executor = self.clone();
+        let plan = plan.clone();
+        BlockingMutationTask {
+            executor: self,
+            inner: BlockingResultTask::new(move || {
+                let result = executor.execute_mut_parallel(&plan, config);
+                Ok((executor, result))
+            }),
+        }
     }
 
     fn create_table(
