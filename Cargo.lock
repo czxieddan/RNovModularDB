@@ -393,6 +393,7 @@ dependencies = [
  "rnmdb-planner",
  "rnmdb-sql",
  "rnmdb-types",
+ "sha2",
 ]
 
 [[package]]
@@ -468,6 +469,7 @@ dependencies = [
  "chacha20poly1305",
  "rand_core 0.9.5",
  "rnmdb-common",
+ "sha2",
  "tempfile",
 ]
 

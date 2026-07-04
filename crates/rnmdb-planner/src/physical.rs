@@ -185,6 +185,10 @@ pub enum PhysicalPlan {
         description: String,
         cost: PlanCost,
     },
+    Unsupported {
+        reason: String,
+        cost: PlanCost,
+    },
     Transaction {
         action: String,
         cost: PlanCost,
@@ -733,6 +737,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Parallel { cost, .. }
             | PhysicalPlan::Mutation { cost, .. }
             | PhysicalPlan::Ddl { cost, .. }
+            | PhysicalPlan::Unsupported { cost, .. }
             | PhysicalPlan::Transaction { cost, .. }
             | PhysicalPlan::Explain { cost, .. } => *cost,
         }
@@ -1038,6 +1043,12 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        PhysicalPlan::Unsupported { reason, cost } => {
+            out.push_str(&format!(
+                "{prefix}Unsupported reason={reason}{}\n",
+                cost_suffix(*cost)
+            ));
+        }
         PhysicalPlan::Transaction { action, cost } => {
             out.push_str(&format!(
                 "{prefix}Transaction action={action}{}\n",
@@ -1100,9 +1111,9 @@ impl PhysicalPlanner {
             };
         }
 
-        PhysicalPlan::Ddl {
-            description: format!(
-                "SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column}"
+        PhysicalPlan::Unsupported {
+            reason: format!(
+                "SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column} requires an index on {inner_column}"
             ),
             cost: fallback_cost,
         }

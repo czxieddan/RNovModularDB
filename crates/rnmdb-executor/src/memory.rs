@@ -3336,7 +3336,7 @@ fn update_rows(
         if row_matches(&columns, row, selection)? {
             let mut updated = row.clone();
             for (index, expr) in &assignments {
-                updated.set_value(*index, eval_expr(&columns, row, expr)?);
+                updated.set_value(*index, eval_expr(&columns, &updated, expr)?);
             }
             recompute_generated_values(&columns, &mut updated)?;
             validate_row_against_columns(&columns, &updated)?;

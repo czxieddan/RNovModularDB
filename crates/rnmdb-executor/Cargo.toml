@@ -13,6 +13,7 @@ rnmdb-index.workspace = true
 rnmdb-planner.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-types.workspace = true
+sha2 = "0.11.0"
 
 [lib]
 path = "src/lib.rs"
