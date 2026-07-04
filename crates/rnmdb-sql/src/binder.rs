@@ -825,8 +825,8 @@ impl<'a> Binder<'a> {
             table: table_name.clone(),
             assignments: bound_assignments,
             selection: selection.clone(),
-            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(table)?,
+            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
     }
 
@@ -864,8 +864,8 @@ impl<'a> Binder<'a> {
             relation_id: table.relation_id(),
             table: table_name.clone(),
             selection: selection.clone(),
-            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(table)?,
+            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
     }
 
@@ -1354,8 +1354,8 @@ impl<'a> Binder<'a> {
             order_by: bound_order_by,
             limit,
             offset,
-            applied_row_policies: self.applied_row_policy_names(table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(table)?,
+            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
     }
 
@@ -1646,8 +1646,8 @@ impl<'a> Binder<'a> {
             order_by: bound_order_by,
             limit,
             offset,
-            applied_row_policies: self.applied_row_policy_names(outer_table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(outer_table)?,
+            applied_row_policies: self.applied_row_policy_names(role_id, outer_table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, outer_table)?,
         }))
     }
 
@@ -3587,7 +3587,10 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn applied_row_policy_names(&self, relation_id: RelationId) -> Vec<String> {
+    fn applied_row_policy_names(&self, role_id: RoleId, relation_id: RelationId) -> Vec<String> {
+        if self.bypasses_row_security(role_id, relation_id) {
+            return Vec::new();
+        }
         let mut names: Vec<String> = self
             .catalog
             .row_policies(relation_id)
@@ -3600,7 +3603,10 @@ impl<'a> Binder<'a> {
         names
     }
 
-    fn bind_row_policies(&self, table: &Table) -> Result<Vec<BoundRowPolicy>> {
+    fn bind_row_policies(&self, role_id: RoleId, table: &Table) -> Result<Vec<BoundRowPolicy>> {
+        if self.bypasses_row_security(role_id, table.relation_id()) {
+            return Ok(Vec::new());
+        }
         let mut policies: Vec<BoundRowPolicy> = self
             .catalog
             .row_policies(table.relation_id())
@@ -3625,6 +3631,11 @@ impl<'a> Binder<'a> {
             });
         }
         Ok(policies)
+    }
+
+    fn bypasses_row_security(&self, role_id: RoleId, relation_id: RelationId) -> bool {
+        self.catalog.role_is_superuser(role_id)
+            || self.catalog.role_owns_relation(role_id, relation_id)
     }
 
     fn validate_policy_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {

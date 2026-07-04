@@ -298,6 +298,7 @@ impl LocalSession {
             .catalog
             .create_table(schema, name.object(), columns)?
             .relation_id();
+        self.catalog.set_table_owner(relation_id, self.role_id)?;
         self.grant_local_table_privileges(relation_id)
     }
 

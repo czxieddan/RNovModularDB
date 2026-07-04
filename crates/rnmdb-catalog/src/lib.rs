@@ -127,6 +127,7 @@ pub struct Table {
     name: String,
     columns: Vec<Column>,
     version: u64,
+    owner_role_id: Option<RoleId>,
 }
 
 impl Table {
@@ -148,6 +149,10 @@ impl Table {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub fn owner_role_id(&self) -> Option<RoleId> {
+        self.owner_role_id
     }
 }
 
@@ -351,6 +356,14 @@ impl Catalog {
         self.grants.retain(|grant| grant.role_id != role.role_id);
         self.procedure_grants
             .retain(|grant| grant.role_id != role.role_id);
+        for schema in self.schemas.values_mut() {
+            for table in schema.tables.values_mut() {
+                if table.owner_role_id == Some(role.role_id) {
+                    table.owner_role_id = None;
+                    table.version += 1;
+                }
+            }
+        }
         Ok(Some(role))
     }
 
@@ -408,6 +421,7 @@ impl Catalog {
                 name: table_name.clone(),
                 columns,
                 version: 1,
+                owner_role_id: None,
             },
         );
         Ok(schema.tables.get(&table_name).expect("table inserted"))
@@ -675,6 +689,18 @@ impl Catalog {
     }
 
     pub fn create_role(&mut self, name: impl Into<String>) -> Result<Role> {
+        self.create_role_with_superuser(name, false)
+    }
+
+    pub fn create_superuser_role(&mut self, name: impl Into<String>) -> Result<Role> {
+        self.create_role_with_superuser(name, true)
+    }
+
+    fn create_role_with_superuser(
+        &mut self,
+        name: impl Into<String>,
+        superuser: bool,
+    ) -> Result<Role> {
         let name = name.into();
         validate_identifier("role", &name)?;
         if self.roles.contains_key(&name) {
@@ -687,10 +713,32 @@ impl Catalog {
         let role = Role {
             role_id: RoleId::new(self.next_role_id),
             name: name.clone(),
+            superuser,
         };
         self.next_role_id += 1;
         self.roles.insert(name, role.clone());
         Ok(role)
+    }
+
+    pub fn set_table_owner(&mut self, relation_id: RelationId, role_id: RoleId) -> Result<()> {
+        self.ensure_role_exists(role_id)?;
+        let table = self
+            .table_by_relation_id_mut(relation_id)
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "relation does not exist"))?;
+        table.owner_role_id = Some(role_id);
+        table.version += 1;
+        Ok(())
+    }
+
+    pub fn role_owns_relation(&self, role_id: RoleId, relation_id: RelationId) -> bool {
+        self.table_by_relation_id(relation_id)
+            .is_some_and(|table| table.owner_role_id == Some(role_id))
+    }
+
+    pub fn role_is_superuser(&self, role_id: RoleId) -> bool {
+        self.roles
+            .values()
+            .any(|role| role.role_id == role_id && role.superuser)
     }
 
     pub fn grant_table_privilege(
@@ -894,6 +942,13 @@ impl Catalog {
         self.schemas
             .values()
             .flat_map(|schema| schema.tables.values())
+            .find(|table| table.relation_id == relation_id)
+    }
+
+    fn table_by_relation_id_mut(&mut self, relation_id: RelationId) -> Option<&mut Table> {
+        self.schemas
+            .values_mut()
+            .flat_map(|schema| schema.tables.values_mut())
             .find(|table| table.relation_id == relation_id)
     }
 }
@@ -1111,6 +1166,7 @@ impl Index {
 pub struct Role {
     role_id: RoleId,
     name: String,
+    superuser: bool,
 }
 
 impl Role {
@@ -1120,6 +1176,10 @@ impl Role {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn is_superuser(&self) -> bool {
+        self.superuser
     }
 }
 
@@ -1298,7 +1358,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 9;
+    const VERSION: u16 = 10;
     const MIN_READ_VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
@@ -1321,6 +1381,7 @@ impl CatalogCodec {
                 write_string(&mut out, &table.schema_name)?;
                 write_string(&mut out, &table.name)?;
                 write_u64(&mut out, table.version);
+                write_optional_role_id(&mut out, table.owner_role_id);
                 write_u32(&mut out, table.columns.len() as u32);
                 for column in &table.columns {
                     write_string(&mut out, &column.name)?;
@@ -1414,6 +1475,7 @@ impl CatalogCodec {
         for role in catalog.roles.values() {
             write_u64(&mut out, role.role_id.get());
             write_string(&mut out, &role.name)?;
+            out.push(u8::from(role.superuser));
         }
 
         write_u32(&mut out, catalog.grants.len() as u32);
@@ -1498,7 +1560,12 @@ impl CatalogCodec {
                 let relation_id = RelationId::new(reader.read_u64("relation id")?);
                 let table_schema = reader.read_string("table schema")?;
                 let table_name = reader.read_string("table name")?;
-                let version = reader.read_u64("table version")?;
+                let table_version = reader.read_u64("table version")?;
+                let owner_role_id = if version >= 10 {
+                    read_optional_role_id(&mut reader, "table owner role id")?
+                } else {
+                    None
+                };
                 let column_count = reader.read_u32("column count")? as usize;
                 let mut columns = Vec::with_capacity(column_count);
                 for _ in 0..column_count {
@@ -1531,7 +1598,8 @@ impl CatalogCodec {
                         schema_name: table_schema,
                         name: table_name,
                         columns,
-                        version,
+                        version: table_version,
+                        owner_role_id,
                     },
                 );
             }
@@ -1658,7 +1726,29 @@ impl CatalogCodec {
         for _ in 0..role_count {
             let role_id = RoleId::new(reader.read_u64("role id")?);
             let name = reader.read_string("role name")?;
-            catalog.roles.insert(name.clone(), Role { role_id, name });
+            let superuser = if version >= 10 {
+                reader.read_bool("role superuser")?
+            } else {
+                false
+            };
+            catalog.roles.insert(
+                name.clone(),
+                Role {
+                    role_id,
+                    name,
+                    superuser,
+                },
+            );
+        }
+
+        for table in catalog
+            .schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
+        {
+            if let Some(owner_role_id) = table.owner_role_id {
+                catalog.ensure_role_exists(owner_role_id)?;
+            }
         }
 
         let grant_count = reader.read_u32("grant count")? as usize;
@@ -1736,6 +1826,27 @@ fn write_u32(out: &mut Vec<u8>, value: u32) {
 
 fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_optional_role_id(out: &mut Vec<u8>, value: Option<RoleId>) {
+    match value {
+        Some(role_id) => {
+            out.push(1);
+            write_u64(out, role_id.get());
+        }
+        None => out.push(0),
+    }
+}
+
+fn read_optional_role_id(
+    reader: &mut CatalogReader<'_>,
+    name: &'static str,
+) -> Result<Option<RoleId>> {
+    if reader.read_bool(name)? {
+        Ok(Some(RoleId::new(reader.read_u64(name)?)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn write_string(out: &mut Vec<u8>, value: &str) -> Result<()> {
