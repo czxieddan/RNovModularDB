@@ -5650,29 +5650,30 @@ fn eval_like_expr(
 fn like_pattern_matches(value: &str, pattern: &str) -> bool {
     let value: Vec<char> = value.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
-    let mut matched = vec![vec![false; pattern.len() + 1]; value.len() + 1];
-    matched[0][0] = true;
+    let mut previous = vec![false; pattern.len() + 1];
+    let mut current = vec![false; pattern.len() + 1];
+    previous[0] = true;
 
     for pattern_index in 0..pattern.len() {
         if pattern[pattern_index] == '%' {
-            matched[0][pattern_index + 1] = matched[0][pattern_index];
+            previous[pattern_index + 1] = previous[pattern_index];
         }
     }
 
-    for value_index in 0..value.len() {
+    for value_char in value {
+        current[0] = false;
         for pattern_index in 0..pattern.len() {
-            matched[value_index + 1][pattern_index + 1] = match pattern[pattern_index] {
-                '%' => {
-                    matched[value_index + 1][pattern_index]
-                        || matched[value_index][pattern_index + 1]
-                }
-                '_' => matched[value_index][pattern_index],
-                literal => matched[value_index][pattern_index] && value[value_index] == literal,
+            current[pattern_index + 1] = match pattern[pattern_index] {
+                '%' => current[pattern_index] || previous[pattern_index + 1],
+                '_' => previous[pattern_index],
+                literal => previous[pattern_index] && value_char == literal,
             };
         }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(false);
     }
 
-    matched[value.len()][pattern.len()]
+    previous[pattern.len()]
 }
 
 fn eval_coalesce_expr(columns: &[ColumnSchema], row: &Row, values: &[Expr]) -> Result<SqlValue> {
