@@ -63,7 +63,7 @@ impl ColumnSchema {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Row {
     values: Vec<SqlValue>,
 }

@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::Bound,
     sync::{
         Arc, Mutex,
@@ -62,12 +62,13 @@ impl MemoryTable {
     pub fn insert(&mut self, row: Row) -> Result<()> {
         validate_row_against_columns(&self.columns, &row)?;
         let pointer = pointer_for_slot(self.rows.len())?;
-        let mut indexes = self.indexes.clone();
-        for index in indexes.values_mut() {
-            index.insert_row(&self.columns, &row, pointer)?;
+        for index in self.indexes.values_mut() {
+            if let Err(err) = index.insert_row(&self.columns, &row, pointer) {
+                self.rebuild_indexes()?;
+                return Err(err);
+            }
         }
         self.rows.push(row);
-        self.indexes = indexes;
         Ok(())
     }
 
@@ -3809,15 +3810,18 @@ fn group_states_from_rows(
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
+    let mut group_indexes: HashMap<Vec<SqlValue>, usize> = HashMap::new();
     for row in rows {
         cancellation.check()?;
         let key = group_by
             .iter()
             .map(|expr| eval_expr(columns, row, expr))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-            group.rows.push(row.clone());
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].rows.push(row.clone());
         } else {
+            let index = groups.len();
+            group_indexes.insert(key.clone(), index);
             groups.push(GroupState {
                 key,
                 rows: vec![row.clone()],
@@ -3828,10 +3832,16 @@ fn group_states_from_rows(
 }
 
 fn merge_group_states(groups: &mut Vec<GroupState>, local_groups: Vec<GroupState>) {
+    let mut group_indexes = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.key.clone(), index))
+        .collect::<HashMap<_, _>>();
     for local_group in local_groups {
-        if let Some(group) = groups.iter_mut().find(|group| group.key == local_group.key) {
-            group.rows.extend(local_group.rows);
+        if let Some(index) = group_indexes.get(&local_group.key).copied() {
+            groups[index].rows.extend(local_group.rows);
         } else {
+            group_indexes.insert(local_group.key.clone(), groups.len());
             groups.push(local_group);
         }
     }
@@ -3896,15 +3906,18 @@ fn grouping_set_states(
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
+    let mut group_indexes: HashMap<Vec<SqlValue>, usize> = HashMap::new();
     for row in batch.rows() {
         cancellation.check()?;
         let key = grouping_set
             .iter()
             .map(|expr| eval_expr(batch.columns(), row, expr))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-            group.rows.push(row.clone());
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].rows.push(row.clone());
         } else {
+            let index = groups.len();
+            group_indexes.insert(key.clone(), index);
             groups.push(GroupState {
                 key,
                 rows: vec![row.clone()],
@@ -4108,9 +4121,10 @@ fn apply_distinct_cancellable(
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let mut rows = Vec::new();
+    let mut seen = HashSet::new();
     for row in batch.rows() {
         cancellation.check()?;
-        if !rows.contains(row) {
+        if seen.insert(row.clone()) {
             rows.push(row.clone());
         }
     }
@@ -4153,10 +4167,12 @@ fn apply_intersect_cancellable(
     if all {
         return apply_intersect_all_cancellable(left, right, cancellation);
     }
+    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let mut emitted = HashSet::new();
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if right.rows().contains(row) && !rows.contains(row) {
+        if right_rows.contains(row) && emitted.insert(row.clone()) {
             rows.push(row.clone());
         }
     }
@@ -4174,10 +4190,12 @@ fn apply_except_cancellable(
     if all {
         return apply_except_all_cancellable(left, right, cancellation);
     }
+    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let mut emitted = HashSet::new();
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if !right.rows().contains(row) && !rows.contains(row) {
+        if !right_rows.contains(row) && emitted.insert(row.clone()) {
             rows.push(row.clone());
         }
     }
@@ -4190,13 +4208,15 @@ fn apply_intersect_all_cancellable(
     right: VectorBatch,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let mut right_rows = right.rows().to_vec();
+    let mut right_counts = row_counts(right.rows());
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
+        if let Some(count) = right_counts.get_mut(row)
+            && *count > 0
+        {
             rows.push(row.clone());
-            right_rows.remove(index);
+            *count -= 1;
         }
     }
     cancellation.check()?;
@@ -4208,18 +4228,28 @@ fn apply_except_all_cancellable(
     right: VectorBatch,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let mut right_rows = right.rows().to_vec();
+    let mut right_counts = row_counts(right.rows());
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
-            right_rows.remove(index);
+        if let Some(count) = right_counts.get_mut(row)
+            && *count > 0
+        {
+            *count -= 1;
         } else {
             rows.push(row.clone());
         }
     }
     cancellation.check()?;
     VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn row_counts(rows: &[Row]) -> HashMap<Row, usize> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row.clone()).or_insert(0) += 1;
+    }
+    counts
 }
 
 fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {

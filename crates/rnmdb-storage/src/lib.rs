@@ -1835,7 +1835,7 @@ impl StorageBackend for SingleFileBackend {
             )
         })?;
         let offset = self.page_offset(page.id())?;
-        let counter = read_existing_page_counter(&mut file, offset)?.unwrap_or(0) + 1;
+        let counter = next_page_counter(read_existing_page_counter(&mut file, offset)?)?;
         let nonce = PageNonce::from_page_counter(page.id(), counter);
         let ciphertext = PageCrypto::encrypt(&key, nonce, &page)?;
 
@@ -2475,6 +2475,17 @@ fn read_existing_page_counter(file: &mut File, offset: u64) -> Result<Option<u32
         ));
     }
     Ok(Some(u32::from_be_bytes(read_fixed::<4>(&header, 8)?)))
+}
+
+fn next_page_counter(current: Option<u32>) -> Result<u32> {
+    match current {
+        Some(u32::MAX) => Err(RnovError::new(
+            ErrorKind::Security,
+            "page encryption counter exhausted; rotate the page key before rewriting this page",
+        )),
+        Some(counter) => Ok(counter + 1),
+        None => Ok(1),
+    }
 }
 
 fn read_fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
