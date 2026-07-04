@@ -1,5 +1,6 @@
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlValue;
+use sha2::{Digest, Sha256};
 
 use crate::vector::{ColumnSchema, Row, VectorBatch};
 
@@ -7,7 +8,8 @@ use crate::vector::{ColumnSchema, Row, VectorBatch};
 pub struct RowCodec;
 
 impl RowCodec {
-    const VERSION: u8 = 1;
+    const VERSION: u8 = 2;
+    const CHECKSUM_LEN: usize = 32;
 
     pub fn encode(columns: &[ColumnSchema], row: &Row) -> Result<Vec<u8>> {
         let _ = VectorBatch::new(columns.to_vec(), vec![row.clone()])?;
@@ -18,18 +20,38 @@ impl RowCodec {
             encoded.extend_from_slice(&checked_len(value_bytes.len(), "row value payload")?);
             encoded.extend_from_slice(&value_bytes);
         }
+        encoded.extend_from_slice(&checksum(&encoded));
         Ok(encoded)
     }
 
     pub fn decode(columns: &[ColumnSchema], bytes: &[u8]) -> Result<Row> {
-        let mut cursor = Cursor::new(bytes);
-        let version = cursor.read_u8("row encoding version")?;
+        let version = *bytes.first().ok_or_else(|| {
+            RnovError::new(ErrorKind::InvalidInput, "truncated row encoding version")
+        })?;
         if version != Self::VERSION {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unsupported row encoding version {version}"),
             ));
         }
+        if bytes.len() < 1 + Self::CHECKSUM_LEN {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "truncated row checksum",
+            ));
+        }
+
+        let checksum_offset = bytes.len() - Self::CHECKSUM_LEN;
+        let (payload, stored_checksum) = bytes.split_at(checksum_offset);
+        if checksum(payload).as_slice() != stored_checksum {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "row checksum mismatch",
+            ));
+        }
+
+        let mut cursor = Cursor::new(payload);
+        let _ = cursor.read_u8("row encoding version")?;
 
         let value_count = cursor.read_u32("row value count")? as usize;
         if value_count != columns.len() {
@@ -66,6 +88,13 @@ fn checked_len(len: usize, name: &'static str) -> Result<[u8; 4]> {
     let len = u32::try_from(len)
         .map_err(|_| RnovError::new(ErrorKind::InvalidInput, format!("{name} is too large")))?;
     Ok(len.to_be_bytes())
+}
+
+fn checksum(bytes: &[u8]) -> [u8; RowCodec::CHECKSUM_LEN] {
+    let digest = Sha256::digest(bytes);
+    let mut checksum = [0_u8; RowCodec::CHECKSUM_LEN];
+    checksum.copy_from_slice(&digest);
+    checksum
 }
 
 struct Cursor<'a> {

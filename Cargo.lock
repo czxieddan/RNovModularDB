@@ -393,6 +393,7 @@ dependencies = [
  "rnmdb-planner",
  "rnmdb-sql",
  "rnmdb-types",
+ "sha2",
 ]
 
 [[package]]
