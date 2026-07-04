@@ -228,7 +228,9 @@ impl<'a> Binder<'a> {
                     privilege: *privilege,
                 })
             }
-            Statement::CallProcedure { name, args } => self.bind_call_procedure(name, args),
+            Statement::CallProcedure { name, args } => {
+                self.bind_call_procedure(name, args, role_id)
+            }
             Statement::Insert {
                 table,
                 columns,
@@ -680,7 +682,12 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn bind_call_procedure(&self, name: &Ident, args: &[Expr]) -> Result<BoundStatement> {
+    fn bind_call_procedure(
+        &self,
+        name: &Ident,
+        args: &[Expr],
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
         let argument_types = args
             .iter()
             .map(procedure_argument_type)
@@ -694,6 +701,7 @@ impl<'a> Binder<'a> {
                     format!("procedure does not exist: {}", name.as_str()),
                 )
             })?;
+        self.require_procedure_privilege(role_id, procedure.procedure_id(), Privilege::Execute)?;
         validate_sql_procedure_body(procedure.body())?;
         Ok(BoundStatement::CallProcedure {
             name: name.clone(),
@@ -3037,7 +3045,7 @@ impl<'a> Binder<'a> {
         let column = table
             .columns()
             .iter()
-            .find(|column| column.name() == column_name)
+            .find(|column| column.name().eq_ignore_ascii_case(column_name))
             .ok_or_else(|| {
                 RnovError::new(
                     ErrorKind::NotFound,
@@ -3551,6 +3559,25 @@ impl<'a> Binder<'a> {
             Err(RnovError::new(
                 ErrorKind::Security,
                 format!("missing {privilege:?} privilege on relation {relation_id}"),
+            ))
+        }
+    }
+
+    fn require_procedure_privilege(
+        &self,
+        role_id: RoleId,
+        procedure_id: rnmdb_common::ids::FunctionId,
+        privilege: Privilege,
+    ) -> Result<()> {
+        if self
+            .catalog
+            .has_procedure_privilege(role_id, procedure_id, privilege)
+        {
+            Ok(())
+        } else {
+            Err(RnovError::new(
+                ErrorKind::Security,
+                format!("missing {privilege:?} privilege on procedure {procedure_id}"),
             ))
         }
     }

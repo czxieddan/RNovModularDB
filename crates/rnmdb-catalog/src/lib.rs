@@ -178,6 +178,7 @@ pub struct Catalog {
     indexes: Vec<Index>,
     roles: BTreeMap<String, Role>,
     grants: Vec<TableGrant>,
+    procedure_grants: Vec<ProcedureGrant>,
     row_policies: BTreeMap<RelationId, Vec<RowPolicy>>,
     row_security: BTreeMap<RelationId, RowSecurityMode>,
 }
@@ -198,6 +199,7 @@ impl Catalog {
             indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
+            procedure_grants: Vec::new(),
             row_policies: BTreeMap::new(),
             row_security: BTreeMap::new(),
         }
@@ -263,7 +265,10 @@ impl Catalog {
         }) else {
             return Ok(None);
         };
-        Ok(Some(self.procedures.remove(position)))
+        let procedure = self.procedures.remove(position);
+        self.procedure_grants
+            .retain(|grant| grant.procedure_id != procedure.procedure_id);
+        Ok(Some(procedure))
     }
 
     pub fn operators(&self) -> &[Operator] {
@@ -338,6 +343,8 @@ impl Catalog {
             return Ok(None);
         };
         self.grants.retain(|grant| grant.role_id != role.role_id);
+        self.procedure_grants
+            .retain(|grant| grant.role_id != role.role_id);
         Ok(Some(role))
     }
 
@@ -712,6 +719,46 @@ impl Catalog {
         })
     }
 
+    pub fn grant_procedure_privilege(
+        &mut self,
+        role_id: RoleId,
+        procedure_id: FunctionId,
+        privilege: Privilege,
+    ) -> Result<()> {
+        if privilege != Privilege::Execute {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "procedures support only Execute privilege",
+            ));
+        }
+        self.ensure_role_exists(role_id)?;
+        self.ensure_procedure_exists(procedure_id)?;
+        let grant = ProcedureGrant {
+            role_id,
+            procedure_id,
+            privilege,
+        };
+        if !self.procedure_grants.contains(&grant) {
+            self.procedure_grants.push(grant);
+        }
+        Ok(())
+    }
+
+    pub fn has_procedure_privilege(
+        &self,
+        role_id: RoleId,
+        procedure_id: FunctionId,
+        privilege: Privilege,
+    ) -> bool {
+        privilege == Privilege::Execute
+            && (role_id == RoleId::new(0)
+                || self.procedure_grants.contains(&ProcedureGrant {
+                    role_id,
+                    procedure_id,
+                    privilege,
+                }))
+    }
+
     pub fn add_row_policy(&mut self, policy: RowPolicy) -> Result<RowPolicy> {
         self.ensure_relation_exists(policy.relation_id)?;
         if policy.name.is_empty() {
@@ -821,6 +868,20 @@ impl Catalog {
         Err(RnovError::new(
             ErrorKind::NotFound,
             "relation does not exist",
+        ))
+    }
+
+    fn ensure_procedure_exists(&self, procedure_id: FunctionId) -> Result<()> {
+        if self
+            .procedures
+            .iter()
+            .any(|procedure| procedure.procedure_id == procedure_id)
+        {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::NotFound,
+            "procedure does not exist",
         ))
     }
 
@@ -1074,6 +1135,13 @@ struct TableGrant {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcedureGrant {
+    role_id: RoleId,
+    procedure_id: FunctionId,
+    privilege: Privilege,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RowSecurityMode {
     deny_by_default: bool,
 }
@@ -1213,7 +1281,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 8;
+    const VERSION: u16 = 9;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
@@ -1337,6 +1405,13 @@ impl CatalogCodec {
             out.push(encode_privilege(grant.privilege));
         }
 
+        write_u32(&mut out, catalog.procedure_grants.len() as u32);
+        for grant in &catalog.procedure_grants {
+            write_u64(&mut out, grant.role_id.get());
+            write_u64(&mut out, grant.procedure_id.get());
+            out.push(encode_privilege(grant.privilege));
+        }
+
         let policy_count: usize = catalog.row_policies.values().map(Vec::len).sum();
         write_u32(&mut out, policy_count as u32);
         for policies in catalog.row_policies.values() {
@@ -1388,6 +1463,7 @@ impl CatalogCodec {
             indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
+            procedure_grants: Vec::new(),
             row_policies: BTreeMap::new(),
             row_security: BTreeMap::new(),
         };
@@ -1574,6 +1650,24 @@ impl CatalogCodec {
                 relation_id: RelationId::new(reader.read_u64("grant relation id")?),
                 privilege: decode_privilege(reader.read_u8("grant privilege")?)?,
             });
+        }
+
+        let procedure_grant_count = reader.read_u32("procedure grant count")? as usize;
+        for _ in 0..procedure_grant_count {
+            let grant = ProcedureGrant {
+                role_id: RoleId::new(reader.read_u64("procedure grant role id")?),
+                procedure_id: FunctionId::new(reader.read_u64("procedure grant procedure id")?),
+                privilege: decode_privilege(reader.read_u8("procedure grant privilege")?)?,
+            };
+            if grant.privilege != Privilege::Execute {
+                return Err(RnovError::new(
+                    ErrorKind::Corruption,
+                    "procedure grant uses non-Execute privilege",
+                ));
+            }
+            catalog.ensure_role_exists(grant.role_id)?;
+            catalog.ensure_procedure_exists(grant.procedure_id)?;
+            catalog.procedure_grants.push(grant);
         }
 
         let policy_count = reader.read_u32("policy count")? as usize;
