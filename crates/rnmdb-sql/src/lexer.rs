@@ -363,7 +363,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek_next_byte(&self) -> Option<u8> {
-        self.input.as_bytes().get(self.position + 1).copied()
+        self.position
+            .checked_add(1)
+            .and_then(|position| self.input.as_bytes().get(position))
+            .copied()
     }
 }
 
