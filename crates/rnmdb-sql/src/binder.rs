@@ -19,6 +19,45 @@ pub struct Binder<'a> {
     catalog: &'a Catalog,
 }
 
+struct CreateOperatorInput<'a> {
+    symbol: &'a str,
+    left_type: &'a SqlType,
+    right_type: &'a SqlType,
+    result_type: &'a SqlType,
+    function_name: &'a str,
+    precedence: Option<u8>,
+    commutator: Option<&'a str>,
+    negator: Option<&'a str>,
+    selectivity: Option<&'a str>,
+}
+
+struct SelectInput<'a> {
+    distinct: bool,
+    select_items: &'a [SelectItem],
+    from: &'a ObjectName,
+    lateral_join: Option<&'a LateralJoin>,
+    selection: &'a Option<Expr>,
+    group_by: &'a [Expr],
+    grouping_sets: &'a [Vec<Expr>],
+    having: &'a Option<Expr>,
+    order_by: &'a [OrderByExpr],
+    limit: Option<usize>,
+    offset: Option<usize>,
+    role_id: RoleId,
+}
+
+struct ProjectionOutputs<'a> {
+    projection: &'a mut Vec<BoundSelectItem>,
+    columns: &'a mut Vec<BoundColumn>,
+}
+
+struct OperatorSignatureMetadata<'a> {
+    precedence: Option<u8>,
+    commutator: Option<&'a str>,
+    negator: Option<&'a str>,
+    selectivity_function_id: Option<rnmdb_common::ids::FunctionId>,
+}
+
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
         Self { catalog }
@@ -158,17 +197,17 @@ impl<'a> Binder<'a> {
                 commutator,
                 negator,
                 selectivity,
-            } => self.bind_create_operator(
+            } => self.bind_create_operator(CreateOperatorInput {
                 symbol,
                 left_type,
                 right_type,
                 result_type,
-                function.as_str(),
-                *precedence,
-                commutator.as_deref(),
-                negator.as_deref(),
-                selectivity.as_ref().map(Ident::as_str),
-            ),
+                function_name: function.as_str(),
+                precedence: *precedence,
+                commutator: commutator.as_deref(),
+                negator: negator.as_deref(),
+                selectivity: selectivity.as_ref().map(Ident::as_str),
+            }),
             Statement::CreateRole {
                 name,
                 if_not_exists,
@@ -252,20 +291,20 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(
-                *distinct,
-                projection,
+            } => self.bind_select(SelectInput {
+                distinct: *distinct,
+                select_items: projection,
                 from,
-                None,
+                lateral_join: None,
                 selection,
                 group_by,
-                &[],
+                grouping_sets: &[],
                 having,
                 order_by,
-                *limit,
-                *offset,
+                limit: *limit,
+                offset: *offset,
                 role_id,
-            ),
+            }),
             Statement::SelectLateral {
                 distinct,
                 projection,
@@ -277,20 +316,20 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(
-                *distinct,
-                projection,
+            } => self.bind_select(SelectInput {
+                distinct: *distinct,
+                select_items: projection,
                 from,
-                Some(lateral_join),
+                lateral_join: Some(lateral_join),
                 selection,
                 group_by,
-                &[],
+                grouping_sets: &[],
                 having,
                 order_by,
-                *limit,
-                *offset,
+                limit: *limit,
+                offset: *offset,
                 role_id,
-            ),
+            }),
             Statement::SelectGroupingSets {
                 distinct,
                 projection,
@@ -302,20 +341,20 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(
-                *distinct,
-                projection,
+            } => self.bind_select(SelectInput {
+                distinct: *distinct,
+                select_items: projection,
                 from,
-                None,
+                lateral_join: None,
                 selection,
                 group_by,
                 grouping_sets,
                 having,
                 order_by,
-                *limit,
-                *offset,
+                limit: *limit,
+                offset: *offset,
                 role_id,
-            ),
+            }),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
             Statement::Intersect { all, left, right } => {
                 self.bind_intersect(*all, left, right, role_id)
@@ -614,19 +653,18 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn bind_create_operator(
-        &self,
-        symbol: &str,
-        left_type: &SqlType,
-        right_type: &SqlType,
-        result_type: &SqlType,
-        function_name: &str,
-        precedence: Option<u8>,
-        commutator: Option<&str>,
-        negator: Option<&str>,
-        selectivity: Option<&str>,
-    ) -> Result<BoundStatement> {
+    fn bind_create_operator(&self, input: CreateOperatorInput<'_>) -> Result<BoundStatement> {
+        let CreateOperatorInput {
+            symbol,
+            left_type,
+            right_type,
+            result_type,
+            function_name,
+            precedence,
+            commutator,
+            negator,
+            selectivity,
+        } = input;
         let argument_types = [left_type.clone(), right_type.clone()];
         let function = self
             .catalog
@@ -674,10 +712,12 @@ impl<'a> Binder<'a> {
                 right_type.clone(),
                 result_type.clone(),
                 function.function_id(),
-                precedence,
-                commutator,
-                negator,
-                selectivity_function_id,
+                OperatorSignatureMetadata {
+                    precedence,
+                    commutator,
+                    negator,
+                    selectivity_function_id,
+                },
             ),
         })
     }
@@ -977,44 +1017,16 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn bind_select(
-        &self,
-        distinct: bool,
-        select_items: &[SelectItem],
-        from: &ObjectName,
-        lateral_join: Option<&LateralJoin>,
-        selection: &Option<Expr>,
-        group_by: &[Expr],
-        grouping_sets: &[Vec<Expr>],
-        having: &Option<Expr>,
-        order_by: &[crate::ast::OrderByExpr],
-        limit: Option<usize>,
-        offset: Option<usize>,
-        role_id: RoleId,
-    ) -> Result<BoundStatement> {
-        let table = self.resolve_table(from)?;
-        self.require_table_privilege(role_id, table.relation_id(), Privilege::Select)?;
-        if let Some(lateral_join) = lateral_join {
-            return self.bind_lateral_select(
-                distinct,
-                select_items,
-                from,
-                table,
-                lateral_join,
-                selection,
-                group_by,
-                having,
-                order_by,
-                limit,
-                offset,
-                role_id,
-            );
+    fn bind_select(&self, input: SelectInput<'_>) -> Result<BoundStatement> {
+        let table = self.resolve_table(input.from)?;
+        self.require_table_privilege(input.role_id, table.relation_id(), Privilege::Select)?;
+        if let Some(lateral_join) = input.lateral_join {
+            return self.bind_lateral_select(&input, table, lateral_join);
         }
 
         let mut columns = Vec::new();
         let mut projection = Vec::new();
-        for item in select_items {
+        for item in input.select_items {
             match item {
                 SelectItem::Wildcard => {
                     for column in table.columns() {
@@ -1189,8 +1201,10 @@ impl<'a> Binder<'a> {
                         "row_number",
                         order_by,
                         alias,
-                        &mut projection,
-                        &mut columns,
+                        ProjectionOutputs {
+                            projection: &mut projection,
+                            columns: &mut columns,
+                        },
                         |order_by| Expr::RowNumberOver { order_by },
                     )?;
                 }
@@ -1203,8 +1217,10 @@ impl<'a> Binder<'a> {
                         "rank",
                         order_by,
                         alias,
-                        &mut projection,
-                        &mut columns,
+                        ProjectionOutputs {
+                            projection: &mut projection,
+                            columns: &mut columns,
+                        },
                         |order_by| Expr::RankOver { order_by },
                     )?;
                 }
@@ -1217,8 +1233,10 @@ impl<'a> Binder<'a> {
                         "dense_rank",
                         order_by,
                         alias,
-                        &mut projection,
-                        &mut columns,
+                        ProjectionOutputs {
+                            projection: &mut projection,
+                            columns: &mut columns,
+                        },
                         |order_by| Expr::DenseRankOver { order_by },
                     )?;
                 }
@@ -1250,8 +1268,8 @@ impl<'a> Binder<'a> {
             .iter()
             .filter(|item| is_aggregate_expr(&item.expr))
             .count();
-        let bound_group_by = self.bind_group_by_exprs(&projection, group_by)?;
-        let bound_grouping_sets = self.bind_grouping_sets(&projection, grouping_sets)?;
+        let bound_group_by = self.bind_group_by_exprs(&projection, input.group_by)?;
+        let bound_grouping_sets = self.bind_grouping_sets(&projection, input.grouping_sets)?;
         if !bound_group_by.is_empty() {
             self.validate_group_by_exprs(table, &bound_group_by)?;
         }
@@ -1274,7 +1292,7 @@ impl<'a> Binder<'a> {
         }
         let mut hidden_group_keys = Vec::new();
         let mut hidden_aggregates = Vec::new();
-        let having = if let Some(having) = having {
+        let having = if let Some(having) = input.having {
             if !grouped && aggregate_count == 0 {
                 return Err(RnovError::new(
                     ErrorKind::InvalidInput,
@@ -1297,16 +1315,17 @@ impl<'a> Binder<'a> {
         } else {
             None
         };
-        if let Some(selection) = selection {
+        if let Some(selection) = input.selection {
             let selection = self.rewrite_table_qualified_expr(table, selection)?;
             self.validate_predicate(table, &selection)?;
         }
-        let selection = selection
+        let selection = input
+            .selection
             .as_ref()
             .map(|selection| self.rewrite_table_qualified_expr(table, selection))
             .transpose()?;
-        let mut bound_order_by = Vec::with_capacity(order_by.len());
-        for order_by in order_by {
+        let mut bound_order_by = Vec::with_capacity(input.order_by.len());
+        for order_by in input.order_by {
             let order_by = OrderByExpr {
                 expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
                 direction: order_by.direction,
@@ -1340,9 +1359,9 @@ impl<'a> Binder<'a> {
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
-            table: from.clone(),
+            table: input.from.clone(),
             lateral_join: None,
-            distinct,
+            distinct: input.distinct,
             projection,
             hidden_group_keys,
             hidden_aggregates,
@@ -1352,10 +1371,10 @@ impl<'a> Binder<'a> {
             grouping_sets: bound_grouping_sets,
             having,
             order_by: bound_order_by,
-            limit,
-            offset,
-            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(role_id, table)?,
+            limit: input.limit,
+            offset: input.offset,
+            applied_row_policies: self.applied_row_policy_names(input.role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(input.role_id, table)?,
         }))
     }
 
@@ -1514,23 +1533,13 @@ impl<'a> Binder<'a> {
         Ok((projection, columns))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn bind_lateral_select(
         &self,
-        distinct: bool,
-        select_items: &[SelectItem],
-        from: &ObjectName,
+        input: &SelectInput<'_>,
         outer_table: &Table,
         lateral_join: &LateralJoin,
-        selection: &Option<Expr>,
-        group_by: &[Expr],
-        having: &Option<Expr>,
-        order_by: &[OrderByExpr],
-        limit: Option<usize>,
-        offset: Option<usize>,
-        role_id: RoleId,
     ) -> Result<BoundStatement> {
-        if !group_by.is_empty() || having.is_some() {
+        if !input.group_by.is_empty() || input.having.is_some() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "JOIN LATERAL does not support GROUP BY or HAVING in this SQL slice",
@@ -1538,12 +1547,12 @@ impl<'a> Binder<'a> {
         }
 
         let inner_table = self.resolve_table(&lateral_join.table)?;
-        self.require_table_privilege(role_id, inner_table.relation_id(), Privilege::Select)?;
+        self.require_table_privilege(input.role_id, inner_table.relation_id(), Privilege::Select)?;
         let lateral_columns = lateral_join_columns(outer_table, inner_table)?;
         let lateral_bound_columns = lateral_columns_to_bound(&lateral_columns);
         let (inner_column, outer_column) = self.bind_lateral_equality(
             outer_table,
-            from,
+            input.from,
             inner_table,
             &lateral_join.table,
             &lateral_join.on,
@@ -1551,7 +1560,7 @@ impl<'a> Binder<'a> {
 
         let mut projection = Vec::new();
         let mut columns = Vec::new();
-        for item in select_items {
+        for item in input.select_items {
             match item {
                 SelectItem::Wildcard => {
                     for lateral_column in &lateral_columns {
@@ -1604,7 +1613,8 @@ impl<'a> Binder<'a> {
             }
         }
 
-        let selection = selection
+        let selection = input
+            .selection
             .as_ref()
             .map(|selection| self.rewrite_lateral_expr(&lateral_columns, selection))
             .transpose()?;
@@ -1612,8 +1622,8 @@ impl<'a> Binder<'a> {
             self.validate_predicate_from_columns(&lateral_bound_columns, selection)?;
         }
 
-        let mut bound_order_by = Vec::with_capacity(order_by.len());
-        for order_by in order_by {
+        let mut bound_order_by = Vec::with_capacity(input.order_by.len());
+        for order_by in input.order_by {
             let order_by = OrderByExpr {
                 expr: self.rewrite_lateral_expr(&lateral_columns, &order_by.expr)?,
                 direction: order_by.direction,
@@ -1627,14 +1637,14 @@ impl<'a> Binder<'a> {
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: outer_table.relation_id(),
-            table: from.clone(),
+            table: input.from.clone(),
             lateral_join: Some(BoundLateralJoin {
                 inner_relation_id: inner_table.relation_id(),
                 inner_table: lateral_join.table.clone(),
                 inner_column,
                 outer_column,
             }),
-            distinct,
+            distinct: input.distinct,
             projection,
             hidden_group_keys: Vec::new(),
             hidden_aggregates: Vec::new(),
@@ -1644,10 +1654,11 @@ impl<'a> Binder<'a> {
             grouping_sets: Vec::new(),
             having: None,
             order_by: bound_order_by,
-            limit,
-            offset,
-            applied_row_policies: self.applied_row_policy_names(role_id, outer_table.relation_id()),
-            row_policy_predicates: self.bind_row_policies(role_id, outer_table)?,
+            limit: input.limit,
+            offset: input.offset,
+            applied_row_policies: self
+                .applied_row_policy_names(input.role_id, outer_table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(input.role_id, outer_table)?,
         }))
     }
 
@@ -1673,25 +1684,23 @@ impl<'a> Binder<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn bind_ranking_window_projection(
         &self,
         table: &Table,
         function_name: &str,
         order_by: &[OrderByExpr],
         alias: &Option<Ident>,
-        projection: &mut Vec<BoundSelectItem>,
-        columns: &mut Vec<BoundColumn>,
+        outputs: ProjectionOutputs<'_>,
         expr: impl FnOnce(Vec<OrderByExpr>) -> Expr,
     ) -> Result<()> {
         let order_by = self.bind_ranking_window_order_by(table, function_name, order_by)?;
-        let column = aggregate_bound_column(columns, function_name, SqlType::Int64, false);
+        let column = aggregate_bound_column(outputs.columns, function_name, SqlType::Int64, false);
         let column = aliased_bound_column(column, alias);
-        projection.push(BoundSelectItem {
+        outputs.projection.push(BoundSelectItem {
             column: column.clone(),
             expr: expr(order_by),
         });
-        columns.push(column);
+        outputs.columns.push(column);
         Ok(())
     }
 
@@ -4742,30 +4751,26 @@ fn deny_default_row_policy_predicate() -> Expr {
     Expr::Bool(false)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn operator_signature_with_metadata(
     symbol: &str,
     left_type: SqlType,
     right_type: SqlType,
     result_type: SqlType,
     function_id: rnmdb_common::ids::FunctionId,
-    precedence: Option<u8>,
-    commutator: Option<&str>,
-    negator: Option<&str>,
-    selectivity_function_id: Option<rnmdb_common::ids::FunctionId>,
+    metadata: OperatorSignatureMetadata<'_>,
 ) -> OperatorSignature {
     let mut signature =
         OperatorSignature::new(symbol, left_type, right_type, result_type, function_id);
-    if let Some(precedence) = precedence {
+    if let Some(precedence) = metadata.precedence {
         signature = signature.with_precedence(precedence);
     }
-    if let Some(commutator) = commutator {
+    if let Some(commutator) = metadata.commutator {
         signature = signature.with_commutator(commutator);
     }
-    if let Some(negator) = negator {
+    if let Some(negator) = metadata.negator {
         signature = signature.with_negator(negator);
     }
-    if let Some(selectivity_function_id) = selectivity_function_id {
+    if let Some(selectivity_function_id) = metadata.selectivity_function_id {
         signature = signature.with_selectivity_function(selectivity_function_id);
     }
     signature
