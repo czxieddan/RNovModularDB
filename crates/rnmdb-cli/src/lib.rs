@@ -526,8 +526,14 @@ impl LocalSession {
         if self.catalog.get_procedure(name, argument_types).is_some() && if_not_exists {
             return Ok(());
         }
-        self.catalog
+        let procedure = self
+            .catalog
             .register_procedure(name, argument_types.to_vec(), body)?;
+        self.catalog.grant_procedure_privilege(
+            self.role_id,
+            procedure.procedure_id(),
+            Privilege::Execute,
+        )?;
         Ok(())
     }
 
