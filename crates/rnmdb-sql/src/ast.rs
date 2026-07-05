@@ -1,7 +1,7 @@
 use std::fmt;
 
 use rnmdb_catalog::{Column, IndexMethod, OperatorSignature, Privilege};
-use rnmdb_common::ids::{RelationId, RoleId};
+use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -642,6 +642,12 @@ pub enum Statement {
         table: ObjectName,
         role: Ident,
     },
+    GrantProcedurePrivilege {
+        privilege: Privilege,
+        name: Ident,
+        argument_types: Vec<SqlType>,
+        role: Ident,
+    },
     CallProcedure {
         name: Ident,
         args: Vec<Expr>,
@@ -955,6 +961,11 @@ pub enum BoundStatement {
     GrantTablePrivilege {
         role_id: RoleId,
         relation_id: RelationId,
+        privilege: Privilege,
+    },
+    GrantProcedurePrivilege {
+        role_id: RoleId,
+        procedure_id: FunctionId,
         privilege: Privilege,
     },
     CallProcedure {

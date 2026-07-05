@@ -4,7 +4,7 @@ use std::{
     future::Future,
     ops::Bound,
     sync::{
-        Arc,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread,
@@ -1562,9 +1562,17 @@ impl Default for ParallelQueryConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MemoryExecutor {
-    tables: BTreeMap<String, MemoryTable>,
+    tables: Arc<RwLock<BTreeMap<String, MemoryTable>>>,
+}
+
+impl Default for MemoryExecutor {
+    fn default() -> Self {
+        Self {
+            tables: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
 }
 
 struct SidewaysIndexLookupInput<'a> {
@@ -1596,6 +1604,32 @@ impl MemoryExecutor {
         Self::default()
     }
 
+    fn read_tables(&self) -> Result<RwLockReadGuard<'_, BTreeMap<String, MemoryTable>>> {
+        self.tables
+            .read()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "memory executor table lock poisoned"))
+    }
+
+    fn write_tables(&self) -> Result<RwLockWriteGuard<'_, BTreeMap<String, MemoryTable>>> {
+        self.tables
+            .write()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "memory executor table lock poisoned"))
+    }
+
+    fn snapshot(&self) -> Result<Self> {
+        Ok(Self {
+            tables: Arc::new(RwLock::new(self.read_tables()?.clone())),
+        })
+    }
+
+    fn with_table<T>(&self, name: &str, f: impl FnOnce(&MemoryTable) -> Result<T>) -> Result<T> {
+        let tables = self.read_tables()?;
+        let table = tables.get(name).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, format!("table not found: {name}"))
+        })?;
+        f(table)
+    }
+
     pub fn register_table(&mut self, name: impl Into<String>, table: MemoryTable) -> Result<()> {
         let name = name.into();
         if name.is_empty() {
@@ -1604,12 +1638,14 @@ impl MemoryExecutor {
                 "registered table name cannot be empty",
             ));
         }
-        self.tables.insert(name, table);
+        self.write_tables()?.insert(name, table);
         Ok(())
     }
 
     pub fn table_statistics(&self, name: &str) -> Option<TableStatistics> {
-        self.tables.get(name).map(MemoryTable::statistics)
+        self.read_tables()
+            .ok()
+            .and_then(|tables| tables.get(name).map(MemoryTable::statistics))
     }
 
     pub fn text_lexeme_statistics(
@@ -1618,7 +1654,8 @@ impl MemoryExecutor {
         column: &str,
         term: &str,
     ) -> Result<Option<TextLexemeStatistics>> {
-        let Some(table) = self.tables.get(table) else {
+        let tables = self.read_tables()?;
+        let Some(table) = tables.get(table) else {
             return Ok(None);
         };
         table.text_lexeme_statistics(column, term)
@@ -1635,15 +1672,15 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => self
-                .tables
-                .get(table)
-                .map(MemoryTable::scan)
-                .ok_or_else(|| {
+            LogicalPlan::Scan { table, .. } => {
+                let tables = self.read_tables()?;
+                tables.get(table).map(MemoryTable::scan).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                }),
+                })
+            }
             LogicalPlan::RecursiveScan { name, .. } => {
-                self.tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
+                let tables = self.read_tables()?;
+                tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
                     RnovError::new(
                         ErrorKind::NotFound,
                         format!("recursive CTE is not active: {name}"),
@@ -1665,13 +1702,16 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let table = self.tables.get(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                    return Ok(batch);
-                }
-                let batch = table.scan();
+                let batch = {
+                    let tables = self.read_tables()?;
+                    let table = tables.get(table).ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                        return Ok(batch);
+                    }
+                    table.scan()
+                };
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -1816,9 +1856,9 @@ impl MemoryExecutor {
     }
 
     fn with_recursive_table(&self, name: &str, batch: &VectorBatch) -> Result<Self> {
-        let mut executor = self.clone();
+        let executor = self.snapshot()?;
         executor
-            .tables
+            .write_tables()?
             .insert(name.to_string(), memory_table_from_batch(batch)?);
         Ok(executor)
     }
@@ -1842,39 +1882,23 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self
-                .tables
-                .get(table)
-                .map(MemoryTable::scan)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                }),
+            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| Ok(table.scan())),
             PhysicalPlan::IndexScan {
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_scan(index, column, value),
+            } => self.with_table(table, |table| table.index_scan(index, column, value)),
             PhysicalPlan::ExpressionIndexScan {
                 table,
                 index,
                 expr,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .expression_index_scan(index, expr, value),
+            } => self.with_table(table, |table| {
+                table.expression_index_scan(index, expr, value)
+            }),
             PhysicalPlan::IndexRangeScan {
                 table,
                 index,
@@ -1884,46 +1908,30 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_range_scan(
+            } => self.with_table(table, |table| {
+                table.index_range_scan(
                     index,
                     column,
                     lower.as_ref(),
                     *lower_inclusive,
                     upper.as_ref(),
                     *upper_inclusive,
-                ),
+                )
+            }),
             PhysicalPlan::IndexSkipScan {
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_skip_scan(index, column, value),
+            } => self.with_table(table, |table| table.index_skip_scan(index, column, value)),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .map(MemoryTable::scan)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?;
+                let batch = self.with_table(table, |table| Ok(table.scan()))?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::InvertedTextScan {
@@ -1932,26 +1940,18 @@ impl MemoryExecutor {
                 column,
                 query,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .text_index_scan(index, column, query, cancellation),
+            } => self.with_table(table, |table| {
+                table.text_index_scan(index, column, query, cancellation)
+            }),
             PhysicalPlan::InvertedValueScan {
                 table,
                 index,
                 column,
                 query,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .inverted_value_scan(index, column, query),
+            } => self.with_table(table, |table| {
+                table.inverted_value_scan(index, column, query)
+            }),
             PhysicalPlan::BlockSummaryScan {
                 table,
                 index,
@@ -1961,46 +1961,34 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .block_summary_scan(
+            } => self.with_table(table, |table| {
+                table.block_summary_scan(
                     index,
                     column,
                     lower,
                     *lower_inclusive,
                     upper,
                     *upper_inclusive,
-                ),
+                )
+            }),
             PhysicalPlan::RangeOverlapScan {
                 table,
                 index,
                 column,
                 range,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .range_overlap_scan(index, column, range),
+            } => self.with_table(table, |table| {
+                table.range_overlap_scan(index, column, range)
+            }),
             PhysicalPlan::BoundsOverlapScan {
                 table,
                 index,
                 column,
                 bounds,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .bounds_overlap_scan(index, column, bounds),
+            } => self.with_table(table, |table| {
+                table.bounds_overlap_scan(index, column, bounds)
+            }),
             PhysicalPlan::SidewaysIndexLookup {
                 outer,
                 inner_table,
@@ -2118,26 +2106,18 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .scan_parallel_cancellable(config, cancellation),
+            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| {
+                table.scan_parallel_cancellable(config, cancellation)
+            }),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?
-                    .scan_parallel_cancellable(config, cancellation)?;
+                let batch = self.with_table(table, |table| {
+                    table.scan_parallel_cancellable(config, cancellation)
+                })?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::SidewaysIndexLookup {
@@ -2294,7 +2274,8 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         let outer_batch = self.execute_physical_cancellable(outer, cancellation)?;
         let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let inner = tables.get(inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {inner_table}"),
@@ -2331,7 +2312,8 @@ impl MemoryExecutor {
         let outer_batch =
             self.execute_physical_parallel_cancellable(input.outer, config, cancellation)?;
         let outer_column_index = column_index(outer_batch.columns(), input.outer_column)?;
-        let inner = self.tables.get(input.inner_table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let inner = tables.get(input.inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {}", input.inner_table),
@@ -2398,7 +2380,8 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         let outer_batch = self.execute_cancellable(outer, cancellation)?;
         let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let inner = tables.get(inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {inner_table}"),
@@ -2452,23 +2435,21 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .scan_parallel_cancellable(config, cancellation),
-            LogicalPlan::RecursiveScan { name, .. } => self
-                .tables
-                .get(name)
-                .ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("recursive CTE is not active: {name}"),
-                    )
-                })?
-                .scan_parallel_cancellable(config, cancellation),
+            LogicalPlan::Scan { table, .. } => self.with_table(table, |table| {
+                table.scan_parallel_cancellable(config, cancellation)
+            }),
+            LogicalPlan::RecursiveScan { name, .. } => {
+                let tables = self.read_tables()?;
+                tables
+                    .get(name)
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::NotFound,
+                            format!("recursive CTE is not active: {name}"),
+                        )
+                    })?
+                    .scan_parallel_cancellable(config, cancellation)
+            }
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(predicate, input, cancellation)?
@@ -2484,13 +2465,16 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let table = self.tables.get(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                    return Ok(batch);
-                }
-                let batch = table.scan_parallel_cancellable(config, cancellation)?;
+                let batch = {
+                    let tables = self.read_tables()?;
+                    let table = tables.get(table).ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                        return Ok(batch);
+                    }
+                    table.scan_parallel_cancellable(config, cancellation)?
+                };
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -2673,7 +2657,8 @@ impl MemoryExecutor {
                 if_not_exists,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 if table
@@ -2693,7 +2678,8 @@ impl MemoryExecutor {
                 encrypted,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 table.set_column_encrypted(column, *encrypted)?;
@@ -2702,7 +2688,7 @@ impl MemoryExecutor {
             LogicalPlan::DropTable {
                 table, if_exists, ..
             } => {
-                if self.tables.remove(table).is_some() || *if_exists {
+                if self.write_tables()?.remove(table).is_some() || *if_exists {
                     Ok(ExecutionResult::SchemaChanged)
                 } else {
                     Err(RnovError::new(
@@ -2716,7 +2702,8 @@ impl MemoryExecutor {
                 columns,
                 values,
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 insert_values(table, columns, values)?;
@@ -2728,7 +2715,8 @@ impl MemoryExecutor {
                 selection,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 update_rows(table, assignments, selection.as_ref())
@@ -2737,7 +2725,8 @@ impl MemoryExecutor {
             LogicalPlan::Delete {
                 table, selection, ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 delete_rows(table, selection.as_ref()).map(ExecutionResult::RowsAffected)
@@ -2827,7 +2816,8 @@ impl MemoryExecutor {
         columns: &[ColumnDef],
         if_not_exists: bool,
     ) -> Result<()> {
-        if self.tables.contains_key(name) {
+        let mut tables = self.write_tables()?;
+        if tables.contains_key(name) {
             if if_not_exists {
                 return Ok(());
             }
@@ -2838,12 +2828,13 @@ impl MemoryExecutor {
         }
         let columns = columns.iter().map(column_schema_from_def).collect();
         let table = MemoryTable::new(columns)?;
-        self.tables.insert(name.to_string(), table);
+        tables.insert(name.to_string(), table);
         Ok(())
     }
 
     fn create_index(&mut self, input: CreateIndexInput<'_>) -> Result<()> {
-        let table = self.tables.get_mut(input.table).ok_or_else(|| {
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(input.table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {}", input.table),
@@ -2861,7 +2852,8 @@ impl MemoryExecutor {
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let table = self.tables.get_mut(input.table).ok_or_else(|| {
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(input.table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {}", input.table),
@@ -2881,7 +2873,9 @@ impl MemoryExecutor {
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
-        self.tables.values_mut().any(|table| table.drop_index(name))
+        self.write_tables()
+            .map(|mut tables| tables.values_mut().any(|table| table.drop_index(name)))
+            .unwrap_or(false)
     }
 
     fn execute_indexed_filter_scan(
@@ -2893,7 +2887,8 @@ impl MemoryExecutor {
         let LogicalPlan::Scan { table, .. } = input else {
             return Ok(None);
         };
-        let table = self.tables.get(table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let table = tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
         if let Some((expr, value)) = indexable_expression_equality(predicate)

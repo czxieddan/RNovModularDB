@@ -2,7 +2,7 @@ use std::{
     future::Future,
     panic::{self, AssertUnwindSafe},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll, Waker},
     thread,
 };
@@ -10,6 +10,17 @@ use std::{
 use rnmdb_common::{ErrorKind, Result, RnovError};
 
 use super::{ExecutionResult, MemoryExecutor};
+
+const MAX_BLOCKING_MEMORY_TASKS: usize = 32;
+
+struct BlockingWorkerState {
+    active: usize,
+    waiters: Vec<Waker>,
+}
+
+struct BlockingWorkerPermit;
+
+static BLOCKING_WORKERS: OnceLock<Mutex<BlockingWorkerState>> = OnceLock::new();
 
 struct BlockingResultState<T> {
     result: Option<Result<T>>,
@@ -59,8 +70,17 @@ impl<T: Send + 'static> Future for BlockingResultTask<T> {
         };
 
         if let Some(job) = job {
+            let permit = match try_acquire_blocking_worker(cx.waker()) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
+                    task.job = Some(job);
+                    return Poll::Pending;
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            };
             let state = Arc::clone(&task.state);
             thread::spawn(move || {
+                let _permit = permit;
                 let result = panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| {
                     Err(RnovError::new(
                         ErrorKind::Internal,
@@ -81,6 +101,44 @@ impl<T: Send + 'static> Future for BlockingResultTask<T> {
         }
 
         Poll::Pending
+    }
+}
+
+fn blocking_workers() -> &'static Mutex<BlockingWorkerState> {
+    BLOCKING_WORKERS.get_or_init(|| {
+        Mutex::new(BlockingWorkerState {
+            active: 0,
+            waiters: Vec::new(),
+        })
+    })
+}
+
+fn try_acquire_blocking_worker(waker: &Waker) -> Result<Option<BlockingWorkerPermit>> {
+    let mut state = blocking_workers().lock().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Internal,
+            "async memory executor worker limit lock poisoned",
+        )
+    })?;
+    if state.active < MAX_BLOCKING_MEMORY_TASKS {
+        state.active += 1;
+        return Ok(Some(BlockingWorkerPermit));
+    }
+    if !state.waiters.iter().any(|waiter| waiter.will_wake(waker)) {
+        state.waiters.push(waker.clone());
+    }
+    Ok(None)
+}
+
+impl Drop for BlockingWorkerPermit {
+    fn drop(&mut self) {
+        let Ok(mut state) = blocking_workers().lock() else {
+            return;
+        };
+        state.active = state.active.saturating_sub(1);
+        if let Some(waker) = state.waiters.pop() {
+            waker.wake();
+        }
     }
 }
 

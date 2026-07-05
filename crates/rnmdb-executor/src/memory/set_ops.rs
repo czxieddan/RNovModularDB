@@ -57,7 +57,7 @@ pub(super) fn apply_intersect_cancellable(
     if all {
         return apply_intersect_all_cancellable(left, right, cancellation);
     }
-    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let right_rows = row_set(right.rows(), cancellation)?;
     let mut emitted = HashSet::new();
     let mut rows = Vec::new();
     for row in left.rows() {
@@ -80,7 +80,7 @@ pub(super) fn apply_except_cancellable(
     if all {
         return apply_except_all_cancellable(left, right, cancellation);
     }
-    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let right_rows = row_set(right.rows(), cancellation)?;
     let mut emitted = HashSet::new();
     let mut rows = Vec::new();
     for row in left.rows() {
@@ -98,15 +98,16 @@ fn apply_intersect_all_cancellable(
     right: VectorBatch,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let mut right_counts = row_counts(right.rows());
+    let mut right_counts = row_counts(right.rows(), cancellation)?;
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if let Some(count) = right_counts.get_mut(row)
-            && *count > 0
-        {
-            rows.push(row.clone());
-            *count -= 1;
+        match right_counts.get_mut(row) {
+            Some(count) if *count > 0 => {
+                rows.push(row.clone());
+                *count -= 1;
+            }
+            _ => {}
         }
     }
     cancellation.check()?;
@@ -118,28 +119,39 @@ fn apply_except_all_cancellable(
     right: VectorBatch,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let mut right_counts = row_counts(right.rows());
+    let mut right_counts = row_counts(right.rows(), cancellation)?;
     let mut rows = Vec::new();
     for row in left.rows() {
         cancellation.check()?;
-        if let Some(count) = right_counts.get_mut(row)
-            && *count > 0
-        {
-            *count -= 1;
-        } else {
-            rows.push(row.clone());
+        match right_counts.get_mut(row) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                continue;
+            }
+            _ => {}
         }
+        rows.push(row.clone());
     }
     cancellation.check()?;
     VectorBatch::new(left.columns().to_vec(), rows)
 }
 
-fn row_counts(rows: &[Row]) -> HashMap<Row, usize> {
+fn row_set(rows: &[Row], cancellation: &CancellationToken) -> Result<HashSet<Row>> {
+    let mut set = HashSet::new();
+    for row in rows {
+        cancellation.check()?;
+        set.insert(row.clone());
+    }
+    Ok(set)
+}
+
+fn row_counts(rows: &[Row], cancellation: &CancellationToken) -> Result<HashMap<Row, usize>> {
     let mut counts = HashMap::new();
     for row in rows {
+        cancellation.check()?;
         *counts.entry(row.clone()).or_insert(0) += 1;
     }
-    counts
+    Ok(counts)
 }
 
 fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {

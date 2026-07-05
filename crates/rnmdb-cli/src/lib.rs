@@ -242,6 +242,15 @@ impl LocalSession {
                     .grant_table_privilege(*role_id, *relation_id, *privilege)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::GrantProcedurePrivilege {
+                role_id,
+                procedure_id,
+                privilege,
+            } => {
+                self.catalog
+                    .grant_procedure_privilege(*role_id, *procedure_id, *privilege)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             statement if is_read_query(statement) => {
                 let plan = self.optimize_read_plan(self.planner.plan(&bound)?);
                 self.executor

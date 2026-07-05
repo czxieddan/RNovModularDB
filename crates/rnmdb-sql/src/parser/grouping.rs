@@ -2,6 +2,8 @@ use rnmdb_common::{ErrorKind, Result, RnovError};
 
 use crate::ast::Expr;
 
+const MAX_CUBE_GROUPING_EXPRESSIONS: usize = 16;
+
 pub(super) fn grouping_sets_union(grouping_sets: &[Vec<Expr>]) -> Vec<Expr> {
     let mut group_by = Vec::new();
     for grouping_set in grouping_sets {
@@ -23,7 +25,7 @@ pub(super) fn rollup_grouping_sets(group_by: &[Expr]) -> Vec<Vec<Expr>> {
 
 pub(super) fn cube_grouping_sets(group_by: &[Expr]) -> Result<Vec<Vec<Expr>>> {
     let bits = usize::BITS as usize;
-    if group_by.len() >= bits {
+    if group_by.len() > MAX_CUBE_GROUPING_EXPRESSIONS || group_by.len() >= bits {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             "CUBE has too many grouping expressions",

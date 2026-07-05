@@ -268,6 +268,39 @@ impl<'a> Binder<'a> {
                     privilege: *privilege,
                 })
             }
+            Statement::GrantProcedurePrivilege {
+                privilege,
+                name,
+                argument_types,
+                role,
+            } => {
+                if *privilege != Privilege::Execute {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "procedure grants only support EXECUTE privilege",
+                    ));
+                }
+                let procedure = self
+                    .catalog
+                    .get_procedure(name.as_str(), argument_types)
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::NotFound,
+                            format!("procedure does not exist: {}", name.as_str()),
+                        )
+                    })?;
+                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("role does not exist: {}", role.as_str()),
+                    )
+                })?;
+                Ok(BoundStatement::GrantProcedurePrivilege {
+                    role_id: role.role_id(),
+                    procedure_id: procedure.procedure_id(),
+                    privilege: *privilege,
+                })
+            }
             Statement::CallProcedure { name, args } => {
                 self.bind_call_procedure(name, args, role_id)
             }
@@ -1549,6 +1582,15 @@ impl<'a> Binder<'a> {
 
         let inner_table = self.resolve_table(&lateral_join.table)?;
         self.require_table_privilege(input.role_id, inner_table.relation_id(), Privilege::Select)?;
+        if !self
+            .bind_row_policies(input.role_id, inner_table)?
+            .is_empty()
+        {
+            return Err(RnovError::new(
+                ErrorKind::Security,
+                "JOIN LATERAL does not support row policies on the inner table",
+            ));
+        }
         let lateral_columns = lateral_join_columns(outer_table, inner_table)?;
         let lateral_bound_columns = lateral_columns_to_bound(&lateral_columns);
         let (inner_column, outer_column) = self.bind_lateral_equality(
@@ -3013,16 +3055,25 @@ impl<'a> Binder<'a> {
     }
 
     fn resolve_column(&self, table: &Table, column_name: &str) -> Result<BoundColumn> {
-        let column = table
+        let mut matches = table
             .columns()
             .iter()
-            .find(|column| column.name().eq_ignore_ascii_case(column_name))
-            .ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::NotFound,
-                    format!("column does not exist: {}.{column_name}", table.name()),
-                )
-            })?;
+            .filter(|column| column.name().eq_ignore_ascii_case(column_name));
+        let column = matches.next().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("column does not exist: {}.{column_name}", table.name()),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "ambiguous column reference {}.{column_name}: multiple case variants exist",
+                    table.name()
+                ),
+            ));
+        }
 
         let generated = column
             .generated_expr()

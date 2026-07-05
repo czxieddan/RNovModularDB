@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write, copy},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     thread,
 };
 
@@ -1146,6 +1146,7 @@ pub struct SingleFileBackend {
     page_size: PageSize,
     superblock_generation: u64,
     page_key: Option<PageCryptoKey>,
+    write_lock: Mutex<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1648,6 +1649,7 @@ impl SingleFileBackend {
             page_size: options.page_size(),
             superblock_generation,
             page_key: options.page_key(),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -1701,6 +1703,7 @@ impl SingleFileBackend {
             page_size,
             superblock_generation,
             page_key,
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -1829,6 +1832,12 @@ impl StorageBackend for SingleFileBackend {
             ));
         }
 
+        let _write_guard = self.write_lock.lock().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "single-file backend write lock poisoned",
+            )
+        })?;
         let key = self.page_key()?;
         let mut file = self.file.try_clone().map_err(|err| {
             RnovError::new(
