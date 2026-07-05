@@ -2,8 +2,20 @@ use rnmdb_common::Result;
 
 use crate::ast::{CaseWhen, Expr, Ident, OrderByExpr};
 
-pub(crate) trait ExprMutator {
-    fn rewrite_qualified_identifier(&mut self, qualifier: &Ident, name: &Ident) -> Result<Expr>;
+struct QualifiedIdentifierRewriter<'a, F>
+where
+    F: FnMut(&Ident, &Ident) -> Result<Expr>,
+{
+    resolver: &'a mut F,
+}
+
+impl<F> QualifiedIdentifierRewriter<'_, F>
+where
+    F: FnMut(&Ident, &Ident) -> Result<Expr>,
+{
+    fn rewrite_qualified_identifier(&mut self, qualifier: &Ident, name: &Ident) -> Result<Expr> {
+        (self.resolver)(qualifier, name)
+    }
 
     fn rewrite_expr(&mut self, expr: &Expr) -> Result<Expr> {
         if let Expr::QualifiedIdentifier { qualifier, name } = expr {
@@ -49,6 +61,13 @@ pub(crate) trait ExprMutator {
     }
 
     fn rewrite_predicate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        if let Some(expr) = self.rewrite_simple_predicate_expr(expr)? {
+            return Ok(Some(expr));
+        }
+        self.rewrite_multi_predicate_expr(expr)
+    }
+
+    fn rewrite_simple_predicate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         match expr {
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
                 expr: Box::new(self.rewrite_expr(expr)?),
@@ -80,6 +99,12 @@ pub(crate) trait ExprMutator {
                 negated: *negated,
             }
             .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_multi_predicate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::Between {
                 expr,
                 low,
@@ -198,38 +223,29 @@ pub(crate) trait ExprMutator {
 
     fn rewrite_window_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         match expr {
-            Expr::RowNumberOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_expr(&order_by.expr)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
+            Expr::RowNumberOver { order_by } => self
+                .rewrite_order_by_exprs(order_by)
                 .map(|order_by| Some(Expr::RowNumberOver { order_by })),
-            Expr::RankOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_expr(&order_by.expr)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
+            Expr::RankOver { order_by } => self
+                .rewrite_order_by_exprs(order_by)
                 .map(|order_by| Some(Expr::RankOver { order_by })),
-            Expr::DenseRankOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_expr(&order_by.expr)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
+            Expr::DenseRankOver { order_by } => self
+                .rewrite_order_by_exprs(order_by)
                 .map(|order_by| Some(Expr::DenseRankOver { order_by })),
             _ => Ok(None),
         }
+    }
+
+    fn rewrite_order_by_exprs(&mut self, order_by: &[OrderByExpr]) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| {
+                Ok(OrderByExpr {
+                    expr: self.rewrite_expr(&order_by.expr)?,
+                    direction: order_by.direction,
+                })
+            })
+            .collect()
     }
 
     fn rewrite_collection_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
@@ -252,22 +268,6 @@ pub(crate) trait ExprMutator {
             .into()),
             _ => Ok(None),
         }
-    }
-}
-
-struct QualifiedIdentifierRewriter<'a, F>
-where
-    F: FnMut(&Ident, &Ident) -> Result<Expr>,
-{
-    resolver: &'a mut F,
-}
-
-impl<F> ExprMutator for QualifiedIdentifierRewriter<'_, F>
-where
-    F: FnMut(&Ident, &Ident) -> Result<Expr>,
-{
-    fn rewrite_qualified_identifier(&mut self, qualifier: &Ident, name: &Ident) -> Result<Expr> {
-        (self.resolver)(qualifier, name)
     }
 }
 
