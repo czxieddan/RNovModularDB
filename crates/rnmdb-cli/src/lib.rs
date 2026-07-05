@@ -436,6 +436,16 @@ impl LocalSession {
     }
 
     fn apply_catalog_drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if self
+            .catalog
+            .get_role(name)
+            .is_some_and(|role| role.role_id() == self.role_id)
+        {
+            return Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::InvalidInput,
+                "cannot drop the active role",
+            ));
+        }
         match self.catalog.drop_role(name)? {
             Some(_) => Ok(()),
             None if if_exists => Ok(()),

@@ -27,9 +27,16 @@ struct BlockingResultState<T> {
     waker: Option<Waker>,
 }
 
+type BlockingJob<T> = Box<dyn FnOnce() -> Result<T> + Send + 'static>;
+
+enum BlockingPoll<T> {
+    Ready(Result<T>),
+    Pending(Option<BlockingJob<T>>),
+}
+
 pub(super) struct BlockingResultTask<T> {
     state: Arc<Mutex<BlockingResultState<T>>>,
-    job: Option<Box<dyn FnOnce() -> Result<T> + Send + 'static>>,
+    job: Option<BlockingJob<T>>,
 }
 
 impl<T> BlockingResultTask<T> {
@@ -51,57 +58,75 @@ impl<T: Send + 'static> Future for BlockingResultTask<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let task = self.get_mut();
-        let state = Arc::clone(&task.state);
-        let job = {
-            let mut state = match state.lock() {
-                Ok(state) => state,
-                Err(_) => {
-                    return Poll::Ready(Err(RnovError::new(
-                        ErrorKind::Internal,
-                        "async memory executor state lock poisoned",
-                    )));
-                }
-            };
-            if let Some(result) = state.result.take() {
-                return Poll::Ready(result);
-            }
-            state.waker = Some(cx.waker().clone());
-            task.job.take()
+        let job = match task.take_ready_result_or_job(cx) {
+            BlockingPoll::Ready(result) => return Poll::Ready(result),
+            BlockingPoll::Pending(job) => job,
         };
-
-        if let Some(job) = job {
-            let permit = match try_acquire_blocking_worker(cx.waker()) {
-                Ok(Some(permit)) => permit,
-                Ok(None) => {
-                    task.job = Some(job);
-                    return Poll::Pending;
-                }
-                Err(err) => return Poll::Ready(Err(err)),
-            };
-            let state = Arc::clone(&task.state);
-            thread::spawn(move || {
-                let _permit = permit;
-                let result = panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| {
-                    Err(RnovError::new(
-                        ErrorKind::Internal,
-                        "async memory executor worker panicked",
-                    ))
-                });
-                let waker = match state.lock() {
-                    Ok(mut state) => {
-                        state.result = Some(result);
-                        state.waker.take()
-                    }
-                    Err(_) => None,
-                };
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            });
+        let Some(job) = job else {
+            return Poll::Pending;
+        };
+        if let Err(err) = task.start_job_or_requeue(job, cx.waker()) {
+            return Poll::Ready(Err(err));
         }
-
         Poll::Pending
     }
+}
+
+impl<T: Send + 'static> BlockingResultTask<T> {
+    fn take_ready_result_or_job(&mut self, cx: &mut Context<'_>) -> BlockingPoll<T> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return BlockingPoll::Ready(Err(RnovError::new(
+                    ErrorKind::Internal,
+                    "async memory executor state lock poisoned",
+                )));
+            }
+        };
+        if let Some(result) = state.result.take() {
+            return BlockingPoll::Ready(result);
+        }
+        state.waker = Some(cx.waker().clone());
+        BlockingPoll::Pending(self.job.take())
+    }
+
+    fn start_job_or_requeue(&mut self, job: BlockingJob<T>, waker: &Waker) -> Result<()> {
+        let permit = match try_acquire_blocking_worker(waker)? {
+            Some(permit) => permit,
+            None => {
+                self.job = Some(job);
+                return Ok(());
+            }
+        };
+        spawn_blocking_job(Arc::clone(&self.state), job, permit);
+        Ok(())
+    }
+}
+
+fn spawn_blocking_job<T: Send + 'static>(
+    state: Arc<Mutex<BlockingResultState<T>>>,
+    job: BlockingJob<T>,
+    permit: BlockingWorkerPermit,
+) {
+    thread::spawn(move || {
+        let _permit = permit;
+        let result = panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| {
+            Err(RnovError::new(
+                ErrorKind::Internal,
+                "async memory executor worker panicked",
+            ))
+        });
+        let waker = match state.lock() {
+            Ok(mut state) => {
+                state.result = Some(result);
+                state.waker.take()
+            }
+            Err(_) => None,
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    });
 }
 
 fn blocking_workers() -> &'static Mutex<BlockingWorkerState> {
@@ -136,7 +161,9 @@ impl Drop for BlockingWorkerPermit {
             return;
         };
         state.active = state.active.saturating_sub(1);
-        if let Some(waker) = state.waiters.pop() {
+        let waiters = std::mem::take(&mut state.waiters);
+        drop(state);
+        for waker in waiters {
             waker.wake();
         }
     }
@@ -156,7 +183,9 @@ impl Future for BlockingMutationTask<'_> {
         let task = self.get_mut();
         match Pin::new(&mut task.inner).poll(cx) {
             Poll::Ready(Ok((executor, result))) => {
-                *task.executor = executor;
+                if result.is_ok() {
+                    *task.executor = executor;
+                }
                 Poll::Ready(result)
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),

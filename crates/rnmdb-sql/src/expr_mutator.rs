@@ -6,24 +6,55 @@ pub(crate) trait ExprMutator {
     fn rewrite_qualified_identifier(&mut self, qualifier: &Ident, name: &Ident) -> Result<Expr>;
 
     fn rewrite_expr(&mut self, expr: &Expr) -> Result<Expr> {
+        if let Expr::QualifiedIdentifier { qualifier, name } = expr {
+            return self.rewrite_qualified_identifier(qualifier, name);
+        }
+        if let Some(expr) = self.rewrite_operator_expr(expr)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.rewrite_predicate_expr(expr)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.rewrite_construct_expr(expr)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.rewrite_aggregate_expr(expr)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.rewrite_window_expr(expr)? {
+            return Ok(expr);
+        }
+        if let Some(expr) = self.rewrite_collection_expr(expr)? {
+            return Ok(expr);
+        }
+        Ok(expr.clone())
+    }
+
+    fn rewrite_operator_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         match expr {
-            Expr::QualifiedIdentifier { qualifier, name } => {
-                self.rewrite_qualified_identifier(qualifier, name)
-            }
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
                 left: Box::new(self.rewrite_expr(left)?),
                 op: op.clone(),
                 right: Box::new(self.rewrite_expr(right)?),
-            }),
+            }
+            .into()),
             Expr::Unary { op, expr } => Ok(Expr::Unary {
                 op: op.clone(),
                 expr: Box::new(self.rewrite_expr(expr)?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.rewrite_expr(expr)?))),
+            }
+            .into()),
+            Expr::Not(expr) => Ok(Some(Expr::Not(Box::new(self.rewrite_expr(expr)?)))),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_predicate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
                 expr: Box::new(self.rewrite_expr(expr)?),
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::IsTruth {
                 expr,
                 value,
@@ -32,11 +63,13 @@ pub(crate) trait ExprMutator {
                 expr: Box::new(self.rewrite_expr(expr)?),
                 value: *value,
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
                 expr: Box::new(self.rewrite_expr(expr)?),
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::IsDistinctFrom {
                 left,
                 right,
@@ -45,7 +78,8 @@ pub(crate) trait ExprMutator {
                 left: Box::new(self.rewrite_expr(left)?),
                 right: Box::new(self.rewrite_expr(right)?),
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::Between {
                 expr,
                 low,
@@ -56,7 +90,8 @@ pub(crate) trait ExprMutator {
                 low: Box::new(self.rewrite_expr(low)?),
                 high: Box::new(self.rewrite_expr(high)?),
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::InList {
                 expr,
                 values,
@@ -68,7 +103,8 @@ pub(crate) trait ExprMutator {
                     .map(|value| self.rewrite_expr(value))
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
-            }),
+            }
+            .into()),
             Expr::Like {
                 expr,
                 pattern,
@@ -77,45 +113,31 @@ pub(crate) trait ExprMutator {
                 expr: Box::new(self.rewrite_expr(expr)?),
                 pattern: Box::new(self.rewrite_expr(pattern)?),
                 negated: *negated,
-            }),
+            }
+            .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_construct_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::Coalesce(values) => values
                 .iter()
                 .map(|value| self.rewrite_expr(value))
                 .collect::<Result<Vec<_>>>()
-                .map(Expr::Coalesce),
+                .map(Expr::Coalesce)
+                .map(Some),
             Expr::NullIf { left, right } => Ok(Expr::NullIf {
                 left: Box::new(self.rewrite_expr(left)?),
                 right: Box::new(self.rewrite_expr(right)?),
-            }),
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => Ok(Expr::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|operand| self.rewrite_expr(operand))
-                    .transpose()?
-                    .map(Box::new),
-                whens: whens
-                    .iter()
-                    .map(|arm| {
-                        Ok(CaseWhen {
-                            condition: self.rewrite_expr(&arm.condition)?,
-                            result: self.rewrite_expr(&arm.result)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|else_expr| self.rewrite_expr(else_expr))
-                    .transpose()?
-                    .map(Box::new),
-            }),
+            }
+            .into()),
+            Expr::Case { .. } => self.rewrite_case_expr(expr).map(Some),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
                 expr: Box::new(self.rewrite_expr(expr)?),
                 data_type: data_type.clone(),
-            }),
+            }
+            .into()),
             Expr::Call { name, args } => args
                 .iter()
                 .map(|arg| self.rewrite_expr(arg))
@@ -123,14 +145,59 @@ pub(crate) trait ExprMutator {
                 .map(|args| Expr::Call {
                     name: name.clone(),
                     args,
-                }),
-            Expr::Count(expr) => Ok(Expr::Count(Box::new(self.rewrite_expr(expr)?))),
-            Expr::CountDistinct(expr) => {
-                Ok(Expr::CountDistinct(Box::new(self.rewrite_expr(expr)?)))
-            }
-            Expr::Sum(expr) => Ok(Expr::Sum(Box::new(self.rewrite_expr(expr)?))),
-            Expr::Min(expr) => Ok(Expr::Min(Box::new(self.rewrite_expr(expr)?))),
-            Expr::Max(expr) => Ok(Expr::Max(Box::new(self.rewrite_expr(expr)?))),
+                })
+                .map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_case_expr(&mut self, expr: &Expr) -> Result<Expr> {
+        let Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } = expr
+        else {
+            unreachable!("rewrite_case_expr only accepts CASE expressions");
+        };
+        Ok(Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| self.rewrite_expr(operand))
+                .transpose()?
+                .map(Box::new),
+            whens: whens
+                .iter()
+                .map(|arm| {
+                    Ok(CaseWhen {
+                        condition: self.rewrite_expr(&arm.condition)?,
+                        result: self.rewrite_expr(&arm.result)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| self.rewrite_expr(else_expr))
+                .transpose()?
+                .map(Box::new),
+        })
+    }
+
+    fn rewrite_aggregate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
+            Expr::Count(expr) => Ok(Some(Expr::Count(Box::new(self.rewrite_expr(expr)?)))),
+            Expr::CountDistinct(expr) => Ok(Some(Expr::CountDistinct(Box::new(
+                self.rewrite_expr(expr)?,
+            )))),
+            Expr::Sum(expr) => Ok(Some(Expr::Sum(Box::new(self.rewrite_expr(expr)?)))),
+            Expr::Min(expr) => Ok(Some(Expr::Min(Box::new(self.rewrite_expr(expr)?)))),
+            Expr::Max(expr) => Ok(Some(Expr::Max(Box::new(self.rewrite_expr(expr)?)))),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_window_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::RowNumberOver { order_by } => order_by
                 .iter()
                 .map(|order_by| {
@@ -140,7 +207,7 @@ pub(crate) trait ExprMutator {
                     })
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::RowNumberOver { order_by }),
+                .map(|order_by| Some(Expr::RowNumberOver { order_by })),
             Expr::RankOver { order_by } => order_by
                 .iter()
                 .map(|order_by| {
@@ -150,7 +217,7 @@ pub(crate) trait ExprMutator {
                     })
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::RankOver { order_by }),
+                .map(|order_by| Some(Expr::RankOver { order_by })),
             Expr::DenseRankOver { order_by } => order_by
                 .iter()
                 .map(|order_by| {
@@ -160,12 +227,19 @@ pub(crate) trait ExprMutator {
                     })
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::DenseRankOver { order_by }),
+                .map(|order_by| Some(Expr::DenseRankOver { order_by })),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_collection_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::Array(values) => values
                 .iter()
                 .map(|value| self.rewrite_expr(value))
                 .collect::<Result<Vec<_>>>()
-                .map(Expr::Array),
+                .map(Expr::Array)
+                .map(Some),
             Expr::Range {
                 lower,
                 upper,
@@ -174,14 +248,9 @@ pub(crate) trait ExprMutator {
                 lower: Box::new(self.rewrite_expr(lower)?),
                 upper: Box::new(self.rewrite_expr(upper)?),
                 bounds: *bounds,
-            }),
-            Expr::Identifier(_)
-            | Expr::Integer(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::CountStar
-            | Expr::HStore(_) => Ok(expr.clone()),
+            }
+            .into()),
+            _ => Ok(None),
         }
     }
 }

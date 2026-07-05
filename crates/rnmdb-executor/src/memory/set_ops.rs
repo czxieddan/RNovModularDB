@@ -29,21 +29,11 @@ pub(super) fn apply_union_cancellable(
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     validate_union_columns(&left, &right)?;
-    let mut rows = Vec::with_capacity(left.rows().len() + right.rows().len());
-    for row in left.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    for row in right.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    cancellation.check()?;
+    let rows = combined_rows(left.rows(), right.rows(), cancellation)?;
     let batch = VectorBatch::new(left.columns().to_vec(), rows)?;
-    if all {
-        Ok(batch)
-    } else {
-        apply_distinct_cancellable(batch, cancellation)
+    match all {
+        true => Ok(batch),
+        false => apply_distinct_cancellable(batch, cancellation),
     }
 }
 
@@ -57,16 +47,7 @@ pub(super) fn apply_intersect_cancellable(
     if all {
         return apply_intersect_all_cancellable(left, right, cancellation);
     }
-    let right_rows = row_set(right.rows(), cancellation)?;
-    let mut emitted = HashSet::new();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if right_rows.contains(row) && emitted.insert(row.clone()) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
+    let rows = distinct_rows_by_right_membership(left.rows(), &right, true, cancellation)?;
     VectorBatch::new(left.columns().to_vec(), rows)
 }
 
@@ -80,16 +61,7 @@ pub(super) fn apply_except_cancellable(
     if all {
         return apply_except_all_cancellable(left, right, cancellation);
     }
-    let right_rows = row_set(right.rows(), cancellation)?;
-    let mut emitted = HashSet::new();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if !right_rows.contains(row) && emitted.insert(row.clone()) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
+    let rows = distinct_rows_by_right_membership(left.rows(), &right, false, cancellation)?;
     VectorBatch::new(left.columns().to_vec(), rows)
 }
 
@@ -143,6 +115,49 @@ fn row_set(rows: &[Row], cancellation: &CancellationToken) -> Result<HashSet<Row
         set.insert(row.clone());
     }
     Ok(set)
+}
+
+fn combined_rows(
+    left: &[Row],
+    right: &[Row],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::with_capacity(left.len() + right.len());
+    append_rows(&mut rows, left, cancellation)?;
+    append_rows(&mut rows, right, cancellation)?;
+    cancellation.check()?;
+    Ok(rows)
+}
+
+fn append_rows(
+    output: &mut Vec<Row>,
+    rows: &[Row],
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    for row in rows {
+        cancellation.check()?;
+        output.push(row.clone());
+    }
+    Ok(())
+}
+
+fn distinct_rows_by_right_membership(
+    left: &[Row],
+    right: &VectorBatch,
+    keep_matches: bool,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
+    let right_rows = row_set(right.rows(), cancellation)?;
+    let mut emitted = HashSet::new();
+    let mut rows = Vec::new();
+    for row in left {
+        cancellation.check()?;
+        if (right_rows.contains(row) == keep_matches) && emitted.insert(row.clone()) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    Ok(rows)
 }
 
 fn row_counts(rows: &[Row], cancellation: &CancellationToken) -> Result<HashMap<Row, usize>> {

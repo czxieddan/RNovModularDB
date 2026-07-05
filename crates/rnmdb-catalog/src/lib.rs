@@ -804,11 +804,11 @@ impl Catalog {
         procedure_id: FunctionId,
         privilege: Privilege,
     ) -> bool {
-        if self.role_is_superuser(role_id) {
-            return true;
+        if privilege != Privilege::Execute {
+            return false;
         }
-        privilege == Privilege::Execute
-            && self.procedure_grants.contains(&ProcedureGrant {
+        self.role_is_superuser(role_id)
+            || self.procedure_grants.contains(&ProcedureGrant {
                 role_id,
                 procedure_id,
                 privilege,

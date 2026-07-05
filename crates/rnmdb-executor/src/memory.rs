@@ -645,6 +645,9 @@ impl MemoryTable {
         cancellation: &CancellationToken,
     ) -> Result<MemoryTableIndex> {
         let worker_count = config.worker_threads().min(self.rows.len());
+        if worker_count == 0 {
+            return Ok(index);
+        }
         let chunk_size = self.rows.len().div_ceil(worker_count);
 
         thread::scope(|scope| {
@@ -2642,7 +2645,7 @@ impl MemoryExecutor {
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropIndex { name, if_exists } => {
-                if self.drop_index(name) || *if_exists {
+                if self.drop_index(name)? || *if_exists {
                     Ok(ExecutionResult::SchemaChanged)
                 } else {
                     Err(RnovError::new(
@@ -2739,11 +2742,12 @@ impl MemoryExecutor {
         &'a mut self,
         plan: &LogicalPlan,
     ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
-        let mut executor = self.clone();
+        let executor = self.snapshot();
         let plan = plan.clone();
         BlockingMutationTask {
             executor: self,
             inner: BlockingResultTask::new(move || {
+                let mut executor = executor?;
                 let result = executor.execute_mut(&plan);
                 Ok((executor, result))
             }),
@@ -2799,11 +2803,12 @@ impl MemoryExecutor {
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
     ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
-        let mut executor = self.clone();
+        let executor = self.snapshot();
         let plan = plan.clone();
         BlockingMutationTask {
             executor: self,
             inner: BlockingResultTask::new(move || {
+                let mut executor = executor?;
                 let result = executor.execute_mut_parallel(&plan, config);
                 Ok((executor, result))
             }),
@@ -2872,10 +2877,11 @@ impl MemoryExecutor {
         )
     }
 
-    fn drop_index(&mut self, name: &str) -> bool {
-        self.write_tables()
-            .map(|mut tables| tables.values_mut().any(|table| table.drop_index(name)))
-            .unwrap_or(false)
+    fn drop_index(&mut self, name: &str) -> Result<bool> {
+        Ok(self
+            .write_tables()?
+            .values_mut()
+            .any(|table| table.drop_index(name)))
     }
 
     fn execute_indexed_filter_scan(

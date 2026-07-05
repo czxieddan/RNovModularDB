@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write, copy},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
     thread,
 };
 
@@ -24,6 +24,10 @@ pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VER
 pub const SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
 
 const PAGE_CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+type SingleFileWriteLock = Arc<Mutex<()>>;
+type SingleFileWriteLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
+
+static SINGLE_FILE_WRITE_LOCKS: OnceLock<SingleFileWriteLockRegistry> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
@@ -1140,13 +1144,51 @@ impl Default for SingleFileOptions {
     }
 }
 
+fn single_file_write_locks() -> &'static SingleFileWriteLockRegistry {
+    SINGLE_FILE_WRITE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn single_file_write_lock_for(path: &Path) -> Result<SingleFileWriteLock> {
+    let lock_path = canonical_lock_path(path)?;
+    let mut locks = single_file_write_locks().lock().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Internal,
+            "single-file write lock registry poisoned",
+        )
+    })?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&lock_path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(lock_path, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn canonical_lock_path(path: &Path) -> Result<PathBuf> {
+    if let Ok(path) = path.canonicalize() {
+        return Ok(path);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to resolve database file path: {err}"),
+            )
+        })
+}
+
 pub struct SingleFileBackend {
     path: PathBuf,
     file: File,
     page_size: PageSize,
     superblock_generation: u64,
     page_key: Option<PageCryptoKey>,
-    write_lock: Mutex<()>,
+    write_lock: SingleFileWriteLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1642,6 +1684,7 @@ impl SingleFileBackend {
                 format!("failed to sync database file: {err}"),
             )
         })?;
+        let write_lock = single_file_write_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1649,7 +1692,7 @@ impl SingleFileBackend {
             page_size: options.page_size(),
             superblock_generation,
             page_key: options.page_key(),
-            write_lock: Mutex::new(()),
+            write_lock,
         })
     }
 
@@ -1696,6 +1739,7 @@ impl SingleFileBackend {
             })?;
         let (_format_version, page_size, superblock_generation) =
             read_single_file_header(&mut file)?;
+        let write_lock = single_file_write_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1703,7 +1747,7 @@ impl SingleFileBackend {
             page_size,
             superblock_generation,
             page_key,
-            write_lock: Mutex::new(()),
+            write_lock,
         })
     }
 
