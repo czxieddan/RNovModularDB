@@ -18,28 +18,47 @@ where
     }
 
     fn rewrite_expr(&mut self, expr: &Expr) -> Result<Expr> {
-        if let Expr::QualifiedIdentifier { qualifier, name } = expr {
-            return self.rewrite_qualified_identifier(qualifier, name);
+        self.rewrite_expr_candidate(expr)?
+            .map_or_else(|| Ok(expr.clone()), Ok)
+    }
+
+    fn rewrite_expr_candidate(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        if let Some(expr) = self.rewrite_qualified_identifier_expr(expr)? {
+            return Ok(Some(expr));
         }
+        self.rewrite_non_identifier_expr(expr)
+    }
+
+    fn rewrite_qualified_identifier_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
+            Expr::QualifiedIdentifier { qualifier, name } => {
+                self.rewrite_qualified_identifier(qualifier, name).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_non_identifier_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         if let Some(expr) = self.rewrite_operator_expr(expr)? {
-            return Ok(expr);
+            return Ok(Some(expr));
         }
         if let Some(expr) = self.rewrite_predicate_expr(expr)? {
-            return Ok(expr);
+            return Ok(Some(expr));
         }
         if let Some(expr) = self.rewrite_construct_expr(expr)? {
-            return Ok(expr);
+            return Ok(Some(expr));
         }
+        self.rewrite_remaining_expr(expr)
+    }
+
+    fn rewrite_remaining_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         if let Some(expr) = self.rewrite_aggregate_expr(expr)? {
-            return Ok(expr);
+            return Ok(Some(expr));
         }
         if let Some(expr) = self.rewrite_window_expr(expr)? {
-            return Ok(expr);
+            return Ok(Some(expr));
         }
-        if let Some(expr) = self.rewrite_collection_expr(expr)? {
-            return Ok(expr);
-        }
-        Ok(expr.clone())
+        self.rewrite_collection_expr(expr)
     }
 
     fn rewrite_operator_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
@@ -104,6 +123,16 @@ where
     }
 
     fn rewrite_multi_predicate_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        if let Some(expr) = self.rewrite_between_expr(expr)? {
+            return Ok(Some(expr));
+        }
+        if let Some(expr) = self.rewrite_in_list_expr(expr)? {
+            return Ok(Some(expr));
+        }
+        self.rewrite_like_expr(expr)
+    }
+
+    fn rewrite_between_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         match expr {
             Expr::Between {
                 expr,
@@ -117,6 +146,12 @@ where
                 negated: *negated,
             }
             .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_in_list_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::InList {
                 expr,
                 values,
@@ -130,6 +165,12 @@ where
                 negated: *negated,
             }
             .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_like_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
             Expr::Like {
                 expr,
                 pattern,
