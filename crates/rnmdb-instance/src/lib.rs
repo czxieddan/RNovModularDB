@@ -327,22 +327,25 @@ impl InstanceIsolation {
     }
 
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        self.namespaces()
-            .iter()
-            .any(|own| other.namespaces().iter().any(|candidate| own == candidate))
+        other.has_namespace(self.catalog_namespace())
+            || other.has_namespace(self.key_namespace())
+            || other.has_namespace(self.buffer_namespace())
+            || other.has_namespace(self.transaction_namespace())
+            || other.has_namespace(self.temp_namespace())
+            || other.has_namespace(self.audit_namespace())
+            || other.has_namespace(self.metrics_namespace())
+            || other.has_namespace(self.background_worker_group())
     }
 
-    fn namespaces(&self) -> [&str; 8] {
-        [
-            self.catalog_namespace(),
-            self.key_namespace(),
-            self.buffer_namespace(),
-            self.transaction_namespace(),
-            self.temp_namespace(),
-            self.audit_namespace(),
-            self.metrics_namespace(),
-            self.background_worker_group(),
-        ]
+    fn has_namespace(&self, namespace: &str) -> bool {
+        namespace == self.catalog_namespace()
+            || namespace == self.key_namespace()
+            || namespace == self.buffer_namespace()
+            || namespace == self.transaction_namespace()
+            || namespace == self.temp_namespace()
+            || namespace == self.audit_namespace()
+            || namespace == self.metrics_namespace()
+            || namespace == self.background_worker_group()
     }
 }
 

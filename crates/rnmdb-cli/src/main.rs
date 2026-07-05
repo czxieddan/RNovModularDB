@@ -54,7 +54,13 @@ fn run_inspect_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        _ => unsupported_command("inspect"),
+        _ => invalid_command_arguments(
+            "inspect",
+            &[
+                "rnmdb inspect <PATH>",
+                "rnmdb inspect --page-key-hex <HEX> <PATH>",
+            ],
+        ),
     }
 }
 
@@ -72,7 +78,13 @@ fn run_verify_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        _ => unsupported_command("verify"),
+        _ => invalid_command_arguments(
+            "verify",
+            &[
+                "rnmdb verify <PATH>",
+                "rnmdb verify --page-key-hex <HEX> <PATH>",
+            ],
+        ),
     }
 }
 
@@ -85,7 +97,7 @@ fn run_backup_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        _ => unsupported_command("backup"),
+        _ => invalid_command_arguments("backup", &["rnmdb backup <SOURCE> <DESTINATION>"]),
     }
 }
 
@@ -105,7 +117,13 @@ fn run_restore_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        _ => unsupported_command("restore"),
+        _ => invalid_command_arguments(
+            "restore",
+            &[
+                "rnmdb restore <BACKUP> <TARGET>",
+                "rnmdb restore --dry-run <BACKUP> <TARGET>",
+            ],
+        ),
     }
 }
 
@@ -126,7 +144,13 @@ fn run_upgrade_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        _ => unsupported_command("upgrade"),
+        _ => invalid_command_arguments(
+            "upgrade",
+            &[
+                "rnmdb upgrade <SOURCE> <TARGET>",
+                "rnmdb upgrade --page-key-hex <HEX> <SOURCE> <TARGET>",
+            ],
+        ),
     }
 }
 
@@ -134,6 +158,14 @@ fn unsupported_command(command: &str) -> rnmdb_common::Result<()> {
     Err(rnmdb_common::RnovError::new(
         rnmdb_common::ErrorKind::InvalidInput,
         format!("unsupported command '{command}'"),
+    ))
+}
+
+fn invalid_command_arguments(command: &str, usage: &[&str]) -> rnmdb_common::Result<()> {
+    let usage = usage.join("; ");
+    Err(rnmdb_common::RnovError::new(
+        rnmdb_common::ErrorKind::InvalidInput,
+        format!("invalid arguments for '{command}'; usage: {usage}"),
     ))
 }
 

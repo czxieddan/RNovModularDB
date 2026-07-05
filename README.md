@@ -144,7 +144,7 @@ The encrypted single-file storage format currently uses `SINGLE_FILE_FORMAT_VERS
 
 Compatibility rules for the current preview:
 
-- Version 2 files are intended to be read and written by this implementation line.
+- Version 2 files are intended to be read and written by this implementation only.
 - Version 1 files can be detected with compatibility diagnostics and upgraded explicitly to version 2 with `upgrade`.
 - Upgrade writes a new target file and leaves the source file untouched. The target path must not already exist.
 - Upgrading encrypted page records requires the page key. Empty version 1 files can be upgraded without a page key.
