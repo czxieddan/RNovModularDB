@@ -206,6 +206,12 @@ impl InstanceConfig {
         &self.isolation
     }
 
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.instance_id == other.instance_id
+            || self.database_id == other.database_id
+            || self.isolation.conflicts_with(&other.isolation)
+    }
+
     pub fn check_resource_usage(&self, usage: &ResourceUsage) -> Result<()> {
         if usage.memory_bytes() > self.limits.max_memory_bytes() {
             return Err(RnovError::new(
@@ -319,6 +325,28 @@ impl InstanceIsolation {
     pub fn background_worker_group(&self) -> &str {
         &self.background_worker_group
     }
+
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        other.has_namespace(self.catalog_namespace())
+            || other.has_namespace(self.key_namespace())
+            || other.has_namespace(self.buffer_namespace())
+            || other.has_namespace(self.transaction_namespace())
+            || other.has_namespace(self.temp_namespace())
+            || other.has_namespace(self.audit_namespace())
+            || other.has_namespace(self.metrics_namespace())
+            || other.has_namespace(self.background_worker_group())
+    }
+
+    fn has_namespace(&self, namespace: &str) -> bool {
+        namespace == self.catalog_namespace()
+            || namespace == self.key_namespace()
+            || namespace == self.buffer_namespace()
+            || namespace == self.transaction_namespace()
+            || namespace == self.temp_namespace()
+            || namespace == self.audit_namespace()
+            || namespace == self.metrics_namespace()
+            || namespace == self.background_worker_group()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -406,36 +434,9 @@ impl InstanceSyncStatus {
         dirty_bytes: usize,
         estimated_flush_bytes: usize,
     ) -> Result<Self> {
-        if estimated_flush_bytes < dirty_bytes {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "estimated flush bytes cannot be lower than dirty bytes",
-            ));
-        }
-        if matches!(state, InstanceSyncState::HybridReady)
-            && (dirty_bytes != 0 || memory_lsn != disk_lsn)
-        {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "hybrid ready status requires equal LSNs and zero dirty bytes",
-            ));
-        }
-        if matches!(state, InstanceSyncState::MemoryOnly)
-            && !matches!(active_target, InstanceSyncTarget::Memory)
-        {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "memory-only status must target memory",
-            ));
-        }
-        if matches!(state, InstanceSyncState::DiskOnly)
-            && !matches!(active_target, InstanceSyncTarget::Disk)
-        {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "disk-only status must target disk",
-            ));
-        }
+        validate_estimated_flush_bytes(dirty_bytes, estimated_flush_bytes)?;
+        validate_hybrid_ready_status(state, memory_lsn, disk_lsn, dirty_bytes)?;
+        validate_sync_state_target(state, active_target)?;
 
         Ok(Self {
             state,
@@ -509,6 +510,52 @@ impl InstanceSyncStatus {
         matches!(self.state, InstanceSyncState::HybridReady)
             && self.dirty_bytes == 0
             && self.memory_lsn == self.disk_lsn
+    }
+}
+
+fn validate_estimated_flush_bytes(dirty_bytes: usize, estimated_flush_bytes: usize) -> Result<()> {
+    if estimated_flush_bytes >= dirty_bytes {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "estimated flush bytes cannot be lower than dirty bytes",
+    ))
+}
+
+fn validate_hybrid_ready_status(
+    state: InstanceSyncState,
+    memory_lsn: u64,
+    disk_lsn: u64,
+    dirty_bytes: usize,
+) -> Result<()> {
+    if !matches!(state, InstanceSyncState::HybridReady) {
+        return Ok(());
+    }
+    if dirty_bytes == 0 && memory_lsn == disk_lsn {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "hybrid ready status requires equal LSNs and zero dirty bytes",
+    ))
+}
+
+fn validate_sync_state_target(
+    state: InstanceSyncState,
+    active_target: InstanceSyncTarget,
+) -> Result<()> {
+    match state {
+        InstanceSyncState::MemoryOnly if active_target != InstanceSyncTarget::Memory => {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory-only status must target memory",
+            ))
+        }
+        InstanceSyncState::DiskOnly if active_target != InstanceSyncTarget::Disk => Err(
+            RnovError::new(ErrorKind::InvalidInput, "disk-only status must target disk"),
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -689,8 +736,25 @@ impl InstanceManager {
                 format!("instance already exists: {instance_id}"),
             ));
         }
+        if let Some(existing) = self.find_isolation_conflict(context.config()) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance isolation conflict: {} cannot share database {} with {}",
+                    context.instance_id(),
+                    context.database_id(),
+                    existing.instance_id()
+                ),
+            ));
+        }
         self.instances.insert(instance_id, context);
         Ok(())
+    }
+
+    fn find_isolation_conflict(&self, config: &InstanceConfig) -> Option<&InstanceRuntimeContext> {
+        self.instances
+            .values()
+            .find(|existing| existing.config().conflicts_with(config))
     }
 
     pub fn get(&self, instance_id: InstanceId) -> Option<&InstanceConfig> {

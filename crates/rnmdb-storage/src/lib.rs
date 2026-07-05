@@ -18,6 +18,11 @@ use rnmdb_common::{
 };
 
 pub use rnmdb_common::config::PageSize;
+pub use single_file_upgrade::{
+    upgrade_single_file, upgrade_single_file_with_key, upgrade_single_file_with_options,
+};
+
+mod single_file_upgrade;
 
 pub const SINGLE_FILE_FORMAT_VERSION: u16 = 2;
 pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
@@ -1294,6 +1299,34 @@ pub struct SingleFileRestoreReport {
     present_page_records: u64,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct SingleFileUpgradeOptions {
+    source_page_key: Option<PageCryptoKey>,
+    target_page_key: Option<PageCryptoKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileUpgradePageReport {
+    page_id: PageId,
+    source_counter: u32,
+    target_counter: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileUpgradeReport {
+    source_path: PathBuf,
+    target_path: PathBuf,
+    source_format_version: u16,
+    target_format_version: u16,
+    bytes_written: u64,
+    page_size: PageSize,
+    superblock_generation: u64,
+    page_record_slots: u64,
+    pages_upgraded: u64,
+    key_rotated: bool,
+    page_reports: Vec<SingleFileUpgradePageReport>,
+}
+
 impl SingleFileFormatCompatibility {
     fn new(path: PathBuf, format_version: u16) -> Self {
         Self {
@@ -1405,6 +1438,102 @@ impl SingleFileRestoreReport {
 
     pub fn present_page_records(&self) -> u64 {
         self.present_page_records
+    }
+}
+
+impl SingleFileUpgradeOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_page_key(mut self, key: PageCryptoKey) -> Self {
+        self.source_page_key = Some(key);
+        self.target_page_key = Some(key);
+        self
+    }
+
+    pub fn with_source_page_key(mut self, key: PageCryptoKey) -> Self {
+        self.source_page_key = Some(key);
+        self
+    }
+
+    pub fn with_target_page_key(mut self, key: PageCryptoKey) -> Self {
+        self.target_page_key = Some(key);
+        self
+    }
+
+    pub fn source_page_key(self) -> Option<PageCryptoKey> {
+        self.source_page_key
+    }
+
+    pub fn target_page_key(self) -> Option<PageCryptoKey> {
+        self.target_page_key.or(self.source_page_key)
+    }
+
+    pub fn key_rotated(self) -> bool {
+        self.source_page_key
+            .zip(self.target_page_key)
+            .is_some_and(|(source, target)| source != target)
+    }
+}
+
+impl SingleFileUpgradePageReport {
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn source_counter(&self) -> u32 {
+        self.source_counter
+    }
+
+    pub fn target_counter(&self) -> u32 {
+        self.target_counter
+    }
+}
+
+impl SingleFileUpgradeReport {
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn target_path(&self) -> &Path {
+        &self.target_path
+    }
+
+    pub fn source_format_version(&self) -> u16 {
+        self.source_format_version
+    }
+
+    pub fn target_format_version(&self) -> u16 {
+        self.target_format_version
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn pages_upgraded(&self) -> u64 {
+        self.pages_upgraded
+    }
+
+    pub fn key_rotated(&self) -> bool {
+        self.key_rotated
+    }
+
+    pub fn page_reports(&self) -> &[SingleFileUpgradePageReport] {
+        &self.page_reports
     }
 }
 
@@ -1900,31 +2029,7 @@ impl StorageBackend for SingleFileBackend {
                 format!("failed to seek encrypted page record: {err}"),
             )
         })?;
-        file.write_all(&Self::PAGE_RECORD_MAGIC).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to write encrypted page record magic: {err}"),
-            )
-        })?;
-        file.write_all(&counter.to_be_bytes()).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to write encrypted page counter: {err}"),
-            )
-        })?;
-        file.write_all(&(ciphertext.len() as u32).to_be_bytes())
-            .map_err(|err| {
-                RnovError::new(
-                    ErrorKind::Io,
-                    format!("failed to write encrypted page length: {err}"),
-                )
-            })?;
-        file.write_all(&ciphertext).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to write encrypted page payload: {err}"),
-            )
-        })?;
+        write_encrypted_page_record(&mut file, counter, &ciphertext)?;
         Ok(())
     }
 
@@ -1947,6 +2052,35 @@ impl StorageBackend for SingleFileBackend {
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED
     }
+}
+
+fn write_encrypted_page_record(file: &mut File, counter: u32, ciphertext: &[u8]) -> Result<()> {
+    file.write_all(&SingleFileBackend::PAGE_RECORD_MAGIC)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to write encrypted page record magic: {err}"),
+            )
+        })?;
+    file.write_all(&counter.to_be_bytes()).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write encrypted page counter: {err}"),
+        )
+    })?;
+    file.write_all(&(ciphertext.len() as u32).to_be_bytes())
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to write encrypted page length: {err}"),
+            )
+        })?;
+    file.write_all(ciphertext).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write encrypted page payload: {err}"),
+        )
+    })
 }
 
 pub fn check_single_file_format_compatibility(
@@ -2334,6 +2468,16 @@ fn write_single_file_header(
     page_size: PageSize,
     superblock_generation: u64,
 ) -> Result<()> {
+    write_single_file_header_with_roots(file, page_size, superblock_generation, 0, 0)
+}
+
+fn write_single_file_header_with_roots(
+    file: &mut File,
+    page_size: PageSize,
+    superblock_generation: u64,
+    catalog_root: u64,
+    free_map_root: u64,
+) -> Result<()> {
     file.seek(SeekFrom::Start(0)).map_err(|err| {
         RnovError::new(
             ErrorKind::Io,
@@ -2351,7 +2495,7 @@ fn write_single_file_header(
         &((SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN) as u64).to_be_bytes(),
     );
 
-    let primary = encode_superblock(superblock_generation, 0, 0);
+    let primary = encode_superblock(superblock_generation, catalog_root, free_map_root);
     let secondary = encode_superblock(0, 0, 0);
 
     file.write_all(&header).map_err(|err| {
@@ -2450,11 +2594,18 @@ fn ensure_single_file_format_supported(format_version: u16) -> Result<()> {
     ) {
         return Ok(());
     }
+    let upgrade_hint = if format_version < SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION {
+        "; run an explicit single-file upgrade before opening this database"
+    } else {
+        ""
+    };
     Err(RnovError::new(
         ErrorKind::Corruption,
         format!(
-            "unsupported database format version {format_version}; supported versions are {}..={}",
-            SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION, SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION
+            "unsupported database format version {format_version}; supported versions are {}..={}{}",
+            SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
+            SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION,
+            upgrade_hint
         ),
     ))
 }

@@ -22,9 +22,10 @@ use rnmdb_sql::{
 };
 use rnmdb_storage::{
     PageCryptoKey, SingleFileBackupReport, SingleFileFormatCompatibility, SingleFileInspection,
-    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileVerificationReport,
-    backup_single_file, check_single_file_format_compatibility, inspect_single_file,
-    inspect_single_file_with_key, restore_single_file, restore_single_file_dry_run,
+    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
+    SingleFileVerificationReport, backup_single_file, check_single_file_format_compatibility,
+    inspect_single_file, inspect_single_file_with_key, restore_single_file,
+    restore_single_file_dry_run, upgrade_single_file, upgrade_single_file_with_key,
     verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_types::SqlType;
@@ -812,17 +813,7 @@ fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<St
     let mut chars = body.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\'' {
-            expanded.push(ch);
-            while let Some(inner) = chars.next() {
-                expanded.push(inner);
-                if inner == '\'' {
-                    if chars.peek() == Some(&'\'') {
-                        expanded.push(chars.next().expect("peeked quote must be present"));
-                        continue;
-                    }
-                    break;
-                }
-            }
+            append_quoted_sql_literal(&mut expanded, &mut chars);
             continue;
         }
 
@@ -831,25 +822,62 @@ fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<St
             continue;
         }
 
-        let mut raw_index = String::new();
-        while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
-            raw_index.push(chars.next().expect("peeked digit must be present"));
-        }
-        let index = raw_index.parse::<usize>().map_err(|_| {
-            RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("procedure parameter ${raw_index} is out of range"),
-            )
-        })?;
-        if index == 0 || index > args.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("procedure parameter ${index} has no argument"),
-            ));
-        }
-        expanded.push_str(procedure_argument_sql_literal(&args[index - 1])?.as_str());
+        append_procedure_argument(&mut expanded, &mut chars, args)?;
     }
     Ok(expanded)
+}
+
+fn append_quoted_sql_literal(
+    expanded: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) {
+    expanded.push('\'');
+    while let Some(inner) = chars.next() {
+        expanded.push(inner);
+        if inner == '\'' && chars.peek() == Some(&'\'') {
+            expanded.push(chars.next().expect("peeked quote must be present"));
+            continue;
+        }
+        if inner == '\'' {
+            break;
+        }
+    }
+}
+
+fn append_procedure_argument(
+    expanded: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    args: &[rnmdb_sql::ast::Expr],
+) -> Result<()> {
+    let index = read_procedure_argument_index(chars)?;
+    validate_procedure_argument_index(index, args.len())?;
+    expanded.push_str(procedure_argument_sql_literal(&args[index - 1])?.as_str());
+    Ok(())
+}
+
+fn read_procedure_argument_index(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<usize> {
+    let mut raw_index = String::new();
+    while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+        raw_index.push(chars.next().expect("peeked digit must be present"));
+    }
+    raw_index.parse::<usize>().map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("procedure parameter ${raw_index} is out of range"),
+        )
+    })
+}
+
+fn validate_procedure_argument_index(index: usize, args_len: usize) -> Result<()> {
+    if index > 0 && index <= args_len {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("procedure parameter ${index} has no argument"),
+    ))
 }
 
 fn procedure_argument_sql_literal(expr: &rnmdb_sql::ast::Expr) -> Result<String> {
@@ -999,4 +1027,19 @@ pub fn restore_storage(
     target: impl AsRef<std::path::Path>,
 ) -> Result<SingleFileRestoreReport> {
     restore_single_file(backup, target)
+}
+
+pub fn upgrade_storage(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> Result<SingleFileUpgradeReport> {
+    upgrade_single_file(source, target)
+}
+
+pub fn upgrade_storage_with_key(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+    key: PageCryptoKey,
+) -> Result<SingleFileUpgradeReport> {
+    upgrade_single_file_with_key(source, target, key)
 }

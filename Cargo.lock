@@ -555,6 +555,7 @@ dependencies = [
  "crc",
  "rand_core 0.9.5",
  "rnmdb-common",
+ "sha2",
  "tempfile",
 ]
 
