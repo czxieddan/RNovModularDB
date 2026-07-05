@@ -55,25 +55,25 @@ printf "CREATE TABLE items (id INT64 NOT NULL, name TEXT); INSERT INTO items (id
 Inspect a single-file store:
 
 ```bash
-cargo run -q -p rnmdb-cli --bin rnmdb -- inspect path/to/database.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- inspect --page-key-hex <64-hex-chars> path/to/database.rnov
+cargo run -q -p rnmdb-cli --bin rnmdb -- inspect path/to/database.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- inspect --page-key-hex <64-hex-chars> path/to/database.rnmdb
 ```
 
 Verify, back up, and restore a single-file store:
 
 ```bash
-cargo run -q -p rnmdb-cli --bin rnmdb -- verify path/to/database.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- verify --page-key-hex <64-hex-chars> path/to/database.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- backup path/to/database.rnov path/to/database.backup.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- restore --dry-run path/to/database.backup.rnov path/to/restored.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- restore path/to/database.backup.rnov path/to/restored.rnov
+cargo run -q -p rnmdb-cli --bin rnmdb -- verify path/to/database.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- verify --page-key-hex <64-hex-chars> path/to/database.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- backup path/to/database.rnmdb path/to/database.backup.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- restore --dry-run path/to/database.backup.rnmdb path/to/restored.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- restore path/to/database.backup.rnmdb path/to/restored.rnmdb
 ```
 
 Upgrade an older single-file store to the current format:
 
 ```bash
-cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade path/to/legacy-v1.rnov path/to/upgraded-v2.rnov
-cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade --page-key-hex <64-hex-chars> path/to/legacy-v1.rnov path/to/upgraded-v2.rnov
+cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade --page-key-hex <64-hex-chars> path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
 ```
 
 `inspect` reports file layout, page size, single-file format version, superblock generation, page record counts, free space, encryption state, and page record details. Supplying `--page-key-hex` also authenticates encrypted page records and verifies decoded page checksums.

@@ -35,8 +35,8 @@ temp/
 *.db
 *.db-shm
 *.db-wal
-*.rnov
-*.rnov-backup
+*.rnmdb
+*.rnmdb-backup
 *.snapshot
 
 # OS/editor noise
