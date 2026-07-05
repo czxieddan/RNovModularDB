@@ -206,6 +206,12 @@ impl InstanceConfig {
         &self.isolation
     }
 
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.instance_id == other.instance_id
+            || self.database_id == other.database_id
+            || self.isolation.conflicts_with(&other.isolation)
+    }
+
     pub fn check_resource_usage(&self, usage: &ResourceUsage) -> Result<()> {
         if usage.memory_bytes() > self.limits.max_memory_bytes() {
             return Err(RnovError::new(
@@ -318,6 +324,25 @@ impl InstanceIsolation {
 
     pub fn background_worker_group(&self) -> &str {
         &self.background_worker_group
+    }
+
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.namespaces()
+            .iter()
+            .any(|own| other.namespaces().iter().any(|candidate| own == candidate))
+    }
+
+    fn namespaces(&self) -> [&str; 8] {
+        [
+            self.catalog_namespace(),
+            self.key_namespace(),
+            self.buffer_namespace(),
+            self.transaction_namespace(),
+            self.temp_namespace(),
+            self.audit_namespace(),
+            self.metrics_namespace(),
+            self.background_worker_group(),
+        ]
     }
 }
 
@@ -689,8 +714,25 @@ impl InstanceManager {
                 format!("instance already exists: {instance_id}"),
             ));
         }
+        if let Some(existing) = self.find_isolation_conflict(context.config()) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "instance isolation conflict: {} cannot share database {} with {}",
+                    context.instance_id(),
+                    context.database_id(),
+                    existing.instance_id()
+                ),
+            ));
+        }
         self.instances.insert(instance_id, context);
         Ok(())
+    }
+
+    fn find_isolation_conflict(&self, config: &InstanceConfig) -> Option<&InstanceRuntimeContext> {
+        self.instances
+            .values()
+            .find(|existing| existing.config().conflicts_with(config))
     }
 
     pub fn get(&self, instance_id: InstanceId) -> Option<&InstanceConfig> {
