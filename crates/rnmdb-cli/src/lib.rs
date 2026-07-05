@@ -22,9 +22,10 @@ use rnmdb_sql::{
 };
 use rnmdb_storage::{
     PageCryptoKey, SingleFileBackupReport, SingleFileFormatCompatibility, SingleFileInspection,
-    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileVerificationReport,
-    backup_single_file, check_single_file_format_compatibility, inspect_single_file,
-    inspect_single_file_with_key, restore_single_file, restore_single_file_dry_run,
+    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
+    SingleFileVerificationReport, backup_single_file, check_single_file_format_compatibility,
+    inspect_single_file, inspect_single_file_with_key, restore_single_file,
+    restore_single_file_dry_run, upgrade_single_file, upgrade_single_file_with_key,
     verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_types::SqlType;
@@ -999,4 +1000,19 @@ pub fn restore_storage(
     target: impl AsRef<std::path::Path>,
 ) -> Result<SingleFileRestoreReport> {
     restore_single_file(backup, target)
+}
+
+pub fn upgrade_storage(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+) -> Result<SingleFileUpgradeReport> {
+    upgrade_single_file(source, target)
+}
+
+pub fn upgrade_storage_with_key(
+    source: impl AsRef<std::path::Path>,
+    target: impl AsRef<std::path::Path>,
+    key: PageCryptoKey,
+) -> Result<SingleFileUpgradeReport> {
+    upgrade_single_file_with_key(source, target, key)
 }

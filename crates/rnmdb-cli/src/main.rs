@@ -2,12 +2,12 @@ use std::io::{self, Read};
 
 use rnmdb_cli::{
     CommandOutput, LocalSession, backup_storage, inspect_storage, inspect_storage_with_key,
-    page_key_from_hex, restore_storage, restore_storage_dry_run, verify_storage,
-    verify_storage_with_key,
+    page_key_from_hex, restore_storage, restore_storage_dry_run, upgrade_storage,
+    upgrade_storage_with_key, verify_storage, verify_storage_with_key,
 };
 use rnmdb_storage::{
     SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun, SingleFileRestoreReport,
-    SingleFileVerificationReport,
+    SingleFileUpgradeReport, SingleFileVerificationReport,
 };
 
 fn main() {
@@ -27,14 +27,26 @@ fn run() -> rnmdb_common::Result<()> {
 }
 
 fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
+    let Some((command, rest)) = args.split_first() else {
+        return run_sql_stdin();
+    };
+    match command.as_str() {
+        "inspect" => run_inspect_command(rest),
+        "verify" => run_verify_command(rest),
+        "backup" => run_backup_command(rest),
+        "restore" => run_restore_command(rest),
+        "upgrade" => run_upgrade_command(rest),
+        _ => unsupported_command(command),
+    }
+}
+
+fn run_inspect_command(args: &[String]) -> rnmdb_common::Result<()> {
     match args {
-        [command, path] if command == "inspect" => {
+        [path] => {
             println!("{}", format_inspection(&inspect_storage(path)?));
             Ok(())
         }
-        [command, key_flag, key_hex, path]
-            if command == "inspect" && key_flag == "--page-key-hex" =>
-        {
+        [key_flag, key_hex, path] if key_flag == "--page-key-hex" => {
             let key = page_key_from_hex(key_hex)?;
             println!(
                 "{}",
@@ -42,13 +54,17 @@ fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        [command, path] if command == "verify" => {
+        _ => unsupported_command("inspect"),
+    }
+}
+
+fn run_verify_command(args: &[String]) -> rnmdb_common::Result<()> {
+    match args {
+        [path] => {
             println!("{}", format_verification(&verify_storage(path)?));
             Ok(())
         }
-        [command, key_flag, key_hex, path]
-            if command == "verify" && key_flag == "--page-key-hex" =>
-        {
+        [key_flag, key_hex, path] if key_flag == "--page-key-hex" => {
             let key = page_key_from_hex(key_hex)?;
             println!(
                 "{}",
@@ -56,33 +72,69 @@ fn run_command(args: &[String]) -> rnmdb_common::Result<()> {
             );
             Ok(())
         }
-        [command, source, destination] if command == "backup" => {
+        _ => unsupported_command("verify"),
+    }
+}
+
+fn run_backup_command(args: &[String]) -> rnmdb_common::Result<()> {
+    match args {
+        [source, destination] => {
             println!(
                 "{}",
                 format_backup_report(&backup_storage(source, destination)?)
             );
             Ok(())
         }
-        [command, dry_run, backup, target] if command == "restore" && dry_run == "--dry-run" => {
+        _ => unsupported_command("backup"),
+    }
+}
+
+fn run_restore_command(args: &[String]) -> rnmdb_common::Result<()> {
+    match args {
+        [dry_run, backup, target] if dry_run == "--dry-run" => {
             println!(
                 "{}",
                 format_restore_dry_run(&restore_storage_dry_run(backup, target)?)
             );
             Ok(())
         }
-        [command, backup, target] if command == "restore" => {
+        [backup, target] => {
             println!(
                 "{}",
                 format_restore_report(&restore_storage(backup, target)?)
             );
             Ok(())
         }
-        [command, ..] => Err(rnmdb_common::RnovError::new(
-            rnmdb_common::ErrorKind::InvalidInput,
-            format!("unsupported command '{command}'"),
-        )),
-        [] => run_sql_stdin(),
+        _ => unsupported_command("restore"),
     }
+}
+
+fn run_upgrade_command(args: &[String]) -> rnmdb_common::Result<()> {
+    match args {
+        [source, target] => {
+            println!(
+                "{}",
+                format_upgrade_report(&upgrade_storage(source, target)?)
+            );
+            Ok(())
+        }
+        [key_flag, key_hex, source, target] if key_flag == "--page-key-hex" => {
+            let key = page_key_from_hex(key_hex)?;
+            println!(
+                "{}",
+                format_upgrade_report(&upgrade_storage_with_key(source, target, key)?)
+            );
+            Ok(())
+        }
+        _ => unsupported_command("upgrade"),
+    }
+}
+
+fn unsupported_command(command: &str) -> rnmdb_common::Result<()> {
+    Err(rnmdb_common::RnovError::new(
+        rnmdb_common::ErrorKind::InvalidInput,
+        format!("unsupported command '{command}'"),
+    ))
 }
 
 fn run_sql_stdin() -> rnmdb_common::Result<()> {
@@ -243,6 +295,32 @@ fn format_backup_report(report: &SingleFileBackupReport) -> String {
         format!("page_record_slots: {}", report.page_record_slots()),
         format!("present_page_records: {}", report.present_page_records()),
     ]
+    .join("\n")
+}
+
+fn format_upgrade_report(report: &SingleFileUpgradeReport) -> String {
+    [
+        format!("source: {}", report.source_path().display()),
+        format!("target: {}", report.target_path().display()),
+        format!("source_format_version: {}", report.source_format_version()),
+        format!("target_format_version: {}", report.target_format_version()),
+        format!("bytes_written: {}", report.bytes_written()),
+        format!("page_size_bytes: {}", report.page_size().bytes()),
+        format!("superblock_generation: {}", report.superblock_generation()),
+        format!("page_record_slots: {}", report.page_record_slots()),
+        format!("pages_upgraded: {}", report.pages_upgraded()),
+        format!("key_rotated: {}", report.key_rotated()),
+    ]
+    .into_iter()
+    .chain(report.page_reports().iter().map(|page| {
+        format!(
+            "upgraded_page: page_id={} source_counter={} target_counter={}",
+            page.page_id().get(),
+            page.source_counter(),
+            page.target_counter()
+        )
+    }))
+    .collect::<Vec<_>>()
     .join("\n")
 }
 

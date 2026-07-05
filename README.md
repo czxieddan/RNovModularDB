@@ -69,6 +69,13 @@ cargo run -q -p rnmdb-cli --bin rnmdb -- restore --dry-run path/to/database.back
 cargo run -q -p rnmdb-cli --bin rnmdb -- restore path/to/database.backup.rnov path/to/restored.rnov
 ```
 
+Upgrade an older single-file store to the current format:
+
+```bash
+cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade path/to/legacy-v1.rnov path/to/upgraded-v2.rnov
+cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade --page-key-hex <64-hex-chars> path/to/legacy-v1.rnov path/to/upgraded-v2.rnov
+```
+
 `inspect` reports file layout, page size, single-file format version, superblock generation, page record counts, free space, encryption state, and page record details. Supplying `--page-key-hex` also authenticates encrypted page records and verifies decoded page checksums.
 
 `verify` without a key validates the file structure. `verify --page-key-hex` also authenticates present encrypted pages. `restore` refuses to overwrite an existing target.
@@ -133,13 +140,15 @@ Notable unsupported areas include decimal, timestamp, UUID, and JSON document ty
 
 ## Storage Compatibility
 
-The encrypted single-file storage format currently uses `SINGLE_FILE_FORMAT_VERSION = 1`. File headers include this version, and open, inspect, verify, backup, and restore paths reject unsupported format versions rather than attempting best-effort decoding.
+The encrypted single-file storage format currently uses `SINGLE_FILE_FORMAT_VERSION = 2`. File headers include this version, and open, inspect, verify, backup, and restore paths reject unsupported format versions rather than attempting best-effort decoding.
 
 Compatibility rules for the current preview:
 
-- Version 1 files are intended to be read and written by this implementation line.
-- Future or otherwise unsupported versions are rejected explicitly.
-- No automatic migration or downgrade path is provided yet.
+- Version 2 files are intended to be read and written by this implementation line.
+- Version 1 files can be detected with compatibility diagnostics and upgraded explicitly to version 2 with `upgrade`.
+- Upgrade writes a new target file and leaves the source file untouched. The target path must not already exist.
+- Upgrading encrypted page records requires the page key. Empty version 1 files can be upgraded without a page key.
+- Future or otherwise unsupported versions are rejected explicitly. Downgrade is not supported.
 - Backups are byte copies that are validated against source layout metadata after copying.
 - Memory-to-disk checkpoint export requires an explicit page encryption key.
 
