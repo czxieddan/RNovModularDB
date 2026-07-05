@@ -1,15 +1,12 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     ops::Bound,
-    panic::{self, AssertUnwindSafe},
-    pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    task::{Context, Poll, Waker},
     thread,
 };
 
@@ -38,105 +35,18 @@ use rnmdb_types::{
 
 use crate::vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns};
 
+mod async_task;
+mod set_ops;
+
+use async_task::{BlockingMutationTask, BlockingResultTask};
+use set_ops::{
+    apply_distinct_cancellable, apply_except_cancellable, apply_intersect_cancellable,
+    apply_union_cancellable,
+};
+
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
-
-struct BlockingResultState<T> {
-    result: Option<Result<T>>,
-    waker: Option<Waker>,
-}
-
-struct BlockingResultTask<T> {
-    state: Arc<Mutex<BlockingResultState<T>>>,
-    job: Option<Box<dyn FnOnce() -> Result<T> + Send + 'static>>,
-}
-
-impl<T> BlockingResultTask<T> {
-    fn new(job: impl FnOnce() -> Result<T> + Send + 'static) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(BlockingResultState {
-                result: None,
-                waker: None,
-            })),
-            job: Some(Box::new(job)),
-        }
-    }
-}
-
-impl<T> Unpin for BlockingResultTask<T> {}
-
-impl<T: Send + 'static> Future for BlockingResultTask<T> {
-    type Output = Result<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let task = self.get_mut();
-        let state = Arc::clone(&task.state);
-        let job = {
-            let mut state = match state.lock() {
-                Ok(state) => state,
-                Err(_) => {
-                    return Poll::Ready(Err(RnovError::new(
-                        ErrorKind::Internal,
-                        "async memory executor state lock poisoned",
-                    )));
-                }
-            };
-            if let Some(result) = state.result.take() {
-                return Poll::Ready(result);
-            }
-            state.waker = Some(cx.waker().clone());
-            task.job.take()
-        };
-
-        if let Some(job) = job {
-            let state = Arc::clone(&task.state);
-            thread::spawn(move || {
-                let result = panic::catch_unwind(AssertUnwindSafe(job)).unwrap_or_else(|_| {
-                    Err(RnovError::new(
-                        ErrorKind::Internal,
-                        "async memory executor worker panicked",
-                    ))
-                });
-                let waker = match state.lock() {
-                    Ok(mut state) => {
-                        state.result = Some(result);
-                        state.waker.take()
-                    }
-                    Err(_) => None,
-                };
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            });
-        }
-
-        Poll::Pending
-    }
-}
-
-struct BlockingMutationTask<'a> {
-    executor: &'a mut MemoryExecutor,
-    inner: BlockingResultTask<(MemoryExecutor, Result<ExecutionResult>)>,
-}
-
-impl Unpin for BlockingMutationTask<'_> {}
-
-impl Future for BlockingMutationTask<'_> {
-    type Output = Result<ExecutionResult>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let task = self.get_mut();
-        match Pin::new(&mut task.inner).poll(cx) {
-            Poll::Ready(Ok((executor, result))) => {
-                *task.executor = executor;
-                Poll::Ready(result)
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct MemoryTable {
@@ -4356,177 +4266,6 @@ fn aggregate_ordered_value(
         }
     }
     Ok(selected.unwrap_or(SqlValue::Null))
-}
-
-fn apply_distinct_cancellable(
-    batch: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut rows = Vec::new();
-    let mut seen = HashSet::new();
-    for row in batch.rows() {
-        cancellation.check()?;
-        if seen.insert(row.clone()) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(batch.columns().to_vec(), rows)
-}
-
-fn apply_union_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_union_columns(&left, &right)?;
-    let mut rows = Vec::with_capacity(left.rows().len() + right.rows().len());
-    for row in left.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    for row in right.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    cancellation.check()?;
-    let batch = VectorBatch::new(left.columns().to_vec(), rows)?;
-    if all {
-        Ok(batch)
-    } else {
-        apply_distinct_cancellable(batch, cancellation)
-    }
-}
-
-fn apply_intersect_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_set_operation_columns("INTERSECT", &left, &right)?;
-    if all {
-        return apply_intersect_all_cancellable(left, right, cancellation);
-    }
-    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
-    let mut emitted = HashSet::new();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if right_rows.contains(row) && emitted.insert(row.clone()) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_except_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_set_operation_columns("EXCEPT", &left, &right)?;
-    if all {
-        return apply_except_all_cancellable(left, right, cancellation);
-    }
-    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
-    let mut emitted = HashSet::new();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if !right_rows.contains(row) && emitted.insert(row.clone()) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_intersect_all_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut right_counts = row_counts(right.rows());
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if let Some(count) = right_counts.get_mut(row)
-            && *count > 0
-        {
-            rows.push(row.clone());
-            *count -= 1;
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_except_all_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut right_counts = row_counts(right.rows());
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if let Some(count) = right_counts.get_mut(row)
-            && *count > 0
-        {
-            *count -= 1;
-        } else {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn row_counts(rows: &[Row]) -> HashMap<Row, usize> {
-    let mut counts = HashMap::new();
-    for row in rows {
-        *counts.entry(row.clone()).or_insert(0) += 1;
-    }
-    counts
-}
-
-fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
-    validate_set_operation_columns("UNION", left, right)
-}
-
-fn validate_set_operation_columns(
-    operation: &str,
-    left: &VectorBatch,
-    right: &VectorBatch,
-) -> Result<()> {
-    if left.columns().len() != right.columns().len() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "{operation} column count mismatch: left has {}, right has {}",
-                left.columns().len(),
-                right.columns().len()
-            ),
-        ));
-    }
-    for (index, (left, right)) in left.columns().iter().zip(right.columns()).enumerate() {
-        if left.data_type() != right.data_type() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "{operation} column {} type mismatch: left is {:?}, right is {:?}",
-                    index + 1,
-                    left.data_type(),
-                    right.data_type()
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]

@@ -1,0 +1,178 @@
+use std::collections::{HashMap, HashSet};
+
+use rnmdb_common::{ErrorKind, Result, RnovError};
+
+use crate::vector::{Row, VectorBatch};
+
+use super::CancellationToken;
+
+pub(super) fn apply_distinct_cancellable(
+    batch: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for row in batch.rows() {
+        cancellation.check()?;
+        if seen.insert(row.clone()) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+pub(super) fn apply_union_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    all: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_union_columns(&left, &right)?;
+    let mut rows = Vec::with_capacity(left.rows().len() + right.rows().len());
+    for row in left.rows() {
+        cancellation.check()?;
+        rows.push(row.clone());
+    }
+    for row in right.rows() {
+        cancellation.check()?;
+        rows.push(row.clone());
+    }
+    cancellation.check()?;
+    let batch = VectorBatch::new(left.columns().to_vec(), rows)?;
+    if all {
+        Ok(batch)
+    } else {
+        apply_distinct_cancellable(batch, cancellation)
+    }
+}
+
+pub(super) fn apply_intersect_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    all: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_set_operation_columns("INTERSECT", &left, &right)?;
+    if all {
+        return apply_intersect_all_cancellable(left, right, cancellation);
+    }
+    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let mut emitted = HashSet::new();
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if right_rows.contains(row) && emitted.insert(row.clone()) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+pub(super) fn apply_except_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    all: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    validate_set_operation_columns("EXCEPT", &left, &right)?;
+    if all {
+        return apply_except_all_cancellable(left, right, cancellation);
+    }
+    let right_rows = right.rows().iter().cloned().collect::<HashSet<_>>();
+    let mut emitted = HashSet::new();
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if !right_rows.contains(row) && emitted.insert(row.clone()) {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn apply_intersect_all_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut right_counts = row_counts(right.rows());
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if let Some(count) = right_counts.get_mut(row)
+            && *count > 0
+        {
+            rows.push(row.clone());
+            *count -= 1;
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn apply_except_all_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let mut right_counts = row_counts(right.rows());
+    let mut rows = Vec::new();
+    for row in left.rows() {
+        cancellation.check()?;
+        if let Some(count) = right_counts.get_mut(row)
+            && *count > 0
+        {
+            *count -= 1;
+        } else {
+            rows.push(row.clone());
+        }
+    }
+    cancellation.check()?;
+    VectorBatch::new(left.columns().to_vec(), rows)
+}
+
+fn row_counts(rows: &[Row]) -> HashMap<Row, usize> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
+    validate_set_operation_columns("UNION", left, right)
+}
+
+fn validate_set_operation_columns(
+    operation: &str,
+    left: &VectorBatch,
+    right: &VectorBatch,
+) -> Result<()> {
+    if left.columns().len() != right.columns().len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{operation} column count mismatch: left has {}, right has {}",
+                left.columns().len(),
+                right.columns().len()
+            ),
+        ));
+    }
+    for (index, (left, right)) in left.columns().iter().zip(right.columns()).enumerate() {
+        if left.data_type() != right.data_type() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{operation} column {} type mismatch: left is {:?}, right is {:?}",
+                    index + 1,
+                    left.data_type(),
+                    right.data_type()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
