@@ -2783,53 +2783,14 @@ impl<'a> Binder<'a> {
                     "HAVING does not support window expressions",
                 ))
             }
-            Expr::Array(values) => {
-                let mut element_type = None;
-                for value in values {
-                    let Some(value_type) =
-                        self.infer_grouped_output_expr_type(projection, value)?
-                    else {
-                        return Ok(None);
-                    };
-                    if value_type == SqlType::Null {
-                        continue;
-                    }
-                    match &element_type {
-                        Some(existing) if *existing != value_type => {
-                            return Err(RnovError::new(
-                                ErrorKind::InvalidInput,
-                                "array literal contains mixed element types",
-                            ));
-                        }
-                        Some(_) => {}
-                        None => element_type = Some(value_type),
-                    }
-                }
-                Ok(Some(SqlType::Array(Box::new(
-                    element_type.unwrap_or(SqlType::Null),
-                ))))
-            }
+            Expr::Array(values) => self.infer_array_expr_type(values, |value| {
+                self.infer_grouped_output_expr_type(projection, value)
+            }),
             Expr::HStore(_) => Ok(Some(SqlType::HStore)),
             Expr::Range { lower, upper, .. } => {
-                let lower_type = self
-                    .infer_grouped_output_expr_type(projection, lower)?
-                    .unwrap_or(SqlType::Null);
-                let upper_type = self
-                    .infer_grouped_output_expr_type(projection, upper)?
-                    .unwrap_or(SqlType::Null);
-                let element_type = match (lower_type, upper_type) {
-                    (SqlType::Null, SqlType::Null) => SqlType::Null,
-                    (SqlType::Null, upper_type) => upper_type,
-                    (lower_type, SqlType::Null) => lower_type,
-                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
-                    _ => {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "range literal bounds have different types",
-                        ));
-                    }
-                };
-                Ok(Some(SqlType::Range(Box::new(element_type))))
+                self.infer_range_expr_type(lower, upper, true, |expr| {
+                    self.infer_grouped_output_expr_type(projection, expr)
+                })
             }
             Expr::Binary { left, right, .. } => {
                 let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
@@ -3508,51 +3469,13 @@ impl<'a> Binder<'a> {
                     "window expressions are only supported as SELECT projections",
                 ))
             }
-            Expr::Array(values) => {
-                let mut element_type = None;
-                for value in values {
-                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
-                        return Ok(None);
-                    };
-                    if value_type == SqlType::Null {
-                        continue;
-                    }
-                    match &element_type {
-                        Some(existing) if *existing != value_type => {
-                            return Err(RnovError::new(
-                                ErrorKind::InvalidInput,
-                                "array literal contains mixed element types",
-                            ));
-                        }
-                        Some(_) => {}
-                        None => element_type = Some(value_type),
-                    }
-                }
-                Ok(Some(SqlType::Array(Box::new(
-                    element_type.unwrap_or(SqlType::Null),
-                ))))
-            }
+            Expr::Array(values) => self
+                .infer_array_expr_type(values, |value| self.infer_policy_expr_type(table, value)),
             Expr::HStore(_) => Ok(Some(SqlType::HStore)),
             Expr::Range { lower, upper, .. } => {
-                let Some(lower_type) = self.infer_policy_expr_type(table, lower)? else {
-                    return Ok(None);
-                };
-                let Some(upper_type) = self.infer_policy_expr_type(table, upper)? else {
-                    return Ok(None);
-                };
-                let element_type = match (lower_type, upper_type) {
-                    (SqlType::Null, SqlType::Null) => SqlType::Null,
-                    (SqlType::Null, upper_type) => upper_type,
-                    (lower_type, SqlType::Null) => lower_type,
-                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
-                    _ => {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "range literal bounds have different types",
-                        ));
-                    }
-                };
-                Ok(Some(SqlType::Range(Box::new(element_type))))
+                self.infer_range_expr_type(lower, upper, false, |expr| {
+                    self.infer_policy_expr_type(table, expr)
+                })
             }
             Expr::Binary { left, right, .. } => {
                 let left_type = self.infer_policy_expr_type(table, left)?;
@@ -3623,13 +3546,12 @@ impl<'a> Binder<'a> {
                 let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(SqlType::Bool));
                 };
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
-                        return Ok(Some(SqlType::Bool));
-                    };
-                    value_types.push(value_type);
-                }
+                let Some(value_types) = self.infer_expr_type_list(values, |value| {
+                    self.infer_policy_expr_type(table, value)
+                })?
+                else {
+                    return Ok(Some(SqlType::Bool));
+                };
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
             Expr::Like { expr, pattern, .. } => {
@@ -3642,13 +3564,12 @@ impl<'a> Binder<'a> {
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
             Expr::Coalesce(values) => {
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_policy_expr_type(table, value)? else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
+                let Some(value_types) = self.infer_expr_type_list(values, |value| {
+                    self.infer_policy_expr_type(table, value)
+                })?
+                else {
+                    return Ok(None);
+                };
                 self.infer_coalesce_result_type(&value_types)
             }
             Expr::NullIf { left, right } => {
@@ -3701,13 +3622,11 @@ impl<'a> Binder<'a> {
                 self.infer_cast_result_type(&source_type, data_type)
             }
             Expr::Call { name, args } => {
-                let mut argument_types = Vec::with_capacity(args.len());
-                for arg in args {
-                    let Some(arg_type) = self.infer_policy_expr_type(table, arg)? else {
-                        return Ok(None);
-                    };
-                    argument_types.push(arg_type);
-                }
+                let Some(argument_types) =
+                    self.infer_expr_type_list(args, |arg| self.infer_policy_expr_type(table, arg))?
+                else {
+                    return Ok(None);
+                };
 
                 Ok(self
                     .catalog
@@ -3800,46 +3719,13 @@ impl<'a> Binder<'a> {
                 ))
             }
             Expr::Array(values) => {
-                let mut element_type = None;
-                for value in values {
-                    let Some(value_type) = self.infer_expr_type(table, value)? else {
-                        return Ok(None);
-                    };
-                    if value_type == SqlType::Null {
-                        continue;
-                    }
-                    match &element_type {
-                        Some(existing) if *existing != value_type => {
-                            return Err(RnovError::new(
-                                ErrorKind::InvalidInput,
-                                "array literal contains mixed element types",
-                            ));
-                        }
-                        Some(_) => {}
-                        None => element_type = Some(value_type),
-                    }
-                }
-                Ok(Some(SqlType::Array(Box::new(
-                    element_type.unwrap_or(SqlType::Null),
-                ))))
+                self.infer_array_expr_type(values, |value| self.infer_expr_type(table, value))
             }
             Expr::HStore(_) => Ok(Some(SqlType::HStore)),
             Expr::Range { lower, upper, .. } => {
-                let lower_type = self.infer_expr_type(table, lower)?.unwrap_or(SqlType::Null);
-                let upper_type = self.infer_expr_type(table, upper)?.unwrap_or(SqlType::Null);
-                let element_type = match (lower_type, upper_type) {
-                    (SqlType::Null, SqlType::Null) => SqlType::Null,
-                    (SqlType::Null, upper_type) => upper_type,
-                    (lower_type, SqlType::Null) => lower_type,
-                    (lower_type, upper_type) if lower_type == upper_type => lower_type,
-                    _ => {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "range literal bounds have different types",
-                        ));
-                    }
-                };
-                Ok(Some(SqlType::Range(Box::new(element_type))))
+                self.infer_range_expr_type(lower, upper, true, |expr| {
+                    self.infer_expr_type(table, expr)
+                })
             }
             Expr::Binary { left, right, .. } => {
                 let Some(left_type) = self.infer_expr_type(table, left)? else {
@@ -3909,13 +3795,11 @@ impl<'a> Binder<'a> {
                 let Some(expr_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
                 };
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_expr_type(table, value)? else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
+                let Some(value_types) =
+                    self.infer_expr_type_list(values, |value| self.infer_expr_type(table, value))?
+                else {
+                    return Ok(None);
+                };
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
             Expr::Like { expr, pattern, .. } => {
@@ -3928,13 +3812,11 @@ impl<'a> Binder<'a> {
                 self.infer_like_result_type(&expr_type, &pattern_type)
             }
             Expr::Coalesce(values) => {
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_expr_type(table, value)? else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
+                let Some(value_types) =
+                    self.infer_expr_type_list(values, |value| self.infer_expr_type(table, value))?
+                else {
+                    return Ok(None);
+                };
                 self.infer_coalesce_result_type(&value_types)
             }
             Expr::NullIf { left, right } => {
@@ -3985,13 +3867,11 @@ impl<'a> Binder<'a> {
                 self.infer_cast_result_type(&source_type, data_type)
             }
             Expr::Call { name, args } => {
-                let mut argument_types = Vec::with_capacity(args.len());
-                for arg in args {
-                    let Some(arg_type) = self.infer_expr_type(table, arg)? else {
-                        return Ok(None);
-                    };
-                    argument_types.push(arg_type);
-                }
+                let Some(argument_types) =
+                    self.infer_expr_type_list(args, |arg| self.infer_expr_type(table, arg))?
+                else {
+                    return Ok(None);
+                };
 
                 let function = self
                     .catalog
@@ -4010,6 +3890,83 @@ impl<'a> Binder<'a> {
                 Ok(Some(function.return_type().clone()))
             }
         }
+    }
+
+    fn infer_array_expr_type<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<SqlType>>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let mut element_type = None;
+        for value in values {
+            let Some(value_type) = infer(value)? else {
+                return Ok(None);
+            };
+            if value_type == SqlType::Null {
+                continue;
+            }
+            match &element_type {
+                Some(existing) if *existing != value_type => {
+                    return Err(RnovError::new(
+                        ErrorKind::InvalidInput,
+                        "array literal contains mixed element types",
+                    ));
+                }
+                Some(_) => {}
+                None => element_type = Some(value_type),
+            }
+        }
+        Ok(Some(SqlType::Array(Box::new(
+            element_type.unwrap_or(SqlType::Null),
+        ))))
+    }
+
+    fn infer_range_expr_type<F>(
+        &self,
+        lower: &Expr,
+        upper: &Expr,
+        unknown_as_null: bool,
+        mut infer: F,
+    ) -> Result<Option<SqlType>>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let lower_type = match infer(lower)? {
+            Some(data_type) => data_type,
+            None if unknown_as_null => SqlType::Null,
+            None => return Ok(None),
+        };
+        let upper_type = match infer(upper)? {
+            Some(data_type) => data_type,
+            None if unknown_as_null => SqlType::Null,
+            None => return Ok(None),
+        };
+        let element_type = match (lower_type, upper_type) {
+            (SqlType::Null, SqlType::Null) => SqlType::Null,
+            (SqlType::Null, upper_type) => upper_type,
+            (lower_type, SqlType::Null) => lower_type,
+            (lower_type, upper_type) if lower_type == upper_type => lower_type,
+            _ => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "range literal bounds have different types",
+                ));
+            }
+        };
+        Ok(Some(SqlType::Range(Box::new(element_type))))
+    }
+
+    fn infer_expr_type_list<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<Vec<SqlType>>>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let mut value_types = Vec::with_capacity(values.len());
+        for value in values {
+            let Some(value_type) = infer(value)? else {
+                return Ok(None);
+            };
+            value_types.push(value_type);
+        }
+        Ok(Some(value_types))
     }
 
     fn infer_expr_type_from_columns(
