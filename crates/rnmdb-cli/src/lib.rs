@@ -242,6 +242,15 @@ impl LocalSession {
                     .grant_table_privilege(*role_id, *relation_id, *privilege)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::GrantProcedurePrivilege {
+                role_id,
+                procedure_id,
+                privilege,
+            } => {
+                self.catalog
+                    .grant_procedure_privilege(*role_id, *procedure_id, *privilege)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             statement if is_read_query(statement) => {
                 let plan = self.optimize_read_plan(self.planner.plan(&bound)?);
                 self.executor
@@ -298,6 +307,7 @@ impl LocalSession {
             .catalog
             .create_table(schema, name.object(), columns)?
             .relation_id();
+        self.catalog.set_table_owner(relation_id, self.role_id)?;
         self.grant_local_table_privileges(relation_id)
     }
 
@@ -426,6 +436,16 @@ impl LocalSession {
     }
 
     fn apply_catalog_drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if self
+            .catalog
+            .get_role(name)
+            .is_some_and(|role| role.role_id() == self.role_id)
+        {
+            return Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::InvalidInput,
+                "cannot drop the active role",
+            ));
+        }
         match self.catalog.drop_role(name)? {
             Some(_) => Ok(()),
             None if if_exists => Ok(()),
@@ -526,8 +546,14 @@ impl LocalSession {
         if self.catalog.get_procedure(name, argument_types).is_some() && if_not_exists {
             return Ok(());
         }
-        self.catalog
+        let procedure = self
+            .catalog
             .register_procedure(name, argument_types.to_vec(), body)?;
+        self.catalog.grant_procedure_privilege(
+            self.role_id,
+            procedure.procedure_id(),
+            Privilege::Execute,
+        )?;
         Ok(())
     }
 

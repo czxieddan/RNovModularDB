@@ -1,34 +1,5 @@
 use rnmdb_common::{ErrorKind, Result, RnovError};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Token {
-    kind: TokenKind,
-    span: Span,
-}
-
-impl Token {
-    fn new(kind: TokenKind, start: usize, end: usize) -> Self {
-        Self {
-            kind,
-            span: Span { start, end },
-        }
-    }
-
-    pub fn kind(&self) -> &TokenKind {
-        &self.kind
-    }
-
-    pub fn span(&self) -> Span {
-        self.span
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
     Select,
@@ -131,6 +102,124 @@ pub enum TokenKind {
     LeftBracket,
     RightBracket,
 }
+static KEYWORDS: phf::Map<&'static str, TokenKind> = phf::phf_map! {
+    "select" => TokenKind::Select,
+    "union" => TokenKind::Union,
+    "intersect" => TokenKind::Intersect,
+    "except" => TokenKind::Except,
+    "with" => TokenKind::With,
+    "recursive" => TokenKind::Recursive,
+    "distinct" => TokenKind::Distinct,
+    "all" => TokenKind::All,
+    "as" => TokenKind::As,
+    "insert" => TokenKind::Insert,
+    "into" => TokenKind::Into,
+    "values" => TokenKind::Values,
+    "update" => TokenKind::Update,
+    "delete" => TokenKind::Delete,
+    "set" => TokenKind::Set,
+    "create" => TokenKind::Create,
+    "index" => TokenKind::Index,
+    "unique" => TokenKind::Unique,
+    "alter" => TokenKind::Alter,
+    "drop" => TokenKind::Drop,
+    "add" => TokenKind::Add,
+    "column" => TokenKind::Column,
+    "if" => TokenKind::If,
+    "exists" => TokenKind::Exists,
+    "table" => TokenKind::Table,
+    "from" => TokenKind::From,
+    "join" => TokenKind::Join,
+    "lateral" => TokenKind::Lateral,
+    "where" => TokenKind::Where,
+    "group" => TokenKind::Group,
+    "grouping" => TokenKind::Grouping,
+    "sets" => TokenKind::Sets,
+    "rollup" => TokenKind::Rollup,
+    "cube" => TokenKind::Cube,
+    "over" => TokenKind::Over,
+    "having" => TokenKind::Having,
+    "order" => TokenKind::Order,
+    "by" => TokenKind::By,
+    "asc" => TokenKind::Asc,
+    "desc" => TokenKind::Desc,
+    "nulls" => TokenKind::Nulls,
+    "first" => TokenKind::First,
+    "last" => TokenKind::Last,
+    "limit" => TokenKind::Limit,
+    "offset" => TokenKind::Offset,
+    "fetch" => TokenKind::Fetch,
+    "next" => TokenKind::Next,
+    "row" => TokenKind::Row,
+    "rows" => TokenKind::Rows,
+    "only" => TokenKind::Only,
+    "function" => TokenKind::Function,
+    "procedure" => TokenKind::Procedure,
+    "returns" => TokenKind::Returns,
+    "operator" => TokenKind::OperatorKeyword,
+    "role" => TokenKind::Role,
+    "grant" => TokenKind::Grant,
+    "on" => TokenKind::On,
+    "to" => TokenKind::To,
+    "policy" => TokenKind::Policy,
+    "using" => TokenKind::Using,
+    "execute" => TokenKind::Execute,
+    "call" => TokenKind::Call,
+    "begin" => TokenKind::Begin,
+    "commit" => TokenKind::Commit,
+    "rollback" => TokenKind::Rollback,
+    "and" => TokenKind::And,
+    "or" => TokenKind::Or,
+    "not" => TokenKind::Not,
+    "case" => TokenKind::Case,
+    "when" => TokenKind::When,
+    "then" => TokenKind::Then,
+    "else" => TokenKind::Else,
+    "end" => TokenKind::End,
+    "is" => TokenKind::Is,
+    "between" => TokenKind::Between,
+    "in" => TokenKind::In,
+    "like" => TokenKind::Like,
+    "null" => TokenKind::Null,
+    "true" => TokenKind::True,
+    "false" => TokenKind::False,
+    "unknown" => TokenKind::Unknown,
+    "encrypted" => TokenKind::Encrypted,
+    "generated" => TokenKind::Generated,
+    "always" => TokenKind::Always,
+    "stored" => TokenKind::Stored,
+    "explain" => TokenKind::Explain,
+    "analyze" => TokenKind::Analyze,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Token {
+    kind: TokenKind,
+    span: Span,
+}
+
+impl Token {
+    fn new(kind: TokenKind, start: usize, end: usize) -> Self {
+        Self {
+            kind,
+            span: Span { start, end },
+        }
+    }
+
+    pub fn kind(&self) -> &TokenKind {
+        &self.kind
+    }
+
+    pub fn span(&self) -> Span {
+        self.span
+    }
+}
 
 pub fn lex(input: &str) -> Result<Vec<Token>> {
     Lexer::new(input).lex()
@@ -195,103 +284,16 @@ impl<'a> Lexer<'a> {
         }
         let raw = &self.input[start..self.position];
         let normalized = raw.to_ascii_lowercase();
-        let kind = match normalized.as_str() {
-            "select" => TokenKind::Select,
-            "union" => TokenKind::Union,
-            "intersect" => TokenKind::Intersect,
-            "except" => TokenKind::Except,
-            "with" => TokenKind::With,
-            "recursive" => TokenKind::Recursive,
-            "distinct" => TokenKind::Distinct,
-            "all" => TokenKind::All,
-            "as" => TokenKind::As,
-            "insert" => TokenKind::Insert,
-            "into" => TokenKind::Into,
-            "values" => TokenKind::Values,
-            "update" => TokenKind::Update,
-            "delete" => TokenKind::Delete,
-            "set" => TokenKind::Set,
-            "create" => TokenKind::Create,
-            "index" => TokenKind::Index,
-            "unique" => TokenKind::Unique,
-            "alter" => TokenKind::Alter,
-            "drop" => TokenKind::Drop,
-            "add" => TokenKind::Add,
-            "column" => TokenKind::Column,
-            "if" => TokenKind::If,
-            "exists" => TokenKind::Exists,
-            "table" => TokenKind::Table,
-            "from" => TokenKind::From,
-            "join" => TokenKind::Join,
-            "lateral" => TokenKind::Lateral,
-            "where" => TokenKind::Where,
-            "group" => TokenKind::Group,
-            "grouping" => TokenKind::Grouping,
-            "sets" => TokenKind::Sets,
-            "rollup" => TokenKind::Rollup,
-            "cube" => TokenKind::Cube,
-            "over" => TokenKind::Over,
-            "having" => TokenKind::Having,
-            "order" => TokenKind::Order,
-            "by" => TokenKind::By,
-            "asc" => TokenKind::Asc,
-            "desc" => TokenKind::Desc,
-            "nulls" => TokenKind::Nulls,
-            "first" => TokenKind::First,
-            "last" => TokenKind::Last,
-            "limit" => TokenKind::Limit,
-            "offset" => TokenKind::Offset,
-            "fetch" => TokenKind::Fetch,
-            "next" => TokenKind::Next,
-            "row" => TokenKind::Row,
-            "rows" => TokenKind::Rows,
-            "only" => TokenKind::Only,
-            "function" => TokenKind::Function,
-            "procedure" => TokenKind::Procedure,
-            "returns" => TokenKind::Returns,
-            "operator" => TokenKind::OperatorKeyword,
-            "role" => TokenKind::Role,
-            "grant" => TokenKind::Grant,
-            "on" => TokenKind::On,
-            "to" => TokenKind::To,
-            "policy" => TokenKind::Policy,
-            "using" => TokenKind::Using,
-            "execute" => TokenKind::Execute,
-            "call" => TokenKind::Call,
-            "begin" => TokenKind::Begin,
-            "commit" => TokenKind::Commit,
-            "rollback" => TokenKind::Rollback,
-            "and" => TokenKind::And,
-            "or" => TokenKind::Or,
-            "not" => TokenKind::Not,
-            "case" => TokenKind::Case,
-            "when" => TokenKind::When,
-            "then" => TokenKind::Then,
-            "else" => TokenKind::Else,
-            "end" => TokenKind::End,
-            "is" => TokenKind::Is,
-            "between" => TokenKind::Between,
-            "in" => TokenKind::In,
-            "like" => TokenKind::Like,
-            "null" => TokenKind::Null,
-            "true" => TokenKind::True,
-            "false" => TokenKind::False,
-            "unknown" => TokenKind::Unknown,
-            "encrypted" => TokenKind::Encrypted,
-            "generated" => TokenKind::Generated,
-            "always" => TokenKind::Always,
-            "stored" => TokenKind::Stored,
-            "explain" => TokenKind::Explain,
-            "analyze" => TokenKind::Analyze,
-            _ => TokenKind::Identifier(normalized),
-        };
+        let kind = KEYWORDS
+            .get(normalized.as_str())
+            .cloned()
+            .unwrap_or(TokenKind::Identifier(normalized));
         Token::new(kind, start, self.position)
     }
 
     fn lex_integer(&mut self) -> Result<Token> {
         let start = self.position;
-        while let Some(byte @ b'0'..=b'9') = self.peek_byte() {
-            let _ = byte;
+        while let Some(b'0'..=b'9') = self.peek_byte() {
             self.position += 1;
         }
         let text = &self.input[start..self.position];
@@ -363,7 +365,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek_next_byte(&self) -> Option<u8> {
-        self.input.as_bytes().get(self.position + 1).copied()
+        self.position
+            .checked_add(1)
+            .and_then(|position| self.input.as_bytes().get(position))
+            .copied()
     }
 }
 

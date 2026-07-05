@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_sql::ast::GeneratedColumn;
 use rnmdb_types::{SqlType, SqlValue};
@@ -63,7 +65,7 @@ impl ColumnSchema {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Row {
     values: Vec<SqlValue>,
 }
@@ -146,7 +148,7 @@ impl VectorBatch {
     fn column_index(&self, name: &str) -> Result<usize> {
         self.columns
             .iter()
-            .position(|column| column.name() == name)
+            .position(|column| column.name().eq_ignore_ascii_case(name))
             .ok_or_else(|| RnovError::new(ErrorKind::NotFound, format!("column not found: {name}")))
     }
 }
@@ -159,17 +161,15 @@ fn validate_columns(columns: &[ColumnSchema]) -> Result<()> {
         ));
     }
 
-    for (index, column) in columns.iter().enumerate() {
+    let mut seen = HashSet::with_capacity(columns.len());
+    for column in columns {
         if column.name().is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "column name cannot be empty",
             ));
         }
-        if columns[..index]
-            .iter()
-            .any(|existing| existing.name() == column.name())
-        {
+        if !seen.insert(column.name().to_ascii_lowercase()) {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("duplicate column: {}", column.name()),

@@ -3,7 +3,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write, copy},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
     thread,
 };
 
@@ -11,6 +11,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Key, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
+use crc::{CRC_64_ECMA_182, Crc};
 use rnmdb_common::{
     error::{ErrorKind, Result, RnovError},
     ids::PageId,
@@ -18,9 +19,15 @@ use rnmdb_common::{
 
 pub use rnmdb_common::config::PageSize;
 
-pub const SINGLE_FILE_FORMAT_VERSION: u16 = 1;
+pub const SINGLE_FILE_FORMAT_VERSION: u16 = 2;
 pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
 pub const SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
+
+const PAGE_CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
+type SingleFileWriteLock = Arc<Mutex<()>>;
+type SingleFileWriteLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
+
+static SINGLE_FILE_WRITE_LOCKS: OnceLock<SingleFileWriteLockRegistry> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
@@ -79,23 +86,17 @@ fn read_header_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8;
 }
 
 fn checksum_page(header: &PageHeader, payload: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    hash = fnv1a(hash, &header.page_id().get().to_be_bytes());
-    hash = fnv1a(hash, &header.lsn().to_be_bytes());
-    hash = fnv1a(hash, &(header.page_size().bytes() as u64).to_be_bytes());
-    hash = fnv1a(hash, &[header.format_version()]);
-    fnv1a(hash, payload)
+    let mut digest = PAGE_CRC64.digest();
+    digest.update(&header.page_id().get().to_be_bytes());
+    digest.update(&header.lsn().to_be_bytes());
+    digest.update(&(header.page_size().bytes() as u64).to_be_bytes());
+    digest.update(&[header.format_version()]);
+    digest.update(payload);
+    digest.finalize()
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+fn checksum_bytes(bytes: &[u8]) -> u64 {
+    PAGE_CRC64.checksum(bytes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,7 +199,7 @@ impl PageHeader {
 pub struct PageCodec;
 
 impl PageCodec {
-    pub const FORMAT_VERSION: u8 = 1;
+    pub const FORMAT_VERSION: u8 = 2;
     const MAGIC: [u8; 8] = *b"RNOVPAGE";
     const HEADER_LEN: usize = 8 + 1 + 8 + 8 + 8 + 8;
 
@@ -634,29 +635,31 @@ pub struct HybridSyncStatus {
     last_mirrored_lsn: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridSyncStatusParts {
+    pub state: HybridState,
+    pub active_target: HybridSyncTarget,
+    pub dirty_pages: usize,
+    pub dirty_bytes: usize,
+    pub mirrored_pages: usize,
+    pub estimated_flush_bytes: usize,
+    pub memory_lsn: u64,
+    pub disk_lsn: u64,
+    pub last_mirrored_lsn: u64,
+}
+
 impl HybridSyncStatus {
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
-        state: HybridState,
-        active_target: HybridSyncTarget,
-        dirty_pages: usize,
-        dirty_bytes: usize,
-        mirrored_pages: usize,
-        estimated_flush_bytes: usize,
-        memory_lsn: u64,
-        disk_lsn: u64,
-        last_mirrored_lsn: u64,
-    ) -> Self {
+    pub const fn new(parts: HybridSyncStatusParts) -> Self {
         Self {
-            state,
-            active_target,
-            dirty_pages,
-            dirty_bytes,
-            mirrored_pages,
-            estimated_flush_bytes,
-            memory_lsn,
-            disk_lsn,
-            last_mirrored_lsn,
+            state: parts.state,
+            active_target: parts.active_target,
+            dirty_pages: parts.dirty_pages,
+            dirty_bytes: parts.dirty_bytes,
+            mirrored_pages: parts.mirrored_pages,
+            estimated_flush_bytes: parts.estimated_flush_bytes,
+            memory_lsn: parts.memory_lsn,
+            disk_lsn: parts.disk_lsn,
+            last_mirrored_lsn: parts.last_mirrored_lsn,
         }
     }
 
@@ -941,17 +944,17 @@ impl HybridBackend {
         } else {
             HybridState::HybridSyncing
         };
-        Ok(HybridSyncStatus::new(
+        Ok(HybridSyncStatus::new(HybridSyncStatusParts {
             state,
             active_target,
             dirty_pages,
             dirty_bytes,
             mirrored_pages,
-            dirty_bytes,
-            lsn_status.memory_lsn,
-            lsn_status.disk_lsn,
-            lsn_status.last_mirrored_lsn,
-        ))
+            estimated_flush_bytes: dirty_bytes,
+            memory_lsn: lsn_status.memory_lsn,
+            disk_lsn: lsn_status.disk_lsn,
+            last_mirrored_lsn: lsn_status.last_mirrored_lsn,
+        }))
     }
 
     fn read_dirty_pages(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeSet<PageId>>> {
@@ -1141,12 +1144,51 @@ impl Default for SingleFileOptions {
     }
 }
 
+fn single_file_write_locks() -> &'static SingleFileWriteLockRegistry {
+    SINGLE_FILE_WRITE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn single_file_write_lock_for(path: &Path) -> Result<SingleFileWriteLock> {
+    let lock_path = canonical_lock_path(path)?;
+    let mut locks = single_file_write_locks().lock().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Internal,
+            "single-file write lock registry poisoned",
+        )
+    })?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&lock_path).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(lock_path, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn canonical_lock_path(path: &Path) -> Result<PathBuf> {
+    if let Ok(path) = path.canonicalize() {
+        return Ok(path);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to resolve database file path: {err}"),
+            )
+        })
+}
+
 pub struct SingleFileBackend {
     path: PathBuf,
     file: File,
     page_size: PageSize,
     superblock_generation: u64,
     page_key: Option<PageCryptoKey>,
+    write_lock: SingleFileWriteLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1642,6 +1684,7 @@ impl SingleFileBackend {
                 format!("failed to sync database file: {err}"),
             )
         })?;
+        let write_lock = single_file_write_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1649,6 +1692,7 @@ impl SingleFileBackend {
             page_size: options.page_size(),
             superblock_generation,
             page_key: options.page_key(),
+            write_lock,
         })
     }
 
@@ -1695,6 +1739,7 @@ impl SingleFileBackend {
             })?;
         let (_format_version, page_size, superblock_generation) =
             read_single_file_header(&mut file)?;
+        let write_lock = single_file_write_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1702,6 +1747,7 @@ impl SingleFileBackend {
             page_size,
             superblock_generation,
             page_key,
+            write_lock,
         })
     }
 
@@ -1830,6 +1876,12 @@ impl StorageBackend for SingleFileBackend {
             ));
         }
 
+        let _write_guard = self.write_lock.lock().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "single-file backend write lock poisoned",
+            )
+        })?;
         let key = self.page_key()?;
         let mut file = self.file.try_clone().map_err(|err| {
             RnovError::new(
@@ -1838,7 +1890,7 @@ impl StorageBackend for SingleFileBackend {
             )
         })?;
         let offset = self.page_offset(page.id())?;
-        let counter = read_existing_page_counter(&mut file, offset)?.unwrap_or(0) + 1;
+        let counter = next_page_counter(read_existing_page_counter(&mut file, offset)?)?;
         let nonce = PageNonce::from_page_counter(page.id(), counter);
         let ciphertext = PageCrypto::encrypt(&key, nonce, &page)?;
 
@@ -2412,7 +2464,7 @@ fn encode_superblock(generation: u64, catalog_root: u64, free_map_root: u64) -> 
     block[0..8].copy_from_slice(&generation.to_be_bytes());
     block[8..16].copy_from_slice(&catalog_root.to_be_bytes());
     block[16..24].copy_from_slice(&free_map_root.to_be_bytes());
-    let checksum = fnv1a(FNV_OFFSET, &block[0..24]);
+    let checksum = checksum_bytes(&block[0..24]);
     block[24..32].copy_from_slice(&checksum.to_be_bytes());
     block
 }
@@ -2432,7 +2484,7 @@ fn read_superblock(file: &mut File, offset: u64) -> Result<(u64, u64, u64)> {
         )
     })?;
     let checksum = u64::from_be_bytes(read_fixed::<8>(&block, 24)?);
-    let expected = fnv1a(FNV_OFFSET, &block[0..24]);
+    let expected = checksum_bytes(&block[0..24]);
     if checksum != expected {
         return Err(RnovError::new(
             ErrorKind::Corruption,
@@ -2478,6 +2530,17 @@ fn read_existing_page_counter(file: &mut File, offset: u64) -> Result<Option<u32
         ));
     }
     Ok(Some(u32::from_be_bytes(read_fixed::<4>(&header, 8)?)))
+}
+
+fn next_page_counter(current: Option<u32>) -> Result<u32> {
+    match current {
+        Some(u32::MAX) => Err(RnovError::new(
+            ErrorKind::Security,
+            "page encryption counter exhausted; rotate the page key before rewriting this page",
+        )),
+        Some(counter) => Ok(counter + 1),
+        None => Ok(1),
+    }
 }
 
 fn read_fixed<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {

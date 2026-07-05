@@ -70,6 +70,21 @@ impl MemoryBTreeIndex {
         Ok(())
     }
 
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name || self.unique != other.unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "btree index merge requires matching index metadata",
+            ));
+        }
+        for (key, pointers) in other.entries {
+            for pointer in pointers {
+                self.insert(key.clone(), pointer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn point_lookup(&self, key: &IndexKey) -> Vec<IndexPointer> {
         self.entries.get(key).cloned().unwrap_or_default()
     }
@@ -172,6 +187,21 @@ impl MemoryHashIndex {
         Ok(())
     }
 
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name || self.unique != other.unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "hash index merge requires matching index metadata",
+            ));
+        }
+        for (key, pointers) in other.entries {
+            for pointer in pointers {
+                self.insert(key.clone(), pointer)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn point_lookup(&self, key: &IndexKey) -> Vec<IndexPointer> {
         self.entries.get(key).cloned().unwrap_or_default()
     }
@@ -215,6 +245,19 @@ impl InvertedTextIndex {
                 .entry(lexeme.term().to_string())
                 .or_default()
                 .insert(pointer);
+        }
+        Ok(())
+    }
+
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "text index merge requires matching index metadata",
+            ));
+        }
+        for (term, pointers) in other.terms {
+            self.terms.entry(term).or_default().extend(pointers);
         }
         Ok(())
     }
@@ -295,6 +338,19 @@ impl InvertedValueIndex {
         Ok(())
     }
 
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "value index merge requires matching index metadata",
+            ));
+        }
+        for (token, pointers) in other.tokens {
+            self.tokens.entry(token).or_default().extend(pointers);
+        }
+        Ok(())
+    }
+
     pub fn lookup_array_value(&self, value: &SqlValue) -> Vec<IndexPointer> {
         self.lookup_token(&ValueToken::ArrayValue(value.encode()))
     }
@@ -371,6 +427,20 @@ impl MemoryRangeIndex {
         }
         self.ensure_range_type(range.element_type())?;
         self.entries.push((range.clone(), pointer));
+        Ok(())
+    }
+
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "range index merge requires matching index metadata",
+            ));
+        }
+        if let Some(element_type) = other.element_type {
+            self.ensure_range_type(&element_type)?;
+        }
+        self.entries.extend(other.entries);
         Ok(())
     }
 
@@ -507,6 +577,20 @@ impl MemoryBoundsIndex {
     pub fn insert_box(&mut self, pointer: IndexPointer, bounds: &BoundingBox) -> Result<()> {
         self.ensure_rank(bounds.rank())?;
         self.entries.push((bounds.clone(), pointer));
+        Ok(())
+    }
+
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "bounds index merge requires matching index metadata",
+            ));
+        }
+        if let Some(rank) = other.rank {
+            self.ensure_rank(rank)?;
+        }
+        self.entries.extend(other.entries);
         Ok(())
     }
 
@@ -793,6 +877,21 @@ impl MemoryCompositeIndex {
         }
         if !pointers.contains(&pointer) {
             pointers.push(pointer);
+        }
+        Ok(())
+    }
+
+    pub fn merge_from(&mut self, other: Self) -> Result<()> {
+        if self.name != other.name || self.unique != other.unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "composite index merge requires matching index metadata",
+            ));
+        }
+        for (key, pointers) in other.entries {
+            for pointer in pointers {
+                self.insert(key.clone(), pointer)?;
+            }
         }
         Ok(())
     }

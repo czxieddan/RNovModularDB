@@ -1,14 +1,14 @@
 use rnmdb_common::error::{ErrorKind, Result, RnovError};
 use std::{cmp::Ordering, collections::BTreeMap};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Truth {
     True,
     False,
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SqlType {
     Null,
     Bool,
@@ -22,7 +22,7 @@ pub enum SqlType {
     Range(Box<SqlType>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum SqlValue {
     Null,
     Bool(bool),
@@ -234,13 +234,13 @@ impl SqlType {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum HStoreValue {
     Null,
     Text(String),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct HStore {
     entries: BTreeMap<String, HStoreValue>,
 }
@@ -287,7 +287,7 @@ impl HStore {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LexemeWeight {
     A,
     B,
@@ -319,7 +319,7 @@ impl LexemeWeight {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TextLexeme {
     term: String,
     positions: Vec<u32>,
@@ -366,7 +366,7 @@ impl TextLexeme {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct TextVector {
     lexemes: BTreeMap<String, TextLexeme>,
 }
@@ -405,7 +405,7 @@ impl TextVector {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ArrayDimension {
     lower_bound: i64,
     len: usize,
@@ -441,7 +441,7 @@ impl ArrayDimension {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SqlArray {
     element_type: SqlType,
     dimensions: Vec<ArrayDimension>,
@@ -536,7 +536,7 @@ impl SqlArray {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum RangeBound {
     Unbounded,
     Included(SqlValue),
@@ -556,7 +556,7 @@ impl RangeBound {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct SqlRange {
     element_type: SqlType,
     lower: Box<RangeBound>,

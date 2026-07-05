@@ -11,6 +11,10 @@ use crate::{
     lexer::{Token, TokenKind, lex},
 };
 
+mod grouping;
+
+use grouping::{cube_grouping_sets, grouping_sets_union, rollup_grouping_sets};
+
 pub fn parse_statement(input: &str) -> Result<Statement> {
     let tokens = lex(input)?;
     let mut parser = Parser::new(tokens);
@@ -569,15 +573,39 @@ impl Parser {
         self.expect_keyword(TokenKind::Grant)?;
         let privilege = self.parse_privilege()?;
         self.expect_keyword(TokenKind::On)?;
-        self.expect_keyword(TokenKind::Table)?;
-        let table = self.parse_object_name()?;
-        self.expect_keyword(TokenKind::To)?;
-        let role = self.parse_ident()?;
-        Ok(Statement::GrantTablePrivilege {
-            privilege,
-            table,
-            role,
-        })
+        if self.consume_if(&TokenKind::Table) {
+            let table = self.parse_object_name()?;
+            self.expect_keyword(TokenKind::To)?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::GrantTablePrivilege {
+                privilege,
+                table,
+                role,
+            });
+        }
+        if self.consume_if(&TokenKind::Procedure) {
+            if privilege != Privilege::Execute {
+                return Err(self.error("expected EXECUTE privilege for procedure grant"));
+            }
+            let name = self.parse_ident()?;
+            self.expect_keyword(TokenKind::LeftParen)?;
+            let argument_types = if self.consume_if(&TokenKind::RightParen) {
+                Vec::new()
+            } else {
+                let types = self.parse_type_list()?;
+                self.expect_keyword(TokenKind::RightParen)?;
+                types
+            };
+            self.expect_keyword(TokenKind::To)?;
+            let role = self.parse_ident()?;
+            return Ok(Statement::GrantProcedurePrivilege {
+                privilege,
+                name,
+                argument_types,
+                role,
+            });
+        }
+        Err(self.error("expected TABLE or PROCEDURE after GRANT privilege ON"))
     }
 
     fn parse_call_procedure(&mut self) -> Result<Statement> {
@@ -1556,7 +1584,7 @@ impl Parser {
         if args.len() != 1 {
             return Err(self.error(format!("{name}() requires exactly one expression")));
         }
-        Ok(args.remove(0))
+        Ok(args.pop().expect("argument length checked"))
     }
 
     fn parse_operator_symbol(&mut self) -> Result<String> {
@@ -1665,104 +1693,7 @@ impl Parser {
 }
 
 fn same_token_variant(left: &TokenKind, right: &TokenKind) -> bool {
-    matches!(
-        (left, right),
-        (TokenKind::Select, TokenKind::Select)
-            | (TokenKind::Union, TokenKind::Union)
-            | (TokenKind::Intersect, TokenKind::Intersect)
-            | (TokenKind::Except, TokenKind::Except)
-            | (TokenKind::With, TokenKind::With)
-            | (TokenKind::Recursive, TokenKind::Recursive)
-            | (TokenKind::Distinct, TokenKind::Distinct)
-            | (TokenKind::All, TokenKind::All)
-            | (TokenKind::As, TokenKind::As)
-            | (TokenKind::Insert, TokenKind::Insert)
-            | (TokenKind::Into, TokenKind::Into)
-            | (TokenKind::Values, TokenKind::Values)
-            | (TokenKind::Update, TokenKind::Update)
-            | (TokenKind::Delete, TokenKind::Delete)
-            | (TokenKind::Set, TokenKind::Set)
-            | (TokenKind::Create, TokenKind::Create)
-            | (TokenKind::Index, TokenKind::Index)
-            | (TokenKind::Unique, TokenKind::Unique)
-            | (TokenKind::Alter, TokenKind::Alter)
-            | (TokenKind::Drop, TokenKind::Drop)
-            | (TokenKind::Add, TokenKind::Add)
-            | (TokenKind::Column, TokenKind::Column)
-            | (TokenKind::If, TokenKind::If)
-            | (TokenKind::Exists, TokenKind::Exists)
-            | (TokenKind::Table, TokenKind::Table)
-            | (TokenKind::From, TokenKind::From)
-            | (TokenKind::Join, TokenKind::Join)
-            | (TokenKind::Lateral, TokenKind::Lateral)
-            | (TokenKind::Where, TokenKind::Where)
-            | (TokenKind::Group, TokenKind::Group)
-            | (TokenKind::Grouping, TokenKind::Grouping)
-            | (TokenKind::Sets, TokenKind::Sets)
-            | (TokenKind::Rollup, TokenKind::Rollup)
-            | (TokenKind::Cube, TokenKind::Cube)
-            | (TokenKind::Over, TokenKind::Over)
-            | (TokenKind::Having, TokenKind::Having)
-            | (TokenKind::Order, TokenKind::Order)
-            | (TokenKind::By, TokenKind::By)
-            | (TokenKind::Asc, TokenKind::Asc)
-            | (TokenKind::Desc, TokenKind::Desc)
-            | (TokenKind::Nulls, TokenKind::Nulls)
-            | (TokenKind::First, TokenKind::First)
-            | (TokenKind::Last, TokenKind::Last)
-            | (TokenKind::Limit, TokenKind::Limit)
-            | (TokenKind::Offset, TokenKind::Offset)
-            | (TokenKind::Fetch, TokenKind::Fetch)
-            | (TokenKind::Next, TokenKind::Next)
-            | (TokenKind::Row, TokenKind::Row)
-            | (TokenKind::Rows, TokenKind::Rows)
-            | (TokenKind::Only, TokenKind::Only)
-            | (TokenKind::Function, TokenKind::Function)
-            | (TokenKind::Procedure, TokenKind::Procedure)
-            | (TokenKind::Returns, TokenKind::Returns)
-            | (TokenKind::OperatorKeyword, TokenKind::OperatorKeyword)
-            | (TokenKind::Role, TokenKind::Role)
-            | (TokenKind::Grant, TokenKind::Grant)
-            | (TokenKind::On, TokenKind::On)
-            | (TokenKind::To, TokenKind::To)
-            | (TokenKind::Policy, TokenKind::Policy)
-            | (TokenKind::Using, TokenKind::Using)
-            | (TokenKind::Execute, TokenKind::Execute)
-            | (TokenKind::Call, TokenKind::Call)
-            | (TokenKind::Begin, TokenKind::Begin)
-            | (TokenKind::Commit, TokenKind::Commit)
-            | (TokenKind::Rollback, TokenKind::Rollback)
-            | (TokenKind::And, TokenKind::And)
-            | (TokenKind::Or, TokenKind::Or)
-            | (TokenKind::Not, TokenKind::Not)
-            | (TokenKind::Case, TokenKind::Case)
-            | (TokenKind::When, TokenKind::When)
-            | (TokenKind::Then, TokenKind::Then)
-            | (TokenKind::Else, TokenKind::Else)
-            | (TokenKind::End, TokenKind::End)
-            | (TokenKind::Is, TokenKind::Is)
-            | (TokenKind::Between, TokenKind::Between)
-            | (TokenKind::In, TokenKind::In)
-            | (TokenKind::Like, TokenKind::Like)
-            | (TokenKind::Null, TokenKind::Null)
-            | (TokenKind::True, TokenKind::True)
-            | (TokenKind::False, TokenKind::False)
-            | (TokenKind::Unknown, TokenKind::Unknown)
-            | (TokenKind::Encrypted, TokenKind::Encrypted)
-            | (TokenKind::Generated, TokenKind::Generated)
-            | (TokenKind::Always, TokenKind::Always)
-            | (TokenKind::Stored, TokenKind::Stored)
-            | (TokenKind::Explain, TokenKind::Explain)
-            | (TokenKind::Analyze, TokenKind::Analyze)
-            | (TokenKind::Comma, TokenKind::Comma)
-            | (TokenKind::Dot, TokenKind::Dot)
-            | (TokenKind::Semicolon, TokenKind::Semicolon)
-            | (TokenKind::Star, TokenKind::Star)
-            | (TokenKind::LeftParen, TokenKind::LeftParen)
-            | (TokenKind::RightParen, TokenKind::RightParen)
-            | (TokenKind::LeftBracket, TokenKind::LeftBracket)
-            | (TokenKind::RightBracket, TokenKind::RightBracket)
-    )
+    std::mem::discriminant(left) == std::mem::discriminant(right)
 }
 
 fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) -> Statement {
@@ -1846,53 +1777,6 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             offset: tail.offset,
         },
     }
-}
-
-fn grouping_sets_union(grouping_sets: &[Vec<Expr>]) -> Vec<Expr> {
-    let mut group_by = Vec::new();
-    for grouping_set in grouping_sets {
-        for expr in grouping_set {
-            if !group_by.iter().any(|existing| existing == expr) {
-                group_by.push(expr.clone());
-            }
-        }
-    }
-    group_by
-}
-
-fn rollup_grouping_sets(group_by: &[Expr]) -> Vec<Vec<Expr>> {
-    (0..=group_by.len())
-        .rev()
-        .map(|count| group_by[..count].to_vec())
-        .collect()
-}
-
-fn cube_grouping_sets(group_by: &[Expr]) -> Result<Vec<Vec<Expr>>> {
-    let bits = usize::BITS as usize;
-    if group_by.len() >= bits {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "CUBE has too many grouping expressions",
-        ));
-    }
-    let set_count = 1usize << group_by.len();
-    Ok((0..set_count)
-        .rev()
-        .map(|mask| {
-            group_by
-                .iter()
-                .enumerate()
-                .filter_map(|(index, expr)| {
-                    let bit = 1usize << (group_by.len() - index - 1);
-                    if mask & bit == 0 {
-                        None
-                    } else {
-                        Some(expr.clone())
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect())
 }
 
 fn ranking_window_function(name: &str) -> Option<fn(Vec<OrderByExpr>) -> Expr> {

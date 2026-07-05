@@ -212,6 +212,11 @@ pub enum LogicalPlan {
         relation_id: RelationId,
         privilege: String,
     },
+    GrantProcedurePrivilege {
+        role_id: RoleId,
+        procedure_id: FunctionId,
+        privilege: String,
+    },
     CallProcedure {
         name: String,
         body: String,
@@ -568,6 +573,15 @@ impl LogicalPlanner {
             } => Ok(LogicalPlan::GrantTablePrivilege {
                 role_id: *role_id,
                 relation_id: *relation_id,
+                privilege: format!("{privilege:?}"),
+            }),
+            BoundStatement::GrantProcedurePrivilege {
+                role_id,
+                procedure_id,
+                privilege,
+            } => Ok(LogicalPlan::GrantProcedurePrivilege {
+                role_id: *role_id,
+                procedure_id: *procedure_id,
                 privilege: format!("{privilege:?}"),
             }),
             BoundStatement::CallProcedure { name, body, args } => Ok(LogicalPlan::CallProcedure {
@@ -1217,6 +1231,15 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}GrantTablePrivilege role={role_id} relation={relation_id} privilege={privilege}\n"
+            ));
+        }
+        LogicalPlan::GrantProcedurePrivilege {
+            role_id,
+            procedure_id,
+            privilege,
+        } => {
+            out.push_str(&format!(
+                "{prefix}GrantProcedurePrivilege role={role_id} procedure={procedure_id} privilege={privilege}\n"
             ));
         }
         LogicalPlan::CallProcedure { name, args, .. } => {

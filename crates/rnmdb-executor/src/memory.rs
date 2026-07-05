@@ -1,9 +1,10 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    future::Future,
     ops::Bound,
     sync::{
-        Arc, Mutex,
+        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     thread,
@@ -26,13 +27,24 @@ use rnmdb_planner::{
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
-use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, OrderByExpr, SortDirection};
+use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, OrderByExpr};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
     TextVector, Truth,
 };
 
 use crate::vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns};
+
+mod async_task;
+mod set_ops;
+mod sort;
+
+use async_task::{BlockingMutationTask, BlockingResultTask};
+use set_ops::{
+    apply_distinct_cancellable, apply_except_cancellable, apply_intersect_cancellable,
+    apply_union_cancellable,
+};
+use sort::{apply_sort_cancellable, compare_sort_row_keys, compare_sort_rows, sort_rows};
 
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
@@ -62,12 +74,13 @@ impl MemoryTable {
     pub fn insert(&mut self, row: Row) -> Result<()> {
         validate_row_against_columns(&self.columns, &row)?;
         let pointer = pointer_for_slot(self.rows.len())?;
-        let mut indexes = self.indexes.clone();
-        for index in indexes.values_mut() {
-            index.insert_row(&self.columns, &row, pointer)?;
+        for index in self.indexes.values_mut() {
+            if let Err(err) = index.insert_row(&self.columns, &row, pointer) {
+                self.rebuild_indexes()?;
+                return Err(err);
+            }
         }
         self.rows.push(row);
-        self.indexes = indexes;
         Ok(())
     }
 
@@ -532,40 +545,11 @@ impl MemoryTable {
     ) -> Result<VectorBatch> {
         config.validate()?;
         cancellation.check()?;
-        if self.rows.is_empty()
-            || config.worker_threads() == 1
-            || self.rows.len() < config.min_parallel_rows()
-        {
-            cancellation.check()?;
-            return Ok(self.scan());
-        }
-
-        let worker_count = config.worker_threads().min(self.rows.len());
-        let chunk_size = self.rows.len().div_ceil(worker_count);
-        let mut rows = Vec::with_capacity(self.rows.len());
-        thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for chunk in self.rows.chunks(chunk_size) {
-                let cancellation = cancellation.clone();
-                handles.push(scope.spawn(move || {
-                    cancellation.check()?;
-                    let rows = chunk.to_vec();
-                    cancellation.check()?;
-                    Ok::<Vec<Row>, RnovError>(rows)
-                }));
-            }
-
-            for handle in handles {
-                let mut chunk = handle.join().map_err(|_| {
-                    RnovError::new(ErrorKind::Internal, "parallel memory scan worker panicked")
-                })??;
-                rows.append(&mut chunk);
-            }
-            Ok::<(), RnovError>(())
-        })?;
-
+        // A plain memory scan only clones rows; later operators decide whether real
+        // per-row work is worth parallelizing.
+        let batch = self.scan();
         cancellation.check()?;
-        VectorBatch::new(self.columns.clone(), rows)
+        Ok(batch)
     }
 
     fn add_column(&mut self, column: ColumnSchema) -> Result<()> {
@@ -656,48 +640,44 @@ impl MemoryTable {
 
     fn build_index_parallel(
         &self,
-        index: MemoryTableIndex,
+        mut index: MemoryTableIndex,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<MemoryTableIndex> {
         let worker_count = config.worker_threads().min(self.rows.len());
+        if worker_count == 0 {
+            return Ok(index);
+        }
         let chunk_size = self.rows.len().div_ceil(worker_count);
-        let index = Mutex::new(index);
 
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
             for (chunk_index, chunk) in self.rows.chunks(chunk_size).enumerate() {
                 let columns = &self.columns;
-                let index = &index;
+                let mut local_index = index.empty_clone();
                 let cancellation = cancellation.clone();
                 let start_slot = chunk_index * chunk_size;
                 handles.push(scope.spawn(move || {
                     for (offset, row) in chunk.iter().enumerate() {
                         cancellation.check()?;
                         let pointer = pointer_for_slot(start_slot + offset)?;
-                        let mut index = index.lock().map_err(|_| {
-                            RnovError::new(
-                                ErrorKind::Internal,
-                                "parallel index build lock poisoned",
-                            )
-                        })?;
-                        index.insert_row(columns, row, pointer)?;
+                        local_index.insert_row(columns, row, pointer)?;
                     }
-                    cancellation.check()
+                    cancellation.check()?;
+                    Ok::<MemoryTableIndex, RnovError>(local_index)
                 }));
             }
 
             for handle in handles {
-                handle.join().map_err(|_| {
+                let local_index = handle.join().map_err(|_| {
                     RnovError::new(ErrorKind::Internal, "parallel index build worker panicked")
                 })??;
+                index.merge_from(local_index)?;
             }
             Ok::<(), RnovError>(())
         })?;
 
-        index
-            .into_inner()
-            .map_err(|_| RnovError::new(ErrorKind::Internal, "parallel index build lock poisoned"))
+        Ok(index)
     }
 
     fn drop_index(&mut self, name: &str) -> bool {
@@ -1049,6 +1029,120 @@ impl MemoryTableIndex {
                     MemoryCompositeIndex::non_unique(name)
                 };
             }
+        }
+    }
+
+    fn empty_clone(&self) -> Self {
+        let mut index = self.clone();
+        index.clear();
+        index
+    }
+
+    fn merge_from(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
+            (
+                Self::BTree {
+                    column_index,
+                    index,
+                },
+                Self::BTree {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::ExpressionBTree { expr, index },
+                Self::ExpressionBTree {
+                    expr: other_expr,
+                    index: other_index,
+                },
+            ) if *expr == other_expr => index.merge_from(other_index),
+            (
+                Self::Hash {
+                    column_index,
+                    index,
+                },
+                Self::Hash {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::ExpressionHash { expr, index },
+                Self::ExpressionHash {
+                    expr: other_expr,
+                    index: other_index,
+                },
+            ) if *expr == other_expr => index.merge_from(other_index),
+            (
+                Self::GinText {
+                    column_index,
+                    index,
+                },
+                Self::GinText {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GinValue {
+                    column_index,
+                    index,
+                },
+                Self::GinValue {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GistRange {
+                    column_index,
+                    index,
+                },
+                Self::GistRange {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::GistBounds {
+                    column_index,
+                    index,
+                },
+                Self::GistBounds {
+                    column_index: other_column_index,
+                    index: other_index,
+                },
+            ) if *column_index == other_column_index => index.merge_from(other_index),
+            (
+                Self::BrinSummary {
+                    column_index,
+                    index,
+                    entries,
+                },
+                Self::BrinSummary {
+                    column_index: other_column_index,
+                    entries: other_entries,
+                    ..
+                },
+            ) if *column_index == other_column_index => {
+                entries.extend(other_entries);
+                rebuild_block_summary_index(index, entries)
+            }
+            (
+                Self::Composite {
+                    column_indexes,
+                    index,
+                },
+                Self::Composite {
+                    column_indexes: other_column_indexes,
+                    index: other_index,
+                },
+            ) if *column_indexes == other_column_indexes => index.merge_from(other_index),
+            _ => Err(RnovError::new(
+                ErrorKind::Internal,
+                "cannot merge incompatible memory table indexes",
+            )),
         }
     }
 
@@ -1471,9 +1565,34 @@ impl Default for ParallelQueryConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MemoryExecutor {
-    tables: BTreeMap<String, MemoryTable>,
+    tables: Arc<RwLock<BTreeMap<String, MemoryTable>>>,
+}
+
+impl Default for MemoryExecutor {
+    fn default() -> Self {
+        Self {
+            tables: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+}
+
+struct SidewaysIndexLookupInput<'a> {
+    outer: &'a PhysicalPlan,
+    inner_table: &'a str,
+    inner_index: &'a str,
+    inner_column: &'a str,
+    outer_column: &'a str,
+}
+
+struct CreateIndexInput<'a> {
+    name: &'a str,
+    table: &'a str,
+    keys: &'a [IndexKeyDef],
+    method: IndexMethod,
+    unique: bool,
+    if_not_exists: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1488,6 +1607,32 @@ impl MemoryExecutor {
         Self::default()
     }
 
+    fn read_tables(&self) -> Result<RwLockReadGuard<'_, BTreeMap<String, MemoryTable>>> {
+        self.tables
+            .read()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "memory executor table lock poisoned"))
+    }
+
+    fn write_tables(&self) -> Result<RwLockWriteGuard<'_, BTreeMap<String, MemoryTable>>> {
+        self.tables
+            .write()
+            .map_err(|_| RnovError::new(ErrorKind::Internal, "memory executor table lock poisoned"))
+    }
+
+    fn snapshot(&self) -> Result<Self> {
+        Ok(Self {
+            tables: Arc::new(RwLock::new(self.read_tables()?.clone())),
+        })
+    }
+
+    fn with_table<T>(&self, name: &str, f: impl FnOnce(&MemoryTable) -> Result<T>) -> Result<T> {
+        let tables = self.read_tables()?;
+        let table = tables.get(name).ok_or_else(|| {
+            RnovError::new(ErrorKind::NotFound, format!("table not found: {name}"))
+        })?;
+        f(table)
+    }
+
     pub fn register_table(&mut self, name: impl Into<String>, table: MemoryTable) -> Result<()> {
         let name = name.into();
         if name.is_empty() {
@@ -1496,12 +1641,14 @@ impl MemoryExecutor {
                 "registered table name cannot be empty",
             ));
         }
-        self.tables.insert(name, table);
+        self.write_tables()?.insert(name, table);
         Ok(())
     }
 
     pub fn table_statistics(&self, name: &str) -> Option<TableStatistics> {
-        self.tables.get(name).map(MemoryTable::statistics)
+        self.read_tables()
+            .ok()
+            .and_then(|tables| tables.get(name).map(MemoryTable::statistics))
     }
 
     pub fn text_lexeme_statistics(
@@ -1510,7 +1657,8 @@ impl MemoryExecutor {
         column: &str,
         term: &str,
     ) -> Result<Option<TextLexemeStatistics>> {
-        let Some(table) = self.tables.get(table) else {
+        let tables = self.read_tables()?;
+        let Some(table) = tables.get(table) else {
             return Ok(None);
         };
         table.text_lexeme_statistics(column, term)
@@ -1527,15 +1675,15 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => self
-                .tables
-                .get(table)
-                .map(MemoryTable::scan)
-                .ok_or_else(|| {
+            LogicalPlan::Scan { table, .. } => {
+                let tables = self.read_tables()?;
+                tables.get(table).map(MemoryTable::scan).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                }),
+                })
+            }
             LogicalPlan::RecursiveScan { name, .. } => {
-                self.tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
+                let tables = self.read_tables()?;
+                tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
                     RnovError::new(
                         ErrorKind::NotFound,
                         format!("recursive CTE is not active: {name}"),
@@ -1557,13 +1705,16 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let table = self.tables.get(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                    return Ok(batch);
-                }
-                let batch = table.scan();
+                let batch = {
+                    let tables = self.read_tables()?;
+                    let table = tables.get(table).ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                        return Ok(batch);
+                    }
+                    table.scan()
+                };
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -1708,9 +1859,9 @@ impl MemoryExecutor {
     }
 
     fn with_recursive_table(&self, name: &str, batch: &VectorBatch) -> Result<Self> {
-        let mut executor = self.clone();
+        let executor = self.snapshot()?;
         executor
-            .tables
+            .write_tables()?
             .insert(name.to_string(), memory_table_from_batch(batch)?);
         Ok(executor)
     }
@@ -1734,39 +1885,23 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self
-                .tables
-                .get(table)
-                .map(MemoryTable::scan)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                }),
+            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| Ok(table.scan())),
             PhysicalPlan::IndexScan {
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_scan(index, column, value),
+            } => self.with_table(table, |table| table.index_scan(index, column, value)),
             PhysicalPlan::ExpressionIndexScan {
                 table,
                 index,
                 expr,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .expression_index_scan(index, expr, value),
+            } => self.with_table(table, |table| {
+                table.expression_index_scan(index, expr, value)
+            }),
             PhysicalPlan::IndexRangeScan {
                 table,
                 index,
@@ -1776,46 +1911,30 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_range_scan(
+            } => self.with_table(table, |table| {
+                table.index_range_scan(
                     index,
                     column,
                     lower.as_ref(),
                     *lower_inclusive,
                     upper.as_ref(),
                     *upper_inclusive,
-                ),
+                )
+            }),
             PhysicalPlan::IndexSkipScan {
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .index_skip_scan(index, column, value),
+            } => self.with_table(table, |table| table.index_skip_scan(index, column, value)),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .map(MemoryTable::scan)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?;
+                let batch = self.with_table(table, |table| Ok(table.scan()))?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::InvertedTextScan {
@@ -1824,26 +1943,18 @@ impl MemoryExecutor {
                 column,
                 query,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .text_index_scan(index, column, query, cancellation),
+            } => self.with_table(table, |table| {
+                table.text_index_scan(index, column, query, cancellation)
+            }),
             PhysicalPlan::InvertedValueScan {
                 table,
                 index,
                 column,
                 query,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .inverted_value_scan(index, column, query),
+            } => self.with_table(table, |table| {
+                table.inverted_value_scan(index, column, query)
+            }),
             PhysicalPlan::BlockSummaryScan {
                 table,
                 index,
@@ -1853,46 +1964,34 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .block_summary_scan(
+            } => self.with_table(table, |table| {
+                table.block_summary_scan(
                     index,
                     column,
                     lower,
                     *lower_inclusive,
                     upper,
                     *upper_inclusive,
-                ),
+                )
+            }),
             PhysicalPlan::RangeOverlapScan {
                 table,
                 index,
                 column,
                 range,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .range_overlap_scan(index, column, range),
+            } => self.with_table(table, |table| {
+                table.range_overlap_scan(index, column, range)
+            }),
             PhysicalPlan::BoundsOverlapScan {
                 table,
                 index,
                 column,
                 bounds,
                 ..
-            } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .bounds_overlap_scan(index, column, bounds),
+            } => self.with_table(table, |table| {
+                table.bounds_overlap_scan(index, column, bounds)
+            }),
             PhysicalPlan::SidewaysIndexLookup {
                 outer,
                 inner_table,
@@ -1991,6 +2090,9 @@ impl MemoryExecutor {
             PhysicalPlan::Parallel { input, .. } => {
                 self.execute_physical_cancellable(input, cancellation)
             }
+            PhysicalPlan::Unsupported { reason, .. } => {
+                Err(RnovError::new(ErrorKind::InvalidInput, reason.clone()))
+            }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "memory executor cannot execute this physical plan",
@@ -2007,26 +2109,18 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .scan_parallel_cancellable(config, cancellation),
+            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| {
+                table.scan_parallel_cancellable(config, cancellation)
+            }),
             PhysicalPlan::TextSearchScan {
                 table,
                 column,
                 query,
                 ..
             } => {
-                let batch = self
-                    .tables
-                    .get(table)
-                    .ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?
-                    .scan_parallel_cancellable(config, cancellation)?;
+                let batch = self.with_table(table, |table| {
+                    table.scan_parallel_cancellable(config, cancellation)
+                })?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::SidewaysIndexLookup {
@@ -2037,11 +2131,13 @@ impl MemoryExecutor {
                 outer_column,
                 ..
             } => self.execute_sideways_index_lookup_parallel(
-                outer,
-                inner_table,
-                inner_index,
-                inner_column,
-                outer_column,
+                SidewaysIndexLookupInput {
+                    outer,
+                    inner_table,
+                    inner_index,
+                    inner_column,
+                    outer_column,
+                },
                 config,
                 cancellation,
             ),
@@ -2150,16 +2246,24 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_async(&self, plan: &LogicalPlan) -> Result<VectorBatch> {
-        self.execute(plan)
+    pub fn execute_async(
+        &self,
+        plan: &LogicalPlan,
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        BlockingResultTask::new(move || executor.execute(&plan))
     }
 
-    pub async fn execute_cancellable_async(
+    pub fn execute_cancellable_async(
         &self,
         plan: &LogicalPlan,
         cancellation: &CancellationToken,
-    ) -> Result<VectorBatch> {
-        self.execute_cancellable(plan, cancellation)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        let cancellation = cancellation.clone();
+        BlockingResultTask::new(move || executor.execute_cancellable(&plan, &cancellation))
     }
 
     fn execute_sideways_index_lookup(
@@ -2173,7 +2277,8 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         let outer_batch = self.execute_physical_cancellable(outer, cancellation)?;
         let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let inner = tables.get(inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {inner_table}"),
@@ -2201,24 +2306,20 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_sideways_index_lookup_parallel(
         &self,
-        outer: &PhysicalPlan,
-        inner_table: &str,
-        inner_index: &str,
-        inner_column: &str,
-        outer_column: &str,
+        input: SidewaysIndexLookupInput<'_>,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         let outer_batch =
-            self.execute_physical_parallel_cancellable(outer, config, cancellation)?;
-        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+            self.execute_physical_parallel_cancellable(input.outer, config, cancellation)?;
+        let outer_column_index = column_index(outer_batch.columns(), input.outer_column)?;
+        let tables = self.read_tables()?;
+        let inner = tables.get(input.inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
-                format!("table not found: {inner_table}"),
+                format!("table not found: {}", input.inner_table),
             )
         })?;
         let columns = joined_columns(outer_batch.columns(), inner.columns())?;
@@ -2230,8 +2331,8 @@ impl MemoryExecutor {
                 outer_batch.rows(),
                 outer_column_index,
                 inner,
-                inner_index,
-                inner_column,
+                input.inner_index,
+                input.inner_column,
                 columns,
                 cancellation,
             );
@@ -2249,8 +2350,8 @@ impl MemoryExecutor {
                         chunk,
                         outer_column_index,
                         inner,
-                        inner_index,
-                        inner_column,
+                        input.inner_index,
+                        input.inner_column,
                         &cancellation,
                     )
                 }));
@@ -2282,7 +2383,8 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         let outer_batch = self.execute_cancellable(outer, cancellation)?;
         let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let inner = tables.get(inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
                 format!("table not found: {inner_table}"),
@@ -2336,23 +2438,21 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => self
-                .tables
-                .get(table)
-                .ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?
-                .scan_parallel_cancellable(config, cancellation),
-            LogicalPlan::RecursiveScan { name, .. } => self
-                .tables
-                .get(name)
-                .ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("recursive CTE is not active: {name}"),
-                    )
-                })?
-                .scan_parallel_cancellable(config, cancellation),
+            LogicalPlan::Scan { table, .. } => self.with_table(table, |table| {
+                table.scan_parallel_cancellable(config, cancellation)
+            }),
+            LogicalPlan::RecursiveScan { name, .. } => {
+                let tables = self.read_tables()?;
+                tables
+                    .get(name)
+                    .ok_or_else(|| {
+                        RnovError::new(
+                            ErrorKind::NotFound,
+                            format!("recursive CTE is not active: {name}"),
+                        )
+                    })?
+                    .scan_parallel_cancellable(config, cancellation)
+            }
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(predicate, input, cancellation)?
@@ -2368,13 +2468,16 @@ impl MemoryExecutor {
                 query,
                 ..
             } => {
-                let table = self.tables.get(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                    return Ok(batch);
-                }
-                let batch = table.scan_parallel_cancellable(config, cancellation)?;
+                let batch = {
+                    let tables = self.read_tables()?;
+                    let table = tables.get(table).ok_or_else(|| {
+                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+                    })?;
+                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                        return Ok(batch);
+                    }
+                    table.scan_parallel_cancellable(config, cancellation)?
+                };
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -2408,7 +2511,13 @@ impl MemoryExecutor {
                 input,
             } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+                apply_grouped_aggregate_parallel_cancellable(
+                    batch,
+                    group_by,
+                    items,
+                    config,
+                    cancellation,
+                )
             }
             LogicalPlan::GroupingSetsAggregate {
                 group_by,
@@ -2470,8 +2579,10 @@ impl MemoryExecutor {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_offset_cancellable(batch, *count, cancellation)
             }
-            LogicalPlan::Parallel { input, .. } => {
-                self.execute_parallel_cancellable(input, config, cancellation)
+            LogicalPlan::Parallel { hint, input } => {
+                let hinted_config =
+                    ParallelQueryConfig::new(hint.workers, config.min_parallel_rows());
+                self.execute_parallel_cancellable(input, hinted_config, cancellation)
             }
             _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -2480,21 +2591,28 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_parallel_async(
+    pub fn execute_parallel_async(
         &self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
-    ) -> Result<VectorBatch> {
-        self.execute_parallel(plan, config)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        BlockingResultTask::new(move || executor.execute_parallel(&plan, config))
     }
 
-    pub async fn execute_parallel_cancellable_async(
+    pub fn execute_parallel_cancellable_async(
         &self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
-    ) -> Result<VectorBatch> {
-        self.execute_parallel_cancellable(plan, config, cancellation)
+    ) -> impl Future<Output = Result<VectorBatch>> + Send + 'static {
+        let executor = self.clone();
+        let plan = plan.clone();
+        let cancellation = cancellation.clone();
+        BlockingResultTask::new(move || {
+            executor.execute_parallel_cancellable(&plan, config, &cancellation)
+        })
     }
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
@@ -2516,11 +2634,18 @@ impl MemoryExecutor {
                 if_not_exists,
                 ..
             } => {
-                self.create_index(name, table, keys, *method, *unique, *if_not_exists)?;
+                self.create_index(CreateIndexInput {
+                    name,
+                    table,
+                    keys,
+                    method: *method,
+                    unique: *unique,
+                    if_not_exists: *if_not_exists,
+                })?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropIndex { name, if_exists } => {
-                if self.drop_index(name) || *if_exists {
+                if self.drop_index(name)? || *if_exists {
                     Ok(ExecutionResult::SchemaChanged)
                 } else {
                     Err(RnovError::new(
@@ -2535,7 +2660,8 @@ impl MemoryExecutor {
                 if_not_exists,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 if table
@@ -2555,7 +2681,8 @@ impl MemoryExecutor {
                 encrypted,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 table.set_column_encrypted(column, *encrypted)?;
@@ -2564,7 +2691,7 @@ impl MemoryExecutor {
             LogicalPlan::DropTable {
                 table, if_exists, ..
             } => {
-                if self.tables.remove(table).is_some() || *if_exists {
+                if self.write_tables()?.remove(table).is_some() || *if_exists {
                     Ok(ExecutionResult::SchemaChanged)
                 } else {
                     Err(RnovError::new(
@@ -2578,7 +2705,8 @@ impl MemoryExecutor {
                 columns,
                 values,
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 insert_values(table, columns, values)?;
@@ -2590,7 +2718,8 @@ impl MemoryExecutor {
                 selection,
                 ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 update_rows(table, assignments, selection.as_ref())
@@ -2599,7 +2728,8 @@ impl MemoryExecutor {
             LogicalPlan::Delete {
                 table, selection, ..
             } => {
-                let table = self.tables.get_mut(table).ok_or_else(|| {
+                let mut tables = self.write_tables()?;
+                let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
                 delete_rows(table, selection.as_ref()).map(ExecutionResult::RowsAffected)
@@ -2608,8 +2738,20 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_mut_async(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
-        self.execute_mut(plan)
+    pub fn execute_mut_async<'a>(
+        &'a mut self,
+        plan: &LogicalPlan,
+    ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
+        let executor = self.snapshot();
+        let plan = plan.clone();
+        BlockingMutationTask {
+            executor: self,
+            inner: BlockingResultTask::new(move || {
+                let mut executor = executor?;
+                let result = executor.execute_mut(&plan);
+                Ok((executor, result))
+            }),
+        }
     }
 
     pub fn execute_mut_parallel(
@@ -2639,12 +2781,14 @@ impl MemoryExecutor {
                 ..
             } => {
                 self.create_index_parallel(
-                    name,
-                    table,
-                    keys,
-                    *method,
-                    *unique,
-                    *if_not_exists,
+                    CreateIndexInput {
+                        name,
+                        table,
+                        keys,
+                        method: *method,
+                        unique: *unique,
+                        if_not_exists: *if_not_exists,
+                    },
                     config,
                     cancellation,
                 )?;
@@ -2654,12 +2798,21 @@ impl MemoryExecutor {
         }
     }
 
-    pub async fn execute_mut_parallel_async(
-        &mut self,
+    pub fn execute_mut_parallel_async<'a>(
+        &'a mut self,
         plan: &LogicalPlan,
         config: ParallelQueryConfig,
-    ) -> Result<ExecutionResult> {
-        self.execute_mut_parallel(plan, config)
+    ) -> impl Future<Output = Result<ExecutionResult>> + 'a {
+        let executor = self.snapshot();
+        let plan = plan.clone();
+        BlockingMutationTask {
+            executor: self,
+            inner: BlockingResultTask::new(move || {
+                let mut executor = executor?;
+                let result = executor.execute_mut_parallel(&plan, config);
+                Ok((executor, result))
+            }),
+        }
     }
 
     fn create_table(
@@ -2668,7 +2821,8 @@ impl MemoryExecutor {
         columns: &[ColumnDef],
         if_not_exists: bool,
     ) -> Result<()> {
-        if self.tables.contains_key(name) {
+        let mut tables = self.write_tables()?;
+        if tables.contains_key(name) {
             if if_not_exists {
                 return Ok(());
             }
@@ -2679,51 +2833,55 @@ impl MemoryExecutor {
         }
         let columns = columns.iter().map(column_schema_from_def).collect();
         let table = MemoryTable::new(columns)?;
-        self.tables.insert(name.to_string(), table);
+        tables.insert(name.to_string(), table);
         Ok(())
     }
 
-    fn create_index(
-        &mut self,
-        name: &str,
-        table: &str,
-        keys: &[IndexKeyDef],
-        method: IndexMethod,
-        unique: bool,
-        if_not_exists: bool,
-    ) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+    fn create_index(&mut self, input: CreateIndexInput<'_>) -> Result<()> {
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(input.table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {}", input.table),
+            )
         })?;
-        if table.indexes.contains_key(name) && if_not_exists {
+        if table.indexes.contains_key(input.name) && input.if_not_exists {
             return Ok(());
         }
-        table.create_index(name, keys, method, unique)
+        table.create_index(input.name, input.keys, input.method, input.unique)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_index_parallel(
         &mut self,
-        name: &str,
-        table: &str,
-        keys: &[IndexKeyDef],
-        method: IndexMethod,
-        unique: bool,
-        if_not_exists: bool,
+        input: CreateIndexInput<'_>,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(input.table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {}", input.table),
+            )
         })?;
-        if table.indexes.contains_key(name) && if_not_exists {
+        if table.indexes.contains_key(input.name) && input.if_not_exists {
             return Ok(());
         }
-        table.create_index_parallel(name, keys, method, unique, config, cancellation)
+        table.create_index_parallel(
+            input.name,
+            input.keys,
+            input.method,
+            input.unique,
+            config,
+            cancellation,
+        )
     }
 
-    fn drop_index(&mut self, name: &str) -> bool {
-        self.tables.values_mut().any(|table| table.drop_index(name))
+    fn drop_index(&mut self, name: &str) -> Result<bool> {
+        Ok(self
+            .write_tables()?
+            .values_mut()
+            .any(|table| table.drop_index(name)))
     }
 
     fn execute_indexed_filter_scan(
@@ -2735,7 +2893,8 @@ impl MemoryExecutor {
         let LogicalPlan::Scan { table, .. } = input else {
             return Ok(None);
         };
-        let table = self.tables.get(table).ok_or_else(|| {
+        let tables = self.read_tables()?;
+        let table = tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
         if let Some((expr, value)) = indexable_expression_equality(predicate)
@@ -3806,15 +3965,18 @@ fn group_states_from_rows(
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
+    let mut group_indexes: HashMap<Vec<SqlValue>, usize> = HashMap::new();
     for row in rows {
         cancellation.check()?;
         let key = group_by
             .iter()
             .map(|expr| eval_expr(columns, row, expr))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-            group.rows.push(row.clone());
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].rows.push(row.clone());
         } else {
+            let index = groups.len();
+            group_indexes.insert(key.clone(), index);
             groups.push(GroupState {
                 key,
                 rows: vec![row.clone()],
@@ -3825,10 +3987,16 @@ fn group_states_from_rows(
 }
 
 fn merge_group_states(groups: &mut Vec<GroupState>, local_groups: Vec<GroupState>) {
+    let mut group_indexes = groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (group.key.clone(), index))
+        .collect::<HashMap<_, _>>();
     for local_group in local_groups {
-        if let Some(group) = groups.iter_mut().find(|group| group.key == local_group.key) {
-            group.rows.extend(local_group.rows);
+        if let Some(index) = group_indexes.get(&local_group.key).copied() {
+            groups[index].rows.extend(local_group.rows);
         } else {
+            group_indexes.insert(local_group.key.clone(), groups.len());
             groups.push(local_group);
         }
     }
@@ -3893,15 +4061,18 @@ fn grouping_set_states(
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
+    let mut group_indexes: HashMap<Vec<SqlValue>, usize> = HashMap::new();
     for row in batch.rows() {
         cancellation.check()?;
         let key = grouping_set
             .iter()
             .map(|expr| eval_expr(batch.columns(), row, expr))
             .collect::<Result<Vec<_>>>()?;
-        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
-            group.rows.push(row.clone());
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].rows.push(row.clone());
         } else {
+            let index = groups.len();
+            group_indexes.insert(key.clone(), index);
             groups.push(GroupState {
                 key,
                 rows: vec![row.clone()],
@@ -4098,303 +4269,6 @@ fn aggregate_ordered_value(
         }
     }
     Ok(selected.unwrap_or(SqlValue::Null))
-}
-
-fn apply_distinct_cancellable(
-    batch: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut rows = Vec::new();
-    for row in batch.rows() {
-        cancellation.check()?;
-        if !rows.contains(row) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(batch.columns().to_vec(), rows)
-}
-
-fn apply_union_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_union_columns(&left, &right)?;
-    let mut rows = Vec::with_capacity(left.rows().len() + right.rows().len());
-    for row in left.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    for row in right.rows() {
-        cancellation.check()?;
-        rows.push(row.clone());
-    }
-    cancellation.check()?;
-    let batch = VectorBatch::new(left.columns().to_vec(), rows)?;
-    if all {
-        Ok(batch)
-    } else {
-        apply_distinct_cancellable(batch, cancellation)
-    }
-}
-
-fn apply_intersect_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_set_operation_columns("INTERSECT", &left, &right)?;
-    if all {
-        return apply_intersect_all_cancellable(left, right, cancellation);
-    }
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if right.rows().contains(row) && !rows.contains(row) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_except_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    all: bool,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    validate_set_operation_columns("EXCEPT", &left, &right)?;
-    if all {
-        return apply_except_all_cancellable(left, right, cancellation);
-    }
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if !right.rows().contains(row) && !rows.contains(row) {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_intersect_all_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut right_rows = right.rows().to_vec();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
-            rows.push(row.clone());
-            right_rows.remove(index);
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn apply_except_all_cancellable(
-    left: VectorBatch,
-    right: VectorBatch,
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    let mut right_rows = right.rows().to_vec();
-    let mut rows = Vec::new();
-    for row in left.rows() {
-        cancellation.check()?;
-        if let Some(index) = right_rows.iter().position(|right_row| right_row == row) {
-            right_rows.remove(index);
-        } else {
-            rows.push(row.clone());
-        }
-    }
-    cancellation.check()?;
-    VectorBatch::new(left.columns().to_vec(), rows)
-}
-
-fn validate_union_columns(left: &VectorBatch, right: &VectorBatch) -> Result<()> {
-    validate_set_operation_columns("UNION", left, right)
-}
-
-fn validate_set_operation_columns(
-    operation: &str,
-    left: &VectorBatch,
-    right: &VectorBatch,
-) -> Result<()> {
-    if left.columns().len() != right.columns().len() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "{operation} column count mismatch: left has {}, right has {}",
-                left.columns().len(),
-                right.columns().len()
-            ),
-        ));
-    }
-    for (index, (left, right)) in left.columns().iter().zip(right.columns()).enumerate() {
-        if left.data_type() != right.data_type() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "{operation} column {} type mismatch: left is {:?}, right is {:?}",
-                    index + 1,
-                    left.data_type(),
-                    right.data_type()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-struct SortRow {
-    keys: Vec<SqlValue>,
-    original_index: usize,
-    row: Row,
-}
-
-fn apply_sort_cancellable(
-    batch: VectorBatch,
-    keys: &[OrderByExpr],
-    cancellation: &CancellationToken,
-) -> Result<VectorBatch> {
-    if keys.is_empty() {
-        return Ok(batch);
-    }
-
-    let mut rows = sort_rows(&batch, keys, cancellation)?;
-    rows.sort_by(|left, right| compare_sort_rows(left, right, keys));
-    cancellation.check()?;
-    VectorBatch::new(
-        batch.columns().to_vec(),
-        rows.into_iter().map(|row| row.row).collect(),
-    )
-}
-
-fn sort_rows(
-    batch: &VectorBatch,
-    keys: &[OrderByExpr],
-    cancellation: &CancellationToken,
-) -> Result<Vec<SortRow>> {
-    let mut rows = Vec::with_capacity(batch.rows().len());
-    for (original_index, row) in batch.rows().iter().enumerate() {
-        cancellation.check()?;
-        let sort_keys = keys
-            .iter()
-            .map(|key| eval_expr(batch.columns(), row, &key.expr))
-            .collect::<Result<Vec<_>>>()?;
-        rows.push(SortRow {
-            keys: sort_keys,
-            original_index,
-            row: row.clone(),
-        });
-    }
-    validate_sort_key_types(&rows, keys.len())?;
-    Ok(rows)
-}
-
-fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
-    let mut key_types = vec![None; key_count];
-    for row in rows {
-        for (index, value) in row.keys.iter().enumerate() {
-            if value.is_null() {
-                continue;
-            }
-            let data_type = value.data_type();
-            if !sortable_type(&data_type) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("ORDER BY expression type is not sortable: {data_type:?}"),
-                ));
-            }
-            match &key_types[index] {
-                Some(existing) if *existing != data_type => {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "ORDER BY expression produced mixed value types",
-                    ));
-                }
-                Some(_) => {}
-                None => key_types[index] = Some(data_type),
-            }
-        }
-    }
-    Ok(())
-}
-
-fn compare_sort_rows(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
-    let ordering = compare_sort_row_keys(left, right, keys);
-    if ordering != Ordering::Equal {
-        return ordering;
-    }
-    left.original_index.cmp(&right.original_index)
-}
-
-fn compare_sort_row_keys(left: &SortRow, right: &SortRow, keys: &[OrderByExpr]) -> Ordering {
-    for (index, key) in keys.iter().enumerate() {
-        let ordering = compare_sort_values(&left.keys[index], &right.keys[index], key.direction);
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
-}
-
-fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirection) -> Ordering {
-    match (left.is_null(), right.is_null()) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => {
-            return if sort_nulls_first(direction) {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            };
-        }
-        (false, true) => {
-            return if sort_nulls_first(direction) {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            };
-        }
-        (false, false) => {}
-    }
-
-    let ordering = match (left, right) {
-        (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
-        (SqlValue::Int64(left), SqlValue::Int64(right)) => left.cmp(right),
-        (SqlValue::UInt64(left), SqlValue::UInt64(right)) => left.cmp(right),
-        (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
-        _ => Ordering::Equal,
-    };
-    if sort_descending(direction) {
-        ordering.reverse()
-    } else {
-        ordering
-    }
-}
-
-fn sort_descending(direction: SortDirection) -> bool {
-    matches!(
-        direction,
-        SortDirection::Desc | SortDirection::DescNullsFirst | SortDirection::DescNullsLast
-    )
-}
-
-fn sort_nulls_first(direction: SortDirection) -> bool {
-    matches!(
-        direction,
-        SortDirection::AscNullsFirst | SortDirection::Desc | SortDirection::DescNullsFirst
-    )
 }
 
 fn apply_limit_cancellable(
@@ -5397,29 +5271,30 @@ fn eval_like_expr(
 fn like_pattern_matches(value: &str, pattern: &str) -> bool {
     let value: Vec<char> = value.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
-    let mut matched = vec![vec![false; pattern.len() + 1]; value.len() + 1];
-    matched[0][0] = true;
+    let mut previous = vec![false; pattern.len() + 1];
+    let mut current = vec![false; pattern.len() + 1];
+    previous[0] = true;
 
     for pattern_index in 0..pattern.len() {
         if pattern[pattern_index] == '%' {
-            matched[0][pattern_index + 1] = matched[0][pattern_index];
+            previous[pattern_index + 1] = previous[pattern_index];
         }
     }
 
-    for value_index in 0..value.len() {
+    for value_char in value {
+        current[0] = false;
         for pattern_index in 0..pattern.len() {
-            matched[value_index + 1][pattern_index + 1] = match pattern[pattern_index] {
-                '%' => {
-                    matched[value_index + 1][pattern_index]
-                        || matched[value_index][pattern_index + 1]
-                }
-                '_' => matched[value_index][pattern_index],
-                literal => matched[value_index][pattern_index] && value[value_index] == literal,
+            current[pattern_index + 1] = match pattern[pattern_index] {
+                '%' => current[pattern_index] || previous[pattern_index + 1],
+                '_' => previous[pattern_index],
+                literal => previous[pattern_index] && value_char == literal,
             };
         }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(false);
     }
 
-    matched[value.len()][pattern.len()]
+    previous[pattern.len()]
 }
 
 fn eval_coalesce_expr(columns: &[ColumnSchema], row: &Row, values: &[Expr]) -> Result<SqlValue> {

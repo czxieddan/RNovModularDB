@@ -13,6 +13,7 @@ rnmdb-index.workspace = true
 rnmdb-planner.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-types.workspace = true
+crc = "3"
 
 [lib]
 path = "src/lib.rs"
