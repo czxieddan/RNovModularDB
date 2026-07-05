@@ -1655,6 +1655,23 @@ pub struct MemoryExecutor {
     tables: BTreeMap<String, MemoryTable>,
 }
 
+struct SidewaysIndexLookupInput<'a> {
+    outer: &'a PhysicalPlan,
+    inner_table: &'a str,
+    inner_index: &'a str,
+    inner_column: &'a str,
+    outer_column: &'a str,
+}
+
+struct CreateIndexInput<'a> {
+    name: &'a str,
+    table: &'a str,
+    keys: &'a [IndexKeyDef],
+    method: IndexMethod,
+    unique: bool,
+    if_not_exists: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionResult {
     Batch(VectorBatch),
@@ -2219,11 +2236,13 @@ impl MemoryExecutor {
                 outer_column,
                 ..
             } => self.execute_sideways_index_lookup_parallel(
-                outer,
-                inner_table,
-                inner_index,
-                inner_column,
-                outer_column,
+                SidewaysIndexLookupInput {
+                    outer,
+                    inner_table,
+                    inner_index,
+                    inner_column,
+                    outer_column,
+                },
                 config,
                 cancellation,
             ),
@@ -2391,24 +2410,19 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_sideways_index_lookup_parallel(
         &self,
-        outer: &PhysicalPlan,
-        inner_table: &str,
-        inner_index: &str,
-        inner_column: &str,
-        outer_column: &str,
+        input: SidewaysIndexLookupInput<'_>,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         let outer_batch =
-            self.execute_physical_parallel_cancellable(outer, config, cancellation)?;
-        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
-        let inner = self.tables.get(inner_table).ok_or_else(|| {
+            self.execute_physical_parallel_cancellable(input.outer, config, cancellation)?;
+        let outer_column_index = column_index(outer_batch.columns(), input.outer_column)?;
+        let inner = self.tables.get(input.inner_table).ok_or_else(|| {
             RnovError::new(
                 ErrorKind::NotFound,
-                format!("table not found: {inner_table}"),
+                format!("table not found: {}", input.inner_table),
             )
         })?;
         let columns = joined_columns(outer_batch.columns(), inner.columns())?;
@@ -2420,8 +2434,8 @@ impl MemoryExecutor {
                 outer_batch.rows(),
                 outer_column_index,
                 inner,
-                inner_index,
-                inner_column,
+                input.inner_index,
+                input.inner_column,
                 columns,
                 cancellation,
             );
@@ -2439,8 +2453,8 @@ impl MemoryExecutor {
                         chunk,
                         outer_column_index,
                         inner,
-                        inner_index,
-                        inner_column,
+                        input.inner_index,
+                        input.inner_column,
                         &cancellation,
                     )
                 }));
@@ -2721,7 +2735,14 @@ impl MemoryExecutor {
                 if_not_exists,
                 ..
             } => {
-                self.create_index(name, table, keys, *method, *unique, *if_not_exists)?;
+                self.create_index(CreateIndexInput {
+                    name,
+                    table,
+                    keys,
+                    method: *method,
+                    unique: *unique,
+                    if_not_exists: *if_not_exists,
+                })?;
                 Ok(ExecutionResult::SchemaChanged)
             }
             LogicalPlan::DropIndex { name, if_exists } => {
@@ -2855,12 +2876,14 @@ impl MemoryExecutor {
                 ..
             } => {
                 self.create_index_parallel(
-                    name,
-                    table,
-                    keys,
-                    *method,
-                    *unique,
-                    *if_not_exists,
+                    CreateIndexInput {
+                        name,
+                        table,
+                        keys,
+                        method: *method,
+                        unique: *unique,
+                        if_not_exists: *if_not_exists,
+                    },
                     config,
                     cancellation,
                 )?;
@@ -2907,43 +2930,42 @@ impl MemoryExecutor {
         Ok(())
     }
 
-    fn create_index(
-        &mut self,
-        name: &str,
-        table: &str,
-        keys: &[IndexKeyDef],
-        method: IndexMethod,
-        unique: bool,
-        if_not_exists: bool,
-    ) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+    fn create_index(&mut self, input: CreateIndexInput<'_>) -> Result<()> {
+        let table = self.tables.get_mut(input.table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {}", input.table),
+            )
         })?;
-        if table.indexes.contains_key(name) && if_not_exists {
+        if table.indexes.contains_key(input.name) && input.if_not_exists {
             return Ok(());
         }
-        table.create_index(name, keys, method, unique)
+        table.create_index(input.name, input.keys, input.method, input.unique)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_index_parallel(
         &mut self,
-        name: &str,
-        table: &str,
-        keys: &[IndexKeyDef],
-        method: IndexMethod,
-        unique: bool,
-        if_not_exists: bool,
+        input: CreateIndexInput<'_>,
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        let table = self.tables.get_mut(table).ok_or_else(|| {
-            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
+        let table = self.tables.get_mut(input.table).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {}", input.table),
+            )
         })?;
-        if table.indexes.contains_key(name) && if_not_exists {
+        if table.indexes.contains_key(input.name) && input.if_not_exists {
             return Ok(());
         }
-        table.create_index_parallel(name, keys, method, unique, config, cancellation)
+        table.create_index_parallel(
+            input.name,
+            input.keys,
+            input.method,
+            input.unique,
+            config,
+            cancellation,
+        )
     }
 
     fn drop_index(&mut self, name: &str) -> bool {

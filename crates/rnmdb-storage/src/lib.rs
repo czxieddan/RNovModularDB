@@ -631,29 +631,31 @@ pub struct HybridSyncStatus {
     last_mirrored_lsn: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HybridSyncStatusParts {
+    pub state: HybridState,
+    pub active_target: HybridSyncTarget,
+    pub dirty_pages: usize,
+    pub dirty_bytes: usize,
+    pub mirrored_pages: usize,
+    pub estimated_flush_bytes: usize,
+    pub memory_lsn: u64,
+    pub disk_lsn: u64,
+    pub last_mirrored_lsn: u64,
+}
+
 impl HybridSyncStatus {
-    #[allow(clippy::too_many_arguments)]
-    pub const fn new(
-        state: HybridState,
-        active_target: HybridSyncTarget,
-        dirty_pages: usize,
-        dirty_bytes: usize,
-        mirrored_pages: usize,
-        estimated_flush_bytes: usize,
-        memory_lsn: u64,
-        disk_lsn: u64,
-        last_mirrored_lsn: u64,
-    ) -> Self {
+    pub const fn new(parts: HybridSyncStatusParts) -> Self {
         Self {
-            state,
-            active_target,
-            dirty_pages,
-            dirty_bytes,
-            mirrored_pages,
-            estimated_flush_bytes,
-            memory_lsn,
-            disk_lsn,
-            last_mirrored_lsn,
+            state: parts.state,
+            active_target: parts.active_target,
+            dirty_pages: parts.dirty_pages,
+            dirty_bytes: parts.dirty_bytes,
+            mirrored_pages: parts.mirrored_pages,
+            estimated_flush_bytes: parts.estimated_flush_bytes,
+            memory_lsn: parts.memory_lsn,
+            disk_lsn: parts.disk_lsn,
+            last_mirrored_lsn: parts.last_mirrored_lsn,
         }
     }
 
@@ -938,17 +940,17 @@ impl HybridBackend {
         } else {
             HybridState::HybridSyncing
         };
-        Ok(HybridSyncStatus::new(
+        Ok(HybridSyncStatus::new(HybridSyncStatusParts {
             state,
             active_target,
             dirty_pages,
             dirty_bytes,
             mirrored_pages,
-            dirty_bytes,
-            lsn_status.memory_lsn,
-            lsn_status.disk_lsn,
-            lsn_status.last_mirrored_lsn,
-        ))
+            estimated_flush_bytes: dirty_bytes,
+            memory_lsn: lsn_status.memory_lsn,
+            disk_lsn: lsn_status.disk_lsn,
+            last_mirrored_lsn: lsn_status.last_mirrored_lsn,
+        }))
     }
 
     fn read_dirty_pages(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeSet<PageId>>> {
