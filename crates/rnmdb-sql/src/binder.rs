@@ -11,6 +11,7 @@ use crate::ast::{
     BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident,
     IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement, TransactionAction,
 };
+use crate::expr_mutator::rewrite_qualified_expr;
 use crate::parser::{parse_expr, parse_statement};
 
 const RLS_DENY_DEFAULT_POLICY: &str = "rnmdb_rls_deny_default";
@@ -3116,7 +3117,7 @@ impl<'a> Binder<'a> {
     }
 
     fn rewrite_table_qualified_expr(&self, table: &Table, expr: &Expr) -> Result<Expr> {
-        self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        rewrite_qualified_expr(expr, &mut |qualifier, name| {
             self.ensure_table_qualifier(table, qualifier)?;
             let _ = self.resolve_column(table, name.as_str())?;
             Ok(Expr::Identifier(name.clone()))
@@ -3124,7 +3125,7 @@ impl<'a> Binder<'a> {
     }
 
     fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
-        self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        rewrite_qualified_expr(expr, &mut |qualifier, name| {
             let matches = columns
                 .iter()
                 .filter(|column| {
@@ -3147,7 +3148,7 @@ impl<'a> Binder<'a> {
     }
 
     fn rewrite_cte_expr(&self, columns: &[BoundColumn], expr: &Expr) -> Result<Expr> {
-        let rewritten = self.rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             if qualifier.as_str().eq_ignore_ascii_case("__cte") {
                 let _ = self.resolve_column_from_bound(columns, name)?;
                 Ok(Expr::Identifier(name.clone()))
@@ -3256,197 +3257,6 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::CountStar
             | Expr::HStore(_) => Ok(()),
-        }
-    }
-
-    fn rewrite_qualified_expr<F>(&self, expr: &Expr, resolver: &mut F) -> Result<Expr>
-    where
-        F: FnMut(&Ident, &Ident) -> Result<Expr>,
-    {
-        match expr {
-            Expr::QualifiedIdentifier { qualifier, name } => resolver(qualifier, name),
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
-                op: op.clone(),
-                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                negated: *negated,
-            }),
-            Expr::IsTruth {
-                expr,
-                value,
-                negated,
-            } => Ok(Expr::IsTruth {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                value: *value,
-                negated: *negated,
-            }),
-            Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                negated: *negated,
-            }),
-            Expr::IsDistinctFrom {
-                left,
-                right,
-                negated,
-            } => Ok(Expr::IsDistinctFrom {
-                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
-                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
-                negated: *negated,
-            }),
-            Expr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => Ok(Expr::Between {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                low: Box::new(self.rewrite_qualified_expr(low, resolver)?),
-                high: Box::new(self.rewrite_qualified_expr(high, resolver)?),
-                negated: *negated,
-            }),
-            Expr::InList {
-                expr,
-                values,
-                negated,
-            } => Ok(Expr::InList {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                values: values
-                    .iter()
-                    .map(|value| self.rewrite_qualified_expr(value, resolver))
-                    .collect::<Result<Vec<_>>>()?,
-                negated: *negated,
-            }),
-            Expr::Like {
-                expr,
-                pattern,
-                negated,
-            } => Ok(Expr::Like {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                pattern: Box::new(self.rewrite_qualified_expr(pattern, resolver)?),
-                negated: *negated,
-            }),
-            Expr::Coalesce(values) => values
-                .iter()
-                .map(|value| self.rewrite_qualified_expr(value, resolver))
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Coalesce),
-            Expr::NullIf { left, right } => Ok(Expr::NullIf {
-                left: Box::new(self.rewrite_qualified_expr(left, resolver)?),
-                right: Box::new(self.rewrite_qualified_expr(right, resolver)?),
-            }),
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => Ok(Expr::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|operand| self.rewrite_qualified_expr(operand, resolver))
-                    .transpose()?
-                    .map(Box::new),
-                whens: whens
-                    .iter()
-                    .map(|arm| {
-                        Ok(CaseWhen {
-                            condition: self.rewrite_qualified_expr(&arm.condition, resolver)?,
-                            result: self.rewrite_qualified_expr(&arm.result, resolver)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|else_expr| self.rewrite_qualified_expr(else_expr, resolver))
-                    .transpose()?
-                    .map(Box::new),
-            }),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.rewrite_qualified_expr(expr, resolver)?),
-                data_type: data_type.clone(),
-            }),
-            Expr::Call { name, args } => args
-                .iter()
-                .map(|arg| self.rewrite_qualified_expr(arg, resolver))
-                .collect::<Result<Vec<_>>>()
-                .map(|args| Expr::Call {
-                    name: name.clone(),
-                    args,
-                }),
-            Expr::Count(expr) => Ok(Expr::Count(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::CountDistinct(expr) => Ok(Expr::CountDistinct(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::Sum(expr) => Ok(Expr::Sum(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::Min(expr) => Ok(Expr::Min(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::Max(expr) => Ok(Expr::Max(Box::new(
-                self.rewrite_qualified_expr(expr, resolver)?,
-            ))),
-            Expr::RowNumberOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_qualified_expr(&order_by.expr, resolver)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::RowNumberOver { order_by }),
-            Expr::RankOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_qualified_expr(&order_by.expr, resolver)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::RankOver { order_by }),
-            Expr::DenseRankOver { order_by } => order_by
-                .iter()
-                .map(|order_by| {
-                    Ok(OrderByExpr {
-                        expr: self.rewrite_qualified_expr(&order_by.expr, resolver)?,
-                        direction: order_by.direction,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|order_by| Expr::DenseRankOver { order_by }),
-            Expr::Array(values) => values
-                .iter()
-                .map(|value| self.rewrite_qualified_expr(value, resolver))
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Array),
-            Expr::Range {
-                lower,
-                upper,
-                bounds,
-            } => Ok(Expr::Range {
-                lower: Box::new(self.rewrite_qualified_expr(lower, resolver)?),
-                upper: Box::new(self.rewrite_qualified_expr(upper, resolver)?),
-                bounds: *bounds,
-            }),
-            Expr::Identifier(_)
-            | Expr::Integer(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::CountStar
-            | Expr::HStore(_) => Ok(expr.clone()),
         }
     }
 
