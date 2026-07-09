@@ -662,6 +662,11 @@ pub enum Statement {
         name: ObjectName,
         if_exists: bool,
     },
+    DropTrigger {
+        name: Ident,
+        table: ObjectName,
+        if_exists: bool,
+    },
     DropFunction {
         name: Ident,
         argument_types: Vec<SqlType>,
@@ -1026,6 +1031,12 @@ pub enum BoundStatement {
     },
     DropIndex {
         name: ObjectName,
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: Ident,
+        relation_id: RelationId,
+        table: ObjectName,
         if_exists: bool,
     },
     DropFunction {

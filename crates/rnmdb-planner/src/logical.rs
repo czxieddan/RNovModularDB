@@ -175,6 +175,12 @@ pub enum LogicalPlan {
         name: String,
         if_exists: bool,
     },
+    DropTrigger {
+        name: String,
+        relation_id: RelationId,
+        table: String,
+        if_exists: bool,
+    },
     DropFunction {
         name: String,
         argument_types: Vec<SqlType>,
@@ -423,6 +429,17 @@ impl LogicalPlanner {
             }),
             BoundStatement::DropIndex { name, if_exists } => Ok(LogicalPlan::DropIndex {
                 name: object_name(name),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropTrigger {
+                name,
+                relation_id,
+                table,
+                if_exists,
+            } => Ok(LogicalPlan::DropTrigger {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
+                table: object_name(table),
                 if_exists: *if_exists,
             }),
             BoundStatement::DropFunction {
@@ -1305,6 +1322,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::DropIndex { name, if_exists } => {
             out.push_str(&format!(
                 "{prefix}DropIndex name={name} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropTrigger {
+            name,
+            table,
+            if_exists,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropTrigger name={name} table={table} if_exists={if_exists}\n"
             ));
         }
         LogicalPlan::DropFunction {

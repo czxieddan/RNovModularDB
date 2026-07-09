@@ -2940,6 +2940,7 @@ impl MemoryExecutor {
                     ))
                 }
             }
+            LogicalPlan::DropTrigger { .. } => Ok(ExecutionResult::SchemaChanged),
             LogicalPlan::AlterTableAddColumn {
                 table,
                 column,

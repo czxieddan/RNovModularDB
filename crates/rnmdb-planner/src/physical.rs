@@ -1639,6 +1639,7 @@ fn ddl_description(plan: &LogicalPlan) -> String {
         }
         LogicalPlan::DropTable { table, .. } => format!("DropTable table={table}"),
         LogicalPlan::DropIndex { name, .. } => format!("DropIndex name={name}"),
+        LogicalPlan::DropTrigger { name, .. } => format!("DropTrigger name={name}"),
         LogicalPlan::DropFunction { name, .. } => format!("DropFunction name={name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure name={name}"),
         LogicalPlan::DropOperator { symbol, .. } => format!("DropOperator symbol={symbol}"),

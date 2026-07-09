@@ -326,6 +326,7 @@ impl Parser {
         self.expect_keyword(TokenKind::Drop)?;
         match self.peek_kind() {
             Some(TokenKind::Index) => self.parse_drop_index_tail(),
+            Some(TokenKind::Trigger) => self.parse_drop_trigger_tail(),
             Some(TokenKind::Table) => self.parse_drop_table_tail(),
             Some(TokenKind::Function) => self.parse_drop_function_tail(),
             Some(TokenKind::Procedure) => self.parse_drop_procedure_tail(),
@@ -341,6 +342,19 @@ impl Parser {
         let if_exists = self.parse_if_exists()?;
         let name = self.parse_object_name()?;
         Ok(Statement::DropIndex { name, if_exists })
+    }
+
+    fn parse_drop_trigger_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Trigger)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        Ok(Statement::DropTrigger {
+            name,
+            table,
+            if_exists,
+        })
     }
 
     fn parse_drop_table_tail(&mut self) -> Result<Statement> {

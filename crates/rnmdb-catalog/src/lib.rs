@@ -734,6 +734,19 @@ impl Catalog {
         Ok(trigger)
     }
 
+    pub fn drop_trigger(&mut self, relation_id: RelationId, name: &str) -> Result<Option<Trigger>> {
+        validate_identifier("trigger", name)?;
+        self.ensure_relation_exists(relation_id)?;
+        let Some(position) = self
+            .triggers
+            .iter()
+            .position(|trigger| trigger.relation_id == relation_id && trigger.name == name)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.triggers.remove(position)))
+    }
+
     pub fn create_index(
         &mut self,
         schema_name: &str,

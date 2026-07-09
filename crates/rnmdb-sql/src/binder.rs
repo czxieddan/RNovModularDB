@@ -128,6 +128,19 @@ impl<'a> Binder<'a> {
             } => self.bind_alter_column_encryption(table, column, *encrypted),
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
             Statement::DropIndex { name, if_exists } => self.bind_drop_index(name, *if_exists),
+            Statement::DropTrigger {
+                name,
+                table,
+                if_exists,
+            } => {
+                let resolved = self.resolve_table(table)?;
+                Ok(BoundStatement::DropTrigger {
+                    name: name.clone(),
+                    relation_id: resolved.relation_id(),
+                    table: table.clone(),
+                    if_exists: *if_exists,
+                })
+            }
             Statement::DropFunction {
                 name,
                 argument_types,

@@ -182,6 +182,17 @@ impl LocalSession {
                 self.apply_catalog_drop_index(name, *if_exists)?;
                 Ok(CommandOutput::SchemaChanged)
             }
+            BoundStatement::DropTrigger {
+                name,
+                relation_id,
+                if_exists,
+                ..
+            } => {
+                let plan = self.planner.plan(&bound)?;
+                self.executor.execute_mut(&plan)?;
+                self.apply_catalog_drop_trigger(name.as_str(), *relation_id, *if_exists)?;
+                Ok(CommandOutput::SchemaChanged)
+            }
             BoundStatement::DropFunction {
                 name,
                 argument_types,
@@ -724,6 +735,22 @@ impl LocalSession {
             None => Err(rnmdb_common::RnovError::new(
                 rnmdb_common::ErrorKind::NotFound,
                 format!("index does not exist: {schema}.{}", name.object()),
+            )),
+        }
+    }
+
+    fn apply_catalog_drop_trigger(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_trigger(relation_id, name)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("trigger does not exist: {name}"),
             )),
         }
     }
