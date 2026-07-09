@@ -1383,7 +1383,11 @@ impl<'a> Binder<'a> {
                 }
                 SelectItem::Expr { expr, alias } => {
                     let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr = self.bind_scalar_subqueries(&expr, input.role_id)?;
+                    let expr = self.bind_scalar_subqueries(
+                        &expr,
+                        input.role_id,
+                        Some(OuterQueryScope { table }),
+                    )?;
                     let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -2126,7 +2130,7 @@ impl<'a> Binder<'a> {
             Expr::ExistsSubquery { query } => {
                 self.bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
             }
-            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id),
+            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id, None),
             _ => Ok(expr.clone()),
         }
     }
@@ -2204,33 +2208,50 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn bind_scalar_subqueries(&self, expr: &Expr, role_id: RoleId) -> Result<Expr> {
+    fn bind_scalar_subqueries(
+        &self,
+        expr: &Expr,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
         match expr {
-            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id),
+            Expr::ScalarSubquery { query } => {
+                self.bind_scalar_subquery_expr(query, role_id, outer_scope)
+            }
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.bind_scalar_subqueries(left, role_id)?),
+                left: Box::new(self.bind_scalar_subqueries(left, role_id, outer_scope)?),
                 op: op.clone(),
-                right: Box::new(self.bind_scalar_subqueries(right, role_id)?),
+                right: Box::new(self.bind_scalar_subqueries(right, role_id, outer_scope)?),
             }),
             Expr::Unary { op, expr } => Ok(Expr::Unary {
                 op: op.clone(),
-                expr: Box::new(self.bind_scalar_subqueries(expr, role_id)?),
+                expr: Box::new(self.bind_scalar_subqueries(expr, role_id, outer_scope)?),
             }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.bind_scalar_subqueries(expr, role_id)?,
-            ))),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.bind_scalar_subqueries(
+                expr,
+                role_id,
+                outer_scope,
+            )?))),
             Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.bind_scalar_subqueries(expr, role_id)?),
+                expr: Box::new(self.bind_scalar_subqueries(expr, role_id, outer_scope)?),
                 data_type: data_type.clone(),
             }),
             _ => Ok(expr.clone()),
         }
     }
 
-    fn bind_scalar_subquery_expr(&self, query: &SelectSubquery, role_id: RoleId) -> Result<Expr> {
-        let bound = self.bind_scalar_subquery(query, role_id)?;
-        Ok(Expr::ScalarSubquery {
-            query: SelectSubquery::Bound(Box::new(bound)),
+    fn bind_scalar_subquery_expr(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let (bound, data_type) = self.bind_scalar_subquery(query, role_id, outer_scope)?;
+        Ok(Expr::Cast {
+            expr: Box::new(Expr::ScalarSubquery {
+                query: SelectSubquery::Bound(Box::new(bound)),
+            }),
+            data_type,
         })
     }
 
@@ -2238,14 +2259,19 @@ impl<'a> Binder<'a> {
         &self,
         query: &SelectSubquery,
         role_id: RoleId,
-    ) -> Result<BoundStatement> {
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<(BoundStatement, SqlType)> {
         match query {
             SelectSubquery::Parsed(statement) => {
-                let bound = self.bind_for_role(statement, role_id)?;
-                let _ = single_query_output_type_for(&bound, "scalar subquery")?;
-                Ok(bound)
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
+                let data_type = single_query_output_type_for(&bound, "scalar subquery")?;
+                Ok((bound, data_type))
             }
-            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+            SelectSubquery::Bound(statement) => {
+                let statement = (**statement).clone();
+                let data_type = single_query_output_type_for(&statement, "scalar subquery")?;
+                Ok((statement, data_type))
+            }
         }
     }
 

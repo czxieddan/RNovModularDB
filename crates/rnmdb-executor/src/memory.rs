@@ -1882,8 +1882,7 @@ impl MemoryExecutor {
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
-                apply_projection_cancellable(batch, &items, cancellation)
+                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
@@ -2113,6 +2112,90 @@ impl MemoryExecutor {
             .collect()
     }
 
+    fn apply_projection_with_scalar_subqueries(
+        &self,
+        batch: VectorBatch,
+        items: &[ProjectionItem],
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if self.projection_has_correlated_scalar_subquery(items)? {
+            return self.apply_correlated_scalar_projection(batch, items, cancellation);
+        }
+        let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
+        apply_projection_cancellable(batch, &items, cancellation)
+    }
+
+    fn apply_correlated_scalar_projection(
+        &self,
+        batch: VectorBatch,
+        items: &[ProjectionItem],
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let columns = projection_columns(batch.columns(), items)?;
+        let mut rows = Vec::with_capacity(batch.rows().len());
+        for row in batch.rows() {
+            cancellation.check()?;
+            rows.push(self.correlated_scalar_projection_row(&batch, items, row, cancellation)?);
+        }
+        cancellation.check()?;
+        VectorBatch::new(columns, rows)
+    }
+
+    fn correlated_scalar_projection_row(
+        &self,
+        batch: &VectorBatch,
+        items: &[ProjectionItem],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<Row> {
+        let values = items
+            .iter()
+            .map(|item| {
+                let expr = self.resolve_scalar_subqueries_for_row(
+                    &item.expr,
+                    batch.columns(),
+                    row,
+                    cancellation,
+                )?;
+                eval_expr(batch.columns(), row, &expr)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Row::new(values))
+    }
+
+    fn projection_has_correlated_scalar_subquery(&self, items: &[ProjectionItem]) -> Result<bool> {
+        for item in items {
+            if self.expr_has_correlated_scalar_subquery(&item.expr)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn expr_has_correlated_scalar_subquery(&self, expr: &Expr) -> Result<bool> {
+        match expr {
+            Expr::ScalarSubquery { query } => self.scalar_subquery_has_outer_refs(query),
+            Expr::Binary { left, right, .. } => Ok(self
+                .expr_has_correlated_scalar_subquery(left)?
+                || self.expr_has_correlated_scalar_subquery(right)?),
+            Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
+                self.expr_has_correlated_scalar_subquery(expr)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn scalar_subquery_has_outer_refs(&self, query: &SelectSubquery) -> Result<bool> {
+        let bound = query.bound().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "scalar subquery was not bound before execution",
+            )
+        })?;
+        let plan = LogicalPlanner::new().plan(bound)?;
+        Ok(logical_plan_has_qualified_identifier(&plan))
+    }
+
     fn resolve_scalar_subqueries(
         &self,
         expr: &Expr,
@@ -2143,6 +2226,59 @@ impl MemoryExecutor {
         }
     }
 
+    fn resolve_scalar_subqueries_for_row(
+        &self,
+        expr: &Expr,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<Expr> {
+        match expr {
+            Expr::ScalarSubquery { query } => {
+                let value =
+                    self.execute_scalar_subquery_for_row(query, columns, row, cancellation)?;
+                Ok(Expr::RuntimeValue(value))
+            }
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.resolve_scalar_subqueries_for_row(
+                    left,
+                    columns,
+                    row,
+                    cancellation,
+                )?),
+                op: op.clone(),
+                right: Box::new(self.resolve_scalar_subqueries_for_row(
+                    right,
+                    columns,
+                    row,
+                    cancellation,
+                )?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.resolve_scalar_subqueries_for_row(
+                    expr,
+                    columns,
+                    row,
+                    cancellation,
+                )?),
+            }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.resolve_scalar_subqueries_for_row(expr, columns, row, cancellation)?,
+            ))),
+            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+                expr: Box::new(self.resolve_scalar_subqueries_for_row(
+                    expr,
+                    columns,
+                    row,
+                    cancellation,
+                )?),
+                data_type: data_type.clone(),
+            }),
+            _ => Ok(expr.clone()),
+        }
+    }
+
     fn execute_scalar_subquery(
         &self,
         query: &SelectSubquery,
@@ -2155,6 +2291,25 @@ impl MemoryExecutor {
             )
         })?;
         let plan = LogicalPlanner::new().plan(bound)?;
+        let batch = self.execute_cancellable(&plan, cancellation)?;
+        scalar_subquery_value(&batch)
+    }
+
+    fn execute_scalar_subquery_for_row(
+        &self,
+        query: &SelectSubquery,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<SqlValue> {
+        let bound = query.bound().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "scalar subquery was not bound before execution",
+            )
+        })?;
+        let plan = LogicalPlanner::new().plan(bound)?;
+        let plan = replace_logical_outer_refs(&plan, columns, row)?;
         let batch = self.execute_cancellable(&plan, cancellation)?;
         scalar_subquery_value(&batch)
     }
@@ -2382,8 +2537,7 @@ impl MemoryExecutor {
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
-                apply_projection_cancellable(batch, &items, cancellation)
+                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2552,8 +2706,7 @@ impl MemoryExecutor {
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
-                apply_projection_cancellable(batch, &items, cancellation)
+                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch =
@@ -2931,8 +3084,7 @@ impl MemoryExecutor {
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
-                apply_projection_cancellable(batch, &items, cancellation)
+                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -4662,14 +4814,7 @@ fn apply_projection_cancellable(
     items: &[rnmdb_planner::logical::ProjectionItem],
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let columns = items
-        .iter()
-        .map(|item| {
-            projection_type(batch.columns(), &item.expr)
-                .map(|data_type| ColumnSchema::new(item.name.as_str(), data_type))
-        })
-        .collect::<Result<Vec<_>>>()?;
-
+    let columns = projection_columns(batch.columns(), items)?;
     let mut rows = Vec::with_capacity(batch.rows().len());
     for row in batch.rows() {
         cancellation.check()?;
@@ -4682,6 +4827,19 @@ fn apply_projection_cancellable(
 
     cancellation.check()?;
     VectorBatch::new(columns, rows)
+}
+
+fn projection_columns(
+    columns: &[ColumnSchema],
+    items: &[ProjectionItem],
+) -> Result<Vec<ColumnSchema>> {
+    items
+        .iter()
+        .map(|item| {
+            projection_type(columns, &item.expr)
+                .map(|data_type| ColumnSchema::new(item.name.as_str(), data_type))
+        })
+        .collect()
 }
 
 fn apply_window_cancellable(
