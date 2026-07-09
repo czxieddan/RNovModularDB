@@ -62,8 +62,9 @@ struct OperatorSignatureMetadata<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct OuterQueryScope<'a> {
-    table: &'a Table,
+enum OuterQueryScope<'a> {
+    Table(&'a Table),
+    Columns(&'a [LateralColumn]),
 }
 
 impl<'a> Binder<'a> {
@@ -1388,7 +1389,7 @@ impl<'a> Binder<'a> {
                         &expr,
                         input.role_id,
                         &mut infer,
-                        Some(OuterQueryScope { table }),
+                        Some(OuterQueryScope::Table(table)),
                     )?;
                     let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
@@ -1830,7 +1831,12 @@ impl<'a> Binder<'a> {
         let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
         let bound_columns = lateral_columns_to_bound(&joined_columns);
         let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
-        let predicate = self.bind_column_subqueries(&bound_columns, &predicate, input.role_id)?;
+        let predicate = self.bind_join_predicate_subqueries(
+            &joined_columns,
+            &bound_columns,
+            &predicate,
+            input.role_id,
+        )?;
         self.validate_predicate_from_columns(&bound_columns, &predicate)?;
         let (projection, columns) = self.bind_join_projection(
             input.select_items,
@@ -2001,6 +2007,23 @@ impl<'a> Binder<'a> {
         self.bind_columns_selection(selection.as_ref(), bound_columns, role_id)
     }
 
+    fn bind_join_predicate_subqueries(
+        &self,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        expr: &Expr,
+        role_id: RoleId,
+    ) -> Result<Expr> {
+        let mut infer =
+            |candidate: &Expr| self.infer_expr_type_from_columns(bound_columns, candidate);
+        self.bind_predicate_subqueries(
+            expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Columns(joined_columns)),
+        )
+    }
+
     fn bind_join_order_by(
         &self,
         order_by: &[OrderByExpr],
@@ -2086,7 +2109,12 @@ impl<'a> Binder<'a> {
 
     fn bind_table_subqueries(&self, table: &Table, expr: &Expr, role_id: RoleId) -> Result<Expr> {
         let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
-        self.bind_predicate_subqueries(expr, role_id, &mut infer, Some(OuterQueryScope { table }))
+        self.bind_predicate_subqueries(
+            expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Table(table)),
+        )
     }
 
     fn bind_column_subqueries(
@@ -2416,7 +2444,7 @@ impl<'a> Binder<'a> {
             &expr,
             role_id,
             &mut infer,
-            Some(OuterQueryScope { table }),
+            Some(OuterQueryScope::Table(table)),
         )?;
         self.validate_sort_expr(table, &expr)?;
         Ok(OrderByExpr {
@@ -3763,16 +3791,42 @@ impl<'a> Binder<'a> {
             return Ok(Expr::Identifier(name.clone()));
         }
         if let Some(outer_scope) = outer_scope
-            && self.table_qualifier_matches(outer_scope.table, qualifier)
+            && let Some(expr) =
+                self.rewrite_outer_qualified_identifier(outer_scope, qualifier, name)?
         {
-            let _ = self.resolve_column(outer_scope.table, name.as_str())?;
-            return Ok(Expr::QualifiedIdentifier {
-                qualifier: qualifier.clone(),
-                name: name.clone(),
-            });
+            return Ok(expr);
         }
         self.ensure_table_qualifier(table, qualifier)?;
         unreachable!("ensure_table_qualifier returned Ok for a non-matching qualifier")
+    }
+
+    fn rewrite_outer_qualified_identifier(
+        &self,
+        outer_scope: OuterQueryScope<'_>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Option<Expr>> {
+        match outer_scope {
+            OuterQueryScope::Table(table) => {
+                if !self.table_qualifier_matches(table, qualifier) {
+                    return Ok(None);
+                }
+                let _ = self.resolve_column(table, name.as_str())?;
+                Ok(Some(Expr::QualifiedIdentifier {
+                    qualifier: qualifier.clone(),
+                    name: name.clone(),
+                }))
+            }
+            OuterQueryScope::Columns(columns) => {
+                let Some(column) = outer_lateral_column(columns, qualifier, name)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Expr::QualifiedIdentifier {
+                    qualifier: qualifier.clone(),
+                    name: Ident::new(column.output_name.as_str()),
+                }))
+            }
+        }
     }
 
     fn replace_outer_refs_for_type_validation(
@@ -3784,8 +3838,8 @@ impl<'a> Binder<'a> {
             return Ok(expr.clone());
         };
         rewrite_qualified_expr(expr, &mut |qualifier, name| {
-            if self.table_qualifier_matches(outer_scope.table, qualifier) {
-                return self.typed_null_for_outer_ref(outer_scope, name);
+            if let Some(expr) = self.typed_null_for_outer_ref(outer_scope, qualifier, name)? {
+                return Ok(expr);
             }
             Ok(Expr::QualifiedIdentifier {
                 qualifier: qualifier.clone(),
@@ -3797,13 +3851,24 @@ impl<'a> Binder<'a> {
     fn typed_null_for_outer_ref(
         &self,
         outer_scope: OuterQueryScope<'_>,
+        qualifier: &Ident,
         name: &Ident,
-    ) -> Result<Expr> {
-        let column = self.resolve_column(outer_scope.table, name.as_str())?;
-        Ok(Expr::Cast {
-            expr: Box::new(Expr::Null),
-            data_type: column.data_type,
-        })
+    ) -> Result<Option<Expr>> {
+        match outer_scope {
+            OuterQueryScope::Table(table) => {
+                if !self.table_qualifier_matches(table, qualifier) {
+                    return Ok(None);
+                }
+                let column = self.resolve_column(table, name.as_str())?;
+                Ok(Some(typed_null_expr(column.data_type)))
+            }
+            OuterQueryScope::Columns(columns) => {
+                let Some(column) = outer_lateral_column(columns, qualifier, name)? else {
+                    return Ok(None);
+                };
+                Ok(Some(typed_null_expr(column.column.data_type.clone())))
+            }
+        }
     }
 
     fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
@@ -5551,6 +5616,35 @@ fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<V
 
 fn lateral_columns_to_bound(columns: &[LateralColumn]) -> Vec<BoundColumn> {
     columns.iter().map(|column| column.column.clone()).collect()
+}
+
+fn outer_lateral_column<'a>(
+    columns: &'a [LateralColumn],
+    qualifier: &Ident,
+    name: &Ident,
+) -> Result<Option<&'a LateralColumn>> {
+    let matches = columns
+        .iter()
+        .filter(|column| {
+            column.table_name.eq_ignore_ascii_case(qualifier.as_str())
+                && column.source_name.eq_ignore_ascii_case(name.as_str())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok(Some(*column)),
+        [] => Ok(None),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("ambiguous outer column reference: {qualifier}.{name}"),
+        )),
+    }
+}
+
+fn typed_null_expr(data_type: SqlType) -> Expr {
+    Expr::Cast {
+        expr: Box::new(Expr::Null),
+        data_type,
+    }
 }
 
 fn join_expr_column(
