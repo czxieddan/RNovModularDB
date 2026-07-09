@@ -150,8 +150,13 @@ impl Parser {
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            columns.push(self.parse_column_def()?);
+            if self.next_is_identifier_keyword("foreign") {
+                foreign_keys.push(self.parse_table_foreign_key()?);
+            } else {
+                columns.push(self.parse_column_def()?);
+            }
 
             if self.consume_if(&TokenKind::Comma) {
                 continue;
@@ -159,6 +164,7 @@ impl Parser {
             break;
         }
         self.expect_keyword(TokenKind::RightParen)?;
+        self.apply_table_foreign_keys(&mut columns, foreign_keys)?;
 
         Ok(Statement::CreateTable {
             name,
@@ -509,6 +515,45 @@ impl Parser {
         let column = self.parse_ident()?;
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(ColumnReference { table, column })
+    }
+
+    fn parse_table_foreign_key(&mut self) -> Result<(Ident, ColumnReference)> {
+        if !self.consume_identifier_keyword("foreign") {
+            return Err(self.error("expected FOREIGN"));
+        }
+        if !self.consume_identifier_keyword("key") {
+            return Err(self.error("expected KEY"));
+        }
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let columns = self.parse_ident_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        let [column] = columns.as_slice() else {
+            return Err(self.error("table-level FOREIGN KEY supports exactly one column"));
+        };
+        let reference = self.parse_column_reference()?;
+        Ok((column.clone(), reference))
+    }
+
+    fn apply_table_foreign_keys(
+        &self,
+        columns: &mut [ColumnDef],
+        foreign_keys: Vec<(Ident, ColumnReference)>,
+    ) -> Result<()> {
+        for (column_name, reference) in foreign_keys {
+            let Some(column) = columns.iter_mut().find(|column| column.name == column_name) else {
+                return Err(self.error(format!(
+                    "table-level FOREIGN KEY references unknown column {column_name}"
+                )));
+            };
+            if column.references.is_some() {
+                return Err(self.error(format!(
+                    "column {} has duplicate references clause",
+                    column.name
+                )));
+            }
+            column.references = Some(reference);
+        }
+        Ok(())
     }
 
     fn parse_create_function_tail(&mut self) -> Result<Statement> {
@@ -1849,6 +1894,13 @@ impl Parser {
         } else {
             false
         }
+    }
+
+    fn next_is_identifier_keyword(&self, expected: &str) -> bool {
+        matches!(
+            self.peek_kind(),
+            Some(TokenKind::Identifier(value)) if value == expected
+        )
     }
 
     fn bump(&mut self) {
