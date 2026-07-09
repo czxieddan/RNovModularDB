@@ -173,4 +173,6 @@ Current boundaries:
 
 ## License
 
-RNovModularDB is licensed under AGPL-3.0-only.
+RNovModularDB is offered under a commercial license and under the GNU Affero
+General Public License. For AGPL licensing, see [LICENSE](LICENSE). For custom
+commercial licensing, contact licensing@aperip.com.

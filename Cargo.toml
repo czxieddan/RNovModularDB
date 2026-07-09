@@ -20,7 +20,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-only OR LicenseRef-RNovModularDB-Commercial"
 rust-version = "1.95"
 
 [workspace.dependencies]
