@@ -1,10 +1,14 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::PageId};
-use rnmdb_types::{HStore, HStoreValue, SqlArray, SqlRange, SqlType, SqlValue, TextVector};
+use rnmdb_types::{
+    HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, TextVector,
+};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IndexKey {
@@ -398,11 +402,27 @@ fn hstore_value_token(value: &HStoreValue) -> HStoreValueToken {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryRangeIndex {
     name: String,
     element_type: Option<SqlType>,
-    entries: Vec<(SqlRange, IndexPointer)>,
+    entries: Vec<RangeEntry>,
+    lower_index: BTreeMap<RangeEndpointKey, BTreeSet<usize>>,
+    upper_index: BTreeMap<RangeEndpointKey, BTreeSet<usize>>,
+    last_recheck_count: AtomicUsize,
+}
+
+impl Clone for MemoryRangeIndex {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            element_type: self.element_type.clone(),
+            entries: self.entries.clone(),
+            lower_index: self.lower_index.clone(),
+            upper_index: self.upper_index.clone(),
+            last_recheck_count: AtomicUsize::new(self.last_recheck_count()),
+        }
+    }
 }
 
 impl MemoryRangeIndex {
@@ -411,11 +431,18 @@ impl MemoryRangeIndex {
             name: name.into(),
             element_type: None,
             entries: Vec::new(),
+            lower_index: BTreeMap::new(),
+            upper_index: BTreeMap::new(),
+            last_recheck_count: AtomicUsize::new(0),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn last_recheck_count(&self) -> usize {
+        self.last_recheck_count.load(AtomicOrdering::Relaxed)
     }
 
     pub fn insert_range(&mut self, pointer: IndexPointer, range: &SqlRange) -> Result<()> {
@@ -426,7 +453,12 @@ impl MemoryRangeIndex {
             ));
         }
         self.ensure_range_type(range.element_type())?;
-        self.entries.push((range.clone(), pointer));
+        let entry_id = self.entries.len();
+        self.index_range_entry(entry_id, range)?;
+        self.entries.push(RangeEntry {
+            range: range.clone(),
+            pointer,
+        });
         Ok(())
     }
 
@@ -440,23 +472,72 @@ impl MemoryRangeIndex {
         if let Some(element_type) = other.element_type {
             self.ensure_range_type(&element_type)?;
         }
-        self.entries.extend(other.entries);
+        for entry in other.entries {
+            self.insert_range(entry.pointer, &entry.range)?;
+        }
         Ok(())
     }
 
     pub fn overlap_scan(&self, query: &SqlRange) -> Result<Vec<IndexPointer>> {
+        self.store_last_recheck_count(0);
         if query.is_empty() {
             return Ok(Vec::new());
         }
         self.ensure_query_range_type(query.element_type())?;
 
+        let candidate_ids = self.overlap_candidate_ids(query)?;
+        self.store_last_recheck_count(candidate_ids.len());
         let mut matches = Vec::new();
-        for (range, pointer) in &self.entries {
-            if range.overlaps(query)? {
-                matches.push(*pointer);
+        for entry_id in candidate_ids {
+            let entry = &self.entries[entry_id];
+            if entry.range.overlaps(query)? {
+                matches.push(entry.pointer);
             }
         }
         Ok(matches)
+    }
+
+    fn index_range_entry(&mut self, entry_id: usize, range: &SqlRange) -> Result<()> {
+        let lower_key = lower_index_key(range.lower())?;
+        let upper_key = upper_index_key(range.upper())?;
+        self.lower_index
+            .entry(lower_key)
+            .or_default()
+            .insert(entry_id);
+        self.upper_index
+            .entry(upper_key)
+            .or_default()
+            .insert(entry_id);
+        Ok(())
+    }
+
+    fn overlap_candidate_ids(&self, query: &SqlRange) -> Result<Vec<usize>> {
+        let lower_ids = self.lower_candidate_ids(query.upper())?;
+        let upper_ids = self.upper_candidate_ids(query.lower())?;
+        Ok(intersect_entry_ids(&lower_ids, &upper_ids))
+    }
+
+    fn lower_candidate_ids(&self, query_upper: &RangeBound) -> Result<BTreeSet<usize>> {
+        let upper_key = upper_index_key(query_upper)?;
+        Ok(self
+            .lower_index
+            .range(..=upper_key)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect())
+    }
+
+    fn upper_candidate_ids(&self, query_lower: &RangeBound) -> Result<BTreeSet<usize>> {
+        let lower_key = lower_index_key(query_lower)?;
+        Ok(self
+            .upper_index
+            .range(lower_key..)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect())
+    }
+
+    fn store_last_recheck_count(&self, value: usize) {
+        self.last_recheck_count
+            .store(value, AtomicOrdering::Relaxed);
     }
 
     fn ensure_range_type(&mut self, element_type: &SqlType) -> Result<()> {
@@ -482,6 +563,85 @@ impl MemoryRangeIndex {
             _ => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct RangeEntry {
+    range: SqlRange,
+    pointer: IndexPointer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RangeEndpointKey {
+    NegInfinity,
+    Finite(SqlValue),
+    PosInfinity,
+}
+
+impl Ord for RangeEndpointKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::NegInfinity, Self::NegInfinity) | (Self::PosInfinity, Self::PosInfinity) => {
+                Ordering::Equal
+            }
+            (Self::NegInfinity, _) | (_, Self::PosInfinity) => Ordering::Less,
+            (Self::PosInfinity, _) | (_, Self::NegInfinity) => Ordering::Greater,
+            (Self::Finite(left), Self::Finite(right)) => compare_endpoint_values(left, right),
+        }
+    }
+}
+
+impl PartialOrd for RangeEndpointKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn lower_index_key(bound: &RangeBound) -> Result<RangeEndpointKey> {
+    match bound {
+        RangeBound::Unbounded => Ok(RangeEndpointKey::NegInfinity),
+        RangeBound::Included(value) | RangeBound::Excluded(value) => finite_endpoint_key(value),
+    }
+}
+
+fn upper_index_key(bound: &RangeBound) -> Result<RangeEndpointKey> {
+    match bound {
+        RangeBound::Unbounded => Ok(RangeEndpointKey::PosInfinity),
+        RangeBound::Included(value) | RangeBound::Excluded(value) => finite_endpoint_key(value),
+    }
+}
+
+fn finite_endpoint_key(value: &SqlValue) -> Result<RangeEndpointKey> {
+    if !is_indexable_range_endpoint(value) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range index endpoint must be a comparable scalar value",
+        ));
+    }
+    Ok(RangeEndpointKey::Finite(value.clone()))
+}
+
+fn is_indexable_range_endpoint(value: &SqlValue) -> bool {
+    matches!(
+        value,
+        SqlValue::Bool(_)
+            | SqlValue::Int64(_)
+            | SqlValue::UInt64(_)
+            | SqlValue::Float64(_)
+            | SqlValue::Uuid(_)
+            | SqlValue::Text(_)
+            | SqlValue::Bytes(_)
+    )
+}
+
+fn compare_endpoint_values(left: &SqlValue, right: &SqlValue) -> Ordering {
+    left.sql_cmp(right)
+        .expect("range endpoint comparison is valid")
+        .expect("range endpoint values are non-null")
+}
+
+fn intersect_entry_ids(left: &BTreeSet<usize>, right: &BTreeSet<usize>) -> Vec<usize> {
+    left.intersection(right).copied().collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
