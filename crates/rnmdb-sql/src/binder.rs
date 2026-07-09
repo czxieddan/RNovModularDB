@@ -61,12 +61,26 @@ struct OperatorSignatureMetadata<'a> {
     selectivity_function_id: Option<rnmdb_common::ids::FunctionId>,
 }
 
+#[derive(Clone, Copy)]
+struct OuterQueryScope<'a> {
+    table: &'a Table,
+}
+
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
         Self { catalog }
     }
 
     pub fn bind_for_role(&self, statement: &Statement, role_id: RoleId) -> Result<BoundStatement> {
+        self.bind_for_role_with_outer(statement, role_id, None)
+    }
+
+    fn bind_for_role_with_outer(
+        &self,
+        statement: &Statement,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
         match statement {
             Statement::CreateTable {
                 name,
@@ -348,21 +362,24 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                join: None,
-                lateral_join: None,
-                selection,
-                group_by,
-                grouping_sets: &[],
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::SelectJoin {
                 distinct,
                 projection,
@@ -374,21 +391,24 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                join: Some(join),
-                lateral_join: None,
-                selection,
-                group_by,
-                grouping_sets: &[],
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: Some(join),
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::SelectLateral {
                 distinct,
                 projection,
@@ -400,21 +420,24 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                join: None,
-                lateral_join: Some(lateral_join),
-                selection,
-                group_by,
-                grouping_sets: &[],
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: Some(lateral_join),
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::SelectGroupingSets {
                 distinct,
                 projection,
@@ -426,21 +449,24 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                join: None,
-                lateral_join: None,
-                selection,
-                group_by,
-                grouping_sets,
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets,
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
             Statement::Intersect { all, left, right } => {
                 self.bind_intersect(*all, left, right, role_id)
@@ -1125,7 +1151,11 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    fn bind_select(&self, input: SelectInput<'_>) -> Result<BoundStatement> {
+    fn bind_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
         let table = self.resolve_table(input.from)?;
         self.require_table_privilege(input.role_id, table.relation_id(), Privilege::Select)?;
         if let Some(lateral_join) = input.lateral_join {
@@ -1427,7 +1457,8 @@ impl<'a> Binder<'a> {
         } else {
             None
         };
-        let selection = self.bind_select_selection(table, input.selection, input.role_id)?;
+        let selection =
+            self.bind_select_selection(table, input.selection, input.role_id, outer_scope)?;
         let mut bound_order_by = Vec::with_capacity(input.order_by.len());
         for order_by in input.order_by {
             let order_by = OrderByExpr {
@@ -1972,6 +2003,16 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn validate_predicate_with_outer(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<()> {
+        let expr = self.replace_outer_refs_for_type_validation(expr, outer_scope)?;
+        self.validate_predicate(table, &expr)
+    }
+
     fn validate_predicate_from_columns(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
         match self.infer_expr_type_from_columns(columns, expr)? {
             Some(SqlType::Bool | SqlType::Null) => Ok(()),
@@ -1988,13 +2029,15 @@ impl<'a> Binder<'a> {
         table: &Table,
         selection: &Option<Expr>,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<Option<Expr>> {
         let Some(selection) = selection else {
             return Ok(None);
         };
-        let selection = self.rewrite_table_qualified_expr(table, selection)?;
+        let selection =
+            self.rewrite_table_qualified_expr_with_outer(table, selection, outer_scope)?;
         let selection = self.bind_table_subqueries(table, &selection, role_id)?;
-        self.validate_predicate(table, &selection)?;
+        self.validate_predicate_with_outer(table, &selection, outer_scope)?;
         Ok(Some(selection))
     }
 
@@ -2014,7 +2057,7 @@ impl<'a> Binder<'a> {
 
     fn bind_table_subqueries(&self, table: &Table, expr: &Expr, role_id: RoleId) -> Result<Expr> {
         let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
-        self.bind_predicate_subqueries(expr, role_id, &mut infer)
+        self.bind_predicate_subqueries(expr, role_id, &mut infer, Some(OuterQueryScope { table }))
     }
 
     fn bind_column_subqueries(
@@ -2024,7 +2067,7 @@ impl<'a> Binder<'a> {
         role_id: RoleId,
     ) -> Result<Expr> {
         let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
-        self.bind_predicate_subqueries(expr, role_id, &mut infer)
+        self.bind_predicate_subqueries(expr, role_id, &mut infer, None)
     }
 
     fn bind_predicate_subqueries<F>(
@@ -2032,29 +2075,50 @@ impl<'a> Binder<'a> {
         expr: &Expr,
         role_id: RoleId,
         infer: &mut F,
+        subquery_outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<Expr>
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
         match expr {
             Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.bind_predicate_subqueries(left, role_id, infer)?),
+                left: Box::new(self.bind_predicate_subqueries(
+                    left,
+                    role_id,
+                    infer,
+                    subquery_outer_scope,
+                )?),
                 op: op.clone(),
-                right: Box::new(self.bind_predicate_subqueries(right, role_id, infer)?),
+                right: Box::new(self.bind_predicate_subqueries(
+                    right,
+                    role_id,
+                    infer,
+                    subquery_outer_scope,
+                )?),
             }),
             Expr::Unary { op, expr } => Ok(Expr::Unary {
                 op: op.clone(),
-                expr: Box::new(self.bind_predicate_subqueries(expr, role_id, infer)?),
+                expr: Box::new(self.bind_predicate_subqueries(
+                    expr,
+                    role_id,
+                    infer,
+                    subquery_outer_scope,
+                )?),
             }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.bind_predicate_subqueries(expr, role_id, infer)?,
-            ))),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.bind_predicate_subqueries(
+                expr,
+                role_id,
+                infer,
+                subquery_outer_scope,
+            )?))),
             Expr::InSubquery {
                 expr,
                 query,
                 negated,
             } => self.bind_in_subquery_expr(expr, query, *negated, role_id, infer),
-            Expr::ExistsSubquery { query } => self.bind_exists_subquery_expr(query, role_id),
+            Expr::ExistsSubquery { query } => {
+                self.bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
+            }
             Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id),
             _ => Ok(expr.clone()),
         }
@@ -2071,7 +2135,7 @@ impl<'a> Binder<'a> {
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
-        let expr = self.bind_predicate_subqueries(expr, role_id, infer)?;
+        let expr = self.bind_predicate_subqueries(expr, role_id, infer, None)?;
         let bound = self.bind_in_subquery(query, role_id)?;
         let expr_type = infer(&expr)?.ok_or_else(|| {
             RnovError::new(
@@ -2099,8 +2163,13 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn bind_exists_subquery_expr(&self, query: &SelectSubquery, role_id: RoleId) -> Result<Expr> {
-        let bound = self.bind_exists_subquery(query, role_id)?;
+    fn bind_exists_subquery_expr(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let bound = self.bind_exists_subquery(query, role_id, outer_scope)?;
         Ok(Expr::ExistsSubquery {
             query: SelectSubquery::Bound(Box::new(bound)),
         })
@@ -2110,10 +2179,11 @@ impl<'a> Binder<'a> {
         &self,
         query: &SelectSubquery,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
         match query {
             SelectSubquery::Parsed(statement) => {
-                let bound = self.bind_for_role(statement, role_id)?;
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
                 let _ = query_output_columns(&bound)?;
                 Ok(bound)
             }
@@ -3623,9 +3693,7 @@ impl<'a> Binder<'a> {
     }
 
     fn ensure_table_qualifier(&self, table: &Table, qualifier: &Ident) -> Result<()> {
-        if qualifier.as_str().eq_ignore_ascii_case(table.name())
-            || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
-        {
+        if self.table_qualifier_matches(table, qualifier) {
             Ok(())
         } else {
             Err(RnovError::new(
@@ -3639,11 +3707,82 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn table_qualifier_matches(&self, table: &Table, qualifier: &Ident) -> bool {
+        qualifier.as_str().eq_ignore_ascii_case(table.name())
+            || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
+    }
+
     fn rewrite_table_qualified_expr(&self, table: &Table, expr: &Expr) -> Result<Expr> {
         rewrite_qualified_expr(expr, &mut |qualifier, name| {
             self.ensure_table_qualifier(table, qualifier)?;
             let _ = self.resolve_column(table, name.as_str())?;
             Ok(Expr::Identifier(name.clone()))
+        })
+    }
+
+    fn rewrite_table_qualified_expr_with_outer(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            self.rewrite_table_qualified_identifier(table, outer_scope, qualifier, name)
+        })
+    }
+
+    fn rewrite_table_qualified_identifier(
+        &self,
+        table: &Table,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Expr> {
+        if self.table_qualifier_matches(table, qualifier) {
+            let _ = self.resolve_column(table, name.as_str())?;
+            return Ok(Expr::Identifier(name.clone()));
+        }
+        if let Some(outer_scope) = outer_scope
+            && self.table_qualifier_matches(outer_scope.table, qualifier)
+        {
+            let _ = self.resolve_column(outer_scope.table, name.as_str())?;
+            return Ok(Expr::QualifiedIdentifier {
+                qualifier: qualifier.clone(),
+                name: name.clone(),
+            });
+        }
+        self.ensure_table_qualifier(table, qualifier)?;
+        unreachable!("ensure_table_qualifier returned Ok for a non-matching qualifier")
+    }
+
+    fn replace_outer_refs_for_type_validation(
+        &self,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let Some(outer_scope) = outer_scope else {
+            return Ok(expr.clone());
+        };
+        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            if self.table_qualifier_matches(outer_scope.table, qualifier) {
+                return self.typed_null_for_outer_ref(outer_scope, name);
+            }
+            Ok(Expr::QualifiedIdentifier {
+                qualifier: qualifier.clone(),
+                name: name.clone(),
+            })
+        })
+    }
+
+    fn typed_null_for_outer_ref(
+        &self,
+        outer_scope: OuterQueryScope<'_>,
+        name: &Ident,
+    ) -> Result<Expr> {
+        let column = self.resolve_column(outer_scope.table, name.as_str())?;
+        Ok(Expr::Cast {
+            expr: Box::new(Expr::Null),
+            data_type: column.data_type,
         })
     }
 

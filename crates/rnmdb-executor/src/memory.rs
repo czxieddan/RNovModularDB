@@ -1835,8 +1835,7 @@ impl MemoryExecutor {
                 input,
             } => {
                 let input = self.execute_cancellable(input, cancellation)?;
-                let subquery = self.execute_cancellable(subquery, cancellation)?;
-                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+                self.apply_logical_exists_subquery_filter(input, subquery, *negated, cancellation)
             }
             LogicalPlan::TextSearch {
                 relation_id,
@@ -2009,6 +2008,44 @@ impl MemoryExecutor {
 
         let executor = self.with_recursive_table(name, &accumulated)?;
         executor.execute_cancellable(query, cancellation)
+    }
+
+    fn apply_logical_exists_subquery_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &LogicalPlan,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if logical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_logical_exists_filter(
+                input,
+                subquery,
+                negated,
+                cancellation,
+            );
+        }
+        let subquery = self.execute_cancellable(subquery, cancellation)?;
+        apply_exists_subquery_filter(input, &subquery, negated, cancellation)
+    }
+
+    fn apply_correlated_logical_exists_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &LogicalPlan,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut rows = Vec::new();
+        for row in input.rows() {
+            cancellation.check()?;
+            let subquery = replace_logical_outer_refs(subquery, input.columns(), row)?;
+            let subquery = self.execute_cancellable(&subquery, cancellation)?;
+            if exists_subquery_keeps_row(&subquery, negated) {
+                rows.push(row.clone());
+            }
+        }
+        VectorBatch::new(input.columns().to_vec(), rows)
     }
 
     fn with_recursive_table(&self, name: &str, batch: &VectorBatch) -> Result<Self> {
@@ -2806,8 +2843,7 @@ impl MemoryExecutor {
                 input,
             } => {
                 let input = self.execute_parallel_cancellable(input, config, cancellation)?;
-                let subquery = self.execute_parallel_cancellable(subquery, config, cancellation)?;
-                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+                self.apply_logical_exists_subquery_filter(input, subquery, *negated, cancellation)
             }
             LogicalPlan::TextSearch {
                 relation_id,
@@ -4323,11 +4359,204 @@ fn apply_exists_subquery_filter(
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     cancellation.check()?;
-    if subquery.rows().is_empty() == negated {
+    if exists_subquery_keeps_row(subquery, negated) {
         Ok(batch)
     } else {
         VectorBatch::new(batch.columns().to_vec(), Vec::new())
     }
+}
+
+fn exists_subquery_keeps_row(subquery: &VectorBatch, negated: bool) -> bool {
+    subquery.rows().is_empty() == negated
+}
+
+fn logical_plan_has_qualified_identifier(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { predicate, input } => {
+            expr_contains_qualified_identifier(predicate)
+                || logical_plan_has_qualified_identifier(input)
+        }
+        LogicalPlan::Project { items, input } => {
+            items
+                .iter()
+                .any(|item| expr_contains_qualified_identifier(&item.expr))
+                || logical_plan_has_qualified_identifier(input)
+        }
+        LogicalPlan::Sort { keys, input } => {
+            keys.iter()
+                .any(|key| expr_contains_qualified_identifier(&key.expr))
+                || logical_plan_has_qualified_identifier(input)
+        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Parallel { input, .. }
+        | LogicalPlan::Explain { input, .. } => logical_plan_has_qualified_identifier(input),
+        _ => false,
+    }
+}
+
+fn replace_logical_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Filter { .. } => replace_filter_outer_refs(plan, columns, row),
+        LogicalPlan::Project { .. } => replace_project_outer_refs(plan, columns, row),
+        LogicalPlan::Sort { .. } => replace_sort_outer_refs(plan, columns, row),
+        _ => replace_input_only_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_filter_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    let LogicalPlan::Filter { predicate, input } = plan else {
+        unreachable!("replace_filter_outer_refs only accepts filter plans")
+    };
+    Ok(LogicalPlan::Filter {
+        predicate: replace_outer_refs_expr(predicate, columns, row)?,
+        input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+    })
+}
+
+fn replace_project_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    let LogicalPlan::Project { items, input } = plan else {
+        unreachable!("replace_project_outer_refs only accepts project plans")
+    };
+    Ok(LogicalPlan::Project {
+        items: replace_projection_outer_refs(items, columns, row)?,
+        input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+    })
+}
+
+fn replace_sort_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    let LogicalPlan::Sort { keys, input } = plan else {
+        unreachable!("replace_sort_outer_refs only accepts sort plans")
+    };
+    Ok(LogicalPlan::Sort {
+        keys: replace_order_by_outer_refs(keys, columns, row)?,
+        input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+    })
+}
+
+fn replace_input_only_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Limit { count, input } => Ok(LogicalPlan::Limit {
+            count: *count,
+            input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+        }),
+        LogicalPlan::Offset { count, input } => Ok(LogicalPlan::Offset {
+            count: *count,
+            input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+        }),
+        LogicalPlan::Distinct { input } => Ok(LogicalPlan::Distinct {
+            input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+        }),
+        LogicalPlan::Parallel { hint, input } => Ok(LogicalPlan::Parallel {
+            hint: hint.clone(),
+            input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+        }),
+        LogicalPlan::Explain {
+            analyze,
+            format,
+            input,
+        } => Ok(LogicalPlan::Explain {
+            analyze: *analyze,
+            format: *format,
+            input: Box::new(replace_logical_outer_refs(input, columns, row)?),
+        }),
+        _ => Ok(plan.clone()),
+    }
+}
+
+fn replace_projection_outer_refs(
+    items: &[ProjectionItem],
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<Vec<ProjectionItem>> {
+    items
+        .iter()
+        .map(|item| {
+            Ok(ProjectionItem {
+                name: item.name.clone(),
+                expr: replace_outer_refs_expr(&item.expr, columns, row)?,
+            })
+        })
+        .collect()
+}
+
+fn replace_order_by_outer_refs(
+    keys: &[OrderByExpr],
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<Vec<OrderByExpr>> {
+    keys.iter()
+        .map(|key| {
+            Ok(OrderByExpr {
+                expr: replace_outer_refs_expr(&key.expr, columns, row)?,
+                direction: key.direction,
+            })
+        })
+        .collect()
+}
+
+fn expr_contains_qualified_identifier(expr: &Expr) -> bool {
+    match expr {
+        Expr::QualifiedIdentifier { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_qualified_identifier(left) || expr_contains_qualified_identifier(right)
+        }
+        Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
+            expr_contains_qualified_identifier(expr)
+        }
+        _ => false,
+    }
+}
+
+fn replace_outer_refs_expr(expr: &Expr, columns: &[ColumnSchema], row: &Row) -> Result<Expr> {
+    match expr {
+        Expr::QualifiedIdentifier { name, .. } => {
+            outer_runtime_value(columns, row, name.as_str()).map(Expr::RuntimeValue)
+        }
+        Expr::Binary { left, op, right } => Ok(Expr::Binary {
+            left: Box::new(replace_outer_refs_expr(left, columns, row)?),
+            op: op.clone(),
+            right: Box::new(replace_outer_refs_expr(right, columns, row)?),
+        }),
+        Expr::Unary { op, expr } => Ok(Expr::Unary {
+            op: op.clone(),
+            expr: Box::new(replace_outer_refs_expr(expr, columns, row)?),
+        }),
+        Expr::Not(expr) => Ok(Expr::Not(Box::new(replace_outer_refs_expr(
+            expr, columns, row,
+        )?))),
+        Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+            expr: Box::new(replace_outer_refs_expr(expr, columns, row)?),
+            data_type: data_type.clone(),
+        }),
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn outer_runtime_value(columns: &[ColumnSchema], row: &Row, name: &str) -> Result<SqlValue> {
+    let index = column_index(columns, name)?;
+    Ok(row.values()[index].clone())
 }
 
 fn apply_nested_loop_join_cancellable(
