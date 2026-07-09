@@ -63,7 +63,10 @@ use set_ops::{
     apply_distinct_cancellable, apply_except_cancellable, apply_intersect_cancellable,
     apply_union_cancellable,
 };
-use sort::{apply_sort_cancellable, compare_sort_row_keys, compare_sort_rows, sort_rows};
+use sort::{
+    apply_sort_cancellable, apply_sort_with_key_values_cancellable, compare_sort_row_keys,
+    compare_sort_rows, sort_rows,
+};
 
 const MEMORY_INDEX_PAGE_ID: PageId = PageId::new(0);
 const MEMORY_SUMMARY_BLOCK_ROWS: usize = 2;
@@ -2324,8 +2327,66 @@ impl MemoryExecutor {
         keys: &[OrderByExpr],
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
+        if self.order_by_needs_row_subquery_resolution(keys)? {
+            return self.apply_sort_with_row_subqueries(batch, keys, cancellation);
+        }
         let keys = self.resolve_order_by_scalar_subqueries(keys, cancellation)?;
         apply_sort_cancellable(batch, &keys, cancellation)
+    }
+
+    fn order_by_needs_row_subquery_resolution(&self, keys: &[OrderByExpr]) -> Result<bool> {
+        for key in keys {
+            if self.expr_has_correlated_scalar_subquery(&key.expr)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_sort_with_row_subqueries(
+        &self,
+        batch: VectorBatch,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let key_values = self.resolve_order_by_row_subquery_values(&batch, keys, cancellation)?;
+        apply_sort_with_key_values_cancellable(batch, keys, key_values, cancellation)
+    }
+
+    fn resolve_order_by_row_subquery_values(
+        &self,
+        batch: &VectorBatch,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        batch
+            .rows()
+            .iter()
+            .map(|row| {
+                self.resolve_order_by_row_subquery_values_for_row(
+                    batch.columns(),
+                    row,
+                    keys,
+                    cancellation,
+                )
+            })
+            .collect()
+    }
+
+    fn resolve_order_by_row_subquery_values_for_row(
+        &self,
+        columns: &[ColumnSchema],
+        row: &Row,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<SqlValue>> {
+        keys.iter()
+            .map(|key| {
+                let expr =
+                    self.resolve_subqueries_for_row(&key.expr, columns, row, cancellation)?;
+                eval_expr(columns, row, &expr)
+            })
+            .collect()
     }
 
     fn resolve_order_by_scalar_subqueries(

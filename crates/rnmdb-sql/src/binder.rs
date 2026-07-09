@@ -2403,7 +2403,7 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
-        let expr = self.bind_scalar_subqueries(&expr, role_id, None)?;
+        let expr = self.bind_scalar_subqueries(&expr, role_id, Some(OuterQueryScope { table }))?;
         self.validate_sort_expr(table, &expr)?;
         Ok(OrderByExpr {
             expr,
