@@ -5581,41 +5581,21 @@ fn replace_order_by_outer_refs(
 }
 
 fn expr_contains_qualified_identifier(expr: &Expr) -> bool {
-    match expr {
-        Expr::QualifiedIdentifier { .. } => true,
-        Expr::Binary { left, right, .. } => {
-            expr_contains_qualified_identifier(left) || expr_contains_qualified_identifier(right)
-        }
-        Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
-            expr_contains_qualified_identifier(expr)
-        }
-        _ => false,
-    }
+    let mut found = false;
+    let _ = rewrite_expr_tree(expr, &mut |candidate| {
+        found |= matches!(candidate, Expr::QualifiedIdentifier { .. });
+        Ok(None)
+    });
+    found
 }
 
 fn replace_outer_refs_expr(expr: &Expr, columns: &[ColumnSchema], row: &Row) -> Result<Expr> {
-    match expr {
-        Expr::QualifiedIdentifier { name, .. } => {
-            outer_runtime_value(columns, row, name.as_str()).map(Expr::RuntimeValue)
-        }
-        Expr::Binary { left, op, right } => Ok(Expr::Binary {
-            left: Box::new(replace_outer_refs_expr(left, columns, row)?),
-            op: op.clone(),
-            right: Box::new(replace_outer_refs_expr(right, columns, row)?),
-        }),
-        Expr::Unary { op, expr } => Ok(Expr::Unary {
-            op: op.clone(),
-            expr: Box::new(replace_outer_refs_expr(expr, columns, row)?),
-        }),
-        Expr::Not(expr) => Ok(Expr::Not(Box::new(replace_outer_refs_expr(
-            expr, columns, row,
-        )?))),
-        Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-            expr: Box::new(replace_outer_refs_expr(expr, columns, row)?),
-            data_type: data_type.clone(),
-        }),
-        _ => Ok(expr.clone()),
-    }
+    rewrite_expr_tree(expr, &mut |candidate| match candidate {
+        Expr::QualifiedIdentifier { name, .. } => outer_runtime_value(columns, row, name.as_str())
+            .map(Expr::RuntimeValue)
+            .map(Some),
+        _ => Ok(None),
+    })
 }
 
 fn outer_runtime_value(columns: &[ColumnSchema], row: &Row, name: &str) -> Result<SqlValue> {
