@@ -2929,6 +2929,7 @@ impl MemoryExecutor {
                 })?;
                 Ok(ExecutionResult::SchemaChanged)
             }
+            LogicalPlan::CreateTrigger { .. } => Ok(ExecutionResult::SchemaChanged),
             LogicalPlan::DropIndex { name, if_exists } => {
                 if self.drop_index(name)? || *if_exists {
                     Ok(ExecutionResult::SchemaChanged)

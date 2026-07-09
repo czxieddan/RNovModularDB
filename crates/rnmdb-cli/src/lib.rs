@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::Path, time::Instant};
 
 use rnmdb_catalog::{
     Catalog, CatalogCodec, ForeignKeyReference, IndexKey, OperatorSignature, Privilege, RowPolicy,
-    Table as CatalogTable,
+    Table as CatalogTable, Trigger, TriggerEvent, TriggerTiming,
 };
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
@@ -51,6 +51,7 @@ pub struct LocalSession {
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
     procedure_call_stack: Vec<String>,
+    trigger_stack: Vec<String>,
     durable: Option<LocalDurableStore>,
     transaction_manager: TransactionManager,
     transaction: Option<LocalTransactionState>,
@@ -152,6 +153,25 @@ impl LocalSession {
                     keys,
                     *method,
                     *unique,
+                    *if_not_exists,
+                )?;
+                Ok(CommandOutput::SchemaChanged)
+            }
+            BoundStatement::CreateTrigger {
+                name,
+                relation_id,
+                timing,
+                event,
+                body,
+                if_not_exists,
+                ..
+            } => {
+                self.apply_catalog_create_trigger(
+                    name.as_str(),
+                    *relation_id,
+                    *timing,
+                    *event,
+                    body,
                     *if_not_exists,
                 )?;
                 Ok(CommandOutput::SchemaChanged)
@@ -351,6 +371,7 @@ impl LocalSession {
             optimizer: RuleOptimizer::new(),
             execution,
             procedure_call_stack: Vec::new(),
+            trigger_stack: Vec::new(),
             durable,
             transaction_manager: TransactionManager::new(),
             transaction: None,
@@ -372,11 +393,20 @@ impl LocalSession {
         let plan = self.planner.plan(statement)?;
         let snapshot = self.executor.snapshot()?;
         let output = self.executor.execute_mut(&plan)?;
-        if let Err(err) = self.validate_foreign_keys_after_mutation(statement) {
+        if let Err(err) = self.finish_mutation_statement(statement, &output) {
             self.executor = snapshot;
             return Err(err);
         }
         Ok(CommandOutput::from(output))
+    }
+
+    fn finish_mutation_statement(
+        &mut self,
+        statement: &BoundStatement,
+        output: &ExecutionResult,
+    ) -> Result<()> {
+        self.validate_foreign_keys_after_mutation(statement)?;
+        self.execute_after_triggers(statement, output)
     }
 
     fn validate_foreign_keys_after_mutation(&self, statement: &BoundStatement) -> Result<()> {
@@ -465,6 +495,63 @@ impl LocalSession {
                     ),
                 )
             })
+    }
+
+    fn execute_after_triggers(
+        &mut self,
+        statement: &BoundStatement,
+        output: &ExecutionResult,
+    ) -> Result<()> {
+        if mutation_rows_affected(output) == 0 {
+            return Ok(());
+        }
+        let Some((relation_id, event)) = self.trigger_target(statement)? else {
+            return Ok(());
+        };
+        let triggers = self
+            .catalog
+            .triggers_for(relation_id, TriggerTiming::After, event)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for trigger in triggers {
+            self.execute_trigger(&trigger)?;
+        }
+        Ok(())
+    }
+
+    fn trigger_target(
+        &self,
+        statement: &BoundStatement,
+    ) -> Result<Option<(RelationId, TriggerEvent)>> {
+        match statement {
+            BoundStatement::Insert { table, .. } => {
+                let table = self.catalog_table_for_name(table)?;
+                Ok(Some((table.relation_id(), TriggerEvent::Insert)))
+            }
+            BoundStatement::Update(update) => Ok(Some((update.relation_id, TriggerEvent::Update))),
+            BoundStatement::Delete(delete) => Ok(Some((delete.relation_id, TriggerEvent::Delete))),
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_trigger(&mut self, trigger: &Trigger) -> Result<()> {
+        let key = trigger_stack_key(trigger);
+        if self.trigger_stack.iter().any(|active| active == &key) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "recursive trigger execution is not allowed: {}",
+                    trigger.name()
+                ),
+            ));
+        }
+        self.trigger_stack.push(key);
+        let result = self.execute(trigger.body()).map(|_| ());
+        self.trigger_stack
+            .pop()
+            .expect("trigger stack must contain active trigger");
+        result
     }
 
     fn execute_transaction(&mut self, action: TransactionAction) -> Result<CommandOutput> {
@@ -603,6 +690,29 @@ impl LocalSession {
             method,
             unique,
         )?;
+        Ok(())
+    }
+
+    fn apply_catalog_create_trigger(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self
+            .catalog
+            .triggers_for(relation_id, timing, event)
+            .iter()
+            .any(|trigger| trigger.name() == name)
+            && if_not_exists
+        {
+            return Ok(());
+        }
+        self.catalog
+            .create_trigger(name, relation_id, timing, event, body)?;
         Ok(())
     }
 
@@ -1084,6 +1194,17 @@ fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
         .get_role("local")
         .map(|role| role.role_id())
         .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
+}
+
+fn mutation_rows_affected(output: &ExecutionResult) -> u64 {
+    match output {
+        ExecutionResult::RowsAffected(rows) => *rows,
+        _ => 0,
+    }
+}
+
+fn trigger_stack_key(trigger: &Trigger) -> String {
+    format!("{}:{}", trigger.relation_id().get(), trigger.name())
 }
 
 fn batch_column_index(batch: &VectorBatch, column: &str) -> Result<usize> {

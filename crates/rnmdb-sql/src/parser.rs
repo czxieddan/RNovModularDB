@@ -1,4 +1,4 @@
-use rnmdb_catalog::{IndexMethod, Privilege};
+use rnmdb_catalog::{IndexMethod, Privilege, TriggerEvent, TriggerTiming};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlType;
 
@@ -124,6 +124,7 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::Index) => self.parse_create_index_tail(unique),
             Some(TokenKind::Table) => self.parse_create_table_tail(),
+            Some(TokenKind::Trigger) => self.parse_create_trigger_tail(unique),
             Some(TokenKind::Function) => self.parse_create_function_tail(),
             Some(TokenKind::Procedure) => self.parse_create_procedure_tail(),
             Some(TokenKind::OperatorKeyword) => self.parse_create_operator_tail(),
@@ -191,6 +192,51 @@ impl Parser {
             unique,
             if_not_exists,
         })
+    }
+
+    fn parse_create_trigger_tail(&mut self, unique: bool) -> Result<Statement> {
+        if unique {
+            return Err(self.error("CREATE UNIQUE TRIGGER is not supported"));
+        }
+        self.expect_keyword(TokenKind::Trigger)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::After)?;
+        let event = self.parse_trigger_event()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::Execute)?;
+        if !self.consume_identifier_keyword("sql") {
+            return Err(self.error("expected SQL after EXECUTE"));
+        }
+        let body = self.parse_string_literal("trigger SQL body")?;
+        Ok(Statement::CreateTrigger {
+            name,
+            table,
+            timing: TriggerTiming::After,
+            event,
+            body,
+            if_not_exists,
+        })
+    }
+
+    fn parse_trigger_event(&mut self) -> Result<TriggerEvent> {
+        match self.peek_kind() {
+            Some(TokenKind::Insert) => {
+                self.bump();
+                Ok(TriggerEvent::Insert)
+            }
+            Some(TokenKind::Update) => {
+                self.bump();
+                Ok(TriggerEvent::Update)
+            }
+            Some(TokenKind::Delete) => {
+                self.bump();
+                Ok(TriggerEvent::Delete)
+            }
+            Some(kind) => Err(self.error(format!("unexpected trigger event {kind:?}"))),
+            None => Err(self.error("expected trigger event")),
+        }
     }
 
     fn parse_index_keys(&mut self) -> Result<Vec<IndexKeyDef>> {

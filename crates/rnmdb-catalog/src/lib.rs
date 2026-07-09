@@ -114,6 +114,18 @@ impl ForeignKeyReference {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TriggerTiming {
+    After,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IndexMethod {
     BTree,
     Hash,
@@ -224,6 +236,7 @@ pub struct Catalog {
     functions: Vec<Function>,
     procedures: Vec<Procedure>,
     operators: Vec<Operator>,
+    triggers: Vec<Trigger>,
     indexes: Vec<Index>,
     roles: BTreeMap<String, Role>,
     grants: Vec<TableGrant>,
@@ -245,6 +258,7 @@ impl Catalog {
             functions: Vec::new(),
             procedures: Vec::new(),
             operators: Vec::new(),
+            triggers: Vec::new(),
             indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
@@ -328,6 +342,22 @@ impl Catalog {
 
     pub fn operators(&self) -> &[Operator] {
         &self.operators
+    }
+
+    pub fn triggers(&self) -> &[Trigger] {
+        &self.triggers
+    }
+
+    pub fn triggers_for(
+        &self,
+        relation_id: RelationId,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+    ) -> Vec<&Trigger> {
+        self.triggers
+            .iter()
+            .filter(|trigger| trigger.matches(relation_id, timing, event))
+            .collect()
     }
 
     pub fn get_operator(
@@ -496,6 +526,8 @@ impl Catalog {
 
         self.indexes
             .retain(|index| index.relation_id != table.relation_id);
+        self.triggers
+            .retain(|trigger| trigger.relation_id != table.relation_id);
         self.grants
             .retain(|grant| grant.relation_id != table.relation_id);
         self.row_policies.remove(&table.relation_id);
@@ -663,6 +695,43 @@ impl Catalog {
         self.next_operator_id += 1;
         self.operators.push(operator.clone());
         Ok(operator)
+    }
+
+    pub fn create_trigger(
+        &mut self,
+        name: impl Into<String>,
+        relation_id: RelationId,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: impl Into<String>,
+    ) -> Result<Trigger> {
+        let name = name.into();
+        let body = body.into();
+        validate_identifier("trigger", &name)?;
+        validate_trigger_body(&body)?;
+        let table = self
+            .table_by_relation_id(relation_id)
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "trigger table does not exist"))?;
+        if self
+            .triggers
+            .iter()
+            .any(|trigger| trigger.relation_id == relation_id && trigger.name == name)
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("trigger already exists: {name}"),
+            ));
+        }
+        let trigger = Trigger {
+            name,
+            relation_id,
+            table_name: table.name.clone(),
+            timing,
+            event,
+            body,
+        };
+        self.triggers.push(trigger.clone());
+        Ok(trigger)
     }
 
     pub fn create_index(
@@ -1206,6 +1275,46 @@ impl Operator {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Trigger {
+    name: String,
+    relation_id: RelationId,
+    table_name: String,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    body: String,
+}
+
+impl Trigger {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn relation_id(&self) -> RelationId {
+        self.relation_id
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn timing(&self) -> TriggerTiming {
+        self.timing
+    }
+
+    pub fn event(&self) -> TriggerEvent {
+        self.event
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    fn matches(&self, relation_id: RelationId, timing: TriggerTiming, event: TriggerEvent) -> bool {
+        self.relation_id == relation_id && self.timing == timing && self.event == event
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Index {
     schema_name: String,
     name: String,
@@ -1361,6 +1470,16 @@ fn validate_identifier(kind: &'static str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_trigger_body(body: &str) -> Result<()> {
+    if body.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "trigger body cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_columns(columns: &[Column]) -> Result<()> {
     if columns.is_empty() {
         return Err(RnovError::new(
@@ -1480,7 +1599,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 11;
+    const VERSION: u16 = 12;
     const MIN_READ_VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
@@ -1569,6 +1688,16 @@ impl CatalogCodec {
                 }
                 None => out.push(0),
             }
+        }
+
+        write_u32(&mut out, catalog.triggers.len() as u32);
+        for trigger in &catalog.triggers {
+            write_string(&mut out, &trigger.name)?;
+            write_u64(&mut out, trigger.relation_id.get());
+            write_string(&mut out, &trigger.table_name)?;
+            out.push(encode_trigger_timing(trigger.timing));
+            out.push(encode_trigger_event(trigger.event));
+            write_string(&mut out, &trigger.body)?;
         }
 
         write_u32(&mut out, catalog.indexes.len() as u32);
@@ -1663,6 +1792,7 @@ impl CatalogCodec {
             functions: Vec::new(),
             procedures: Vec::new(),
             operators: Vec::new(),
+            triggers: Vec::new(),
             indexes: Vec::new(),
             roles: BTreeMap::new(),
             grants: Vec::new(),
@@ -1807,6 +1937,23 @@ impl CatalogCodec {
                     selectivity_function_id,
                 },
             });
+        }
+
+        if version >= 12 {
+            let trigger_count = reader.read_u32("trigger count")? as usize;
+            for _ in 0..trigger_count {
+                let trigger = Trigger {
+                    name: reader.read_string("trigger name")?,
+                    relation_id: RelationId::new(reader.read_u64("trigger relation id")?),
+                    table_name: reader.read_string("trigger table")?,
+                    timing: decode_trigger_timing(reader.read_u8("trigger timing")?)?,
+                    event: decode_trigger_event(reader.read_u8("trigger event")?)?,
+                    body: reader.read_string("trigger body")?,
+                };
+                validate_trigger_body(&trigger.body)?;
+                catalog.ensure_relation_exists(trigger.relation_id)?;
+                catalog.triggers.push(trigger);
+            }
         }
 
         let index_count = reader.read_u32("index count")? as usize;
@@ -2094,6 +2241,42 @@ fn decode_index_method(raw: u8) -> Result<IndexMethod> {
         unknown => Err(RnovError::new(
             ErrorKind::Corruption,
             format!("unknown index method tag {unknown}"),
+        )),
+    }
+}
+
+fn encode_trigger_timing(timing: TriggerTiming) -> u8 {
+    match timing {
+        TriggerTiming::After => 0,
+    }
+}
+
+fn decode_trigger_timing(raw: u8) -> Result<TriggerTiming> {
+    match raw {
+        0 => Ok(TriggerTiming::After),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown trigger timing tag {unknown}"),
+        )),
+    }
+}
+
+fn encode_trigger_event(event: TriggerEvent) -> u8 {
+    match event {
+        TriggerEvent::Insert => 0,
+        TriggerEvent::Update => 1,
+        TriggerEvent::Delete => 2,
+    }
+}
+
+fn decode_trigger_event(raw: u8) -> Result<TriggerEvent> {
+    match raw {
+        0 => Ok(TriggerEvent::Insert),
+        1 => Ok(TriggerEvent::Update),
+        2 => Ok(TriggerEvent::Delete),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown trigger event tag {unknown}"),
         )),
     }
 }

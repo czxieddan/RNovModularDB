@@ -1,4 +1,4 @@
-use rnmdb_catalog::IndexMethod;
+use rnmdb_catalog::{IndexMethod, TriggerEvent, TriggerTiming};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
@@ -143,6 +143,15 @@ pub enum LogicalPlan {
         keys: Vec<IndexKeyDef>,
         method: IndexMethod,
         unique: bool,
+        if_not_exists: bool,
+    },
+    CreateTrigger {
+        name: String,
+        relation_id: RelationId,
+        table: String,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
         if_not_exists: bool,
     },
     AlterTableAddColumn {
@@ -362,6 +371,23 @@ impl LogicalPlanner {
                 keys: keys.iter().map(index_key_def_from_bound).collect(),
                 method: *method,
                 unique: *unique,
+                if_not_exists: *if_not_exists,
+            }),
+            BoundStatement::CreateTrigger {
+                name,
+                relation_id,
+                table,
+                timing,
+                event,
+                body,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateTrigger {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
+                table: object_name(table),
+                timing: *timing,
+                event: *event,
+                body: body.clone(),
                 if_not_exists: *if_not_exists,
             }),
             BoundStatement::AlterTableAddColumn {
@@ -1224,6 +1250,23 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", "),
                 exists
+            ));
+        }
+        LogicalPlan::CreateTrigger {
+            name,
+            table,
+            timing,
+            event,
+            if_not_exists,
+            ..
+        } => {
+            let exists = if *if_not_exists {
+                " if_not_exists=true"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{exists}\n"
             ));
         }
         LogicalPlan::AlterTableAddColumn {

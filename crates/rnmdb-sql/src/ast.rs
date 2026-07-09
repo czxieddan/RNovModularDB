@@ -1,6 +1,9 @@
 use std::fmt;
 
-use rnmdb_catalog::{Column, ForeignKeyReference, IndexMethod, OperatorSignature, Privilege};
+use rnmdb_catalog::{
+    Column, ForeignKeyReference, IndexMethod, OperatorSignature, Privilege, TriggerEvent,
+    TriggerTiming,
+};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_types::{SqlFloat64, SqlType};
 
@@ -633,6 +636,14 @@ pub enum Statement {
         unique: bool,
         if_not_exists: bool,
     },
+    CreateTrigger {
+        name: Ident,
+        table: ObjectName,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
+        if_not_exists: bool,
+    },
     AlterTableAddColumn {
         table: ObjectName,
         column: ColumnDef,
@@ -985,6 +996,15 @@ pub enum BoundStatement {
         keys: Vec<BoundIndexKey>,
         method: IndexMethod,
         unique: bool,
+        if_not_exists: bool,
+    },
+    CreateTrigger {
+        name: Ident,
+        relation_id: RelationId,
+        table: ObjectName,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
         if_not_exists: bool,
     },
     AlterTableAddColumn {

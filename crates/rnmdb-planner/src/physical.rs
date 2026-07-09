@@ -1630,6 +1630,7 @@ fn ddl_description(plan: &LogicalPlan) -> String {
     match plan {
         LogicalPlan::CreateTable { table, .. } => format!("CreateTable table={table}"),
         LogicalPlan::CreateIndex { name, .. } => format!("CreateIndex name={name}"),
+        LogicalPlan::CreateTrigger { name, .. } => format!("CreateTrigger name={name}"),
         LogicalPlan::AlterTableAddColumn { table, column, .. } => {
             format!("AlterTableAddColumn table={table} column={}", column.name)
         }

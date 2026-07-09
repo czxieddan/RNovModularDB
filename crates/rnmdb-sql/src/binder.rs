@@ -88,6 +88,14 @@ impl<'a> Binder<'a> {
                 unique,
                 if_not_exists,
             } => self.bind_create_index(name, table, keys, *method, *unique, *if_not_exists),
+            Statement::CreateTrigger {
+                name,
+                table,
+                timing,
+                event,
+                body,
+                if_not_exists,
+            } => self.bind_create_trigger(name, table, *timing, *event, body, *if_not_exists),
             Statement::AlterTableAddColumn {
                 table,
                 column,
@@ -863,6 +871,28 @@ impl<'a> Binder<'a> {
             ));
         }
         Ok(())
+    }
+
+    fn bind_create_trigger(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        timing: rnmdb_catalog::TriggerTiming,
+        event: rnmdb_catalog::TriggerEvent,
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        validate_trigger_sql_body(body)?;
+        Ok(BoundStatement::CreateTrigger {
+            name: name.clone(),
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            timing,
+            event,
+            body: body.to_string(),
+            if_not_exists,
+        })
     }
 
     fn bind_insert(
@@ -5378,6 +5408,20 @@ fn validate_sql_procedure_body(body: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_trigger_sql_body(body: &str) -> Result<()> {
+    let statement = parse_statement(body)?;
+    if matches!(
+        statement,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
+    ) {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "trigger SQL body must be INSERT, UPDATE, or DELETE",
+    ))
 }
 
 fn procedure_argument_type(expr: &Expr) -> Result<SqlType> {
