@@ -1899,7 +1899,7 @@ impl MemoryExecutor {
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
+                self.apply_projection_with_subqueries(batch, items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
@@ -2129,20 +2129,20 @@ impl MemoryExecutor {
             .collect()
     }
 
-    fn apply_projection_with_scalar_subqueries(
+    fn apply_projection_with_subqueries(
         &self,
         batch: VectorBatch,
         items: &[ProjectionItem],
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
-        if self.projection_has_correlated_scalar_subquery(items)? {
-            return self.apply_correlated_scalar_projection(batch, items, cancellation);
+        if self.projection_needs_row_subquery_resolution(items)? {
+            return self.apply_projection_with_row_subqueries(batch, items, cancellation);
         }
         let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
         apply_projection_cancellable(batch, &items, cancellation)
     }
 
-    fn apply_correlated_scalar_projection(
+    fn apply_projection_with_row_subqueries(
         &self,
         batch: VectorBatch,
         items: &[ProjectionItem],
@@ -2152,7 +2152,7 @@ impl MemoryExecutor {
         let mut rows = Vec::with_capacity(batch.rows().len());
         for row in batch.rows() {
             cancellation.check()?;
-            rows.push(self.correlated_scalar_projection_row(&batch, items, row, cancellation)?);
+            rows.push(self.row_subquery_projection_row(&batch, items, row, cancellation)?);
         }
         cancellation.check()?;
         VectorBatch::new(columns, rows)
@@ -2228,7 +2228,7 @@ impl MemoryExecutor {
         Ok(matched)
     }
 
-    fn correlated_scalar_projection_row(
+    fn row_subquery_projection_row(
         &self,
         batch: &VectorBatch,
         items: &[ProjectionItem],
@@ -2238,7 +2238,7 @@ impl MemoryExecutor {
         let values = items
             .iter()
             .map(|item| {
-                let expr = self.resolve_scalar_subqueries_for_row(
+                let expr = self.resolve_subqueries_for_row(
                     &item.expr,
                     batch.columns(),
                     row,
@@ -2250,9 +2250,9 @@ impl MemoryExecutor {
         Ok(Row::new(values))
     }
 
-    fn projection_has_correlated_scalar_subquery(&self, items: &[ProjectionItem]) -> Result<bool> {
+    fn projection_needs_row_subquery_resolution(&self, items: &[ProjectionItem]) -> Result<bool> {
         for item in items {
-            if self.expr_has_correlated_scalar_subquery(&item.expr)? {
+            if self.expr_needs_row_subquery_resolution(&item.expr)? {
                 return Ok(true);
             }
         }
@@ -2402,22 +2402,6 @@ impl MemoryExecutor {
                 })
             })
             .collect()
-    }
-
-    fn resolve_scalar_subqueries_for_row(
-        &self,
-        expr: &Expr,
-        columns: &[ColumnSchema],
-        row: &Row,
-        cancellation: &CancellationToken,
-    ) -> Result<Expr> {
-        rewrite_expr_tree(expr, &mut |candidate| match candidate {
-            Expr::ScalarSubquery { query } => self
-                .execute_scalar_subquery_for_row(query, columns, row, cancellation)
-                .map(Expr::RuntimeValue)
-                .map(Some),
-            _ => Ok(None),
-        })
     }
 
     fn resolve_subqueries_for_row(
@@ -2755,7 +2739,7 @@ impl MemoryExecutor {
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
+                self.apply_projection_with_subqueries(batch, items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2929,7 +2913,7 @@ impl MemoryExecutor {
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
+                self.apply_projection_with_subqueries(batch, items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch =
@@ -3320,7 +3304,7 @@ impl MemoryExecutor {
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                self.apply_projection_with_scalar_subqueries(batch, items, cancellation)
+                self.apply_projection_with_subqueries(batch, items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -5841,14 +5825,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         }
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
-        Expr::InSubquery { .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "IN subquery must be planned as a filter before projection",
-        )),
-        Expr::ExistsSubquery { .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "EXISTS subquery must be planned as a filter before projection",
-        )),
+        Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => Ok(SqlType::Bool),
         Expr::ScalarSubquery { .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "scalar subquery must be resolved before projection",

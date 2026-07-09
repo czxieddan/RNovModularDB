@@ -1383,9 +1383,11 @@ impl<'a> Binder<'a> {
                 }
                 SelectItem::Expr { expr, alias } => {
                     let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr = self.bind_scalar_subqueries(
+                    let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+                    let expr = self.bind_predicate_subqueries(
                         &expr,
                         input.role_id,
+                        &mut infer,
                         Some(OuterQueryScope { table }),
                     )?;
                     let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
@@ -2179,20 +2181,6 @@ impl<'a> Binder<'a> {
             }
             SelectSubquery::Bound(statement) => Ok((**statement).clone()),
         }
-    }
-
-    fn bind_scalar_subqueries(
-        &self,
-        expr: &Expr,
-        role_id: RoleId,
-        outer_scope: Option<OuterQueryScope<'_>>,
-    ) -> Result<Expr> {
-        crate::rewrite_expr_tree(expr, &mut |candidate| match candidate {
-            Expr::ScalarSubquery { query } => self
-                .bind_scalar_subquery_expr(query, role_id, outer_scope)
-                .map(Some),
-            _ => Ok(None),
-        })
     }
 
     fn bind_scalar_subquery_expr(
