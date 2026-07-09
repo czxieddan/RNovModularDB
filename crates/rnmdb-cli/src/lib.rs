@@ -382,13 +382,26 @@ impl LocalSession {
     fn validate_foreign_keys_after_mutation(&self, statement: &BoundStatement) -> Result<()> {
         match statement {
             BoundStatement::Insert { table, .. } => self.validate_table_foreign_keys(table),
-            BoundStatement::Update(update) => self.validate_table_foreign_keys(&update.table),
+            BoundStatement::Update(_) | BoundStatement::Delete(_) => {
+                self.validate_all_foreign_keys()
+            }
             _ => Ok(()),
         }
     }
 
     fn validate_table_foreign_keys(&self, table_name: &ObjectName) -> Result<()> {
         let table = self.catalog_table_for_name(table_name)?;
+        self.validate_catalog_table_foreign_keys(table)
+    }
+
+    fn validate_all_foreign_keys(&self) -> Result<()> {
+        for table in self.catalog.tables() {
+            self.validate_catalog_table_foreign_keys(table)?;
+        }
+        Ok(())
+    }
+
+    fn validate_catalog_table_foreign_keys(&self, table: &CatalogTable) -> Result<()> {
         if !table
             .columns()
             .iter()
