@@ -5,7 +5,7 @@ use rnmdb_catalog::{
     TriggerTiming,
 };
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
-use rnmdb_types::{SqlFloat64, SqlType};
+use rnmdb_types::{SqlFloat64, SqlType, SqlValue};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Ident(String);
@@ -146,6 +146,7 @@ pub enum Expr {
     String(String),
     Bool(bool),
     Null,
+    RuntimeValue(SqlValue),
     CountStar,
     Count(Box<Expr>),
     CountDistinct(Box<Expr>),
@@ -213,6 +214,9 @@ pub enum Expr {
         negated: bool,
     },
     ExistsSubquery {
+        query: SelectSubquery,
+    },
+    ScalarSubquery {
         query: SelectSubquery,
     },
     Like {
@@ -297,6 +301,7 @@ impl fmt::Display for Expr {
             Self::Bool(true) => f.write_str("TRUE"),
             Self::Bool(false) => f.write_str("FALSE"),
             Self::Null => f.write_str("NULL"),
+            Self::RuntimeValue(value) => write!(f, "{value:?}"),
             Self::CountStar => f.write_str("count(*)"),
             Self::Count(expr) => write!(f, "count({expr})"),
             Self::CountDistinct(expr) => write!(f, "count(DISTINCT {expr})"),
@@ -414,6 +419,7 @@ impl fmt::Display for Expr {
                 }
             }
             Self::ExistsSubquery { .. } => f.write_str("EXISTS (subquery)"),
+            Self::ScalarSubquery { .. } => f.write_str("(subquery)"),
             Self::Like {
                 expr,
                 pattern,

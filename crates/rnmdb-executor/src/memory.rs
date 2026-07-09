@@ -29,13 +29,16 @@ use rnmdb_planner::{
     cost::{TableStatistics, TextLexemeStatistics},
     logical::{
         AggregateFunction, AggregateItem, GroupedAggregateItem, GroupedAggregateItemKind,
-        LogicalPlan, WindowFunction, WindowItem,
+        LogicalPlan, LogicalPlanner, ProjectionItem, WindowFunction, WindowItem,
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
 use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
-    ast::{CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, JoinKind, OrderByExpr},
+    ast::{
+        CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, JoinKind, OrderByExpr,
+        SelectSubquery,
+    },
     parser::parse_expr,
 };
 use rnmdb_types::{
@@ -1807,13 +1810,14 @@ impl MemoryExecutor {
                 })
             }
             LogicalPlan::Filter { predicate, input } => {
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
-                    self.execute_indexed_filter_scan(predicate, input, cancellation)?
+                    self.execute_indexed_filter_scan(&predicate, input, cancellation)?
                 {
                     return Ok(batch);
                 }
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_filter_cancellable(batch, predicate, cancellation)
+                apply_filter_cancellable(batch, &predicate, cancellation)
             }
             LogicalPlan::InSubqueryFilter {
                 expr,
@@ -1875,11 +1879,13 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_cancellable(left, cancellation)?;
                 let right = self.execute_cancellable(right, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_projection_cancellable(batch, items, cancellation)
+                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
+                apply_projection_cancellable(batch, &items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
@@ -2011,6 +2017,68 @@ impl MemoryExecutor {
             .write_tables()?
             .insert(name.to_string(), memory_table_from_batch(batch)?);
         Ok(executor)
+    }
+
+    fn resolve_projection_scalar_subqueries(
+        &self,
+        items: &[ProjectionItem],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<ProjectionItem>> {
+        items
+            .iter()
+            .map(|item| {
+                Ok(ProjectionItem {
+                    name: item.name.clone(),
+                    expr: self.resolve_scalar_subqueries(&item.expr, cancellation)?,
+                })
+            })
+            .collect()
+    }
+
+    fn resolve_scalar_subqueries(
+        &self,
+        expr: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<Expr> {
+        match expr {
+            Expr::ScalarSubquery { query } => {
+                let value = self.execute_scalar_subquery(query, cancellation)?;
+                Ok(Expr::RuntimeValue(value))
+            }
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.resolve_scalar_subqueries(left, cancellation)?),
+                op: op.clone(),
+                right: Box::new(self.resolve_scalar_subqueries(right, cancellation)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.resolve_scalar_subqueries(expr, cancellation)?),
+            }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.resolve_scalar_subqueries(expr, cancellation)?,
+            ))),
+            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+                expr: Box::new(self.resolve_scalar_subqueries(expr, cancellation)?),
+                data_type: data_type.clone(),
+            }),
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn execute_scalar_subquery(
+        &self,
+        query: &SelectSubquery,
+        cancellation: &CancellationToken,
+    ) -> Result<SqlValue> {
+        let bound = query.bound().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "scalar subquery was not bound before execution",
+            )
+        })?;
+        let plan = LogicalPlanner::new().plan(bound)?;
+        let batch = self.execute_cancellable(&plan, cancellation)?;
+        scalar_subquery_value(&batch)
     }
 
     pub fn execute_physical(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
@@ -2203,13 +2271,15 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_physical_cancellable(left, cancellation)?;
                 let right = self.execute_physical_cancellable(right, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_filter_cancellable(batch, predicate, cancellation)
+                apply_filter_cancellable(batch, &predicate, cancellation)
             }
             PhysicalPlan::InSubqueryFilter {
                 expr,
@@ -2234,7 +2304,8 @@ impl MemoryExecutor {
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_projection_cancellable(batch, items, cancellation)
+                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
+                apply_projection_cancellable(batch, &items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2370,9 +2441,10 @@ impl MemoryExecutor {
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                apply_filter_cancellable(batch, predicate, cancellation)
+                apply_filter_cancellable(batch, &predicate, cancellation)
             }
             PhysicalPlan::InSubqueryFilter {
                 expr,
@@ -2402,7 +2474,8 @@ impl MemoryExecutor {
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                apply_projection_cancellable(batch, items, cancellation)
+                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
+                apply_projection_cancellable(batch, &items, cancellation)
             }
             PhysicalPlan::Window { items, input, .. } => {
                 let batch =
@@ -2708,13 +2781,14 @@ impl MemoryExecutor {
                     .scan_parallel_cancellable(config, cancellation)
             }
             LogicalPlan::Filter { predicate, input } => {
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
-                    self.execute_indexed_filter_scan(predicate, input, cancellation)?
+                    self.execute_indexed_filter_scan(&predicate, input, cancellation)?
                 {
                     return Ok(batch);
                 }
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_filter_cancellable(batch, predicate, cancellation)
+                apply_filter_cancellable(batch, &predicate, cancellation)
             }
             LogicalPlan::InSubqueryFilter {
                 expr,
@@ -2776,11 +2850,13 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_projection_cancellable(batch, items, cancellation)
+                let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
+                apply_projection_cancellable(batch, &items, cancellation)
             }
             LogicalPlan::Window { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -4155,6 +4231,26 @@ struct InSubqueryValues {
     has_null: bool,
 }
 
+fn scalar_subquery_value(batch: &VectorBatch) -> Result<SqlValue> {
+    if batch.columns().len() != 1 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "scalar subquery expected one column, got {}",
+                batch.columns().len()
+            ),
+        ));
+    }
+    match batch.rows() {
+        [] => Ok(SqlValue::Null),
+        [row] => Ok(row.values()[0].clone()),
+        rows => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("scalar subquery returned more than one row: {}", rows.len()),
+        )),
+    }
+}
+
 fn apply_in_subquery_filter_cancellable(
     batch: VectorBatch,
     subquery: VectorBatch,
@@ -5006,6 +5102,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Bool(_) => Ok(SqlType::Bool),
         Expr::Null => Ok(SqlType::Null),
+        Expr::RuntimeValue(value) => Ok(value.data_type()),
         Expr::CountStar => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "COUNT(*) requires aggregate execution",
@@ -5074,6 +5171,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::ExistsSubquery { .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "EXISTS subquery must be planned as a filter before projection",
+        )),
+        Expr::ScalarSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "scalar subquery must be resolved before projection",
         )),
         Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Coalesce(values) => projection_coalesce_type(columns, values),
@@ -5390,6 +5491,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         | Expr::String(_)
         | Expr::Bool(_)
         | Expr::Null
+        | Expr::RuntimeValue(_)
         | Expr::Array(_)
         | Expr::HStore(_)
         | Expr::Range { .. } => literal_value(expr),
@@ -5452,6 +5554,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::ExistsSubquery { .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "EXISTS subquery must be executed by an ExistsSubqueryFilter plan",
+        )),
+        Expr::ScalarSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "scalar subquery must be resolved before expression evaluation",
         )),
         Expr::Like {
             expr,
@@ -6350,6 +6456,7 @@ fn literal_value(expr: &Expr) -> Result<SqlValue> {
         Expr::String(value) => Ok(SqlValue::Text(value.clone())),
         Expr::Bool(value) => Ok(SqlValue::Bool(*value)),
         Expr::Null => Ok(SqlValue::Null),
+        Expr::RuntimeValue(value) => Ok(value.clone()),
         Expr::Array(values) => array_literal_value(values),
         Expr::HStore(entries) => hstore_literal_value(entries),
         Expr::Range {

@@ -1353,6 +1353,7 @@ impl<'a> Binder<'a> {
                 }
                 SelectItem::Expr { expr, alias } => {
                     let expr = self.rewrite_table_qualified_expr(table, expr)?;
+                    let expr = self.bind_scalar_subqueries(&expr, input.role_id)?;
                     let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
                         RnovError::new(
                             ErrorKind::InvalidInput,
@@ -2054,6 +2055,7 @@ impl<'a> Binder<'a> {
                 negated,
             } => self.bind_in_subquery_expr(expr, query, *negated, role_id, infer),
             Expr::ExistsSubquery { query } => self.bind_exists_subquery_expr(query, role_id),
+            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id),
             _ => Ok(expr.clone()),
         }
     }
@@ -2119,6 +2121,51 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn bind_scalar_subqueries(&self, expr: &Expr, role_id: RoleId) -> Result<Expr> {
+        match expr {
+            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id),
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.bind_scalar_subqueries(left, role_id)?),
+                op: op.clone(),
+                right: Box::new(self.bind_scalar_subqueries(right, role_id)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.bind_scalar_subqueries(expr, role_id)?),
+            }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.bind_scalar_subqueries(expr, role_id)?,
+            ))),
+            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
+                expr: Box::new(self.bind_scalar_subqueries(expr, role_id)?),
+                data_type: data_type.clone(),
+            }),
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn bind_scalar_subquery_expr(&self, query: &SelectSubquery, role_id: RoleId) -> Result<Expr> {
+        let bound = self.bind_scalar_subquery(query, role_id)?;
+        Ok(Expr::ScalarSubquery {
+            query: SelectSubquery::Bound(Box::new(bound)),
+        })
+    }
+
+    fn bind_scalar_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role(statement, role_id)?;
+                let _ = single_query_output_type_for(&bound, "scalar subquery")?;
+                Ok(bound)
+            }
+            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+        }
+    }
+
     fn infer_bound_in_subquery_type(&self, query: &SelectSubquery) -> Result<Option<SqlType>> {
         if query.bound().is_some() {
             Ok(Some(SqlType::Bool))
@@ -2128,6 +2175,16 @@ impl<'a> Binder<'a> {
                 "IN subquery is only supported in bound SELECT predicates",
             ))
         }
+    }
+
+    fn infer_bound_scalar_subquery_type(&self, query: &SelectSubquery) -> Result<Option<SqlType>> {
+        let Some(bound) = query.bound() else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "scalar subquery is only supported after binding",
+            ));
+        };
+        single_query_output_type_for(bound, "scalar subquery").map(Some)
     }
 
     fn bind_ranking_window_projection(
@@ -2492,6 +2549,7 @@ impl<'a> Binder<'a> {
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
+            | Expr::RuntimeValue(_)
             | Expr::HStore(_) => Ok(()),
             Expr::Array(values) => values
                 .iter()
@@ -2562,6 +2620,10 @@ impl<'a> Binder<'a> {
                 "GROUP BY does not support subqueries",
             )),
             Expr::ExistsSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support subqueries",
+            )),
+            Expr::ScalarSubquery { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "GROUP BY does not support subqueries",
             )),
@@ -3073,7 +3135,12 @@ impl<'a> Binder<'a> {
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
+            | Expr::RuntimeValue(_)
             | Expr::HStore(_) => Ok(expr.clone()),
+            Expr::ScalarSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support scalar subqueries yet",
+            )),
         }
     }
 
@@ -3247,6 +3314,8 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
             Expr::CountStar
             | Expr::Count(_)
             | Expr::CountDistinct(_)
@@ -3627,6 +3696,7 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "bound recursive CTE expression must not contain qualified column references",
             )),
+            Expr::RuntimeValue(_) => Ok(()),
             Expr::Binary { left, right, .. } => {
                 self.validate_cte_identifiers(columns, left)?;
                 self.validate_cte_identifiers(columns, right)
@@ -3665,6 +3735,10 @@ impl<'a> Binder<'a> {
                 "recursive CTE expressions do not support subqueries",
             )),
             Expr::ExistsSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE expressions do not support subqueries",
+            )),
+            Expr::ScalarSubquery { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "recursive CTE expressions do not support subqueries",
             )),
@@ -3946,6 +4020,8 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
             Expr::CountStar => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
@@ -4204,6 +4280,8 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
             Expr::CountStar => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "COUNT(*) is only supported as a SELECT projection",
@@ -4508,6 +4586,8 @@ impl<'a> Binder<'a> {
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
             Expr::CountStar
             | Expr::Count(_)
             | Expr::CountDistinct(_)
@@ -5120,6 +5200,7 @@ fn hidden_group_key_nullable(table: &Table, expr: &Expr) -> bool {
             .unwrap_or(true),
         Expr::Integer(_) | Expr::Float64(_) | Expr::String(_) | Expr::Bool(_) => false,
         Expr::Null => true,
+        Expr::RuntimeValue(value) => value.is_null(),
         _ => true,
     }
 }
@@ -5154,13 +5235,17 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
 }
 
 fn single_query_output_type(statement: &BoundStatement) -> Result<SqlType> {
+    single_query_output_type_for(statement, "IN subquery")
+}
+
+fn single_query_output_type_for(statement: &BoundStatement, context: &str) -> Result<SqlType> {
     let columns = query_output_columns(statement)?;
     match columns {
         [column] => Ok(column.data_type.clone()),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!(
-                "IN subquery must return exactly one column, got {}",
+                "{context} must return exactly one column, got {}",
                 columns.len()
             ),
         )),

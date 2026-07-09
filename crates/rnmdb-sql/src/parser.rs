@@ -1445,6 +1445,13 @@ impl Parser {
             }
             Some(TokenKind::LeftParen) => {
                 self.bump();
+                if self.peek_kind() == Some(&TokenKind::Select) {
+                    let query = self.parse_query()?;
+                    self.expect_keyword(TokenKind::RightParen)?;
+                    return Ok(Expr::ScalarSubquery {
+                        query: SelectSubquery::Parsed(Box::new(query)),
+                    });
+                }
                 let expr = self.parse_expr()?;
                 self.expect_keyword(TokenKind::RightParen)?;
                 Ok(expr)
