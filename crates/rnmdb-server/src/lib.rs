@@ -1,6 +1,8 @@
 use std::{
+    fmt,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    path::{Path, PathBuf},
 };
 
 use rnmdb_cli::CommandOutput;
@@ -9,10 +11,37 @@ use rnmdb_common::ids::{DatabaseId, InstanceId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_instance::{InstanceConfig, InstanceManager, ResourceLimits, ResourceUsage};
 use rnmdb_security::{AuthenticationProvider, LocalCredentialStore};
+use rnmdb_storage::PageCryptoKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
     TemporaryMemory,
+    SingleFile,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SingleFileRuntimeConfig {
+    path: PathBuf,
+    page_key: PageCryptoKey,
+}
+
+impl SingleFileRuntimeConfig {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn page_key(&self) -> PageCryptoKey {
+        self.page_key
+    }
+}
+
+impl fmt::Debug for SingleFileRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SingleFileRuntimeConfig")
+            .field("path", &self.path)
+            .field("page_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +49,7 @@ pub struct EmbeddedRuntimeConfig {
     instance: InstanceConfig,
     mode: EmbeddedRuntimeMode,
     temporary: bool,
+    single_file: Option<SingleFileRuntimeConfig>,
     credentials: Option<LocalCredentialStore>,
 }
 
@@ -37,6 +67,41 @@ impl EmbeddedRuntimeConfig {
             instance: InstanceConfig::isolated(instance_id, database_id, limits),
             mode: EmbeddedRuntimeMode::TemporaryMemory,
             temporary: true,
+            single_file: None,
+            credentials: None,
+        }
+    }
+
+    pub fn single_file_with_key(
+        instance_id: InstanceId,
+        database_id: DatabaseId,
+        path: impl AsRef<Path>,
+        page_key: PageCryptoKey,
+    ) -> Self {
+        Self::single_file_with_key_and_limits(
+            instance_id,
+            database_id,
+            path,
+            page_key,
+            ResourceLimits::default(),
+        )
+    }
+
+    pub fn single_file_with_key_and_limits(
+        instance_id: InstanceId,
+        database_id: DatabaseId,
+        path: impl AsRef<Path>,
+        page_key: PageCryptoKey,
+        limits: ResourceLimits,
+    ) -> Self {
+        Self {
+            instance: InstanceConfig::isolated(instance_id, database_id, limits),
+            mode: EmbeddedRuntimeMode::SingleFile,
+            temporary: false,
+            single_file: Some(SingleFileRuntimeConfig {
+                path: path.as_ref().to_path_buf(),
+                page_key,
+            }),
             credentials: None,
         }
     }
@@ -63,7 +128,7 @@ impl EmbeddedRuntimeConfig {
     }
 
     pub fn disk_writes_allowed(&self) -> bool {
-        false
+        matches!(self.mode, EmbeddedRuntimeMode::SingleFile)
     }
 
     pub fn authentication_required(&self) -> bool {
@@ -72,6 +137,10 @@ impl EmbeddedRuntimeConfig {
 
     pub fn credentials(&self) -> Option<&LocalCredentialStore> {
         self.credentials.as_ref()
+    }
+
+    pub fn single_file(&self) -> Option<&SingleFileRuntimeConfig> {
+        self.single_file.as_ref()
     }
 }
 
@@ -176,9 +245,11 @@ fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()>
     loop {
         command.clear();
         if read_sql_command(&mut reader, &mut command)? == 0 {
+            checkpoint_client_session(runtime, &mut session)?;
             return Ok(());
         }
         if execute_sql_command_line(runtime, &mut session, &mut writer, command.trim())? {
+            checkpoint_client_session(runtime, &mut session)?;
             return Ok(());
         }
     }
@@ -220,7 +291,14 @@ fn execute_sql_command_line(
         return Ok(false);
     };
     let line = match session.execute(command) {
-        Ok(output) => protocol_output_line(output),
+        Ok(output) => {
+            let should_checkpoint = command_output_needs_checkpoint(&output);
+            let line = protocol_output_line(output);
+            if should_checkpoint {
+                checkpoint_local_session(runtime, session)?;
+            }
+            line
+        }
         Err(err) => format!("ERR {}", protocol_text(&err.to_string())),
     };
     write_protocol_line(writer, &line)?;
@@ -257,6 +335,30 @@ fn authenticate_client(runtime: &EmbeddedRuntime, username: &str, password: &str
     credentials
         .authenticate(username, password)
         .map(|principal| principal.is_some())
+}
+
+fn command_output_needs_checkpoint(output: &CommandOutput) -> bool {
+    matches!(
+        output,
+        CommandOutput::RowsAffected(_) | CommandOutput::SchemaChanged
+    )
+}
+
+fn checkpoint_client_session(
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
+) -> Result<()> {
+    let Some(session) = session.as_mut() else {
+        return Ok(());
+    };
+    checkpoint_local_session(runtime, session)
+}
+
+fn checkpoint_local_session(runtime: &EmbeddedRuntime, session: &mut LocalSession) -> Result<()> {
+    if runtime.config().disk_writes_allowed() {
+        session.checkpoint()?;
+    }
+    Ok(())
 }
 
 fn parse_auth_command(command: &str) -> Option<(&str, &str)> {
@@ -369,14 +471,21 @@ impl EmbeddedRuntime {
     }
 
     pub fn open_session_with_usage(&self, usage: ResourceUsage) -> Result<LocalSession> {
-        if !self.config.is_memory_only() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "embedded runtime only supports memory sessions",
-            ));
-        }
         self.config.instance().check_resource_usage(&usage)?;
-        LocalSession::memory()
+        match self.config.mode() {
+            EmbeddedRuntimeMode::TemporaryMemory => LocalSession::memory(),
+            EmbeddedRuntimeMode::SingleFile => self.open_single_file_session(),
+        }
+    }
+
+    fn open_single_file_session(&self) -> Result<LocalSession> {
+        let config = self.config.single_file().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "single-file runtime mode is missing storage config",
+            )
+        })?;
+        LocalSession::single_file_with_key(config.path(), config.page_key())
     }
 
     pub async fn open_session_with_usage_async(
