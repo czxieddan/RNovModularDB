@@ -713,6 +713,36 @@ impl BoundingBox {
             .zip(other.axes.iter())
             .all(|(left, right)| left.intersects(*right)))
     }
+
+    fn union(&self, other: &Self) -> Self {
+        let axes = self
+            .axes
+            .iter()
+            .copied()
+            .zip(other.axes.iter().copied())
+            .map(|(left, right)| AxisBounds {
+                lower: left.lower().min(right.lower()),
+                upper: left.upper().max(right.upper()),
+            })
+            .collect();
+        Self { axes }
+    }
+
+    fn area(&self) -> f64 {
+        self.axes
+            .iter()
+            .map(|axis| axis.upper().saturating_sub(axis.lower()).saturating_add(1) as f64)
+            .product()
+    }
+
+    fn enlargement_for(&self, other: &Self) -> f64 {
+        self.union(other).area() - self.area()
+    }
+
+    fn center_on_axis(&self, axis_index: usize) -> i64 {
+        let axis = self.axes[axis_index];
+        axis.lower().saturating_add(axis.upper()) / 2
+    }
 }
 
 #[derive(Debug)]
@@ -720,9 +750,9 @@ pub struct MemoryBoundsIndex {
     name: String,
     rank: Option<usize>,
     entries: Vec<BoundsEntry>,
-    lower_indexes: Vec<BTreeMap<i64, BTreeSet<usize>>>,
-    upper_indexes: Vec<BTreeMap<i64, BTreeSet<usize>>>,
+    tree: Option<BoundsRTree>,
     last_recheck_count: AtomicUsize,
+    last_tree_node_visit_count: AtomicUsize,
 }
 
 impl Clone for MemoryBoundsIndex {
@@ -731,9 +761,9 @@ impl Clone for MemoryBoundsIndex {
             name: self.name.clone(),
             rank: self.rank,
             entries: self.entries.clone(),
-            lower_indexes: self.lower_indexes.clone(),
-            upper_indexes: self.upper_indexes.clone(),
+            tree: self.tree.clone(),
             last_recheck_count: AtomicUsize::new(self.last_recheck_count()),
+            last_tree_node_visit_count: AtomicUsize::new(self.last_tree_node_visit_count()),
         }
     }
 }
@@ -744,9 +774,9 @@ impl MemoryBoundsIndex {
             name: name.into(),
             rank: None,
             entries: Vec::new(),
-            lower_indexes: Vec::new(),
-            upper_indexes: Vec::new(),
+            tree: None,
             last_recheck_count: AtomicUsize::new(0),
+            last_tree_node_visit_count: AtomicUsize::new(0),
         }
     }
 
@@ -758,10 +788,15 @@ impl MemoryBoundsIndex {
         self.last_recheck_count.load(AtomicOrdering::Relaxed)
     }
 
+    pub fn last_tree_node_visit_count(&self) -> usize {
+        self.last_tree_node_visit_count
+            .load(AtomicOrdering::Relaxed)
+    }
+
     pub fn insert_box(&mut self, pointer: IndexPointer, bounds: &BoundingBox) -> Result<()> {
         self.ensure_rank(bounds.rank())?;
         let entry_id = self.entries.len();
-        self.index_bounds_entry(entry_id, bounds);
+        self.insert_tree_entry(entry_id, bounds)?;
         self.entries.push(BoundsEntry {
             bounds: bounds.clone(),
             pointer,
@@ -787,12 +822,13 @@ impl MemoryBoundsIndex {
 
     pub fn intersection_scan(&self, query: &BoundingBox) -> Result<Vec<IndexPointer>> {
         self.store_last_recheck_count(0);
+        self.store_last_tree_node_visit_count(0);
         self.ensure_query_rank(query.rank())?;
         if self.rank.is_none() {
             return Ok(Vec::new());
         }
 
-        let candidate_ids = self.intersection_candidate_ids(query);
+        let candidate_ids = self.intersection_candidate_ids(query)?;
         self.store_last_recheck_count(candidate_ids.len());
         let mut matches = Vec::new();
         for entry_id in candidate_ids {
@@ -804,53 +840,37 @@ impl MemoryBoundsIndex {
         Ok(matches)
     }
 
-    fn index_bounds_entry(&mut self, entry_id: usize, bounds: &BoundingBox) {
-        for (axis_index, axis) in bounds.axes().iter().copied().enumerate() {
-            self.lower_indexes[axis_index]
-                .entry(axis.lower())
-                .or_default()
-                .insert(entry_id);
-            self.upper_indexes[axis_index]
-                .entry(axis.upper())
-                .or_default()
-                .insert(entry_id);
-        }
+    fn insert_tree_entry(&mut self, entry_id: usize, bounds: &BoundingBox) -> Result<()> {
+        let tree = self.tree.as_mut().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "bounds index rank must be initialized before insert",
+            )
+        })?;
+        tree.insert(BoundsLeaf {
+            entry_id,
+            bounds: bounds.clone(),
+        });
+        Ok(())
     }
 
-    fn intersection_candidate_ids(&self, query: &BoundingBox) -> Vec<usize> {
-        let mut candidates = None;
-        for (axis_index, axis) in query.axes().iter().copied().enumerate() {
-            let axis_ids = self.axis_candidate_ids(axis_index, axis);
-            candidates = Some(merge_axis_candidates(candidates, axis_ids));
-            if candidates.as_ref().is_some_and(BTreeSet::is_empty) {
-                break;
-            }
-        }
-        candidates.unwrap_or_default().into_iter().collect()
-    }
-
-    fn axis_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
-        let lower_ids = self.axis_lower_candidate_ids(axis_index, query);
-        let upper_ids = self.axis_upper_candidate_ids(axis_index, query);
-        lower_ids.intersection(&upper_ids).copied().collect()
-    }
-
-    fn axis_lower_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
-        self.lower_indexes[axis_index]
-            .range(..=query.upper())
-            .flat_map(|(_, ids)| ids.iter().copied())
-            .collect()
-    }
-
-    fn axis_upper_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
-        self.upper_indexes[axis_index]
-            .range(query.lower()..)
-            .flat_map(|(_, ids)| ids.iter().copied())
-            .collect()
+    fn intersection_candidate_ids(&self, query: &BoundingBox) -> Result<Vec<usize>> {
+        let Some(tree) = &self.tree else {
+            return Ok(Vec::new());
+        };
+        let mut stats = BoundsTreeSearchStats::default();
+        let ids = tree.intersection_candidate_ids(query, &mut stats)?;
+        self.store_last_tree_node_visit_count(stats.node_visits);
+        Ok(ids)
     }
 
     fn store_last_recheck_count(&self, value: usize) {
         self.last_recheck_count
+            .store(value, AtomicOrdering::Relaxed);
+    }
+
+    fn store_last_tree_node_visit_count(&self, value: usize) {
+        self.last_tree_node_visit_count
             .store(value, AtomicOrdering::Relaxed);
     }
 
@@ -863,8 +883,7 @@ impl MemoryBoundsIndex {
             Some(_) => Ok(()),
             None => {
                 self.rank = Some(rank);
-                self.lower_indexes = empty_axis_indexes(rank);
-                self.upper_indexes = empty_axis_indexes(rank);
+                self.tree = Some(BoundsRTree::new(rank));
                 Ok(())
             }
         }
@@ -887,18 +906,260 @@ struct BoundsEntry {
     pointer: IndexPointer,
 }
 
-fn empty_axis_indexes(rank: usize) -> Vec<BTreeMap<i64, BTreeSet<usize>>> {
-    std::iter::repeat_with(BTreeMap::new).take(rank).collect()
+const BOUNDS_RTREE_MAX_CHILDREN: usize = 8;
+
+#[derive(Clone, Debug)]
+struct BoundsRTree {
+    rank: usize,
+    root: Option<BoundsTreeNode>,
 }
 
-fn merge_axis_candidates(
-    current: Option<BTreeSet<usize>>,
-    axis_ids: BTreeSet<usize>,
-) -> BTreeSet<usize> {
-    match current {
-        Some(existing) => existing.intersection(&axis_ids).copied().collect(),
-        None => axis_ids,
+impl BoundsRTree {
+    fn new(rank: usize) -> Self {
+        Self { rank, root: None }
     }
+
+    fn insert(&mut self, leaf: BoundsLeaf) {
+        if self.root.is_none() {
+            self.root = Some(BoundsTreeNode::leaf(vec![leaf]));
+            return;
+        }
+        let sibling = self
+            .root
+            .as_mut()
+            .and_then(|root| root.insert_leaf(leaf, self.rank));
+        if let Some(sibling) = sibling {
+            let root = self.root.take().expect("root checked above");
+            self.root = Some(BoundsTreeNode::internal(vec![root, sibling]));
+        }
+    }
+
+    fn intersection_candidate_ids(
+        &self,
+        query: &BoundingBox,
+        stats: &mut BoundsTreeSearchStats,
+    ) -> Result<Vec<usize>> {
+        let mut ids = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_intersections(query, stats, &mut ids)?;
+        }
+        Ok(ids)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoundsTreeNode {
+    bounds: BoundingBox,
+    children: BoundsTreeChildren,
+}
+
+impl BoundsTreeNode {
+    fn leaf(leaves: Vec<BoundsLeaf>) -> Self {
+        let bounds = bounds_for_leaves(&leaves);
+        Self {
+            bounds,
+            children: BoundsTreeChildren::Leaf(leaves),
+        }
+    }
+
+    fn internal(nodes: Vec<Self>) -> Self {
+        let bounds = bounds_for_nodes(&nodes);
+        Self {
+            bounds,
+            children: BoundsTreeChildren::Internal(nodes),
+        }
+    }
+
+    fn insert_leaf(&mut self, leaf: BoundsLeaf, rank: usize) -> Option<Self> {
+        let sibling = match &mut self.children {
+            BoundsTreeChildren::Leaf(leaves) => insert_leaf_child(leaves, leaf, rank),
+            BoundsTreeChildren::Internal(nodes) => insert_internal_child(nodes, leaf, rank),
+        };
+        self.refresh_bounds();
+        sibling
+    }
+
+    fn collect_intersections(
+        &self,
+        query: &BoundingBox,
+        stats: &mut BoundsTreeSearchStats,
+        ids: &mut Vec<usize>,
+    ) -> Result<()> {
+        stats.node_visits += 1;
+        if !self.bounds.intersects(query)? {
+            return Ok(());
+        }
+        match &self.children {
+            BoundsTreeChildren::Leaf(leaves) => collect_leaf_intersections(leaves, query, ids),
+            BoundsTreeChildren::Internal(nodes) => {
+                collect_node_intersections(nodes, query, stats, ids)
+            }
+        }
+    }
+
+    fn refresh_bounds(&mut self) {
+        self.bounds = match &self.children {
+            BoundsTreeChildren::Leaf(leaves) => bounds_for_leaves(leaves),
+            BoundsTreeChildren::Internal(nodes) => bounds_for_nodes(nodes),
+        };
+    }
+}
+
+#[derive(Clone, Debug)]
+enum BoundsTreeChildren {
+    Leaf(Vec<BoundsLeaf>),
+    Internal(Vec<BoundsTreeNode>),
+}
+
+#[derive(Clone, Debug)]
+struct BoundsLeaf {
+    entry_id: usize,
+    bounds: BoundingBox,
+}
+
+#[derive(Default)]
+struct BoundsTreeSearchStats {
+    node_visits: usize,
+}
+
+fn insert_leaf_child(
+    leaves: &mut Vec<BoundsLeaf>,
+    leaf: BoundsLeaf,
+    rank: usize,
+) -> Option<BoundsTreeNode> {
+    leaves.push(leaf);
+    (leaves.len() > BOUNDS_RTREE_MAX_CHILDREN).then(|| split_leaf_node(leaves, rank))
+}
+
+fn insert_internal_child(
+    nodes: &mut Vec<BoundsTreeNode>,
+    leaf: BoundsLeaf,
+    rank: usize,
+) -> Option<BoundsTreeNode> {
+    let child_index = choose_bounds_child(nodes, &leaf.bounds);
+    if let Some(sibling) = nodes[child_index].insert_leaf(leaf, rank) {
+        nodes.push(sibling);
+    }
+    (nodes.len() > BOUNDS_RTREE_MAX_CHILDREN).then(|| split_internal_node(nodes, rank))
+}
+
+fn choose_bounds_child(nodes: &[BoundsTreeNode], bounds: &BoundingBox) -> usize {
+    nodes
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| compare_child_enlargement(left, right, bounds))
+        .map(|(index, _)| index)
+        .expect("internal node has at least one child")
+}
+
+fn compare_child_enlargement(
+    left: &BoundsTreeNode,
+    right: &BoundsTreeNode,
+    bounds: &BoundingBox,
+) -> Ordering {
+    left.bounds
+        .enlargement_for(bounds)
+        .total_cmp(&right.bounds.enlargement_for(bounds))
+        .then_with(|| left.bounds.area().total_cmp(&right.bounds.area()))
+}
+
+fn split_leaf_node(leaves: &mut Vec<BoundsLeaf>, rank: usize) -> BoundsTreeNode {
+    let axis = widest_leaf_axis(leaves, rank);
+    leaves.sort_by(|left, right| compare_leaf_on_axis(left, right, axis));
+    let right = leaves.split_off(leaves.len() / 2);
+    BoundsTreeNode::leaf(right)
+}
+
+fn split_internal_node(nodes: &mut Vec<BoundsTreeNode>, rank: usize) -> BoundsTreeNode {
+    let axis = widest_node_axis(nodes, rank);
+    nodes.sort_by(|left, right| compare_node_on_axis(left, right, axis));
+    let right = nodes.split_off(nodes.len() / 2);
+    BoundsTreeNode::internal(right)
+}
+
+fn widest_leaf_axis(leaves: &[BoundsLeaf], rank: usize) -> usize {
+    (0..rank)
+        .max_by_key(|axis| leaf_axis_spread(leaves, *axis))
+        .unwrap_or(0)
+}
+
+fn widest_node_axis(nodes: &[BoundsTreeNode], rank: usize) -> usize {
+    (0..rank)
+        .max_by_key(|axis| node_axis_spread(nodes, *axis))
+        .unwrap_or(0)
+}
+
+fn leaf_axis_spread(leaves: &[BoundsLeaf], axis: usize) -> i64 {
+    axis_center_spread(leaves.iter().map(|leaf| leaf.bounds.center_on_axis(axis)))
+}
+
+fn node_axis_spread(nodes: &[BoundsTreeNode], axis: usize) -> i64 {
+    axis_center_spread(nodes.iter().map(|node| node.bounds.center_on_axis(axis)))
+}
+
+fn axis_center_spread(centers: impl Iterator<Item = i64>) -> i64 {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for center in centers {
+        min = min.min(center);
+        max = max.max(center);
+    }
+    max.saturating_sub(min)
+}
+
+fn compare_leaf_on_axis(left: &BoundsLeaf, right: &BoundsLeaf, axis: usize) -> Ordering {
+    left.bounds
+        .center_on_axis(axis)
+        .cmp(&right.bounds.center_on_axis(axis))
+        .then_with(|| left.entry_id.cmp(&right.entry_id))
+}
+
+fn compare_node_on_axis(left: &BoundsTreeNode, right: &BoundsTreeNode, axis: usize) -> Ordering {
+    left.bounds
+        .center_on_axis(axis)
+        .cmp(&right.bounds.center_on_axis(axis))
+        .then_with(|| left.bounds.area().total_cmp(&right.bounds.area()))
+}
+
+fn collect_leaf_intersections(
+    leaves: &[BoundsLeaf],
+    query: &BoundingBox,
+    ids: &mut Vec<usize>,
+) -> Result<()> {
+    for leaf in leaves {
+        if leaf.bounds.intersects(query)? {
+            ids.push(leaf.entry_id);
+        }
+    }
+    Ok(())
+}
+
+fn collect_node_intersections(
+    nodes: &[BoundsTreeNode],
+    query: &BoundingBox,
+    stats: &mut BoundsTreeSearchStats,
+    ids: &mut Vec<usize>,
+) -> Result<()> {
+    for node in nodes {
+        node.collect_intersections(query, stats, ids)?;
+    }
+    Ok(())
+}
+
+fn bounds_for_leaves(leaves: &[BoundsLeaf]) -> BoundingBox {
+    union_bounds(leaves.iter().map(|leaf| &leaf.bounds))
+}
+
+fn bounds_for_nodes(nodes: &[BoundsTreeNode]) -> BoundingBox {
+    union_bounds(nodes.iter().map(|node| &node.bounds))
+}
+
+fn union_bounds<'a>(mut bounds: impl Iterator<Item = &'a BoundingBox>) -> BoundingBox {
+    let first = bounds
+        .next()
+        .expect("R-tree nodes are never built from empty children")
+        .clone();
+    bounds.fold(first, |combined, next| combined.union(next))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
