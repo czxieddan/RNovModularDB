@@ -431,6 +431,13 @@ impl Catalog {
         self.schemas.get(schema_name)?.tables.get(table_name)
     }
 
+    pub fn tables(&self) -> Vec<&Table> {
+        self.schemas
+            .values()
+            .flat_map(|schema| schema.tables.values())
+            .collect()
+    }
+
     pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<Option<Table>> {
         let schema = self.schemas.get_mut(schema_name).ok_or_else(|| {
             RnovError::new(

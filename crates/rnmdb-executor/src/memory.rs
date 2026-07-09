@@ -10,7 +10,10 @@ use std::{
     thread,
 };
 
-use rnmdb_catalog::IndexMethod;
+use rnmdb_catalog::{
+    Catalog, Column as CatalogColumn, Index as CatalogIndex, IndexKey as CatalogIndexKey,
+    IndexMethod, Table as CatalogTable,
+};
 use rnmdb_common::Result;
 use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
 use rnmdb_fts::{SimpleTokenizer, TextPhraseQuery, TextQuery, TextVectorBuilder};
@@ -27,13 +30,20 @@ use rnmdb_planner::{
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
-use rnmdb_sql::ast::{CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, OrderByExpr};
+use rnmdb_sql::{
+    ast::{CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, OrderByExpr},
+    parser::parse_expr,
+};
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
     TextVector, Truth,
 };
 
-use crate::vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns};
+use crate::{
+    durable::DurableTableRows,
+    row::RowCodec,
+    vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns},
+};
 
 mod async_task;
 mod set_ops;
@@ -87,6 +97,15 @@ impl MemoryTable {
     pub fn scan(&self) -> VectorBatch {
         VectorBatch::new(self.columns.clone(), self.rows.clone())
             .expect("stored rows are validated on insert")
+    }
+
+    fn snapshot_rows(&self, name: &str) -> Result<DurableTableRows> {
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| RowCodec::encode(&self.columns, row))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DurableTableRows::new(name, rows))
     }
 
     fn index_scan(&self, index_name: &str, column: &str, value: &Expr) -> Result<VectorBatch> {
@@ -1645,6 +1664,50 @@ impl MemoryExecutor {
         Ok(())
     }
 
+    pub fn snapshot_tables(&self) -> Result<Vec<DurableTableRows>> {
+        let tables = self.read_tables()?;
+        tables
+            .iter()
+            .map(|(name, table)| table.snapshot_rows(name))
+            .collect()
+    }
+
+    pub fn restore_tables(&mut self, catalog: &Catalog, tables: &[DurableTableRows]) -> Result<()> {
+        let mut restored = BTreeMap::new();
+        for table in tables {
+            restore_durable_table(catalog, table, &mut restored)?;
+        }
+        restore_empty_catalog_tables(catalog, &mut restored)?;
+        *self.write_tables()? = restored;
+        self.rebuild_indexes_from_catalog(catalog)
+    }
+
+    pub fn rebuild_indexes_from_catalog(&mut self, catalog: &Catalog) -> Result<()> {
+        for index in catalog.indexes() {
+            self.rebuild_catalog_index(index)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_catalog_index(&mut self, index: &CatalogIndex) -> Result<()> {
+        let table_key = self.catalog_index_table_key(index)?;
+        let keys = catalog_index_key_defs(index.keys())?;
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(&table_key).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found for index: {table_key}"),
+            )
+        })?;
+        table.drop_index(index.name());
+        table.create_index(index.name(), &keys, index.method(), index.unique())
+    }
+
+    fn catalog_index_table_key(&self, index: &CatalogIndex) -> Result<String> {
+        let tables = self.read_tables()?;
+        executor_table_key_for_catalog_name(&tables, index.schema_name(), index.table_name())
+    }
+
     pub fn table_statistics(&self, name: &str) -> Option<TableStatistics> {
         self.read_tables()
             .ok()
@@ -2961,6 +3024,145 @@ fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
         schema = schema.with_generated(generated.clone());
     }
     schema
+}
+
+fn column_schema_from_catalog_column(column: &CatalogColumn) -> Result<ColumnSchema> {
+    let mut schema = ColumnSchema::new(column.name(), column.data_type().clone());
+    if !column.nullable() {
+        schema = schema.not_null();
+    }
+    if column.is_encrypted() {
+        schema = schema.encrypted();
+    }
+    if let Some(generated) = catalog_generated_column(column)? {
+        schema = schema.with_generated(generated);
+    }
+    Ok(schema)
+}
+
+fn catalog_generated_column(column: &CatalogColumn) -> Result<Option<GeneratedColumn>> {
+    let Some(expr) = column.generated_expr() else {
+        return Ok(None);
+    };
+    Ok(Some(GeneratedColumn {
+        expr: parse_expr(expr)?,
+        stored: column.generated_stored(),
+    }))
+}
+
+fn catalog_table_columns(table: &CatalogTable) -> Result<Vec<ColumnSchema>> {
+    table
+        .columns()
+        .iter()
+        .map(column_schema_from_catalog_column)
+        .collect()
+}
+
+fn restore_durable_table(
+    catalog: &Catalog,
+    table: &DurableTableRows,
+    restored: &mut BTreeMap<String, MemoryTable>,
+) -> Result<()> {
+    let catalog_table = catalog_table_for_executor_name(catalog, table.name())?;
+    let memory_table = memory_table_from_durable_rows(catalog_table, table.rows())?;
+    restored.insert(table.name().to_string(), memory_table);
+    Ok(())
+}
+
+fn restore_empty_catalog_tables(
+    catalog: &Catalog,
+    restored: &mut BTreeMap<String, MemoryTable>,
+) -> Result<()> {
+    for table in catalog.tables() {
+        if restored_table_contains(restored, table) {
+            continue;
+        }
+        let name = default_executor_table_name(table);
+        restored.insert(name, MemoryTable::new(catalog_table_columns(table)?)?);
+    }
+    Ok(())
+}
+
+fn restored_table_contains(restored: &BTreeMap<String, MemoryTable>, table: &CatalogTable) -> bool {
+    restored
+        .keys()
+        .any(|name| catalog_table_matches_executor_name(table, name))
+}
+
+fn memory_table_from_durable_rows(table: &CatalogTable, rows: &[Vec<u8>]) -> Result<MemoryTable> {
+    let mut memory_table = MemoryTable::new(catalog_table_columns(table)?)?;
+    for row in rows {
+        let decoded = RowCodec::decode(memory_table.columns(), row)?;
+        memory_table.insert(decoded)?;
+    }
+    Ok(memory_table)
+}
+
+fn catalog_table_for_executor_name<'a>(
+    catalog: &'a Catalog,
+    name: &str,
+) -> Result<&'a CatalogTable> {
+    let matches = catalog
+        .tables()
+        .into_iter()
+        .filter(|table| catalog_table_matches_executor_name(table, name))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [table] => Ok(*table),
+        [] => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("durable table has no catalog entry: {name}"),
+        )),
+        _ => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("durable table name is ambiguous: {name}"),
+        )),
+    }
+}
+
+fn catalog_table_matches_executor_name(table: &CatalogTable, name: &str) -> bool {
+    name == table.name() || name == qualified_catalog_table_name(table)
+}
+
+fn default_executor_table_name(table: &CatalogTable) -> String {
+    if table.schema_name() == "public" {
+        table.name().to_string()
+    } else {
+        qualified_catalog_table_name(table)
+    }
+}
+
+fn qualified_catalog_table_name(table: &CatalogTable) -> String {
+    format!("{}.{}", table.schema_name(), table.name())
+}
+
+fn catalog_index_key_defs(keys: &[CatalogIndexKey]) -> Result<Vec<IndexKeyDef>> {
+    keys.iter().map(catalog_index_key_def).collect()
+}
+
+fn catalog_index_key_def(key: &CatalogIndexKey) -> Result<IndexKeyDef> {
+    match key {
+        CatalogIndexKey::Column(name) => Ok(IndexKeyDef::Column(Ident::new(name))),
+        CatalogIndexKey::Expression(expr) => Ok(IndexKeyDef::Expression(parse_expr(expr)?)),
+    }
+}
+
+fn executor_table_key_for_catalog_name(
+    tables: &BTreeMap<String, MemoryTable>,
+    schema: &str,
+    table: &str,
+) -> Result<String> {
+    let qualified = format!("{schema}.{table}");
+    if tables.contains_key(&qualified) {
+        return Ok(qualified);
+    }
+    if tables.contains_key(table) {
+        return Ok(table.to_string());
+    }
+    Err(RnovError::new(
+        ErrorKind::NotFound,
+        format!("table not found for catalog relation: {schema}.{table}"),
+    ))
 }
 
 fn schema_row_width_bytes(columns: &[ColumnSchema]) -> f64 {

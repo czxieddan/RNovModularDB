@@ -1,11 +1,12 @@
-use std::time::Instant;
+use std::{path::Path, time::Instant};
 
-use rnmdb_catalog::{Catalog, IndexKey, OperatorSignature, Privilege, RowPolicy};
+use rnmdb_catalog::{Catalog, CatalogCodec, IndexKey, OperatorSignature, Privilege, RowPolicy};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{DatabaseId, RelationId, RoleId},
 };
 use rnmdb_executor::{
+    durable::{DurableExecutorImage, read_image_from_backend, write_image_to_backend},
     memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
     vector::VectorBatch,
 };
@@ -21,12 +22,12 @@ use rnmdb_sql::{
     parser::parse_statement,
 };
 use rnmdb_storage::{
-    PageCryptoKey, SingleFileBackupReport, SingleFileFormatCompatibility, SingleFileInspection,
-    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
-    SingleFileVerificationReport, backup_single_file, check_single_file_format_compatibility,
-    inspect_single_file, inspect_single_file_with_key, restore_single_file,
-    restore_single_file_dry_run, upgrade_single_file, upgrade_single_file_with_key,
-    verify_single_file, verify_single_file_with_key,
+    PageCryptoKey, SingleFileBackend, SingleFileBackupReport, SingleFileFormatCompatibility,
+    SingleFileInspection, SingleFileOptions, SingleFileRestoreDryRun, SingleFileRestoreReport,
+    SingleFileUpgradeReport, SingleFileVerificationReport, backup_single_file,
+    check_single_file_format_compatibility, inspect_single_file, inspect_single_file_with_key,
+    restore_single_file, restore_single_file_dry_run, upgrade_single_file,
+    upgrade_single_file_with_key, verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_types::SqlType;
 
@@ -46,6 +47,11 @@ pub struct LocalSession {
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
     procedure_call_stack: Vec<String>,
+    durable: Option<LocalDurableStore>,
+}
+
+struct LocalDurableStore {
+    backend: SingleFileBackend,
 }
 
 impl LocalSession {
@@ -58,19 +64,32 @@ impl LocalSession {
     }
 
     pub fn memory_with_execution(execution: LocalExecutionConfig) -> Result<Self> {
-        let mut catalog = Catalog::new(DatabaseId::new(1));
-        catalog.create_schema("public")?;
-        register_builtin_functions(&mut catalog)?;
-        let role = catalog.create_role("local")?;
-        Ok(Self {
+        let (catalog, role_id) = default_catalog()?;
+        Ok(Self::from_parts(
             catalog,
-            role_id: role.role_id(),
-            executor: MemoryExecutor::new(),
-            planner: LogicalPlanner::new(),
-            optimizer: RuleOptimizer::new(),
+            role_id,
+            MemoryExecutor::new(),
             execution,
-            procedure_call_stack: Vec::new(),
-        })
+            None,
+        ))
+    }
+
+    pub fn single_file_with_key(path: impl AsRef<Path>, key: PageCryptoKey) -> Result<Self> {
+        let backend = open_or_create_single_file(path.as_ref(), key)?;
+        let mut session = load_session_from_backend(&backend, LocalExecutionConfig::default())?;
+        session.durable = Some(LocalDurableStore { backend });
+        Ok(session)
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let image = self.encode_durable_image()?;
+        let durable = self.durable.as_ref().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "local session has no durable storage backend",
+            )
+        })?;
+        write_image_to_backend(&durable.backend, durable.backend.page_size(), &image)
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
@@ -288,6 +307,33 @@ impl LocalSession {
 
     pub async fn execute_async(&mut self, sql: &str) -> Result<CommandOutput> {
         self.execute(sql)
+    }
+
+    fn from_parts(
+        catalog: Catalog,
+        role_id: RoleId,
+        executor: MemoryExecutor,
+        execution: LocalExecutionConfig,
+        durable: Option<LocalDurableStore>,
+    ) -> Self {
+        Self {
+            catalog,
+            role_id,
+            executor,
+            planner: LogicalPlanner::new(),
+            optimizer: RuleOptimizer::new(),
+            execution,
+            procedure_call_stack: Vec::new(),
+            durable,
+        }
+    }
+
+    fn encode_durable_image(&self) -> Result<Vec<u8>> {
+        DurableExecutorImage::new(
+            CatalogCodec::encode(&self.catalog)?,
+            self.executor.snapshot_tables()?,
+        )
+        .encode()
     }
 
     fn apply_catalog_create_table(
@@ -806,6 +852,49 @@ impl Default for LocalExecutionConfig {
             min_parallel_rows: 1024,
         }
     }
+}
+
+fn open_or_create_single_file(path: &Path, key: PageCryptoKey) -> Result<SingleFileBackend> {
+    if path.exists() {
+        return SingleFileBackend::open_with_key(path, key);
+    }
+    SingleFileBackend::create(path, SingleFileOptions::default().with_page_key(key))
+}
+
+fn load_session_from_backend(
+    backend: &SingleFileBackend,
+    execution: LocalExecutionConfig,
+) -> Result<LocalSession> {
+    match read_image_from_backend(backend)? {
+        Some(image) => decode_session_image(&image, execution),
+        None => LocalSession::memory_with_execution(execution),
+    }
+}
+
+fn decode_session_image(image: &[u8], execution: LocalExecutionConfig) -> Result<LocalSession> {
+    let image = DurableExecutorImage::decode(image)?;
+    let catalog = CatalogCodec::decode(image.catalog())?;
+    let role_id = local_role_id(&catalog)?;
+    let mut executor = MemoryExecutor::new();
+    executor.restore_tables(&catalog, image.tables())?;
+    Ok(LocalSession::from_parts(
+        catalog, role_id, executor, execution, None,
+    ))
+}
+
+fn default_catalog() -> Result<(Catalog, RoleId)> {
+    let mut catalog = Catalog::new(DatabaseId::new(1));
+    catalog.create_schema("public")?;
+    register_builtin_functions(&mut catalog)?;
+    let role_id = catalog.create_role("local")?.role_id();
+    Ok((catalog, role_id))
+}
+
+fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
+    catalog
+        .get_role("local")
+        .map(|role| role.role_id())
+        .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
 }
 
 fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<String> {
