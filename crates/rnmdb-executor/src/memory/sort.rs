@@ -134,6 +134,7 @@ fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirecti
             .get()
             .partial_cmp(&right.get())
             .unwrap_or(Ordering::Equal),
+        (SqlValue::Uuid(left), SqlValue::Uuid(right)) => left.cmp(right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
         (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
         _ => Ordering::Equal,

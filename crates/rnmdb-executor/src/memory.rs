@@ -40,7 +40,7 @@ use rnmdb_sql::{
 };
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlRange, SqlType,
-    SqlValue, TextVector, Truth,
+    SqlUuid, SqlValue, TextVector, Truth,
 };
 
 use crate::{
@@ -3325,6 +3325,7 @@ fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
         SqlType::Null => 1.0,
         SqlType::Bool => 1.0,
         SqlType::Int64 | SqlType::UInt64 | SqlType::Float64 => 8.0,
+        SqlType::Uuid => 16.0,
         SqlType::Text | SqlType::Bytes => 32.0,
         SqlType::HStore | SqlType::TextVector => 64.0,
         SqlType::Array(_) => 32.0,
@@ -5181,6 +5182,7 @@ fn sortable_type(data_type: &SqlType) -> bool {
             | SqlType::Int64
             | SqlType::UInt64
             | SqlType::Float64
+            | SqlType::Uuid
             | SqlType::Text
             | SqlType::Bytes
     )
@@ -5921,6 +5923,15 @@ fn eval_cast_expr(
     data_type: &SqlType,
 ) -> Result<SqlValue> {
     let value = eval_expr(columns, row, expr)?;
+    cast_value(value, data_type)
+}
+
+fn cast_literal_value(expr: &Expr, data_type: &SqlType) -> Result<SqlValue> {
+    let value = literal_value(expr)?;
+    cast_value(value, data_type)
+}
+
+fn cast_value(value: SqlValue, data_type: &SqlType) -> Result<SqlValue> {
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
@@ -5952,6 +5963,8 @@ fn eval_cast_expr(
             })?;
             SqlFloat64::new(parsed).map(SqlValue::Float64)
         }
+        (SqlValue::Uuid(value), SqlType::Text) => Ok(SqlValue::Text(value.to_hyphenated_string())),
+        (SqlValue::Text(value), SqlType::Uuid) => SqlUuid::parse_str(&value).map(SqlValue::Uuid),
         (SqlValue::Bool(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
         (SqlValue::Text(value), SqlType::Bool) => match value.to_ascii_lowercase().as_str() {
             "true" => Ok(SqlValue::Bool(true)),
@@ -6142,6 +6155,7 @@ fn literal_value(expr: &Expr) -> Result<SqlValue> {
             bounds,
         } => range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive),
         Expr::Unary { op, expr } if unary_arithmetic_operator(op) => unary_literal_value(op, expr),
+        Expr::Cast { expr, data_type } => cast_literal_value(expr, data_type),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("unsupported memory literal: {expr}"),

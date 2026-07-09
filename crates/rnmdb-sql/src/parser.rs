@@ -1469,6 +1469,7 @@ impl Parser {
                     SqlType::Float64
                 }
                 "doubleprecision" => SqlType::Float64,
+                "uuid" => SqlType::Uuid,
                 "text" | "string" | "varchar" => SqlType::Text,
                 "bytes" | "bytea" => SqlType::Bytes,
                 "hstore" => SqlType::HStore,

@@ -15,6 +15,7 @@ pub enum SqlType {
     Int64,
     UInt64,
     Float64,
+    Uuid,
     Text,
     Bytes,
     HStore,
@@ -30,12 +31,101 @@ pub enum SqlValue {
     Int64(i64),
     UInt64(u64),
     Float64(SqlFloat64),
+    Uuid(SqlUuid),
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
     TextVector(TextVector),
     Array(SqlArray),
     Range(SqlRange),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlUuid([u8; 16]);
+
+impl SqlUuid {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn parse_str(value: &str) -> Result<Self> {
+        validate_uuid_shape(value)?;
+        let mut bytes = [0_u8; 16];
+        let mut byte_index = 0_usize;
+        let mut chars = value
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'-');
+        while byte_index < bytes.len() {
+            let high = chars.next().expect("uuid shape validated");
+            let low = chars.next().expect("uuid shape validated");
+            bytes[byte_index] = parse_hex_pair(high, low)?;
+            byte_index += 1;
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub fn to_hyphenated_string(self) -> String {
+        let mut out = String::with_capacity(36);
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                out.push('-');
+            }
+            out.push(hex_char(byte >> 4));
+            out.push(hex_char(byte & 0x0f));
+        }
+        out
+    }
+}
+
+fn validate_uuid_shape(value: &str) -> Result<()> {
+    if value.len() != 36 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "uuid text must use hyphenated 36-character form",
+        ));
+    }
+    for (position, byte) in value.as_bytes().iter().enumerate() {
+        let expects_hyphen = matches!(position, 8 | 13 | 18 | 23);
+        if (*byte == b'-') != expects_hyphen {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "uuid text has invalid hyphen positions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_hex_pair(high: u8, low: u8) -> Result<u8> {
+    let high = hex_value(high)?;
+    let low = hex_value(low)?;
+    Ok((high << 4) | low)
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "uuid text contains non-hex character",
+        )),
+    }
+}
+
+fn hex_char(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + value - 10),
+        _ => unreachable!("uuid nybble is in range"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -88,6 +178,7 @@ impl SqlValue {
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
     const TAG_FLOAT64: u8 = 10;
+    const TAG_UUID: u8 = 11;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -100,6 +191,7 @@ impl SqlValue {
             Self::Int64(_) => SqlType::Int64,
             Self::UInt64(_) => SqlType::UInt64,
             Self::Float64(_) => SqlType::Float64,
+            Self::Uuid(_) => SqlType::Uuid,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
@@ -138,6 +230,7 @@ impl SqlValue {
             Self::Int64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::UInt64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::Float64(value) => encoded.extend_from_slice(&value.to_bits().to_be_bytes()),
+            Self::Uuid(value) => encoded.extend_from_slice(&value.as_bytes()),
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
@@ -190,6 +283,9 @@ impl SqlValue {
             Self::TAG_FLOAT64 => Ok(Self::Float64(SqlFloat64::from_bits(u64::from_be_bytes(
                 read_array::<8>(payload, "float64")?,
             ))?)),
+            Self::TAG_UUID => Ok(Self::Uuid(SqlUuid::from_bytes(read_array::<16>(
+                payload, "uuid",
+            )?))),
             Self::TAG_TEXT => {
                 let bytes = decode_bytes(payload, "text")?;
                 let text = String::from_utf8(bytes).map_err(|_| {
@@ -216,6 +312,7 @@ impl SqlValue {
             Self::Int64(_) => Self::TAG_INT64,
             Self::UInt64(_) => Self::TAG_UINT64,
             Self::Float64(_) => Self::TAG_FLOAT64,
+            Self::Uuid(_) => Self::TAG_UUID,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
@@ -238,6 +335,7 @@ impl SqlType {
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
     const TAG_FLOAT64: u8 = 10;
+    const TAG_UUID: u8 = 11;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -246,6 +344,7 @@ impl SqlType {
             Self::Int64 => encoded.push(Self::TAG_INT64),
             Self::UInt64 => encoded.push(Self::TAG_UINT64),
             Self::Float64 => encoded.push(Self::TAG_FLOAT64),
+            Self::Uuid => encoded.push(Self::TAG_UUID),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
@@ -268,6 +367,7 @@ impl SqlType {
             Self::TAG_INT64 => Ok(Self::Int64),
             Self::TAG_UINT64 => Ok(Self::UInt64),
             Self::TAG_FLOAT64 => Ok(Self::Float64),
+            Self::TAG_UUID => Ok(Self::Uuid),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
@@ -959,6 +1059,7 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
         }
         (SqlValue::UInt64(a), SqlValue::UInt64(b)) => Ok(a.cmp(b)),
         (SqlValue::Float64(a), SqlValue::Float64(b)) => compare_float64_values(*a, *b),
+        (SqlValue::Uuid(a), SqlValue::Uuid(b)) => Ok(a.cmp(b)),
         (SqlValue::Text(a), SqlValue::Text(b)) => Ok(a.cmp(b)),
         (SqlValue::Bytes(a), SqlValue::Bytes(b)) => Ok(a.cmp(b)),
         _ => Err(RnovError::new(
