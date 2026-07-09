@@ -1817,6 +1817,15 @@ impl MemoryExecutor {
                 let subquery = self.execute_cancellable(subquery, cancellation)?;
                 apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
             }
+            LogicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+            } => {
+                let input = self.execute_cancellable(input, cancellation)?;
+                let subquery = self.execute_cancellable(subquery, cancellation)?;
+                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+            }
             LogicalPlan::TextSearch {
                 relation_id,
                 table,
@@ -2205,6 +2214,16 @@ impl MemoryExecutor {
                 let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
                 apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
             }
+            PhysicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+                ..
+            } => {
+                let input = self.execute_physical_cancellable(input, cancellation)?;
+                let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
+                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+            }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -2359,6 +2378,18 @@ impl MemoryExecutor {
                 let subquery =
                     self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
                 apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+            }
+            PhysicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+                ..
+            } => {
+                let input =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                let subquery =
+                    self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
+                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
@@ -2686,6 +2717,15 @@ impl MemoryExecutor {
                 let input = self.execute_parallel_cancellable(input, config, cancellation)?;
                 let subquery = self.execute_parallel_cancellable(subquery, config, cancellation)?;
                 apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+            }
+            LogicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+            } => {
+                let input = self.execute_parallel_cancellable(input, config, cancellation)?;
+                let subquery = self.execute_parallel_cancellable(subquery, config, cancellation)?;
+                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
             }
             LogicalPlan::TextSearch {
                 relation_id,
@@ -4170,6 +4210,20 @@ fn in_subquery_keeps_row(
     })
 }
 
+fn apply_exists_subquery_filter(
+    batch: VectorBatch,
+    subquery: &VectorBatch,
+    negated: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    cancellation.check()?;
+    if subquery.rows().is_empty() == negated {
+        Ok(batch)
+    } else {
+        VectorBatch::new(batch.columns().to_vec(), Vec::new())
+    }
+}
+
 fn apply_nested_loop_join_cancellable(
     left: VectorBatch,
     right: VectorBatch,
@@ -5007,6 +5061,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             ErrorKind::InvalidInput,
             "IN subquery must be planned as a filter before projection",
         )),
+        Expr::ExistsSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "EXISTS subquery must be planned as a filter before projection",
+        )),
         Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Coalesce(values) => projection_coalesce_type(columns, values),
         Expr::NullIf { left, right } => projection_nullif_type(columns, left, right),
@@ -5380,6 +5438,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::InSubquery { .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "IN subquery must be executed by an InSubqueryFilter plan",
+        )),
+        Expr::ExistsSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "EXISTS subquery must be executed by an ExistsSubqueryFilter plan",
         )),
         Expr::Like {
             expr,

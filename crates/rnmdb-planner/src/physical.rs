@@ -131,6 +131,12 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         cost: PlanCost,
     },
+    ExistsSubqueryFilter {
+        subquery: Box<PhysicalPlan>,
+        negated: bool,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
     Projection {
         items: Vec<ProjectionItem>,
         input: Box<PhysicalPlan>,
@@ -583,6 +589,16 @@ impl PhysicalPlanner {
                 input: Box::new(self.plan(input)),
                 cost,
             },
+            LogicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+            } => PhysicalPlan::ExistsSubqueryFilter {
+                subquery: Box::new(self.plan(subquery)),
+                negated: *negated,
+                input: Box::new(self.plan(input)),
+                cost,
+            },
             LogicalPlan::Project { items, input } => PhysicalPlan::Projection {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
@@ -764,6 +780,7 @@ impl PhysicalPlan {
             | PhysicalPlan::NestedLoopJoin { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::InSubqueryFilter { cost, .. }
+            | PhysicalPlan::ExistsSubqueryFilter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Window { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -991,6 +1008,20 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             let op = if *negated { "NOT IN" } else { "IN" };
             out.push_str(&format!(
                 "{prefix}InSubqueryFilter expr={expr} op={op}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+            write_physical_plan(subquery, indent + 1, out);
+        }
+        PhysicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+            cost,
+        } => {
+            let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
+            out.push_str(&format!(
+                "{prefix}ExistsSubqueryFilter op={op}{}\n",
                 cost_suffix(*cost)
             ));
             write_physical_plan(input, indent + 1, out);

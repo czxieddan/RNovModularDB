@@ -52,6 +52,15 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             negated,
             input: Box::new(optimize_plan(*input)),
         },
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            subquery: Box::new(optimize_plan(*subquery)),
+            negated,
+            input: Box::new(optimize_plan(*input)),
+        },
         LogicalPlan::Project { items, input } => LogicalPlan::Project {
             items,
             input: Box::new(optimize_plan(*input)),
@@ -177,6 +186,15 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             input,
         } => LogicalPlan::InSubqueryFilter {
             expr,
+            subquery: Box::new(annotate_parallel(*subquery, workers)),
+            negated,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::ExistsSubqueryFilter {
             subquery: Box::new(annotate_parallel(*subquery, workers)),
             negated,
             input: Box::new(annotate_parallel(*input, workers)),

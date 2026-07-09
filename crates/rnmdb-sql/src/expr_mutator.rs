@@ -132,6 +132,9 @@ where
         if let Some(expr) = self.rewrite_in_subquery_expr(expr)? {
             return Ok(Some(expr));
         }
+        if let Some(expr) = self.rewrite_exists_subquery_expr(expr) {
+            return Ok(Some(expr));
+        }
         self.rewrite_like_expr(expr)
     }
 
@@ -185,6 +188,15 @@ where
             }
             .into()),
             _ => Ok(None),
+        }
+    }
+
+    fn rewrite_exists_subquery_expr(&mut self, expr: &Expr) -> Option<Expr> {
+        match expr {
+            Expr::ExistsSubquery { query } => Some(Expr::ExistsSubquery {
+                query: query.clone(),
+            }),
+            _ => None,
         }
     }
 

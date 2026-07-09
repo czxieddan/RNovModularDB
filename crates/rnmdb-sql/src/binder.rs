@@ -2010,6 +2010,7 @@ impl<'a> Binder<'a> {
                 query,
                 negated,
             } => self.bind_in_subquery_expr(expr, query, *negated, role_id, infer),
+            Expr::ExistsSubquery { query } => self.bind_exists_subquery_expr(query, role_id),
             _ => Ok(expr.clone()),
         }
     }
@@ -2047,6 +2048,28 @@ impl<'a> Binder<'a> {
             SelectSubquery::Parsed(statement) => {
                 let bound = self.bind_for_role(statement, role_id)?;
                 let _ = single_query_output_type(&bound)?;
+                Ok(bound)
+            }
+            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+        }
+    }
+
+    fn bind_exists_subquery_expr(&self, query: &SelectSubquery, role_id: RoleId) -> Result<Expr> {
+        let bound = self.bind_exists_subquery(query, role_id)?;
+        Ok(Expr::ExistsSubquery {
+            query: SelectSubquery::Bound(Box::new(bound)),
+        })
+    }
+
+    fn bind_exists_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role(statement, role_id)?;
+                let _ = query_output_columns(&bound)?;
                 Ok(bound)
             }
             SelectSubquery::Bound(statement) => Ok((**statement).clone()),
@@ -2495,6 +2518,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "GROUP BY does not support subqueries",
             )),
+            Expr::ExistsSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support subqueries",
+            )),
             Expr::Like { expr, pattern, .. } => {
                 self.validate_group_by_expr_shape(expr)?;
                 self.validate_group_by_expr_shape(pattern)
@@ -2814,6 +2841,10 @@ impl<'a> Binder<'a> {
             Expr::InSubquery { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "HAVING does not support IN subqueries yet",
+            )),
+            Expr::ExistsSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support EXISTS subqueries yet",
             )),
             Expr::Like {
                 expr,
@@ -3279,6 +3310,7 @@ impl<'a> Binder<'a> {
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
             Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
+            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
                     return Ok(None);
@@ -3586,6 +3618,10 @@ impl<'a> Binder<'a> {
                 Ok(())
             }
             Expr::InSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE expressions do not support subqueries",
+            )),
+            Expr::ExistsSubquery { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "recursive CTE expressions do not support subqueries",
             )),
@@ -3982,6 +4018,10 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "row policy predicates do not support subqueries",
             )),
+            Expr::ExistsSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "row policy predicates do not support subqueries",
+            )),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(SqlType::Bool));
@@ -4232,6 +4272,7 @@ impl<'a> Binder<'a> {
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
             Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
+            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -4480,6 +4521,8 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_nullif_result_type(&left_type, &right_type)
             }
+            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
+            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
             other => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unsupported generated column expression: {other}"),

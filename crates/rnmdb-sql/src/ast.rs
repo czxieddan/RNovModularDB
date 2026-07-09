@@ -187,6 +187,9 @@ pub enum Expr {
         query: SelectSubquery,
         negated: bool,
     },
+    ExistsSubquery {
+        query: SelectSubquery,
+    },
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
@@ -385,6 +388,7 @@ impl fmt::Display for Expr {
                     write!(f, "{expr} IN (subquery)")
                 }
             }
+            Self::ExistsSubquery { .. } => f.write_str("EXISTS (subquery)"),
             Self::Like {
                 expr,
                 pattern,

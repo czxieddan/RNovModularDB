@@ -1229,6 +1229,7 @@ impl Parser {
     fn parse_primary_expr(&mut self) -> Result<Expr> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Case) => self.parse_case_expr(),
+            Some(TokenKind::Exists) => self.parse_exists_subquery_expr(),
             Some(TokenKind::Identifier(_)) => {
                 let first = self.parse_ident()?;
                 if first.as_str() == "array" && self.consume_if(&TokenKind::LeftBracket) {
@@ -1373,6 +1374,16 @@ impl Parser {
             Some(kind) => Err(self.error(format!("unexpected expression token {kind:?}"))),
             None => Err(self.error("expected expression")),
         }
+    }
+
+    fn parse_exists_subquery_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(TokenKind::Exists)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let query = self.parse_query()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::ExistsSubquery {
+            query: SelectSubquery::Parsed(Box::new(query)),
+        })
     }
 
     fn parse_case_expr(&mut self) -> Result<Expr> {

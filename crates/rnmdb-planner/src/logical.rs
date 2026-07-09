@@ -30,6 +30,11 @@ pub enum LogicalPlan {
         negated: bool,
         input: Box<LogicalPlan>,
     },
+    ExistsSubqueryFilter {
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+        input: Box<LogicalPlan>,
+    },
     TextSearch {
         relation_id: RelationId,
         table: String,
@@ -806,6 +811,7 @@ impl LogicalPlanner {
                 self.plan_select_predicate(relation_id, table, right, input)
             }
             Expr::InSubquery { .. } | Expr::Not(_) => self.plan_bound_predicate(predicate, input),
+            Expr::ExistsSubquery { .. } => self.plan_bound_predicate(predicate, input),
             _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
             _ => plan_selection(relation_id, table, predicate, input),
         }
@@ -823,6 +829,9 @@ impl LogicalPlanner {
                 query,
                 negated,
             } => self.plan_in_subquery_filter(expr, query.bound(), *negated, input),
+            Expr::ExistsSubquery { query } => {
+                self.plan_exists_subquery_filter(query.bound(), false, input)
+            }
             _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
             _ => Ok(LogicalPlan::Filter {
                 predicate: predicate.clone(),
@@ -838,6 +847,9 @@ impl LogicalPlanner {
                 query,
                 negated,
             } => self.plan_in_subquery_filter(expr, query.bound(), !*negated, input),
+            Expr::ExistsSubquery { query } => {
+                self.plan_exists_subquery_filter(query.bound(), true, input)
+            }
             _ if contains_in_subquery(expr) => Err(unsupported_in_subquery_predicate()),
             _ => Ok(LogicalPlan::Filter {
                 predicate: Expr::Not(Box::new(expr.clone())),
@@ -861,6 +873,25 @@ impl LogicalPlanner {
         })?;
         Ok(LogicalPlan::InSubqueryFilter {
             expr: expr.clone(),
+            subquery: Box::new(self.plan(query)?),
+            negated,
+            input: Box::new(input),
+        })
+    }
+
+    fn plan_exists_subquery_filter(
+        &self,
+        query: Option<&BoundStatement>,
+        negated: bool,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let query = query.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "EXISTS subquery was not bound before planning",
+            )
+        })?;
+        Ok(LogicalPlan::ExistsSubqueryFilter {
             subquery: Box::new(self.plan(query)?),
             negated,
             input: Box::new(input),
@@ -906,6 +937,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         } => {
             let op = if *negated { "NOT IN" } else { "IN" };
             out.push_str(&format!("{prefix}InSubqueryFilter expr={expr} op={op}\n"));
+            write_plan(input, indent + 1, out);
+            write_plan(subquery, indent + 1, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => {
+            let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
+            out.push_str(&format!("{prefix}ExistsSubqueryFilter op={op}\n"));
             write_plan(input, indent + 1, out);
             write_plan(subquery, indent + 1, out);
         }
@@ -1442,6 +1483,13 @@ fn write_plan_with_costs(
             write_plan_with_costs(input, indent + 1, cost_model, out);
             write_plan_with_costs(subquery, indent + 1, cost_model, out);
         }
+        LogicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(input, indent + 1, cost_model, out);
+            write_plan_with_costs(subquery, indent + 1, cost_model, out);
+        }
         LogicalPlan::SidewaysLookup { outer, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(outer, indent + 1, cost_model, out);
@@ -1482,6 +1530,7 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
         LogicalPlan::Project { items, .. } => Some(items),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::InSubqueryFilter { input, .. }
+        | LogicalPlan::ExistsSubqueryFilter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. }
@@ -1494,7 +1543,7 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
 fn first_filter_predicate(plan: &LogicalPlan) -> Option<&Expr> {
     match plan {
         LogicalPlan::Filter { predicate, .. } => Some(predicate),
-        LogicalPlan::InSubqueryFilter { .. } => None,
+        LogicalPlan::InSubqueryFilter { .. } | LogicalPlan::ExistsSubqueryFilter { .. } => None,
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
@@ -1616,7 +1665,7 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
 }
 
 fn contains_in_subquery(expr: &Expr) -> bool {
-    matches!(expr, Expr::InSubquery { .. })
+    matches!(expr, Expr::InSubquery { .. } | Expr::ExistsSubquery { .. })
         || contains_in_subquery_operator(expr)
         || contains_in_subquery_predicate(expr)
         || contains_in_subquery_construct(expr)
@@ -1692,7 +1741,7 @@ fn contains_in_subquery_collection(expr: &Expr) -> bool {
 fn unsupported_in_subquery_predicate() -> RnovError {
     RnovError::new(
         ErrorKind::InvalidInput,
-        "IN subquery predicates currently support top-level terms combined with AND",
+        "subquery predicates currently support top-level terms combined with AND",
     )
 }
 
