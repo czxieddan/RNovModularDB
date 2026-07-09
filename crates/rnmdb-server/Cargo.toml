@@ -13,6 +13,7 @@ tokio-runtime = ["dep:tokio", "rnmdb-cli/tokio-runtime"]
 rnmdb-cli.workspace = true
 rnmdb-common.workspace = true
 rnmdb-instance.workspace = true
+rnmdb-security.workspace = true
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]

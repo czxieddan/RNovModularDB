@@ -8,6 +8,7 @@ use rnmdb_cli::LocalSession;
 use rnmdb_common::ids::{DatabaseId, InstanceId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_instance::{InstanceConfig, InstanceManager, ResourceLimits, ResourceUsage};
+use rnmdb_security::{AuthenticationProvider, LocalCredentialStore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
@@ -19,6 +20,7 @@ pub struct EmbeddedRuntimeConfig {
     instance: InstanceConfig,
     mode: EmbeddedRuntimeMode,
     temporary: bool,
+    credentials: Option<LocalCredentialStore>,
 }
 
 impl EmbeddedRuntimeConfig {
@@ -35,7 +37,13 @@ impl EmbeddedRuntimeConfig {
             instance: InstanceConfig::isolated(instance_id, database_id, limits),
             mode: EmbeddedRuntimeMode::TemporaryMemory,
             temporary: true,
+            credentials: None,
         }
+    }
+
+    pub fn with_credentials(mut self, credentials: LocalCredentialStore) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     pub fn instance(&self) -> &InstanceConfig {
@@ -56,6 +64,14 @@ impl EmbeddedRuntimeConfig {
 
     pub fn disk_writes_allowed(&self) -> bool {
         false
+    }
+
+    pub fn authentication_required(&self) -> bool {
+        self.credentials.is_some()
+    }
+
+    pub fn credentials(&self) -> Option<&LocalCredentialStore> {
+        self.credentials.as_ref()
     }
 }
 
@@ -86,7 +102,7 @@ impl SqlTcpServer {
             .listener
             .accept()
             .map_err(|err| io_error("failed to accept SQL TCP client", err))?;
-        handle_sql_client(stream, self.runtime.open_session()?)
+        handle_sql_client(stream, &self.runtime)
     }
 
     pub fn serve(&self) -> Result<()> {
@@ -149,21 +165,30 @@ impl TokioEmbeddedRuntime {
     }
 }
 
-fn handle_sql_client(stream: TcpStream, mut session: LocalSession) -> Result<()> {
+fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()> {
     let reader_stream = stream
         .try_clone()
         .map_err(|err| io_error("failed to clone SQL TCP client stream", err))?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
+    let mut session = initial_client_session(runtime)?;
     let mut command = String::new();
     loop {
         command.clear();
         if read_sql_command(&mut reader, &mut command)? == 0 {
             return Ok(());
         }
-        if execute_sql_command_line(&mut session, &mut writer, command.trim())? {
+        if execute_sql_command_line(runtime, &mut session, &mut writer, command.trim())? {
             return Ok(());
         }
+    }
+}
+
+fn initial_client_session(runtime: &EmbeddedRuntime) -> Result<Option<LocalSession>> {
+    if runtime.config().authentication_required() {
+        Ok(None)
+    } else {
+        runtime.open_session().map(Some)
     }
 }
 
@@ -174,7 +199,8 @@ fn read_sql_command(reader: &mut BufReader<TcpStream>, command: &mut String) -> 
 }
 
 fn execute_sql_command_line(
-    session: &mut LocalSession,
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
@@ -186,12 +212,74 @@ fn execute_sql_command_line(
         write_protocol_line(writer, "ERR empty command")?;
         return Ok(false);
     }
+    if auth_command_tail(command).is_some() {
+        return execute_auth_command(runtime, session, writer, command);
+    }
+    let Some(session) = session.as_mut() else {
+        write_protocol_line(writer, "ERR authentication required")?;
+        return Ok(false);
+    };
     let line = match session.execute(command) {
         Ok(output) => protocol_output_line(output),
         Err(err) => format!("ERR {}", protocol_text(&err.to_string())),
     };
     write_protocol_line(writer, &line)?;
     Ok(false)
+}
+
+fn execute_auth_command(
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
+    writer: &mut TcpStream,
+    command: &str,
+) -> Result<bool> {
+    if session.is_some() {
+        write_protocol_line(writer, "OK authenticated")?;
+        return Ok(false);
+    }
+    let Some((username, password)) = parse_auth_command(command) else {
+        write_protocol_line(writer, "ERR usage: AUTH <username> <password>")?;
+        return Ok(false);
+    };
+    if authenticate_client(runtime, username, password)? {
+        *session = Some(runtime.open_session()?);
+        write_protocol_line(writer, "OK authenticated")?;
+    } else {
+        write_protocol_line(writer, "ERR authentication failed")?;
+    }
+    Ok(false)
+}
+
+fn authenticate_client(runtime: &EmbeddedRuntime, username: &str, password: &str) -> Result<bool> {
+    let Some(credentials) = runtime.config().credentials() else {
+        return Ok(true);
+    };
+    credentials
+        .authenticate(username, password)
+        .map(|principal| principal.is_some())
+}
+
+fn parse_auth_command(command: &str) -> Option<(&str, &str)> {
+    let tail = auth_command_tail(command)?.trim_start();
+    let (username, password) = tail.split_once(char::is_whitespace)?;
+    let password = password.trim_start();
+    if username.is_empty() || password.is_empty() {
+        None
+    } else {
+        Some((username, password))
+    }
+}
+
+fn auth_command_tail(command: &str) -> Option<&str> {
+    if command.eq_ignore_ascii_case("auth") {
+        return Some("");
+    }
+    let (head, tail) = command.split_once(char::is_whitespace)?;
+    if head.eq_ignore_ascii_case("auth") {
+        Some(tail)
+    } else {
+        None
+    }
 }
 
 fn protocol_output_line(output: CommandOutput) -> String {
