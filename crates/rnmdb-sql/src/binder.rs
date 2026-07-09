@@ -1456,6 +1456,10 @@ impl<'a> Binder<'a> {
             let mut grouped_outputs = projection.clone();
             grouped_outputs.extend(hidden_group_keys.iter().cloned());
             grouped_outputs.extend(hidden_aggregates.iter().cloned());
+            let mut infer =
+                |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
+            let having =
+                self.bind_predicate_subqueries(&having, input.role_id, &mut infer, None)?;
             self.validate_grouped_having_expr(&grouped_outputs, &having)?;
             Some(having)
         } else {
@@ -3002,14 +3006,25 @@ impl<'a> Binder<'a> {
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
             }),
-            Expr::InSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING does not support IN subqueries yet",
-            )),
-            Expr::ExistsSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING does not support EXISTS subqueries yet",
-            )),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(self.rewrite_grouped_having_expr(
+                    table,
+                    projection,
+                    group_by,
+                    hidden_group_keys,
+                    hidden_aggregates,
+                    expr,
+                )?),
+                query: query.clone(),
+                negated: *negated,
+            }),
+            Expr::ExistsSubquery { query } => Ok(Expr::ExistsSubquery {
+                query: query.clone(),
+            }),
             Expr::Like {
                 expr,
                 pattern,
@@ -3196,10 +3211,9 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::RuntimeValue(_)
             | Expr::HStore(_) => Ok(expr.clone()),
-            Expr::ScalarSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING does not support scalar subqueries yet",
-            )),
+            Expr::ScalarSubquery { query } => Ok(Expr::ScalarSubquery {
+                query: query.clone(),
+            }),
         }
     }
 
