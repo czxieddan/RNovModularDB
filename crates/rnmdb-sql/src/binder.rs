@@ -2115,7 +2115,14 @@ impl<'a> Binder<'a> {
                 expr,
                 query,
                 negated,
-            } => self.bind_in_subquery_expr(expr, query, *negated, role_id, infer),
+            } => self.bind_in_subquery_expr(
+                expr,
+                query,
+                *negated,
+                role_id,
+                infer,
+                subquery_outer_scope,
+            ),
             Expr::ExistsSubquery { query } => {
                 self.bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
             }
@@ -2131,12 +2138,13 @@ impl<'a> Binder<'a> {
         negated: bool,
         role_id: RoleId,
         infer: &mut F,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<Expr>
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
         let expr = self.bind_predicate_subqueries(expr, role_id, infer, None)?;
-        let bound = self.bind_in_subquery(query, role_id)?;
+        let bound = self.bind_in_subquery(query, role_id, outer_scope)?;
         let expr_type = infer(&expr)?.ok_or_else(|| {
             RnovError::new(
                 ErrorKind::InvalidInput,
@@ -2152,10 +2160,15 @@ impl<'a> Binder<'a> {
         })
     }
 
-    fn bind_in_subquery(&self, query: &SelectSubquery, role_id: RoleId) -> Result<BoundStatement> {
+    fn bind_in_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
         match query {
             SelectSubquery::Parsed(statement) => {
-                let bound = self.bind_for_role(statement, role_id)?;
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
                 let _ = single_query_output_type(&bound)?;
                 Ok(bound)
             }

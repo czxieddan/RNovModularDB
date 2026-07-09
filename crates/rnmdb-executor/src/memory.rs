@@ -1826,8 +1826,7 @@ impl MemoryExecutor {
                 input,
             } => {
                 let input = self.execute_cancellable(input, cancellation)?;
-                let subquery = self.execute_cancellable(subquery, cancellation)?;
-                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+                self.apply_logical_in_subquery_filter(input, subquery, expr, *negated, cancellation)
             }
             LogicalPlan::ExistsSubqueryFilter {
                 subquery,
@@ -2027,6 +2026,48 @@ impl MemoryExecutor {
         }
         let subquery = self.execute_cancellable(subquery, cancellation)?;
         apply_exists_subquery_filter(input, &subquery, negated, cancellation)
+    }
+
+    fn apply_logical_in_subquery_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &LogicalPlan,
+        expr: &Expr,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if logical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_logical_in_filter(
+                input,
+                subquery,
+                expr,
+                negated,
+                cancellation,
+            );
+        }
+        let subquery = self.execute_cancellable(subquery, cancellation)?;
+        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+    }
+
+    fn apply_correlated_logical_in_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &LogicalPlan,
+        expr: &Expr,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut rows = Vec::new();
+        for row in input.rows() {
+            cancellation.check()?;
+            let subquery = replace_logical_outer_refs(subquery, input.columns(), row)?;
+            let subquery = self.execute_cancellable(&subquery, cancellation)?;
+            let values = collect_in_subquery_values(&subquery, cancellation)?;
+            if in_subquery_keeps_row(input.columns(), row, expr, &values, negated)? {
+                rows.push(row.clone());
+            }
+        }
+        VectorBatch::new(input.columns().to_vec(), rows)
     }
 
     fn apply_correlated_logical_exists_filter(
@@ -2834,8 +2875,7 @@ impl MemoryExecutor {
                 input,
             } => {
                 let input = self.execute_parallel_cancellable(input, config, cancellation)?;
-                let subquery = self.execute_parallel_cancellable(subquery, config, cancellation)?;
-                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+                self.apply_logical_in_subquery_filter(input, subquery, expr, *negated, cancellation)
             }
             LogicalPlan::ExistsSubqueryFilter {
                 subquery,
