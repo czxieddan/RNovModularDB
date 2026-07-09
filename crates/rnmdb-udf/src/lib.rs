@@ -1,7 +1,9 @@
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
-use rnmdb_types::SqlType;
+use rnmdb_types::{SqlType, SqlValue};
+
+const WASM_SCALAR_ENTRYPOINT: &str = "run";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdfBudget {
@@ -526,4 +528,104 @@ impl UdfRegistry {
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty()
     }
+}
+
+#[derive(Clone)]
+pub struct WasmScalarRuntime {
+    engine: wasmtime::Engine,
+}
+
+impl WasmScalarRuntime {
+    pub fn new() -> Result<Self> {
+        let mut config = wasmtime::Config::new();
+        config.consume_fuel(true);
+        let engine = wasmtime::Engine::new(&config)
+            .map_err(|err| wasm_runtime_error("failed to create wasm engine", err))?;
+        Ok(Self { engine })
+    }
+
+    pub fn execute_scalar(
+        &self,
+        definition: &UdfDefinition,
+        arguments: &[SqlValue],
+    ) -> Result<SqlValue> {
+        let module = wasm_module_for_scalar(definition)?;
+        let argument = i64_unary_argument(definition, arguments)?;
+        let result = self.execute_i64_unary(module, definition.sandbox_policy(), argument)?;
+        Ok(SqlValue::Int64(result))
+    }
+
+    fn execute_i64_unary(
+        &self,
+        module: &WasmModuleDefinition,
+        policy: &UdfSandboxPolicy,
+        argument: i64,
+    ) -> Result<i64> {
+        let wasm_module = self.compile_module(module)?;
+        let mut store = self.create_store(policy)?;
+        let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[])
+            .map_err(|err| wasm_runtime_error("failed to instantiate wasm module", err))?;
+        let function = instance
+            .get_typed_func::<i64, i64>(&mut store, WASM_SCALAR_ENTRYPOINT)
+            .map_err(|err| wasm_runtime_error("failed to resolve wasm scalar entrypoint", err))?;
+        function
+            .call(&mut store, argument)
+            .map_err(|err| wasm_runtime_error("wasm scalar execution failed", err))
+    }
+
+    fn compile_module(&self, module: &WasmModuleDefinition) -> Result<wasmtime::Module> {
+        wasmtime::Module::from_binary(&self.engine, module.module_bytes())
+            .map_err(|err| wasm_runtime_error("failed to compile wasm module", err))
+    }
+
+    fn create_store(&self, policy: &UdfSandboxPolicy) -> Result<wasmtime::Store<()>> {
+        let mut store = wasmtime::Store::new(&self.engine, ());
+        store
+            .set_fuel(policy.budget().max_instructions())
+            .map_err(|err| wasm_runtime_error("failed to set wasm fuel budget", err))?;
+        Ok(store)
+    }
+}
+
+fn wasm_module_for_scalar(definition: &UdfDefinition) -> Result<&WasmModuleDefinition> {
+    if definition.kind() != FunctionKind::WasmSandbox || definition.class() != FunctionClass::Scalar
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar runtime requires a scalar wasm function",
+        ));
+    }
+    definition.wasm_module().ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar runtime requires an attached wasm module",
+        )
+    })
+}
+
+fn i64_unary_argument(definition: &UdfDefinition, arguments: &[SqlValue]) -> Result<i64> {
+    ensure_i64_unary_signature(definition)?;
+    let [SqlValue::Int64(argument)] = arguments else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar runtime currently supports one i64 argument",
+        ));
+    };
+    Ok(*argument)
+}
+
+fn ensure_i64_unary_signature(definition: &UdfDefinition) -> Result<()> {
+    if definition.argument_types() != [SqlType::Int64]
+        || definition.return_type() != Some(&SqlType::Int64)
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar runtime currently supports run(i64) -> i64",
+        ));
+    }
+    Ok(())
+}
+
+fn wasm_runtime_error(context: &str, err: impl Display) -> RnovError {
+    RnovError::new(ErrorKind::InvalidInput, format!("{context}: {err}"))
 }

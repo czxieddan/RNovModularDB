@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 rnmdb-common.workspace = true
 rnmdb-types.workspace = true
+wasmtime.workspace = true
 
 [lib]
 path = "src/lib.rs"
