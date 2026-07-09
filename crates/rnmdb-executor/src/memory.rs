@@ -40,6 +40,7 @@ use rnmdb_sql::{
         SelectSubquery,
     },
     parser::parse_expr,
+    rewrite_expr_tree,
 };
 use rnmdb_types::{
     ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlJson, SqlRange,
@@ -2200,16 +2201,18 @@ impl MemoryExecutor {
     }
 
     fn expr_has_correlated_scalar_subquery(&self, expr: &Expr) -> Result<bool> {
-        match expr {
-            Expr::ScalarSubquery { query } => self.scalar_subquery_has_outer_refs(query),
-            Expr::Binary { left, right, .. } => Ok(self
-                .expr_has_correlated_scalar_subquery(left)?
-                || self.expr_has_correlated_scalar_subquery(right)?),
-            Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
-                self.expr_has_correlated_scalar_subquery(expr)
+        let mut found = false;
+        rewrite_expr_tree(expr, &mut |candidate| {
+            if found {
+                return Ok(Some(candidate.clone()));
             }
-            _ => Ok(false),
-        }
+            let Expr::ScalarSubquery { query } = candidate else {
+                return Ok(None);
+            };
+            found = self.scalar_subquery_has_outer_refs(query)?;
+            Ok(Some(candidate.clone()))
+        })?;
+        Ok(found)
     }
 
     fn scalar_subquery_has_outer_refs(&self, query: &SelectSubquery) -> Result<bool> {
@@ -2228,29 +2231,13 @@ impl MemoryExecutor {
         expr: &Expr,
         cancellation: &CancellationToken,
     ) -> Result<Expr> {
-        match expr {
-            Expr::ScalarSubquery { query } => {
-                let value = self.execute_scalar_subquery(query, cancellation)?;
-                Ok(Expr::RuntimeValue(value))
-            }
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.resolve_scalar_subqueries(left, cancellation)?),
-                op: op.clone(),
-                right: Box::new(self.resolve_scalar_subqueries(right, cancellation)?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.resolve_scalar_subqueries(expr, cancellation)?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.resolve_scalar_subqueries(expr, cancellation)?,
-            ))),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.resolve_scalar_subqueries(expr, cancellation)?),
-                data_type: data_type.clone(),
-            }),
-            _ => Ok(expr.clone()),
-        }
+        rewrite_expr_tree(expr, &mut |candidate| match candidate {
+            Expr::ScalarSubquery { query } => self
+                .execute_scalar_subquery(query, cancellation)
+                .map(Expr::RuntimeValue)
+                .map(Some),
+            _ => Ok(None),
+        })
     }
 
     fn resolve_scalar_subqueries_for_row(
@@ -2260,50 +2247,13 @@ impl MemoryExecutor {
         row: &Row,
         cancellation: &CancellationToken,
     ) -> Result<Expr> {
-        match expr {
-            Expr::ScalarSubquery { query } => {
-                let value =
-                    self.execute_scalar_subquery_for_row(query, columns, row, cancellation)?;
-                Ok(Expr::RuntimeValue(value))
-            }
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.resolve_scalar_subqueries_for_row(
-                    left,
-                    columns,
-                    row,
-                    cancellation,
-                )?),
-                op: op.clone(),
-                right: Box::new(self.resolve_scalar_subqueries_for_row(
-                    right,
-                    columns,
-                    row,
-                    cancellation,
-                )?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.resolve_scalar_subqueries_for_row(
-                    expr,
-                    columns,
-                    row,
-                    cancellation,
-                )?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(
-                self.resolve_scalar_subqueries_for_row(expr, columns, row, cancellation)?,
-            ))),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.resolve_scalar_subqueries_for_row(
-                    expr,
-                    columns,
-                    row,
-                    cancellation,
-                )?),
-                data_type: data_type.clone(),
-            }),
-            _ => Ok(expr.clone()),
-        }
+        rewrite_expr_tree(expr, &mut |candidate| match candidate {
+            Expr::ScalarSubquery { query } => self
+                .execute_scalar_subquery_for_row(query, columns, row, cancellation)
+                .map(Expr::RuntimeValue)
+                .map(Some),
+            _ => Ok(None),
+        })
     }
 
     fn execute_scalar_subquery(

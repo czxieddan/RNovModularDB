@@ -2084,57 +2084,22 @@ impl<'a> Binder<'a> {
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
-        match expr {
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.bind_predicate_subqueries(
-                    left,
-                    role_id,
-                    infer,
-                    subquery_outer_scope,
-                )?),
-                op: op.clone(),
-                right: Box::new(self.bind_predicate_subqueries(
-                    right,
-                    role_id,
-                    infer,
-                    subquery_outer_scope,
-                )?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.bind_predicate_subqueries(
-                    expr,
-                    role_id,
-                    infer,
-                    subquery_outer_scope,
-                )?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.bind_predicate_subqueries(
-                expr,
-                role_id,
-                infer,
-                subquery_outer_scope,
-            )?))),
+        crate::rewrite_expr_tree(expr, &mut |candidate| match candidate {
             Expr::InSubquery {
                 expr,
                 query,
                 negated,
-            } => self.bind_in_subquery_expr(
-                expr,
-                query,
-                *negated,
-                role_id,
-                infer,
-                subquery_outer_scope,
-            ),
-            Expr::ExistsSubquery { query } => {
-                self.bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
-            }
-            Expr::ScalarSubquery { query } => {
-                self.bind_scalar_subquery_expr(query, role_id, subquery_outer_scope)
-            }
-            _ => Ok(expr.clone()),
-        }
+            } => self
+                .bind_in_subquery_expr(expr, query, *negated, role_id, infer, subquery_outer_scope)
+                .map(Some),
+            Expr::ExistsSubquery { query } => self
+                .bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
+                .map(Some),
+            Expr::ScalarSubquery { query } => self
+                .bind_scalar_subquery_expr(query, role_id, subquery_outer_scope)
+                .map(Some),
+            _ => Ok(None),
+        })
     }
 
     fn bind_in_subquery_expr<F>(
@@ -2216,30 +2181,12 @@ impl<'a> Binder<'a> {
         role_id: RoleId,
         outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<Expr> {
-        match expr {
-            Expr::ScalarSubquery { query } => {
-                self.bind_scalar_subquery_expr(query, role_id, outer_scope)
-            }
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.bind_scalar_subqueries(left, role_id, outer_scope)?),
-                op: op.clone(),
-                right: Box::new(self.bind_scalar_subqueries(right, role_id, outer_scope)?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.bind_scalar_subqueries(expr, role_id, outer_scope)?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.bind_scalar_subqueries(
-                expr,
-                role_id,
-                outer_scope,
-            )?))),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.bind_scalar_subqueries(expr, role_id, outer_scope)?),
-                data_type: data_type.clone(),
-            }),
-            _ => Ok(expr.clone()),
-        }
+        crate::rewrite_expr_tree(expr, &mut |candidate| match candidate {
+            Expr::ScalarSubquery { query } => self
+                .bind_scalar_subquery_expr(query, role_id, outer_scope)
+                .map(Some),
+            _ => Ok(None),
+        })
     }
 
     fn bind_scalar_subquery_expr(
