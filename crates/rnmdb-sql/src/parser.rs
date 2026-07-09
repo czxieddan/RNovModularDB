@@ -4,9 +4,10 @@ use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
-        JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem,
-        SelectSubquery, SortDirection, Statement, TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ColumnReference, ExplainFormat, Expr, GeneratedColumn,
+        Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr,
+        RangeLiteralBounds, SelectItem, SelectSubquery, SortDirection, Statement,
+        TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -395,6 +396,7 @@ impl Parser {
         let mut nullable = true;
         let mut encrypted = false;
         let mut generated = None;
+        let mut references = None;
 
         loop {
             match self.peek_kind() {
@@ -420,6 +422,12 @@ impl Parser {
                     self.expect_keyword(TokenKind::Stored)?;
                     generated = Some(GeneratedColumn { expr, stored: true });
                 }
+                Some(TokenKind::References) => {
+                    if references.is_some() {
+                        return Err(self.error("column has duplicate references clause"));
+                    }
+                    references = Some(self.parse_column_reference()?);
+                }
                 _ => break,
             }
         }
@@ -430,7 +438,17 @@ impl Parser {
             nullable,
             encrypted,
             generated,
+            references,
         })
+    }
+
+    fn parse_column_reference(&mut self) -> Result<ColumnReference> {
+        self.expect_keyword(TokenKind::References)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let column = self.parse_ident()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(ColumnReference { table, column })
     }
 
     fn parse_create_function_tail(&mut self) -> Result<Statement> {

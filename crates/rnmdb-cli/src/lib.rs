@@ -1,6 +1,9 @@
-use std::{path::Path, time::Instant};
+use std::{collections::HashSet, path::Path, time::Instant};
 
-use rnmdb_catalog::{Catalog, CatalogCodec, IndexKey, OperatorSignature, Privilege, RowPolicy};
+use rnmdb_catalog::{
+    Catalog, CatalogCodec, ForeignKeyReference, IndexKey, OperatorSignature, Privilege, RowPolicy,
+    Table as CatalogTable,
+};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{DatabaseId, RelationId, RoleId},
@@ -30,7 +33,7 @@ use rnmdb_storage::{
     upgrade_single_file_with_key, verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
-use rnmdb_types::SqlType;
+use rnmdb_types::{SqlType, SqlValue};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
@@ -324,10 +327,7 @@ impl LocalSession {
                 }
                 Ok(CommandOutput::Text(text))
             }
-            _ => {
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
+            _ => self.execute_mutation_with_constraints(&bound),
         }
     }
 
@@ -363,6 +363,95 @@ impl LocalSession {
             self.executor.snapshot_tables()?,
         )
         .encode()
+    }
+
+    fn execute_mutation_with_constraints(
+        &mut self,
+        statement: &BoundStatement,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(statement)?;
+        let snapshot = self.executor.snapshot()?;
+        let output = self.executor.execute_mut(&plan)?;
+        if let Err(err) = self.validate_foreign_keys_after_mutation(statement) {
+            self.executor = snapshot;
+            return Err(err);
+        }
+        Ok(CommandOutput::from(output))
+    }
+
+    fn validate_foreign_keys_after_mutation(&self, statement: &BoundStatement) -> Result<()> {
+        match statement {
+            BoundStatement::Insert { table, .. } => self.validate_table_foreign_keys(table),
+            BoundStatement::Update(update) => self.validate_table_foreign_keys(&update.table),
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_table_foreign_keys(&self, table_name: &ObjectName) -> Result<()> {
+        let table = self.catalog_table_for_name(table_name)?;
+        if !table
+            .columns()
+            .iter()
+            .any(|column| column.foreign_key().is_some())
+        {
+            return Ok(());
+        }
+        let batch = self.executor.scan_catalog_table(table)?;
+        for column in table.columns() {
+            if let Some(reference) = column.foreign_key() {
+                self.validate_column_foreign_key(&batch, table, column.name(), reference)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_column_foreign_key(
+        &self,
+        child_batch: &VectorBatch,
+        child_table: &CatalogTable,
+        child_column: &str,
+        reference: &ForeignKeyReference,
+    ) -> Result<()> {
+        let child_index = batch_column_index(child_batch, child_column)?;
+        let parent_table = self.foreign_key_parent(reference)?;
+        let parent_batch = self.executor.scan_catalog_table(parent_table)?;
+        let parent_index = batch_column_index(&parent_batch, reference.column_name())?;
+        let parent_values = collect_non_null_values(&parent_batch, parent_index);
+        validate_child_values_exist(
+            child_batch,
+            child_table,
+            child_column,
+            child_index,
+            reference,
+            &parent_values,
+        )
+    }
+
+    fn catalog_table_for_name(&self, name: &ObjectName) -> Result<&CatalogTable> {
+        let schema = name.schema().unwrap_or("public");
+        self.catalog
+            .get_table(schema, name.object())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table does not exist: {schema}.{}", name.object()),
+                )
+            })
+    }
+
+    fn foreign_key_parent(&self, reference: &ForeignKeyReference) -> Result<&CatalogTable> {
+        self.catalog
+            .get_table(reference.schema_name(), reference.table_name())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "foreign key parent table does not exist: {}.{}",
+                        reference.schema_name(),
+                        reference.table_name()
+                    ),
+                )
+            })
     }
 
     fn execute_transaction(&mut self, action: TransactionAction) -> Result<CommandOutput> {
@@ -431,7 +520,7 @@ impl LocalSession {
         }
         let columns = columns
             .iter()
-            .map(ColumnDef::to_catalog_column)
+            .map(|column| column.to_catalog_column_with_default_schema(schema))
             .collect::<Vec<_>>();
         let relation_id = self
             .catalog
@@ -622,8 +711,11 @@ impl LocalSession {
         {
             return Ok(());
         }
-        self.catalog
-            .add_column(schema, table.object(), column.to_catalog_column())?;
+        self.catalog.add_column(
+            schema,
+            table.object(),
+            column.to_catalog_column_with_default_schema(schema),
+        )?;
         Ok(())
     }
 
@@ -979,6 +1071,77 @@ fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
         .get_role("local")
         .map(|role| role.role_id())
         .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
+}
+
+fn batch_column_index(batch: &VectorBatch, column: &str) -> Result<usize> {
+    batch
+        .columns()
+        .iter()
+        .position(|existing| existing.name() == column)
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("column does not exist in batch: {column}"),
+            )
+        })
+}
+
+fn collect_non_null_values(batch: &VectorBatch, column_index: usize) -> HashSet<SqlValue> {
+    batch
+        .rows()
+        .iter()
+        .filter_map(|row| non_null_value(row.values()[column_index].clone()))
+        .collect()
+}
+
+fn non_null_value(value: SqlValue) -> Option<SqlValue> {
+    if value == SqlValue::Null {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn validate_child_values_exist(
+    child_batch: &VectorBatch,
+    child_table: &CatalogTable,
+    child_column: &str,
+    child_index: usize,
+    reference: &ForeignKeyReference,
+    parent_values: &HashSet<SqlValue>,
+) -> Result<()> {
+    for row in child_batch.rows() {
+        let value = &row.values()[child_index];
+        if *value != SqlValue::Null && !parent_values.contains(value) {
+            return Err(foreign_key_violation(
+                child_table,
+                child_column,
+                reference,
+                value,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn foreign_key_violation(
+    child_table: &CatalogTable,
+    child_column: &str,
+    reference: &ForeignKeyReference,
+    value: &SqlValue,
+) -> RnovError {
+    RnovError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "foreign key violation on {}.{}: value {:?} has no parent {}.{}.{}",
+            child_table.name(),
+            child_column,
+            value,
+            reference.schema_name(),
+            reference.table_name(),
+            reference.column_name()
+        ),
+    )
 }
 
 fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<String> {

@@ -14,6 +14,7 @@ pub struct Column {
     encrypted: bool,
     generated_expr: Option<String>,
     generated_stored: bool,
+    foreign_key: Option<ForeignKeyReference>,
 }
 
 impl Column {
@@ -25,6 +26,7 @@ impl Column {
             encrypted: false,
             generated_expr: None,
             generated_stored: false,
+            foreign_key: None,
         }
     }
 
@@ -41,6 +43,11 @@ impl Column {
     pub fn generated(mut self, expr: impl Into<String>, stored: bool) -> Self {
         self.generated_expr = Some(expr.into());
         self.generated_stored = stored;
+        self
+    }
+
+    pub fn references(mut self, foreign_key: ForeignKeyReference) -> Self {
+        self.foreign_key = Some(foreign_key);
         self
     }
 
@@ -66,6 +73,43 @@ impl Column {
 
     pub fn generated_stored(&self) -> bool {
         self.generated_stored
+    }
+
+    pub fn foreign_key(&self) -> Option<&ForeignKeyReference> {
+        self.foreign_key.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForeignKeyReference {
+    schema_name: String,
+    table_name: String,
+    column_name: String,
+}
+
+impl ForeignKeyReference {
+    pub fn new(
+        schema_name: impl Into<String>,
+        table_name: impl Into<String>,
+        column_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_name: schema_name.into(),
+            table_name: table_name.into(),
+            column_name: column_name.into(),
+        }
+    }
+
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn column_name(&self) -> &str {
+        &self.column_name
     }
 }
 
@@ -396,6 +440,7 @@ impl Catalog {
         let table_name = table_name.into();
         validate_identifier("table", &table_name)?;
         validate_columns(&columns)?;
+        self.validate_column_references(schema_name, &columns)?;
 
         let schema = self.schemas.get_mut(schema_name).ok_or_else(|| {
             RnovError::new(
@@ -465,6 +510,7 @@ impl Catalog {
         column: Column,
     ) -> Result<&Table> {
         validate_columns(std::slice::from_ref(&column))?;
+        self.validate_column_references(schema_name, std::slice::from_ref(&column))?;
         let table = self
             .schemas
             .get_mut(schema_name)
@@ -961,6 +1007,39 @@ impl Catalog {
             .flat_map(|schema| schema.tables.values_mut())
             .find(|table| table.relation_id == relation_id)
     }
+
+    fn validate_column_references(&self, default_schema: &str, columns: &[Column]) -> Result<()> {
+        for column in columns {
+            if let Some(reference) = column.foreign_key() {
+                self.validate_column_reference(default_schema, column, reference)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_column_reference(
+        &self,
+        default_schema: &str,
+        column: &Column,
+        reference: &ForeignKeyReference,
+    ) -> Result<()> {
+        let schema_name = empty_as_default(reference.schema_name(), default_schema);
+        validate_identifier("referenced table", reference.table_name())?;
+        validate_identifier("referenced column", reference.column_name())?;
+        let referenced_table = self
+            .get_table(schema_name, reference.table_name())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "referenced table does not exist: {schema_name}.{}",
+                        reference.table_name()
+                    ),
+                )
+            })?;
+        let referenced_column = find_column(referenced_table, reference.column_name())?;
+        validate_reference_type(column, referenced_column)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1364,11 +1443,44 @@ fn validate_index_keys(table: &Table, keys: &[IndexKey], method: IndexMethod) ->
     Ok(())
 }
 
+fn empty_as_default<'a>(value: &'a str, default: &'a str) -> &'a str {
+    if value.is_empty() { default } else { value }
+}
+
+fn find_column<'a>(table: &'a Table, column_name: &str) -> Result<&'a Column> {
+    table
+        .columns()
+        .iter()
+        .find(|column| column.name() == column_name)
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("referenced column does not exist: {column_name}"),
+            )
+        })
+}
+
+fn validate_reference_type(column: &Column, referenced_column: &Column) -> Result<()> {
+    if column.data_type() == referenced_column.data_type() {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "foreign key column {} type {:?} does not match referenced column {} type {:?}",
+            column.name(),
+            column.data_type(),
+            referenced_column.name(),
+            referenced_column.data_type()
+        ),
+    ))
+}
+
 pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 10;
+    const VERSION: u16 = 11;
     const MIN_READ_VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
@@ -1406,6 +1518,7 @@ impl CatalogCodec {
                         }
                         None => out.push(0),
                     }
+                    write_foreign_key_reference(&mut out, column.foreign_key())?;
                 }
             }
         }
@@ -1599,6 +1712,11 @@ impl CatalogCodec {
                         encrypted,
                         generated_expr,
                         generated_stored,
+                        foreign_key: if version >= 11 {
+                            read_foreign_key_reference(&mut reader)?
+                        } else {
+                            None
+                        },
                     });
                 }
                 schema.tables.insert(
@@ -1857,6 +1975,35 @@ fn read_optional_role_id(
     } else {
         Ok(None)
     }
+}
+
+fn write_foreign_key_reference(
+    out: &mut Vec<u8>,
+    reference: Option<&ForeignKeyReference>,
+) -> Result<()> {
+    match reference {
+        Some(reference) => {
+            out.push(1);
+            write_string(out, reference.schema_name())?;
+            write_string(out, reference.table_name())?;
+            write_string(out, reference.column_name())?;
+        }
+        None => out.push(0),
+    }
+    Ok(())
+}
+
+fn read_foreign_key_reference(
+    reader: &mut CatalogReader<'_>,
+) -> Result<Option<ForeignKeyReference>> {
+    if !reader.read_bool("foreign key reference present")? {
+        return Ok(None);
+    }
+    Ok(Some(ForeignKeyReference::new(
+        reader.read_string("foreign key schema")?,
+        reader.read_string("foreign key table")?,
+        reader.read_string("foreign key column")?,
+    )))
 }
 
 fn write_string(out: &mut Vec<u8>, value: &str) -> Result<()> {

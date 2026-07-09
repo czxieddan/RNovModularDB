@@ -1,6 +1,6 @@
 use std::fmt;
 
-use rnmdb_catalog::{Column, IndexMethod, OperatorSignature, Privilege};
+use rnmdb_catalog::{Column, ForeignKeyReference, IndexMethod, OperatorSignature, Privilege};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_types::{SqlFloat64, SqlType};
 
@@ -70,6 +70,7 @@ pub struct ColumnDef {
     pub nullable: bool,
     pub encrypted: bool,
     pub generated: Option<GeneratedColumn>,
+    pub references: Option<ColumnReference>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,8 +79,18 @@ pub struct GeneratedColumn {
     pub stored: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnReference {
+    pub table: ObjectName,
+    pub column: Ident,
+}
+
 impl ColumnDef {
     pub fn to_catalog_column(&self) -> Column {
+        self.to_catalog_column_with_default_schema("public")
+    }
+
+    pub fn to_catalog_column_with_default_schema(&self, default_schema: &str) -> Column {
         let mut column = Column::new(self.name.as_str(), self.data_type.clone());
         if !self.nullable {
             column = column.not_null();
@@ -90,8 +101,19 @@ impl ColumnDef {
         if let Some(generated) = &self.generated {
             column = column.generated(generated.expr.to_string(), generated.stored);
         }
+        if let Some(reference) = &self.references {
+            column = column.references(catalog_reference(reference, default_schema));
+        }
         column
     }
+}
+
+fn catalog_reference(reference: &ColumnReference, default_schema: &str) -> ForeignKeyReference {
+    ForeignKeyReference::new(
+        reference.table.schema().unwrap_or(default_schema),
+        reference.table.object(),
+        reference.column.as_str(),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

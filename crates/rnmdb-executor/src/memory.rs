@@ -1694,6 +1694,14 @@ impl MemoryExecutor {
         self.column_crypto.decrypt_batch(relation_id, batch)
     }
 
+    pub fn scan_catalog_table(&self, table: &CatalogTable) -> Result<VectorBatch> {
+        let table_key = {
+            let tables = self.read_tables()?;
+            executor_table_key_for_catalog_name(&tables, table.schema_name(), table.name())?
+        };
+        self.scan_table(table.relation_id(), &table_key)
+    }
+
     fn decrypt_physical_scan(
         &self,
         relation_id: RelationId,
