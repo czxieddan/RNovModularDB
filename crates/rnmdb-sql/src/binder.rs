@@ -1822,6 +1822,7 @@ impl<'a> Binder<'a> {
         let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
         let bound_columns = lateral_columns_to_bound(&joined_columns);
         let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
+        let predicate = self.bind_column_subqueries(&bound_columns, &predicate, input.role_id)?;
         self.validate_predicate_from_columns(&bound_columns, &predicate)?;
         let (projection, columns) =
             self.bind_join_projection(input.select_items, &joined_columns, &bound_columns)?;

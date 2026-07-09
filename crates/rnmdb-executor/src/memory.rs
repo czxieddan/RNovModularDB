@@ -1882,6 +1882,15 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_cancellable(left, cancellation)?;
                 let right = self.execute_cancellable(right, cancellation)?;
+                if self.expr_needs_row_subquery_resolution(predicate)? {
+                    return self.apply_nested_loop_join_with_subqueries(
+                        left,
+                        right,
+                        *kind,
+                        predicate,
+                        cancellation,
+                    );
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
@@ -2163,6 +2172,57 @@ impl MemoryExecutor {
         }
         cancellation.check()?;
         VectorBatch::new(batch.columns().to_vec(), rows)
+    }
+
+    fn apply_nested_loop_join_with_subqueries(
+        &self,
+        left: VectorBatch,
+        right: VectorBatch,
+        kind: JoinKind,
+        predicate: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let columns = joined_columns_for_join(left.columns(), right.columns(), kind)?;
+        let null_right = null_row(right.columns());
+        let mut rows = Vec::new();
+        for left_row in left.rows() {
+            cancellation.check()?;
+            let matched = self.push_matching_join_rows_with_subqueries(
+                &columns,
+                left_row,
+                &right,
+                predicate,
+                &mut rows,
+                cancellation,
+            )?;
+            if kind == JoinKind::Left && !matched {
+                rows.push(join_rows(left_row, &null_right));
+            }
+        }
+        VectorBatch::new(columns, rows)
+    }
+
+    fn push_matching_join_rows_with_subqueries(
+        &self,
+        columns: &[ColumnSchema],
+        left_row: &Row,
+        right: &VectorBatch,
+        predicate: &Expr,
+        rows: &mut Vec<Row>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        let mut matched = false;
+        for right_row in right.rows() {
+            cancellation.check()?;
+            let row = join_rows(left_row, right_row);
+            let predicate =
+                self.resolve_subqueries_for_row(predicate, columns, &row, cancellation)?;
+            if eval_predicate(columns, &row, &predicate)? {
+                rows.push(row);
+                matched = true;
+            }
+        }
+        Ok(matched)
     }
 
     fn correlated_scalar_projection_row(
@@ -2563,6 +2623,15 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_physical_cancellable(left, cancellation)?;
                 let right = self.execute_physical_cancellable(right, cancellation)?;
+                if self.expr_needs_row_subquery_resolution(predicate)? {
+                    return self.apply_nested_loop_join_with_subqueries(
+                        left,
+                        right,
+                        *kind,
+                        predicate,
+                        cancellation,
+                    );
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
@@ -3151,6 +3220,15 @@ impl MemoryExecutor {
             } => {
                 let left = self.execute_parallel_cancellable(left, config, cancellation)?;
                 let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                if self.expr_needs_row_subquery_resolution(predicate)? {
+                    return self.apply_nested_loop_join_with_subqueries(
+                        left,
+                        right,
+                        *kind,
+                        predicate,
+                        cancellation,
+                    );
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
