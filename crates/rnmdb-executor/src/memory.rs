@@ -39,8 +39,8 @@ use rnmdb_sql::{
     parser::parse_expr,
 };
 use rnmdb_types::{
-    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlRange, SqlType,
-    SqlUuid, SqlValue, TextVector, Truth,
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlRange, SqlTimestamp,
+    SqlType, SqlUuid, SqlValue, TextVector, Truth,
 };
 
 use crate::{
@@ -3324,7 +3324,7 @@ fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
     match data_type {
         SqlType::Null => 1.0,
         SqlType::Bool => 1.0,
-        SqlType::Int64 | SqlType::UInt64 | SqlType::Float64 => 8.0,
+        SqlType::Int64 | SqlType::UInt64 | SqlType::Float64 | SqlType::Timestamp => 8.0,
         SqlType::Uuid => 16.0,
         SqlType::Text | SqlType::Bytes => 32.0,
         SqlType::HStore | SqlType::TextVector => 64.0,
@@ -5183,6 +5183,7 @@ fn sortable_type(data_type: &SqlType) -> bool {
             | SqlType::UInt64
             | SqlType::Float64
             | SqlType::Uuid
+            | SqlType::Timestamp
             | SqlType::Text
             | SqlType::Bytes
     )
@@ -5965,6 +5966,12 @@ fn cast_value(value: SqlValue, data_type: &SqlType) -> Result<SqlValue> {
         }
         (SqlValue::Uuid(value), SqlType::Text) => Ok(SqlValue::Text(value.to_hyphenated_string())),
         (SqlValue::Text(value), SqlType::Uuid) => SqlUuid::parse_str(&value).map(SqlValue::Uuid),
+        (SqlValue::Timestamp(value), SqlType::Text) => {
+            Ok(SqlValue::Text(value.to_rfc3339_string()))
+        }
+        (SqlValue::Text(value), SqlType::Timestamp) => {
+            SqlTimestamp::parse_str(&value).map(SqlValue::Timestamp)
+        }
         (SqlValue::Bool(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
         (SqlValue::Text(value), SqlType::Bool) => match value.to_ascii_lowercase().as_str() {
             "true" => Ok(SqlValue::Bool(true)),

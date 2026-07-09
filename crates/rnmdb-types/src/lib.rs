@@ -16,6 +16,7 @@ pub enum SqlType {
     UInt64,
     Float64,
     Uuid,
+    Timestamp,
     Text,
     Bytes,
     HStore,
@@ -32,6 +33,7 @@ pub enum SqlValue {
     UInt64(u64),
     Float64(SqlFloat64),
     Uuid(SqlUuid),
+    Timestamp(SqlTimestamp),
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
@@ -128,6 +130,268 @@ fn hex_char(value: u8) -> char {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlTimestamp(i64);
+
+impl SqlTimestamp {
+    pub fn from_epoch_micros(epoch_micros: i64) -> Self {
+        Self(epoch_micros)
+    }
+
+    pub fn parse_str(value: &str) -> Result<Self> {
+        let (date, time) = parse_timestamp_text(value)?;
+        let epoch_micros = timestamp_epoch_micros(date, time)?;
+        Ok(Self(epoch_micros))
+    }
+
+    pub fn epoch_micros(self) -> i64 {
+        self.0
+    }
+
+    pub fn to_rfc3339_string(self) -> String {
+        let days = self.0.div_euclid(MICROS_PER_DAY);
+        let day_micros = self.0.rem_euclid(MICROS_PER_DAY);
+        let (year, month, day) = civil_from_days(days);
+        let (hour, minute, second, micros) = split_day_micros(day_micros);
+        let fraction = format_timestamp_fraction(micros);
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{fraction}Z")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DateParts {
+    year: i32,
+    month: u8,
+    day: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimeParts {
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micros: u32,
+}
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
+const MICROS_PER_DAY: i64 = SECONDS_PER_DAY * MICROS_PER_SECOND;
+
+fn parse_timestamp_text(value: &str) -> Result<(DateParts, TimeParts)> {
+    let value = value.trim();
+    let value = value.strip_suffix('Z').unwrap_or(value);
+    let (date, time) = split_timestamp_parts(value)?;
+    Ok((parse_date_parts(date)?, parse_time_parts(time)?))
+}
+
+fn split_timestamp_parts(value: &str) -> Result<(&str, &str)> {
+    value
+        .split_once('T')
+        .or_else(|| value.split_once(' '))
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "timestamp text must include date and time",
+            )
+        })
+}
+
+fn parse_date_parts(value: &str) -> Result<DateParts> {
+    let (year, month, day) = split_three(value, '-', "timestamp date")?;
+    let date = DateParts {
+        year: parse_year(year)?,
+        month: parse_two_digit_u8(month, "timestamp month")?,
+        day: parse_two_digit_u8(day, "timestamp day")?,
+    };
+    validate_date_parts(date)?;
+    Ok(date)
+}
+
+fn parse_time_parts(value: &str) -> Result<TimeParts> {
+    let (time, fraction) = split_time_fraction(value)?;
+    let (hour, minute, second) = split_three(time, ':', "timestamp time")?;
+    let time = TimeParts {
+        hour: parse_two_digit_u8(hour, "timestamp hour")?,
+        minute: parse_two_digit_u8(minute, "timestamp minute")?,
+        second: parse_two_digit_u8(second, "timestamp second")?,
+        micros: fraction
+            .map(parse_fraction_micros)
+            .transpose()?
+            .unwrap_or(0),
+    };
+    validate_time_parts(time)?;
+    Ok(time)
+}
+
+fn split_time_fraction(value: &str) -> Result<(&str, Option<&str>)> {
+    let mut parts = value.split('.');
+    let Some(time) = parts.next() else {
+        return Err(invalid_timestamp("timestamp time is missing"));
+    };
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid_timestamp(
+            "timestamp fraction contains multiple dots",
+        ));
+    }
+    Ok((time, fraction))
+}
+
+fn split_three<'a>(
+    value: &'a str,
+    separator: char,
+    label: &str,
+) -> Result<(&'a str, &'a str, &'a str)> {
+    let mut parts = value.split(separator);
+    let Some(first) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    let Some(second) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    let Some(third) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    if parts.next().is_some() {
+        return Err(invalid_timestamp(label));
+    }
+    Ok((first, second, third))
+}
+
+fn parse_year(value: &str) -> Result<i32> {
+    if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp("timestamp year must use four digits"));
+    }
+    value
+        .parse::<i32>()
+        .map_err(|_| invalid_timestamp("timestamp year is invalid"))
+}
+
+fn parse_two_digit_u8(value: &str, label: &str) -> Result<u8> {
+    if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp(label));
+    }
+    value.parse::<u8>().map_err(|_| invalid_timestamp(label))
+}
+
+fn parse_fraction_micros(value: &str) -> Result<u32> {
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp(
+            "timestamp fraction must use one to six digits",
+        ));
+    }
+    let mut micros = value
+        .parse::<u32>()
+        .map_err(|_| invalid_timestamp("timestamp fraction must use one to six digits"))?;
+    for _ in value.len()..6 {
+        micros *= 10;
+    }
+    Ok(micros)
+}
+
+fn validate_date_parts(date: DateParts) -> Result<()> {
+    if !(1..=9999).contains(&date.year) {
+        return Err(invalid_timestamp("timestamp year is out of range"));
+    }
+    let max_day = days_in_month(date.year, date.month)?;
+    if date.day == 0 || date.day > max_day {
+        return Err(invalid_timestamp("timestamp day is out of range"));
+    }
+    Ok(())
+}
+
+fn validate_time_parts(time: TimeParts) -> Result<()> {
+    if time.hour > 23 || time.minute > 59 || time.second > 59 {
+        return Err(invalid_timestamp("timestamp time is out of range"));
+    }
+    Ok(())
+}
+
+fn days_in_month(year: i32, month: u8) -> Result<u8> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Ok(31),
+        4 | 6 | 9 | 11 => Ok(30),
+        2 if leap_year(year) => Ok(29),
+        2 => Ok(28),
+        _ => Err(invalid_timestamp("timestamp month is out of range")),
+    }
+}
+
+fn leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn timestamp_epoch_micros(date: DateParts, time: TimeParts) -> Result<i64> {
+    let days = days_from_civil(date.year, date.month, date.day);
+    let seconds =
+        i64::from(time.hour) * 3_600 + i64::from(time.minute) * 60 + i64::from(time.second);
+    checked_timestamp_micros(days, seconds, time.micros)
+}
+
+fn checked_timestamp_micros(days: i64, seconds: i64, micros: u32) -> Result<i64> {
+    days.checked_mul(MICROS_PER_DAY)
+        .and_then(|value| value.checked_add(seconds * MICROS_PER_SECOND))
+        .and_then(|value| value.checked_add(i64::from(micros)))
+        .ok_or_else(|| invalid_timestamp("timestamp value is out of range"))
+}
+
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = floor_div(year, 400);
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let days = days + 719_468;
+    let era = floor_div(days, 146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (
+        year + if month <= 2 { 1 } else { 0 },
+        month as u8,
+        day as u8,
+    )
+}
+
+fn floor_div(value: i64, divisor: i64) -> i64 {
+    value.div_euclid(divisor)
+}
+
+fn split_day_micros(day_micros: i64) -> (u8, u8, u8, u32) {
+    let total_seconds = day_micros / MICROS_PER_SECOND;
+    let micros = (day_micros % MICROS_PER_SECOND) as u32;
+    let hour = (total_seconds / 3_600) as u8;
+    let minute = ((total_seconds % 3_600) / 60) as u8;
+    let second = (total_seconds % 60) as u8;
+    (hour, minute, second, micros)
+}
+
+fn format_timestamp_fraction(micros: u32) -> String {
+    if micros == 0 {
+        return String::new();
+    }
+    let mut fraction = format!("{micros:06}");
+    while fraction.ends_with('0') {
+        fraction.pop();
+    }
+    format!(".{fraction}")
+}
+
+fn invalid_timestamp(message: &str) -> RnovError {
+    RnovError::new(ErrorKind::InvalidInput, message)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SqlFloat64(u64);
 
@@ -179,6 +443,7 @@ impl SqlValue {
     const TAG_TEXT_VECTOR: u8 = 9;
     const TAG_FLOAT64: u8 = 10;
     const TAG_UUID: u8 = 11;
+    const TAG_TIMESTAMP: u8 = 12;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -192,6 +457,7 @@ impl SqlValue {
             Self::UInt64(_) => SqlType::UInt64,
             Self::Float64(_) => SqlType::Float64,
             Self::Uuid(_) => SqlType::Uuid,
+            Self::Timestamp(_) => SqlType::Timestamp,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
@@ -231,6 +497,9 @@ impl SqlValue {
             Self::UInt64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::Float64(value) => encoded.extend_from_slice(&value.to_bits().to_be_bytes()),
             Self::Uuid(value) => encoded.extend_from_slice(&value.as_bytes()),
+            Self::Timestamp(value) => {
+                encoded.extend_from_slice(&value.epoch_micros().to_be_bytes())
+            }
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
@@ -286,6 +555,9 @@ impl SqlValue {
             Self::TAG_UUID => Ok(Self::Uuid(SqlUuid::from_bytes(read_array::<16>(
                 payload, "uuid",
             )?))),
+            Self::TAG_TIMESTAMP => Ok(Self::Timestamp(SqlTimestamp::from_epoch_micros(
+                i64::from_be_bytes(read_array::<8>(payload, "timestamp")?),
+            ))),
             Self::TAG_TEXT => {
                 let bytes = decode_bytes(payload, "text")?;
                 let text = String::from_utf8(bytes).map_err(|_| {
@@ -313,6 +585,7 @@ impl SqlValue {
             Self::UInt64(_) => Self::TAG_UINT64,
             Self::Float64(_) => Self::TAG_FLOAT64,
             Self::Uuid(_) => Self::TAG_UUID,
+            Self::Timestamp(_) => Self::TAG_TIMESTAMP,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
@@ -336,6 +609,7 @@ impl SqlType {
     const TAG_TEXT_VECTOR: u8 = 9;
     const TAG_FLOAT64: u8 = 10;
     const TAG_UUID: u8 = 11;
+    const TAG_TIMESTAMP: u8 = 12;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -345,6 +619,7 @@ impl SqlType {
             Self::UInt64 => encoded.push(Self::TAG_UINT64),
             Self::Float64 => encoded.push(Self::TAG_FLOAT64),
             Self::Uuid => encoded.push(Self::TAG_UUID),
+            Self::Timestamp => encoded.push(Self::TAG_TIMESTAMP),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
@@ -368,6 +643,7 @@ impl SqlType {
             Self::TAG_UINT64 => Ok(Self::UInt64),
             Self::TAG_FLOAT64 => Ok(Self::Float64),
             Self::TAG_UUID => Ok(Self::Uuid),
+            Self::TAG_TIMESTAMP => Ok(Self::Timestamp),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
@@ -1060,6 +1336,7 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
         (SqlValue::UInt64(a), SqlValue::UInt64(b)) => Ok(a.cmp(b)),
         (SqlValue::Float64(a), SqlValue::Float64(b)) => compare_float64_values(*a, *b),
         (SqlValue::Uuid(a), SqlValue::Uuid(b)) => Ok(a.cmp(b)),
+        (SqlValue::Timestamp(a), SqlValue::Timestamp(b)) => Ok(a.cmp(b)),
         (SqlValue::Text(a), SqlValue::Text(b)) => Ok(a.cmp(b)),
         (SqlValue::Bytes(a), SqlValue::Bytes(b)) => Ok(a.cmp(b)),
         _ => Err(RnovError::new(

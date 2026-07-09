@@ -629,6 +629,7 @@ fn is_indexable_range_endpoint(value: &SqlValue) -> bool {
             | SqlValue::UInt64(_)
             | SqlValue::Float64(_)
             | SqlValue::Uuid(_)
+            | SqlValue::Timestamp(_)
             | SqlValue::Text(_)
             | SqlValue::Bytes(_)
     )

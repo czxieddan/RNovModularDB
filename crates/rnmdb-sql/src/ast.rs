@@ -458,6 +458,7 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::UInt64 => "UINT64".to_string(),
         SqlType::Float64 => "FLOAT64".to_string(),
         SqlType::Uuid => "UUID".to_string(),
+        SqlType::Timestamp => "TIMESTAMP".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),

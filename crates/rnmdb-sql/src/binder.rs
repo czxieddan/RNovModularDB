@@ -2005,6 +2005,7 @@ impl<'a> Binder<'a> {
                 | SqlType::UInt64
                 | SqlType::Float64
                 | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -2025,6 +2026,7 @@ impl<'a> Binder<'a> {
                 | SqlType::UInt64
                 | SqlType::Float64
                 | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -2062,6 +2064,7 @@ impl<'a> Binder<'a> {
                 | SqlType::UInt64
                 | SqlType::Float64
                 | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             )
@@ -2280,6 +2283,7 @@ impl<'a> Binder<'a> {
                     | SqlType::UInt64
                     | SqlType::Float64
                     | SqlType::Uuid
+                    | SqlType::Timestamp
                     | SqlType::Text
                     | SqlType::Bytes,
                 ) => {}
@@ -2460,6 +2464,7 @@ impl<'a> Binder<'a> {
             | SqlType::UInt64
             | SqlType::Float64
             | SqlType::Uuid
+            | SqlType::Timestamp
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -3267,6 +3272,7 @@ impl<'a> Binder<'a> {
             | SqlType::UInt64
             | SqlType::Float64
             | SqlType::Uuid
+            | SqlType::Timestamp
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -4784,6 +4790,8 @@ impl<'a> Binder<'a> {
                     | (SqlType::Text, SqlType::Float64)
                     | (SqlType::Uuid, SqlType::Text)
                     | (SqlType::Text, SqlType::Uuid)
+                    | (SqlType::Timestamp, SqlType::Text)
+                    | (SqlType::Text, SqlType::Timestamp)
                     | (SqlType::Bool, SqlType::Text)
                     | (SqlType::Text, SqlType::Bool)
             )
@@ -5225,6 +5233,7 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::UInt64 => "UINT64".to_string(),
         SqlType::Float64 => "FLOAT64".to_string(),
         SqlType::Uuid => "UUID".to_string(),
+        SqlType::Timestamp => "TIMESTAMP".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),

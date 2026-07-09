@@ -1470,6 +1470,7 @@ impl Parser {
                 }
                 "doubleprecision" => SqlType::Float64,
                 "uuid" => SqlType::Uuid,
+                "timestamp" | "datetime" => SqlType::Timestamp,
                 "text" | "string" | "varchar" => SqlType::Text,
                 "bytes" | "bytea" => SqlType::Bytes,
                 "hstore" => SqlType::HStore,
