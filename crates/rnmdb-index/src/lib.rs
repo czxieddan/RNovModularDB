@@ -714,11 +714,27 @@ impl BoundingBox {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryBoundsIndex {
     name: String,
     rank: Option<usize>,
-    entries: Vec<(BoundingBox, IndexPointer)>,
+    entries: Vec<BoundsEntry>,
+    lower_indexes: Vec<BTreeMap<i64, BTreeSet<usize>>>,
+    upper_indexes: Vec<BTreeMap<i64, BTreeSet<usize>>>,
+    last_recheck_count: AtomicUsize,
+}
+
+impl Clone for MemoryBoundsIndex {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            rank: self.rank,
+            entries: self.entries.clone(),
+            lower_indexes: self.lower_indexes.clone(),
+            upper_indexes: self.upper_indexes.clone(),
+            last_recheck_count: AtomicUsize::new(self.last_recheck_count()),
+        }
+    }
 }
 
 impl MemoryBoundsIndex {
@@ -727,6 +743,9 @@ impl MemoryBoundsIndex {
             name: name.into(),
             rank: None,
             entries: Vec::new(),
+            lower_indexes: Vec::new(),
+            upper_indexes: Vec::new(),
+            last_recheck_count: AtomicUsize::new(0),
         }
     }
 
@@ -734,9 +753,18 @@ impl MemoryBoundsIndex {
         &self.name
     }
 
+    pub fn last_recheck_count(&self) -> usize {
+        self.last_recheck_count.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn insert_box(&mut self, pointer: IndexPointer, bounds: &BoundingBox) -> Result<()> {
         self.ensure_rank(bounds.rank())?;
-        self.entries.push((bounds.clone(), pointer));
+        let entry_id = self.entries.len();
+        self.index_bounds_entry(entry_id, bounds);
+        self.entries.push(BoundsEntry {
+            bounds: bounds.clone(),
+            pointer,
+        });
         Ok(())
     }
 
@@ -750,20 +778,79 @@ impl MemoryBoundsIndex {
         if let Some(rank) = other.rank {
             self.ensure_rank(rank)?;
         }
-        self.entries.extend(other.entries);
+        for entry in other.entries {
+            self.insert_box(entry.pointer, &entry.bounds)?;
+        }
         Ok(())
     }
 
     pub fn intersection_scan(&self, query: &BoundingBox) -> Result<Vec<IndexPointer>> {
+        self.store_last_recheck_count(0);
         self.ensure_query_rank(query.rank())?;
+        if self.rank.is_none() {
+            return Ok(Vec::new());
+        }
 
+        let candidate_ids = self.intersection_candidate_ids(query);
+        self.store_last_recheck_count(candidate_ids.len());
         let mut matches = Vec::new();
-        for (bounds, pointer) in &self.entries {
-            if bounds.intersects(query)? {
-                matches.push(*pointer);
+        for entry_id in candidate_ids {
+            let entry = &self.entries[entry_id];
+            if entry.bounds.intersects(query)? {
+                matches.push(entry.pointer);
             }
         }
         Ok(matches)
+    }
+
+    fn index_bounds_entry(&mut self, entry_id: usize, bounds: &BoundingBox) {
+        for (axis_index, axis) in bounds.axes().iter().copied().enumerate() {
+            self.lower_indexes[axis_index]
+                .entry(axis.lower())
+                .or_default()
+                .insert(entry_id);
+            self.upper_indexes[axis_index]
+                .entry(axis.upper())
+                .or_default()
+                .insert(entry_id);
+        }
+    }
+
+    fn intersection_candidate_ids(&self, query: &BoundingBox) -> Vec<usize> {
+        let mut candidates = None;
+        for (axis_index, axis) in query.axes().iter().copied().enumerate() {
+            let axis_ids = self.axis_candidate_ids(axis_index, axis);
+            candidates = Some(merge_axis_candidates(candidates, axis_ids));
+            if candidates.as_ref().is_some_and(BTreeSet::is_empty) {
+                break;
+            }
+        }
+        candidates.unwrap_or_default().into_iter().collect()
+    }
+
+    fn axis_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
+        let lower_ids = self.axis_lower_candidate_ids(axis_index, query);
+        let upper_ids = self.axis_upper_candidate_ids(axis_index, query);
+        lower_ids.intersection(&upper_ids).copied().collect()
+    }
+
+    fn axis_lower_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
+        self.lower_indexes[axis_index]
+            .range(..=query.upper())
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect()
+    }
+
+    fn axis_upper_candidate_ids(&self, axis_index: usize, query: AxisBounds) -> BTreeSet<usize> {
+        self.upper_indexes[axis_index]
+            .range(query.lower()..)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect()
+    }
+
+    fn store_last_recheck_count(&self, value: usize) {
+        self.last_recheck_count
+            .store(value, AtomicOrdering::Relaxed);
     }
 
     fn ensure_rank(&mut self, rank: usize) -> Result<()> {
@@ -775,6 +862,8 @@ impl MemoryBoundsIndex {
             Some(_) => Ok(()),
             None => {
                 self.rank = Some(rank);
+                self.lower_indexes = empty_axis_indexes(rank);
+                self.upper_indexes = empty_axis_indexes(rank);
                 Ok(())
             }
         }
@@ -788,6 +877,26 @@ impl MemoryBoundsIndex {
             )),
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoundsEntry {
+    bounds: BoundingBox,
+    pointer: IndexPointer,
+}
+
+fn empty_axis_indexes(rank: usize) -> Vec<BTreeMap<i64, BTreeSet<usize>>> {
+    std::iter::repeat_with(BTreeMap::new).take(rank).collect()
+}
+
+fn merge_axis_candidates(
+    current: Option<BTreeSet<usize>>,
+    axis_ids: BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    match current {
+        Some(existing) => existing.intersection(&axis_ids).copied().collect(),
+        None => axis_ids,
     }
 }
 
