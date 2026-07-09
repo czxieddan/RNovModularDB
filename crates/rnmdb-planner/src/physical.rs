@@ -9,7 +9,7 @@ use crate::{
 };
 use rnmdb_catalog::{IndexKey, IndexMethod};
 use rnmdb_common::ids::RelationId;
-use rnmdb_sql::ast::{ExplainFormat, Expr, OrderByExpr};
+use rnmdb_sql::ast::{ExplainFormat, Expr, JoinKind, OrderByExpr};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PhysicalPlan {
@@ -110,6 +110,13 @@ pub enum PhysicalPlan {
         inner_index: String,
         inner_column: String,
         outer_column: String,
+        cost: PlanCost,
+    },
+    NestedLoopJoin {
+        kind: JoinKind,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        predicate: Expr,
         cost: PlanCost,
     },
     Filter {
@@ -535,6 +542,18 @@ impl PhysicalPlanner {
                 outer_column,
                 cost,
             ),
+            LogicalPlan::NestedLoopJoin {
+                kind,
+                left,
+                right,
+                predicate,
+            } => PhysicalPlan::NestedLoopJoin {
+                kind: *kind,
+                left: Box::new(self.plan(left)),
+                right: Box::new(self.plan(right)),
+                predicate: predicate.clone(),
+                cost,
+            },
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(scan) = self.index_scan(predicate, input, cost) {
                     return scan;
@@ -723,6 +742,7 @@ impl PhysicalPlan {
             | PhysicalPlan::RangeOverlapScan { cost, .. }
             | PhysicalPlan::BoundsOverlapScan { cost, .. }
             | PhysicalPlan::SidewaysIndexLookup { cost, .. }
+            | PhysicalPlan::NestedLoopJoin { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Window { cost, .. }
@@ -914,6 +934,21 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
             write_physical_plan(outer, indent + 1, out);
+        }
+        PhysicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}NestedLoopJoin kind={} predicate={predicate}{}\n",
+                join_kind_name(*kind),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(left, indent + 1, out);
+            write_physical_plan(right, indent + 1, out);
         }
         PhysicalPlan::Filter {
             predicate,
@@ -1508,6 +1543,13 @@ fn cost_suffix(cost: PlanCost) -> String {
         cost.row_width_bytes,
         cost.total()
     )
+}
+
+fn join_kind_name(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
+    }
 }
 
 fn explain_format_suffix(format: ExplainFormat) -> &'static str {

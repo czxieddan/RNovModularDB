@@ -883,6 +883,7 @@ fn is_read_query(statement: &BoundStatement) -> bool {
     matches!(
         statement,
         BoundStatement::Select(_)
+            | BoundStatement::SelectJoin(_)
             | BoundStatement::Union(_)
             | BoundStatement::Intersect(_)
             | BoundStatement::Except(_)

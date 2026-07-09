@@ -7,9 +7,10 @@ use rnmdb_types::SqlType;
 
 use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
-    BoundIntersect, BoundLateralJoin, BoundQuery, BoundRecursiveCte, BoundRowPolicy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident,
-    IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement, TransactionAction,
+    BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery, BoundRecursiveCte,
+    BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
+    CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName,
+    OrderByExpr, SelectItem, Statement, TransactionAction,
 };
 use crate::expr_mutator::rewrite_qualified_expr;
 use crate::parser::{parse_expr, parse_statement};
@@ -36,6 +37,7 @@ struct SelectInput<'a> {
     distinct: bool,
     select_items: &'a [SelectItem],
     from: &'a ObjectName,
+    join: Option<&'a JoinClause>,
     lateral_join: Option<&'a LateralJoin>,
     selection: &'a Option<Expr>,
     group_by: &'a [Expr],
@@ -329,6 +331,33 @@ impl<'a> Binder<'a> {
                 distinct: *distinct,
                 select_items: projection,
                 from,
+                join: None,
+                lateral_join: None,
+                selection,
+                group_by,
+                grouping_sets: &[],
+                having,
+                order_by,
+                limit: *limit,
+                offset: *offset,
+                role_id,
+            }),
+            Statement::SelectJoin {
+                distinct,
+                projection,
+                from,
+                join,
+                selection,
+                group_by,
+                having,
+                order_by,
+                limit,
+                offset,
+            } => self.bind_select(SelectInput {
+                distinct: *distinct,
+                select_items: projection,
+                from,
+                join: Some(join),
                 lateral_join: None,
                 selection,
                 group_by,
@@ -354,6 +383,7 @@ impl<'a> Binder<'a> {
                 distinct: *distinct,
                 select_items: projection,
                 from,
+                join: None,
                 lateral_join: Some(lateral_join),
                 selection,
                 group_by,
@@ -379,6 +409,7 @@ impl<'a> Binder<'a> {
                 distinct: *distinct,
                 select_items: projection,
                 from,
+                join: None,
                 lateral_join: None,
                 selection,
                 group_by,
@@ -1057,6 +1088,9 @@ impl<'a> Binder<'a> {
         if let Some(lateral_join) = input.lateral_join {
             return self.bind_lateral_select(&input, table, lateral_join);
         }
+        if let Some(join) = input.join {
+            return self.bind_join_select(&input, table, join);
+        }
 
         let mut columns = Vec::new();
         let mut projection = Vec::new();
@@ -1703,6 +1737,191 @@ impl<'a> Binder<'a> {
                 .applied_row_policy_names(input.role_id, outer_table.relation_id()),
             row_policy_predicates: self.bind_row_policies(input.role_id, outer_table)?,
         }))
+    }
+
+    fn bind_join_select(
+        &self,
+        input: &SelectInput<'_>,
+        left_table: &Table,
+        join: &JoinClause,
+    ) -> Result<BoundStatement> {
+        self.validate_join_select_shape(input)?;
+        let right_table = self.resolve_table(&join.table)?;
+        self.require_table_privilege(input.role_id, right_table.relation_id(), Privilege::Select)?;
+
+        let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
+        let bound_columns = lateral_columns_to_bound(&joined_columns);
+        let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
+        self.validate_predicate_from_columns(&bound_columns, &predicate)?;
+        let (projection, columns) =
+            self.bind_join_projection(input.select_items, &joined_columns, &bound_columns)?;
+        let selection =
+            self.bind_join_selection(input.selection, &joined_columns, &bound_columns)?;
+        let order_by =
+            self.bind_join_order_by(input.order_by, &joined_columns, &bound_columns, &projection)?;
+
+        let select = BoundSelect {
+            relation_id: left_table.relation_id(),
+            table: input.from.clone(),
+            lateral_join: None,
+            distinct: input.distinct,
+            projection,
+            hidden_group_keys: Vec::new(),
+            hidden_aggregates: Vec::new(),
+            columns,
+            selection,
+            group_by: Vec::new(),
+            grouping_sets: Vec::new(),
+            having: None,
+            order_by,
+            limit: input.limit,
+            offset: input.offset,
+            applied_row_policies: self
+                .applied_row_policy_names(input.role_id, left_table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(input.role_id, left_table)?,
+        };
+        Ok(BoundStatement::SelectJoin(BoundJoinSelect {
+            select,
+            join: BoundJoin {
+                kind: join.kind,
+                right_relation_id: right_table.relation_id(),
+                right_table: join.table.clone(),
+                predicate,
+                applied_row_policies: self
+                    .applied_row_policy_names(input.role_id, right_table.relation_id()),
+                row_policy_predicates: self.bind_row_policies(input.role_id, right_table)?,
+            },
+        }))
+    }
+
+    fn validate_join_select_shape(&self, input: &SelectInput<'_>) -> Result<()> {
+        if input.group_by.is_empty() && input.grouping_sets.is_empty() && input.having.is_none() {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "JOIN does not support GROUP BY, GROUPING SETS, or HAVING in this SQL slice",
+        ))
+    }
+
+    fn bind_join_projection(
+        &self,
+        select_items: &[SelectItem],
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
+        let mut projection = Vec::new();
+        let mut columns = Vec::new();
+        for item in select_items {
+            self.push_join_projection_item(
+                item,
+                joined_columns,
+                bound_columns,
+                &mut projection,
+                &mut columns,
+            )?;
+        }
+        Ok((projection, columns))
+    }
+
+    fn push_join_projection_item(
+        &self,
+        item: &SelectItem,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => self.push_join_wildcard(joined_columns, projection, columns),
+            SelectItem::Expr { expr, alias } => {
+                let expr = self.rewrite_lateral_expr(joined_columns, expr)?;
+                let column = self.join_projection_column(
+                    joined_columns,
+                    bound_columns,
+                    columns,
+                    &expr,
+                    alias,
+                )?;
+                projection.push(BoundSelectItem {
+                    column: column.clone(),
+                    expr,
+                });
+                columns.push(column);
+                Ok(())
+            }
+        }
+    }
+
+    fn push_join_wildcard(
+        &self,
+        joined_columns: &[LateralColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        for joined_column in joined_columns {
+            projection.push(BoundSelectItem {
+                column: joined_column.column.clone(),
+                expr: Expr::Identifier(Ident::new(joined_column.output_name.as_str())),
+            });
+            columns.push(joined_column.column.clone());
+        }
+        Ok(())
+    }
+
+    fn join_projection_column(
+        &self,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        columns: &[BoundColumn],
+        expr: &Expr,
+        alias: &Option<Ident>,
+    ) -> Result<BoundColumn> {
+        let data_type = self
+            .infer_expr_type_from_columns(bound_columns, expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer select expression type: {expr}"),
+                )
+            })?;
+        let column = join_expr_column(joined_columns, columns, expr, data_type);
+        Ok(aliased_bound_column(column, alias))
+    }
+
+    fn bind_join_selection(
+        &self,
+        selection: &Option<Expr>,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+    ) -> Result<Option<Expr>> {
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_lateral_expr(joined_columns, selection))
+            .transpose()?;
+        if let Some(selection) = &selection {
+            self.validate_predicate_from_columns(bound_columns, selection)?;
+        }
+        Ok(selection)
+    }
+
+    fn bind_join_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &[BoundSelectItem],
+    ) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| {
+                let order_by = OrderByExpr {
+                    expr: self.rewrite_lateral_expr(joined_columns, &order_by.expr)?,
+                    direction: order_by.direction,
+                };
+                self.bind_plain_output_sort_expr(bound_columns, projection, &order_by)
+            })
+            .collect()
     }
 
     fn validate_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
@@ -4652,6 +4871,7 @@ fn mark_grouping_set_projection_columns_nullable(
 fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
     match statement {
         BoundStatement::Select(select) => Ok(&select.columns),
+        BoundStatement::SelectJoin(join_select) => Ok(&join_select.select.columns),
         BoundStatement::Union(union) => Ok(&union.columns),
         BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
         BoundStatement::Except(except) => Ok(&except.columns),
@@ -4766,6 +4986,10 @@ enum LateralSide {
 }
 
 fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColumn>> {
+    join_clause_columns(outer, inner, JoinKind::Inner)
+}
+
+fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<Vec<LateralColumn>> {
     let mut columns = Vec::new();
     for column in bound_columns_for_table(outer)? {
         columns.push(LateralColumn {
@@ -4784,6 +5008,9 @@ fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColum
         {
             output_name = format!("inner_{output_name}");
         }
+        if kind == JoinKind::Left {
+            column.nullable = true;
+        }
         column.name = output_name.clone();
         columns.push(LateralColumn {
             table_name: inner.name().to_string(),
@@ -4797,6 +5024,28 @@ fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColum
 
 fn lateral_columns_to_bound(columns: &[LateralColumn]) -> Vec<BoundColumn> {
     columns.iter().map(|column| column.column.clone()).collect()
+}
+
+fn join_expr_column(
+    joined_columns: &[LateralColumn],
+    existing_columns: &[BoundColumn],
+    expr: &Expr,
+    data_type: SqlType,
+) -> BoundColumn {
+    if let Expr::Identifier(identifier) = expr
+        && let Some(column) = joined_columns
+            .iter()
+            .find(|column| column.output_name.eq_ignore_ascii_case(identifier.as_str()))
+    {
+        return column.column.clone();
+    }
+    BoundColumn {
+        name: format!("expr{}", existing_columns.len() + 1),
+        data_type,
+        nullable: true,
+        encrypted: false,
+        generated: None,
+    }
 }
 
 fn validate_set_operation_columns(

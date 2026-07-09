@@ -268,6 +268,17 @@ impl CostModel {
                     outer.io + probes * inner.io,
                 )
             }
+            LogicalPlan::NestedLoopJoin { left, right, .. } => {
+                let left = self.estimate(left);
+                let right = self.estimate(right);
+                let comparisons = left.rows.max(1.0) * right.rows.max(1.0);
+                PlanCost::new(
+                    (comparisons * DEFAULT_FILTER_SELECTIVITY).max(1.0),
+                    left.row_width_bytes + right.row_width_bytes,
+                    left.cpu + right.cpu + comparisons * self.parameters.cpu_operator_cost,
+                    left.io + right.io,
+                )
+            }
             LogicalPlan::Filter { input, .. } => {
                 let input = self.estimate(input);
                 input

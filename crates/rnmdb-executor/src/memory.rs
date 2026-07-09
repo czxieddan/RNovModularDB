@@ -35,7 +35,7 @@ use rnmdb_planner::{
 };
 use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
-    ast::{CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, OrderByExpr},
+    ast::{CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, JoinKind, OrderByExpr},
     parser::parse_expr,
 };
 use rnmdb_types::{
@@ -1840,6 +1840,16 @@ impl MemoryExecutor {
                 outer_column,
                 cancellation,
             ),
+            LogicalPlan::NestedLoopJoin {
+                kind,
+                left,
+                right,
+                predicate,
+            } => {
+                let left = self.execute_cancellable(left, cancellation)?;
+                let right = self.execute_cancellable(right, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+            }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -2157,6 +2167,17 @@ impl MemoryExecutor {
                 outer_column,
                 cancellation,
             ),
+            PhysicalPlan::NestedLoopJoin {
+                kind,
+                left,
+                right,
+                predicate,
+                ..
+            } => {
+                let left = self.execute_physical_cancellable(left, cancellation)?;
+                let right = self.execute_physical_cancellable(right, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+            }
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -2595,9 +2616,12 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => self.with_table(table, |table| {
-                table.scan_parallel_cancellable(config, cancellation)
-            }),
+            LogicalPlan::Scan { relation_id, table } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.scan_parallel_cancellable(config, cancellation)
+                })?,
+            ),
             LogicalPlan::RecursiveScan { name, .. } => {
                 let tables = self.read_tables()?;
                 tables
@@ -2620,6 +2644,7 @@ impl MemoryExecutor {
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
             LogicalPlan::TextSearch {
+                relation_id,
                 table,
                 column,
                 query,
@@ -2631,10 +2656,11 @@ impl MemoryExecutor {
                         RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                     })?;
                     if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                        return Ok(batch);
+                        return self.column_crypto.decrypt_batch(*relation_id, batch);
                     }
                     table.scan_parallel_cancellable(config, cancellation)?
                 };
+                let batch = self.column_crypto.decrypt_batch(*relation_id, batch)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -2650,6 +2676,16 @@ impl MemoryExecutor {
                 outer_column,
                 cancellation,
             ),
+            LogicalPlan::NestedLoopJoin {
+                kind,
+                left,
+                right,
+                predicate,
+            } => {
+                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                apply_nested_loop_join_cancellable(left, right, *kind, predicate, cancellation)
+            }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -4019,6 +4055,64 @@ fn apply_filter_cancellable(
     VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
+fn apply_nested_loop_join_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    kind: JoinKind,
+    predicate: &Expr,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let columns = joined_columns_for_join(left.columns(), right.columns(), kind)?;
+    let null_right = null_row(right.columns());
+    let mut rows = Vec::new();
+    for left_row in left.rows() {
+        cancellation.check()?;
+        let matched = push_matching_join_rows(
+            &columns,
+            left_row,
+            &right,
+            predicate,
+            &mut rows,
+            cancellation,
+        )?;
+        if kind == JoinKind::Left && !matched {
+            rows.push(join_rows(left_row, &null_right));
+        }
+    }
+    VectorBatch::new(columns, rows)
+}
+
+fn push_matching_join_rows(
+    columns: &[ColumnSchema],
+    left_row: &Row,
+    right: &VectorBatch,
+    predicate: &Expr,
+    rows: &mut Vec<Row>,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    let mut matched = false;
+    for right_row in right.rows() {
+        cancellation.check()?;
+        let row = join_rows(left_row, right_row);
+        if eval_predicate(columns, &row, predicate)? {
+            rows.push(row);
+            matched = true;
+        }
+    }
+    Ok(matched)
+}
+
+fn join_rows(left: &Row, right: &Row) -> Row {
+    let mut values = Vec::with_capacity(left.values().len() + right.values().len());
+    values.extend_from_slice(left.values());
+    values.extend_from_slice(right.values());
+    Row::new(values)
+}
+
+fn null_row(columns: &[ColumnSchema]) -> Row {
+    Row::new(vec![SqlValue::Null; columns.len()])
+}
+
 fn apply_projection_cancellable(
     batch: VectorBatch,
     items: &[rnmdb_planner::logical::ProjectionItem],
@@ -4178,21 +4272,41 @@ fn ranking_window_values(
 }
 
 fn joined_columns(outer: &[ColumnSchema], inner: &[ColumnSchema]) -> Result<Vec<ColumnSchema>> {
+    joined_columns_with_inner_nullable(outer, inner, false)
+}
+
+fn joined_columns_for_join(
+    outer: &[ColumnSchema],
+    inner: &[ColumnSchema],
+    kind: JoinKind,
+) -> Result<Vec<ColumnSchema>> {
+    joined_columns_with_inner_nullable(outer, inner, kind == JoinKind::Left)
+}
+
+fn joined_columns_with_inner_nullable(
+    outer: &[ColumnSchema],
+    inner: &[ColumnSchema],
+    force_inner_nullable: bool,
+) -> Result<Vec<ColumnSchema>> {
     let mut columns = outer.to_vec();
     for column in inner {
         let mut name = column.name().to_string();
         while columns.iter().any(|existing| existing.name() == name) {
             name = format!("inner_{name}");
         }
-        columns.push(column_schema_like(column, name));
+        columns.push(column_schema_like(
+            column,
+            name,
+            force_inner_nullable || column.nullable(),
+        ));
     }
     let _ = VectorBatch::new(columns.clone(), Vec::new())?;
     Ok(columns)
 }
 
-fn column_schema_like(column: &ColumnSchema, name: String) -> ColumnSchema {
+fn column_schema_like(column: &ColumnSchema, name: String, nullable: bool) -> ColumnSchema {
     let mut schema = ColumnSchema::new(name, column.data_type().clone());
-    if !column.nullable() {
+    if !nullable {
         schema = schema.not_null();
     }
     if column.is_encrypted() {

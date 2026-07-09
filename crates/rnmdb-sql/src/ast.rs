@@ -508,6 +508,19 @@ pub struct LateralJoin {
     pub on: Expr,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: ObjectName,
+    pub on: Expr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecursiveCte {
     pub name: ObjectName,
@@ -677,6 +690,18 @@ pub enum Statement {
         limit: Option<usize>,
         offset: Option<usize>,
     },
+    SelectJoin {
+        distinct: bool,
+        projection: Vec<SelectItem>,
+        from: ObjectName,
+        join: JoinClause,
+        selection: Option<Expr>,
+        group_by: Vec<Expr>,
+        having: Option<Expr>,
+        order_by: Vec<OrderByExpr>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
     SelectLateral {
         distinct: bool,
         projection: Vec<SelectItem>,
@@ -790,6 +815,22 @@ pub struct BoundLateralJoin {
     pub inner_table: ObjectName,
     pub inner_column: String,
     pub outer_column: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundJoin {
+    pub kind: JoinKind,
+    pub right_relation_id: RelationId,
+    pub right_table: ObjectName,
+    pub predicate: Expr,
+    pub applied_row_policies: Vec<String>,
+    pub row_policy_predicates: Vec<BoundRowPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundJoinSelect {
+    pub select: BoundSelect,
+    pub join: BoundJoin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -981,6 +1022,7 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Select(BoundSelect),
+    SelectJoin(BoundJoinSelect),
     Union(BoundUnion),
     Intersect(BoundIntersect),
     Except(BoundExcept),

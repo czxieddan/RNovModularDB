@@ -3,8 +3,8 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundIndexKey, BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, IndexKeyDef, ObjectName,
-    OrderByExpr, TransactionAction,
+    BoundIndexKey, BoundJoin, BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, IndexKeyDef,
+    JoinKind, ObjectName, OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -37,6 +37,12 @@ pub enum LogicalPlan {
         inner_table: String,
         inner_column: String,
         outer_column: String,
+    },
+    NestedLoopJoin {
+        kind: JoinKind,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        predicate: Expr,
     },
     Project {
         items: Vec<ProjectionItem>,
@@ -455,6 +461,13 @@ impl LogicalPlanner {
                 };
                 self.plan_select_with_input(select, input, true)
             }
+            BoundStatement::SelectJoin(join_select) => {
+                let input = LogicalPlan::Scan {
+                    relation_id: join_select.select.relation_id,
+                    table: object_name(&join_select.select.table),
+                };
+                self.plan_select_join(&join_select.select, &join_select.join, input)
+            }
             BoundStatement::Union(union) => Ok(LogicalPlan::Union {
                 all: union.all,
                 left: Box::new(self.plan(&union.left)?),
@@ -758,6 +771,24 @@ impl LogicalPlanner {
             Ok(plan)
         }
     }
+
+    fn plan_select_join(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        join: &BoundJoin,
+        mut plan: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        for policy in &select.row_policy_predicates {
+            plan = plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
+        }
+        plan = LogicalPlan::NestedLoopJoin {
+            kind: join.kind,
+            left: Box::new(plan),
+            right: Box::new(join_right_plan(join)?),
+            predicate: join.predicate.clone(),
+        };
+        self.plan_select_with_input(select, plan, false)
+    }
 }
 
 impl LogicalPlan {
@@ -811,6 +842,19 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column}\n"
             ));
             write_plan(outer, indent + 1, out);
+        }
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => {
+            out.push_str(&format!(
+                "{prefix}NestedLoopJoin kind={} predicate={predicate}\n",
+                join_kind_name(*kind)
+            ));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
         }
         LogicalPlan::Project { items, input } => {
             let columns = items
@@ -1307,7 +1351,8 @@ fn write_plan_with_costs(
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(outer, indent + 1, cost_model, out);
         }
-        LogicalPlan::Union { left, right, .. }
+        LogicalPlan::NestedLoopJoin { left, right, .. }
+        | LogicalPlan::Union { left, right, .. }
         | LogicalPlan::Intersect { left, right, .. }
         | LogicalPlan::Except { left, right, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
@@ -1417,6 +1462,29 @@ fn plan_selection(
         predicate: predicate.clone(),
         input: Box::new(fallback_input),
     })
+}
+
+fn join_right_plan(join: &BoundJoin) -> Result<LogicalPlan> {
+    let mut plan = LogicalPlan::Scan {
+        relation_id: join.right_relation_id,
+        table: object_name(&join.right_table),
+    };
+    for policy in &join.row_policy_predicates {
+        plan = plan_selection(
+            join.right_relation_id,
+            &join.right_table,
+            &policy.predicate,
+            plan,
+        )?;
+    }
+    Ok(plan)
+}
+
+fn join_kind_name(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
+    }
 }
 
 fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {

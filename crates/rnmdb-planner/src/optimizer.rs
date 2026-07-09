@@ -133,6 +133,17 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             inner_column,
             outer_column,
         },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+            predicate,
+        },
         other => other,
     }
 }
@@ -248,6 +259,17 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             inner_table,
             inner_column,
             outer_column,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
+            predicate,
         },
         other => other,
     }

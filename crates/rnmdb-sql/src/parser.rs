@@ -5,8 +5,8 @@ use rnmdb_types::SqlType;
 use crate::{
     ast::{
         Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
-        LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection,
-        Statement, TransactionAction,
+        JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem,
+        SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -703,17 +703,7 @@ impl Parser {
         }
         self.expect_keyword(TokenKind::From)?;
         let from = self.parse_object_name()?;
-        let lateral_join = if self.consume_if(&TokenKind::Join) {
-            self.expect_keyword(TokenKind::Lateral)?;
-            let table = self.parse_object_name()?;
-            self.expect_keyword(TokenKind::On)?;
-            Some(LateralJoin {
-                table,
-                on: self.parse_expr()?,
-            })
-        } else {
-            None
-        };
+        let (join, lateral_join) = self.parse_select_join()?;
         let selection = if self.consume_if(&TokenKind::Where) {
             Some(self.parse_expr()?)
         } else {
@@ -745,8 +735,8 @@ impl Parser {
         } else {
             None
         };
-        if lateral_join.is_some() && !grouping_sets.is_empty() {
-            return Err(self.error("JOIN LATERAL does not support GROUPING SETS yet"));
+        if (join.is_some() || lateral_join.is_some()) && !grouping_sets.is_empty() {
+            return Err(self.error("JOIN does not support GROUPING SETS yet"));
         }
         if !grouping_sets.is_empty() {
             return Ok(Statement::SelectGroupingSets {
@@ -775,6 +765,19 @@ impl Parser {
                 limit: None,
                 offset: None,
             })
+        } else if let Some(join) = join {
+            Ok(Statement::SelectJoin {
+                distinct,
+                projection,
+                from,
+                join,
+                selection,
+                group_by,
+                having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })
         } else {
             Ok(Statement::Select {
                 distinct,
@@ -788,6 +791,53 @@ impl Parser {
                 offset: None,
             })
         }
+    }
+
+    fn parse_select_join(&mut self) -> Result<(Option<JoinClause>, Option<LateralJoin>)> {
+        if self.consume_if(&TokenKind::Left) {
+            let _ = self.consume_if(&TokenKind::Outer);
+            return self
+                .parse_join_clause(JoinKind::Left)
+                .map(|join| (Some(join), None));
+        }
+        if self.consume_if(&TokenKind::Inner) {
+            self.expect_keyword(TokenKind::Join)?;
+            return self
+                .parse_join_table(JoinKind::Inner)
+                .map(|join| (Some(join), None));
+        }
+        if !self.consume_if(&TokenKind::Join) {
+            return Ok((None, None));
+        }
+        if self.consume_if(&TokenKind::Lateral) {
+            return self.parse_lateral_join().map(|join| (None, Some(join)));
+        }
+        self.parse_join_table(JoinKind::Inner)
+            .map(|join| (Some(join), None))
+    }
+
+    fn parse_join_clause(&mut self, kind: JoinKind) -> Result<JoinClause> {
+        self.expect_keyword(TokenKind::Join)?;
+        self.parse_join_table(kind)
+    }
+
+    fn parse_join_table(&mut self, kind: JoinKind) -> Result<JoinClause> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        Ok(JoinClause {
+            kind,
+            table,
+            on: self.parse_expr()?,
+        })
+    }
+
+    fn parse_lateral_join(&mut self) -> Result<LateralJoin> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        Ok(LateralJoin {
+            table,
+            on: self.parse_expr()?,
+        })
     }
 
     fn parse_query(&mut self) -> Result<Statement> {
@@ -1721,6 +1771,27 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             distinct,
             projection,
             from,
+            selection,
+            group_by,
+            having,
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
+        Statement::SelectJoin {
+            distinct,
+            projection,
+            from,
+            join,
+            selection,
+            group_by,
+            having,
+            ..
+        } => Statement::SelectJoin {
+            distinct,
+            projection,
+            from,
+            join,
             selection,
             group_by,
             having,
