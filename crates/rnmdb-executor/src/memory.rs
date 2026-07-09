@@ -1638,7 +1638,7 @@ impl MemoryExecutor {
             .map_err(|_| RnovError::new(ErrorKind::Internal, "memory executor table lock poisoned"))
     }
 
-    fn snapshot(&self) -> Result<Self> {
+    pub fn snapshot(&self) -> Result<Self> {
         Ok(Self {
             tables: Arc::new(RwLock::new(self.read_tables()?.clone())),
         })

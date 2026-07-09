@@ -17,7 +17,7 @@ use rnmdb_planner::{
     physical::{IndexAccessPath, IndexCatalog, PhysicalPlanner},
 };
 use rnmdb_sql::{
-    ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName},
+    ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName, TransactionAction},
     binder::Binder,
     parser::parse_statement,
 };
@@ -29,6 +29,7 @@ use rnmdb_storage::{
     restore_single_file, restore_single_file_dry_run, upgrade_single_file,
     upgrade_single_file_with_key, verify_single_file, verify_single_file_with_key,
 };
+use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
 use rnmdb_types::SqlType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,10 +49,32 @@ pub struct LocalSession {
     execution: LocalExecutionConfig,
     procedure_call_stack: Vec<String>,
     durable: Option<LocalDurableStore>,
+    transaction_manager: TransactionManager,
+    transaction: Option<LocalTransactionState>,
 }
 
 struct LocalDurableStore {
     backend: SingleFileBackend,
+}
+
+struct LocalTransactionState {
+    transaction: Transaction,
+    catalog_snapshot: Catalog,
+    executor_snapshot: MemoryExecutor,
+}
+
+impl LocalTransactionState {
+    fn capture(
+        transaction: Transaction,
+        catalog: &Catalog,
+        executor: &MemoryExecutor,
+    ) -> Result<Self> {
+        Ok(Self {
+            transaction,
+            catalog_snapshot: catalog.clone(),
+            executor_snapshot: executor.snapshot()?,
+        })
+    }
 }
 
 impl LocalSession {
@@ -95,6 +118,9 @@ impl LocalSession {
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
         let statement = parse_statement(sql)?;
         let bound = Binder::new(&self.catalog).bind_for_role(&statement, self.role_id)?;
+        if let BoundStatement::Transaction { action } = &bound {
+            return self.execute_transaction(*action);
+        }
 
         match &bound {
             BoundStatement::CreateTable {
@@ -325,6 +351,8 @@ impl LocalSession {
             execution,
             procedure_call_stack: Vec::new(),
             durable,
+            transaction_manager: TransactionManager::new(),
+            transaction: None,
         }
     }
 
@@ -334,6 +362,60 @@ impl LocalSession {
             self.executor.snapshot_tables()?,
         )
         .encode()
+    }
+
+    fn execute_transaction(&mut self, action: TransactionAction) -> Result<CommandOutput> {
+        match action {
+            TransactionAction::Begin => self.begin_transaction(),
+            TransactionAction::Commit => self.commit_transaction(),
+            TransactionAction::Rollback => self.rollback_transaction(),
+        }
+    }
+
+    fn begin_transaction(&mut self) -> Result<CommandOutput> {
+        if self.transaction.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "nested local transactions are not supported",
+            ));
+        }
+        let transaction = self
+            .transaction_manager
+            .begin(IsolationLevel::ReadCommitted)?;
+        self.transaction = Some(LocalTransactionState::capture(
+            transaction,
+            &self.catalog,
+            &self.executor,
+        )?);
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn commit_transaction(&mut self) -> Result<CommandOutput> {
+        let transaction = self.take_transaction("commit")?;
+        self.transaction_manager
+            .commit(transaction.transaction.id())?;
+        if self.durable.is_some() {
+            self.checkpoint()?;
+        }
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn rollback_transaction(&mut self) -> Result<CommandOutput> {
+        let transaction = self.take_transaction("rollback")?;
+        self.transaction_manager
+            .abort(transaction.transaction.id())?;
+        self.catalog = transaction.catalog_snapshot;
+        self.executor = transaction.executor_snapshot;
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn take_transaction(&mut self, action: &str) -> Result<LocalTransactionState> {
+        self.transaction.take().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot {action} without an active local transaction"),
+            )
+        })
     }
 
     fn apply_catalog_create_table(

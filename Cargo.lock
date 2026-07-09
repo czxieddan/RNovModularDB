@@ -457,6 +457,7 @@ dependencies = [
  "rnmdb-planner",
  "rnmdb-sql",
  "rnmdb-storage",
+ "rnmdb-txn",
  "rnmdb-types",
  "tempfile",
  "tokio",

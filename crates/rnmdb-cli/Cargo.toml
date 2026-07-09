@@ -16,6 +16,7 @@ rnmdb-executor.workspace = true
 rnmdb-planner.workspace = true
 rnmdb-sql.workspace = true
 rnmdb-storage.workspace = true
+rnmdb-txn.workspace = true
 rnmdb-types.workspace = true
 tokio = { workspace = true, optional = true }
 
