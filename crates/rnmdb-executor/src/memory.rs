@@ -1810,6 +1810,10 @@ impl MemoryExecutor {
                 })
             }
             LogicalPlan::Filter { predicate, input } => {
+                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                    let batch = self.execute_cancellable(input, cancellation)?;
+                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(&predicate, input, cancellation)?
@@ -2139,6 +2143,29 @@ impl MemoryExecutor {
         }
         cancellation.check()?;
         VectorBatch::new(columns, rows)
+    }
+
+    fn apply_correlated_scalar_filter(
+        &self,
+        batch: VectorBatch,
+        predicate: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut rows = Vec::new();
+        for row in batch.rows() {
+            cancellation.check()?;
+            let predicate = self.resolve_scalar_subqueries_for_row(
+                predicate,
+                batch.columns(),
+                row,
+                cancellation,
+            )?;
+            if eval_predicate(batch.columns(), row, &predicate)? {
+                rows.push(row.clone());
+            }
+        }
+        cancellation.check()?;
+        VectorBatch::new(batch.columns().to_vec(), rows)
     }
 
     fn correlated_scalar_projection_row(
@@ -2510,6 +2537,10 @@ impl MemoryExecutor {
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
+                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                    let batch = self.execute_physical_cancellable(input, cancellation)?;
+                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_filter_cancellable(batch, &predicate, cancellation)
@@ -2673,6 +2704,11 @@ impl MemoryExecutor {
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
+                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                    let batch =
+                        self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
@@ -3012,6 +3048,10 @@ impl MemoryExecutor {
                     .scan_parallel_cancellable(config, cancellation)
             }
             LogicalPlan::Filter { predicate, input } => {
+                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                    let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
                     self.execute_indexed_filter_scan(&predicate, input, cancellation)?

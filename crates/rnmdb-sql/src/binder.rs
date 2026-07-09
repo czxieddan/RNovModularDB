@@ -2130,7 +2130,9 @@ impl<'a> Binder<'a> {
             Expr::ExistsSubquery { query } => {
                 self.bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
             }
-            Expr::ScalarSubquery { query } => self.bind_scalar_subquery_expr(query, role_id, None),
+            Expr::ScalarSubquery { query } => {
+                self.bind_scalar_subquery_expr(query, role_id, subquery_outer_scope)
+            }
             _ => Ok(expr.clone()),
         }
     }
