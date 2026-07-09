@@ -1786,6 +1786,7 @@ impl<'a> Binder<'a> {
                 &lateral_bound_columns,
                 &projection,
                 &order_by,
+                input.role_id,
             )?);
         }
 
@@ -1843,8 +1844,13 @@ impl<'a> Binder<'a> {
             &bound_columns,
             input.role_id,
         )?;
-        let order_by =
-            self.bind_join_order_by(input.order_by, &joined_columns, &bound_columns, &projection)?;
+        let order_by = self.bind_join_order_by(
+            input.order_by,
+            &joined_columns,
+            &bound_columns,
+            &projection,
+            input.role_id,
+        )?;
 
         let select = BoundSelect {
             relation_id: left_table.relation_id(),
@@ -2001,6 +2007,7 @@ impl<'a> Binder<'a> {
         joined_columns: &[LateralColumn],
         bound_columns: &[BoundColumn],
         projection: &[BoundSelectItem],
+        role_id: RoleId,
     ) -> Result<Vec<OrderByExpr>> {
         order_by
             .iter()
@@ -2009,7 +2016,7 @@ impl<'a> Binder<'a> {
                     expr: self.rewrite_lateral_expr(joined_columns, &order_by.expr)?,
                     direction: order_by.direction,
                 };
-                self.bind_plain_output_sort_expr(bound_columns, projection, &order_by)
+                self.bind_plain_output_sort_expr(bound_columns, projection, &order_by, role_id)
             })
             .collect()
     }
@@ -2346,6 +2353,7 @@ impl<'a> Binder<'a> {
         columns: &[BoundColumn],
         projection: &[BoundSelectItem],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => self
@@ -2359,6 +2367,8 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
         match self.infer_expr_type_from_columns(columns, &expr)? {
             Some(
                 SqlType::Null
