@@ -10,7 +10,7 @@ use crate::ast::{
     BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery, BoundRecursiveCte,
     BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
     CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName,
-    OrderByExpr, SelectItem, Statement, TransactionAction,
+    OrderByExpr, SelectItem, SelectSubquery, Statement, TransactionAction,
 };
 use crate::expr_mutator::rewrite_qualified_expr;
 use crate::parser::{parse_expr, parse_statement};
@@ -1383,15 +1383,7 @@ impl<'a> Binder<'a> {
         } else {
             None
         };
-        if let Some(selection) = input.selection {
-            let selection = self.rewrite_table_qualified_expr(table, selection)?;
-            self.validate_predicate(table, &selection)?;
-        }
-        let selection = input
-            .selection
-            .as_ref()
-            .map(|selection| self.rewrite_table_qualified_expr(table, selection))
-            .transpose()?;
+        let selection = self.bind_select_selection(table, input.selection, input.role_id)?;
         let mut bound_order_by = Vec::with_capacity(input.order_by.len());
         for order_by in input.order_by {
             let order_by = OrderByExpr {
@@ -1695,9 +1687,8 @@ impl<'a> Binder<'a> {
             .as_ref()
             .map(|selection| self.rewrite_lateral_expr(&lateral_columns, selection))
             .transpose()?;
-        if let Some(selection) = &selection {
-            self.validate_predicate_from_columns(&lateral_bound_columns, selection)?;
-        }
+        let selection =
+            self.bind_columns_selection(selection.as_ref(), &lateral_bound_columns, input.role_id)?;
 
         let mut bound_order_by = Vec::with_capacity(input.order_by.len());
         for order_by in input.order_by {
@@ -1755,8 +1746,12 @@ impl<'a> Binder<'a> {
         self.validate_predicate_from_columns(&bound_columns, &predicate)?;
         let (projection, columns) =
             self.bind_join_projection(input.select_items, &joined_columns, &bound_columns)?;
-        let selection =
-            self.bind_join_selection(input.selection, &joined_columns, &bound_columns)?;
+        let selection = self.bind_join_selection(
+            input.selection,
+            &joined_columns,
+            &bound_columns,
+            input.role_id,
+        )?;
         let order_by =
             self.bind_join_order_by(input.order_by, &joined_columns, &bound_columns, &projection)?;
 
@@ -1894,15 +1889,13 @@ impl<'a> Binder<'a> {
         selection: &Option<Expr>,
         joined_columns: &[LateralColumn],
         bound_columns: &[BoundColumn],
+        role_id: RoleId,
     ) -> Result<Option<Expr>> {
         let selection = selection
             .as_ref()
             .map(|selection| self.rewrite_lateral_expr(joined_columns, selection))
             .transpose()?;
-        if let Some(selection) = &selection {
-            self.validate_predicate_from_columns(bound_columns, selection)?;
-        }
-        Ok(selection)
+        self.bind_columns_selection(selection.as_ref(), bound_columns, role_id)
     }
 
     fn bind_join_order_by(
@@ -1943,6 +1936,131 @@ impl<'a> Binder<'a> {
                 format!("predicate must be bool, got {other:?}"),
             )),
             None => Ok(()),
+        }
+    }
+
+    fn bind_select_selection(
+        &self,
+        table: &Table,
+        selection: &Option<Expr>,
+        role_id: RoleId,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.rewrite_table_qualified_expr(table, selection)?;
+        let selection = self.bind_table_subqueries(table, &selection, role_id)?;
+        self.validate_predicate(table, &selection)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_columns_selection(
+        &self,
+        selection: Option<&Expr>,
+        columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.bind_column_subqueries(columns, selection, role_id)?;
+        self.validate_predicate_from_columns(columns, &selection)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_table_subqueries(&self, table: &Table, expr: &Expr, role_id: RoleId) -> Result<Expr> {
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        self.bind_predicate_subqueries(expr, role_id, &mut infer)
+    }
+
+    fn bind_column_subqueries(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+        role_id: RoleId,
+    ) -> Result<Expr> {
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        self.bind_predicate_subqueries(expr, role_id, &mut infer)
+    }
+
+    fn bind_predicate_subqueries<F>(
+        &self,
+        expr: &Expr,
+        role_id: RoleId,
+        infer: &mut F,
+    ) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        match expr {
+            Expr::Binary { left, op, right } => Ok(Expr::Binary {
+                left: Box::new(self.bind_predicate_subqueries(left, role_id, infer)?),
+                op: op.clone(),
+                right: Box::new(self.bind_predicate_subqueries(right, role_id, infer)?),
+            }),
+            Expr::Unary { op, expr } => Ok(Expr::Unary {
+                op: op.clone(),
+                expr: Box::new(self.bind_predicate_subqueries(expr, role_id, infer)?),
+            }),
+            Expr::Not(expr) => Ok(Expr::Not(Box::new(
+                self.bind_predicate_subqueries(expr, role_id, infer)?,
+            ))),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self.bind_in_subquery_expr(expr, query, *negated, role_id, infer),
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    fn bind_in_subquery_expr<F>(
+        &self,
+        expr: &Expr,
+        query: &SelectSubquery,
+        negated: bool,
+        role_id: RoleId,
+        infer: &mut F,
+    ) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let expr = self.bind_predicate_subqueries(expr, role_id, infer)?;
+        let bound = self.bind_in_subquery(query, role_id)?;
+        let expr_type = infer(&expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer IN subquery expression type: {expr}"),
+            )
+        })?;
+        let subquery_type = single_query_output_type(&bound)?;
+        self.infer_in_list_result_type(&expr_type, std::slice::from_ref(&subquery_type))?;
+        Ok(Expr::InSubquery {
+            expr: Box::new(expr),
+            query: SelectSubquery::Bound(Box::new(bound)),
+            negated,
+        })
+    }
+
+    fn bind_in_subquery(&self, query: &SelectSubquery, role_id: RoleId) -> Result<BoundStatement> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role(statement, role_id)?;
+                let _ = single_query_output_type(&bound)?;
+                Ok(bound)
+            }
+            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+        }
+    }
+
+    fn infer_bound_in_subquery_type(&self, query: &SelectSubquery) -> Result<Option<SqlType>> {
+        if query.bound().is_some() {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "IN subquery is only supported in bound SELECT predicates",
+            ))
         }
     }
 
@@ -2373,6 +2491,10 @@ impl<'a> Binder<'a> {
                     .iter()
                     .try_for_each(|value| self.validate_group_by_expr_shape(value))
             }
+            Expr::InSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "GROUP BY does not support subqueries",
+            )),
             Expr::Like { expr, pattern, .. } => {
                 self.validate_group_by_expr_shape(expr)?;
                 self.validate_group_by_expr_shape(pattern)
@@ -2689,6 +2811,10 @@ impl<'a> Binder<'a> {
                     .collect::<Result<Vec<_>>>()?,
                 negated: *negated,
             }),
+            Expr::InSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support IN subqueries yet",
+            )),
             Expr::Like {
                 expr,
                 pattern,
@@ -3152,6 +3278,7 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
+            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
                     return Ok(None);
@@ -3458,6 +3585,10 @@ impl<'a> Binder<'a> {
                 }
                 Ok(())
             }
+            Expr::InSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "recursive CTE expressions do not support subqueries",
+            )),
             Expr::Like { expr, pattern, .. } => {
                 self.validate_cte_identifiers(columns, expr)?;
                 self.validate_cte_identifiers(columns, pattern)
@@ -3847,6 +3978,10 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
+            Expr::InSubquery { .. } => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "row policy predicates do not support subqueries",
+            )),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
                     return Ok(Some(SqlType::Bool));
@@ -4096,6 +4231,7 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
+            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -4927,6 +5063,20 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             "set operation operands must be SELECT queries",
+        )),
+    }
+}
+
+fn single_query_output_type(statement: &BoundStatement) -> Result<SqlType> {
+    let columns = query_output_columns(statement)?;
+    match columns {
+        [column] => Ok(column.data_type.clone()),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "IN subquery must return exactly one column, got {}",
+                columns.len()
+            ),
         )),
     }
 }

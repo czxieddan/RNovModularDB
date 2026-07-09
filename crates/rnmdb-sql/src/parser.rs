@@ -6,7 +6,7 @@ use crate::{
     ast::{
         Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
         JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem,
-        SortDirection, Statement, TransactionAction,
+        SelectSubquery, SortDirection, Statement, TransactionAction,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -1129,11 +1129,24 @@ impl Parser {
         if self.consume_if(&TokenKind::RightParen) {
             return Err(self.error("IN requires at least one expression"));
         }
+        if self.peek_kind() == Some(&TokenKind::Select) {
+            return self.parse_in_subquery_tail(expr, negated);
+        }
         let values = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(Expr::InList {
             expr: Box::new(expr),
             values,
+            negated,
+        })
+    }
+
+    fn parse_in_subquery_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        let query = self.parse_query()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::InSubquery {
+            expr: Box::new(expr),
+            query: SelectSubquery::Parsed(Box::new(query)),
             negated,
         })
     }

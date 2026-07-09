@@ -124,6 +124,13 @@ pub enum PhysicalPlan {
         input: Box<PhysicalPlan>,
         cost: PlanCost,
     },
+    InSubqueryFilter {
+        expr: Expr,
+        subquery: Box<PhysicalPlan>,
+        negated: bool,
+        input: Box<PhysicalPlan>,
+        cost: PlanCost,
+    },
     Projection {
         items: Vec<ProjectionItem>,
         input: Box<PhysicalPlan>,
@@ -564,6 +571,18 @@ impl PhysicalPlanner {
                     cost,
                 }
             }
+            LogicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+            } => PhysicalPlan::InSubqueryFilter {
+                expr: expr.clone(),
+                subquery: Box::new(self.plan(subquery)),
+                negated: *negated,
+                input: Box::new(self.plan(input)),
+                cost,
+            },
             LogicalPlan::Project { items, input } => PhysicalPlan::Projection {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
@@ -744,6 +763,7 @@ impl PhysicalPlan {
             | PhysicalPlan::SidewaysIndexLookup { cost, .. }
             | PhysicalPlan::NestedLoopJoin { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
+            | PhysicalPlan::InSubqueryFilter { cost, .. }
             | PhysicalPlan::Projection { cost, .. }
             | PhysicalPlan::Window { cost, .. }
             | PhysicalPlan::Aggregate { cost, .. }
@@ -960,6 +980,21 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
             write_physical_plan(input, indent + 1, out);
+        }
+        PhysicalPlan::InSubqueryFilter {
+            expr,
+            subquery,
+            negated,
+            input,
+            cost,
+        } => {
+            let op = if *negated { "NOT IN" } else { "IN" };
+            out.push_str(&format!(
+                "{prefix}InSubqueryFilter expr={expr} op={op}{}\n",
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(input, indent + 1, out);
+            write_physical_plan(subquery, indent + 1, out);
         }
         PhysicalPlan::Projection { items, input, cost } => {
             let columns = items

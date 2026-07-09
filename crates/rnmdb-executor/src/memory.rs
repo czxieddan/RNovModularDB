@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     ops::Bound,
     sync::{
@@ -1807,6 +1807,16 @@ impl MemoryExecutor {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
+            LogicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+            } => {
+                let input = self.execute_cancellable(input, cancellation)?;
+                let subquery = self.execute_cancellable(subquery, cancellation)?;
+                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+            }
             LogicalPlan::TextSearch {
                 relation_id,
                 table,
@@ -2184,6 +2194,17 @@ impl MemoryExecutor {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
+            PhysicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+                ..
+            } => {
+                let input = self.execute_physical_cancellable(input, cancellation)?;
+                let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
+                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+            }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 apply_projection_cancellable(batch, items, cancellation)
@@ -2325,6 +2346,19 @@ impl MemoryExecutor {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
+            }
+            PhysicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+                ..
+            } => {
+                let input =
+                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+                let subquery =
+                    self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
+                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
@@ -2642,6 +2676,16 @@ impl MemoryExecutor {
                 }
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_filter_cancellable(batch, predicate, cancellation)
+            }
+            LogicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+            } => {
+                let input = self.execute_parallel_cancellable(input, config, cancellation)?;
+                let subquery = self.execute_parallel_cancellable(subquery, config, cancellation)?;
+                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
             }
             LogicalPlan::TextSearch {
                 relation_id,
@@ -4056,6 +4100,76 @@ fn apply_filter_cancellable(
     VectorBatch::new(batch.columns().to_vec(), rows)
 }
 
+struct InSubqueryValues {
+    values: HashSet<SqlValue>,
+    has_null: bool,
+}
+
+fn apply_in_subquery_filter_cancellable(
+    batch: VectorBatch,
+    subquery: VectorBatch,
+    expr: &Expr,
+    negated: bool,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let values = collect_in_subquery_values(&subquery, cancellation)?;
+    let mut rows = Vec::new();
+    for row in batch.rows() {
+        cancellation.check()?;
+        if in_subquery_keeps_row(batch.columns(), row, expr, &values, negated)? {
+            rows.push(row.clone());
+        }
+    }
+    VectorBatch::new(batch.columns().to_vec(), rows)
+}
+
+fn collect_in_subquery_values(
+    batch: &VectorBatch,
+    cancellation: &CancellationToken,
+) -> Result<InSubqueryValues> {
+    if batch.columns().len() != 1 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "IN subquery execution expected one column, got {}",
+                batch.columns().len()
+            ),
+        ));
+    }
+    let mut values = HashSet::with_capacity(batch.rows().len());
+    let mut has_null = false;
+    for row in batch.rows() {
+        cancellation.check()?;
+        let value = row.values()[0].clone();
+        if value.is_null() {
+            has_null = true;
+        } else {
+            values.insert(value);
+        }
+    }
+    Ok(InSubqueryValues { values, has_null })
+}
+
+fn in_subquery_keeps_row(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    values: &InSubqueryValues,
+    negated: bool,
+) -> Result<bool> {
+    let value = eval_expr(columns, row, expr)?;
+    if value.is_null() {
+        return Ok(false);
+    }
+    let matched = values.values.contains(&value);
+    Ok(match (matched, values.has_null, negated) {
+        (true, _, false) => true,
+        (true, _, true) => false,
+        (false, false, true) => true,
+        _ => false,
+    })
+}
+
 fn apply_nested_loop_join_cancellable(
     left: VectorBatch,
     right: VectorBatch,
@@ -4889,6 +5003,10 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         }
         Expr::Between { .. } => Ok(SqlType::Bool),
         Expr::InList { .. } => Ok(SqlType::Bool),
+        Expr::InSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "IN subquery must be planned as a filter before projection",
+        )),
         Expr::Like { .. } => Ok(SqlType::Bool),
         Expr::Coalesce(values) => projection_coalesce_type(columns, values),
         Expr::NullIf { left, right } => projection_nullif_type(columns, left, right),
@@ -5259,6 +5377,10 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             values,
             negated,
         } => eval_in_list_expr(columns, row, expr, values, *negated),
+        Expr::InSubquery { .. } => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "IN subquery must be executed by an InSubqueryFilter plan",
+        )),
         Expr::Like {
             expr,
             pattern,

@@ -24,6 +24,12 @@ pub enum LogicalPlan {
         predicate: Expr,
         input: Box<LogicalPlan>,
     },
+    InSubqueryFilter {
+        expr: Expr,
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+        input: Box<LogicalPlan>,
+    },
     TextSearch {
         relation_id: RelationId,
         table: String,
@@ -639,12 +645,9 @@ impl LogicalPlanner {
         }
         if let Some(predicate) = &select.selection {
             plan = if include_table_dependent_rewrites {
-                plan_selection(select.relation_id, &select.table, predicate, plan)?
+                self.plan_select_predicate(select.relation_id, &select.table, predicate, plan)?
             } else {
-                LogicalPlan::Filter {
-                    predicate: predicate.clone(),
-                    input: Box::new(plan),
-                }
+                self.plan_bound_predicate(predicate, plan)?
             };
         }
         let grouping_sets = !select.grouping_sets.is_empty();
@@ -789,6 +792,80 @@ impl LogicalPlanner {
         };
         self.plan_select_with_input(select, plan, false)
     }
+
+    fn plan_select_predicate(
+        &self,
+        relation_id: RelationId,
+        table: &ObjectName,
+        predicate: &Expr,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        match predicate {
+            Expr::Binary { left, op, right } if op == "AND" => {
+                let input = self.plan_select_predicate(relation_id, table, left, input)?;
+                self.plan_select_predicate(relation_id, table, right, input)
+            }
+            Expr::InSubquery { .. } | Expr::Not(_) => self.plan_bound_predicate(predicate, input),
+            _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
+            _ => plan_selection(relation_id, table, predicate, input),
+        }
+    }
+
+    fn plan_bound_predicate(&self, predicate: &Expr, input: LogicalPlan) -> Result<LogicalPlan> {
+        match predicate {
+            Expr::Binary { left, op, right } if op == "AND" => {
+                let input = self.plan_bound_predicate(left, input)?;
+                self.plan_bound_predicate(right, input)
+            }
+            Expr::Not(expr) => self.plan_negated_bound_predicate(expr, input),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self.plan_in_subquery_filter(expr, query.bound(), *negated, input),
+            _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
+            _ => Ok(LogicalPlan::Filter {
+                predicate: predicate.clone(),
+                input: Box::new(input),
+            }),
+        }
+    }
+
+    fn plan_negated_bound_predicate(&self, expr: &Expr, input: LogicalPlan) -> Result<LogicalPlan> {
+        match expr {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self.plan_in_subquery_filter(expr, query.bound(), !*negated, input),
+            _ if contains_in_subquery(expr) => Err(unsupported_in_subquery_predicate()),
+            _ => Ok(LogicalPlan::Filter {
+                predicate: Expr::Not(Box::new(expr.clone())),
+                input: Box::new(input),
+            }),
+        }
+    }
+
+    fn plan_in_subquery_filter(
+        &self,
+        expr: &Expr,
+        query: Option<&BoundStatement>,
+        negated: bool,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let query = query.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "IN subquery was not bound before planning",
+            )
+        })?;
+        Ok(LogicalPlan::InSubqueryFilter {
+            expr: expr.clone(),
+            subquery: Box::new(self.plan(query)?),
+            negated,
+            input: Box::new(input),
+        })
+    }
 }
 
 impl LogicalPlan {
@@ -820,6 +897,17 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
             write_plan(input, indent + 1, out);
+        }
+        LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery,
+            negated,
+            input,
+        } => {
+            let op = if *negated { "NOT IN" } else { "IN" };
+            out.push_str(&format!("{prefix}InSubqueryFilter expr={expr} op={op}\n"));
+            write_plan(input, indent + 1, out);
+            write_plan(subquery, indent + 1, out);
         }
         LogicalPlan::TextSearch {
             table,
@@ -1347,6 +1435,13 @@ fn write_plan_with_costs(
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(input, indent + 1, cost_model, out);
         }
+        LogicalPlan::InSubqueryFilter {
+            input, subquery, ..
+        } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(input, indent + 1, cost_model, out);
+            write_plan_with_costs(subquery, indent + 1, cost_model, out);
+        }
         LogicalPlan::SidewaysLookup { outer, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(outer, indent + 1, cost_model, out);
@@ -1386,6 +1481,7 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
     match plan {
         LogicalPlan::Project { items, .. } => Some(items),
         LogicalPlan::Filter { input, .. }
+        | LogicalPlan::InSubqueryFilter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. }
@@ -1398,6 +1494,7 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
 fn first_filter_predicate(plan: &LogicalPlan) -> Option<&Expr> {
     match plan {
         LogicalPlan::Filter { predicate, .. } => Some(predicate),
+        LogicalPlan::InSubqueryFilter { .. } => None,
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
@@ -1431,7 +1528,9 @@ fn plan_selection(
     predicate: &Expr,
     fallback_input: LogicalPlan,
 ) -> Result<LogicalPlan> {
-    if let Some((column, query)) = text_search_predicate(predicate) {
+    if base_scan_matches(&fallback_input, relation_id, table)
+        && let Some((column, query)) = text_search_predicate(predicate)
+    {
         let parsed = TextQuery::parse(query)?;
         return Ok(LogicalPlan::TextSearch {
             relation_id,
@@ -1462,6 +1561,17 @@ fn plan_selection(
         predicate: predicate.clone(),
         input: Box::new(fallback_input),
     })
+}
+
+fn base_scan_matches(input: &LogicalPlan, relation_id: RelationId, table: &ObjectName) -> bool {
+    let LogicalPlan::Scan {
+        relation_id: input_relation,
+        table: input_table,
+    } = input
+    else {
+        return false;
+    };
+    *input_relation == relation_id && input_table == &object_name(table)
 }
 
 fn join_right_plan(join: &BoundJoin) -> Result<LogicalPlan> {
@@ -1503,6 +1613,87 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
     };
 
     Some((column.as_str(), query.as_str()))
+}
+
+fn contains_in_subquery(expr: &Expr) -> bool {
+    matches!(expr, Expr::InSubquery { .. })
+        || contains_in_subquery_operator(expr)
+        || contains_in_subquery_predicate(expr)
+        || contains_in_subquery_construct(expr)
+        || contains_in_subquery_collection(expr)
+}
+
+fn contains_in_subquery_operator(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary { left, right, .. } => {
+            contains_in_subquery(left) || contains_in_subquery(right)
+        }
+        Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
+            contains_in_subquery(expr)
+        }
+        _ => false,
+    }
+}
+
+fn contains_in_subquery_predicate(expr: &Expr) -> bool {
+    match expr {
+        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::IsUnknown { expr, .. } => {
+            contains_in_subquery(expr)
+        }
+        Expr::IsDistinctFrom { left, right, .. } | Expr::NullIf { left, right } => {
+            contains_in_subquery(left) || contains_in_subquery(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_in_subquery(expr) || contains_in_subquery(low) || contains_in_subquery(high),
+        Expr::InList { expr, values, .. } => {
+            contains_in_subquery(expr) || values.iter().any(contains_in_subquery)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            contains_in_subquery(expr) || contains_in_subquery(pattern)
+        }
+        _ => false,
+    }
+}
+
+fn contains_in_subquery_construct(expr: &Expr) -> bool {
+    match expr {
+        Expr::Coalesce(values) | Expr::Array(values) => values.iter().any(contains_in_subquery),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            operand.as_deref().is_some_and(contains_in_subquery)
+                || whens.iter().any(|arm| {
+                    contains_in_subquery(&arm.condition) || contains_in_subquery(&arm.result)
+                })
+                || else_expr.as_deref().is_some_and(contains_in_subquery)
+        }
+        Expr::Call { args, .. } => args.iter().any(contains_in_subquery),
+        _ => false,
+    }
+}
+
+fn contains_in_subquery_collection(expr: &Expr) -> bool {
+    match expr {
+        Expr::RowNumberOver { order_by }
+        | Expr::RankOver { order_by }
+        | Expr::DenseRankOver { order_by } => {
+            order_by.iter().any(|key| contains_in_subquery(&key.expr))
+        }
+        Expr::Range { lower, upper, .. } => {
+            contains_in_subquery(lower) || contains_in_subquery(upper)
+        }
+        _ => false,
+    }
+}
+
+fn unsupported_in_subquery_predicate() -> RnovError {
+    RnovError::new(
+        ErrorKind::InvalidInput,
+        "IN subquery predicates currently support top-level terms combined with AND",
+    )
 }
 
 fn bound_select_from_statement(statement: &BoundStatement) -> Result<&rnmdb_sql::ast::BoundSelect> {

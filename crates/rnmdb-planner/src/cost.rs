@@ -285,6 +285,18 @@ impl CostModel {
                     .with_rows(input.rows * DEFAULT_FILTER_SELECTIVITY)
                     .add_cpu(input.rows * self.parameters.cpu_operator_cost)
             }
+            LogicalPlan::InSubqueryFilter {
+                input, subquery, ..
+            } => {
+                let input = self.estimate(input);
+                let subquery = self.estimate(subquery);
+                PlanCost::new(
+                    input.rows * DEFAULT_FILTER_SELECTIVITY,
+                    input.row_width_bytes,
+                    input.cpu + subquery.cpu + input.rows * self.parameters.cpu_operator_cost,
+                    input.io + subquery.io,
+                )
+            }
             LogicalPlan::Project { items, input } => {
                 let input = self.estimate(input);
                 input.add_cpu(input.rows * self.parameters.cpu_operator_cost * items.len() as f64)

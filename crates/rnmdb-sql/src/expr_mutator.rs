@@ -129,6 +129,9 @@ where
         if let Some(expr) = self.rewrite_in_list_expr(expr)? {
             return Ok(Some(expr));
         }
+        if let Some(expr) = self.rewrite_in_subquery_expr(expr)? {
+            return Ok(Some(expr));
+        }
         self.rewrite_like_expr(expr)
     }
 
@@ -162,6 +165,22 @@ where
                     .iter()
                     .map(|value| self.rewrite_expr(value))
                     .collect::<Result<Vec<_>>>()?,
+                negated: *negated,
+            }
+            .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_in_subquery_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(self.rewrite_expr(expr)?),
+                query: query.clone(),
                 negated: *negated,
             }
             .into()),

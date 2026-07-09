@@ -95,6 +95,21 @@ impl ColumnDef {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectSubquery {
+    Parsed(Box<Statement>),
+    Bound(Box<BoundStatement>),
+}
+
+impl SelectSubquery {
+    pub fn bound(&self) -> Option<&BoundStatement> {
+        match self {
+            Self::Bound(statement) => Some(statement),
+            Self::Parsed(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Expr {
     Identifier(Ident),
     QualifiedIdentifier {
@@ -165,6 +180,11 @@ pub enum Expr {
     InList {
         expr: Box<Expr>,
         values: Vec<Expr>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<Expr>,
+        query: SelectSubquery,
         negated: bool,
     },
     Like {
@@ -357,6 +377,13 @@ impl fmt::Display for Expr {
                     write!(f, "{value}")?;
                 }
                 f.write_str(")")
+            }
+            Self::InSubquery { expr, negated, .. } => {
+                if *negated {
+                    write!(f, "{expr} NOT IN (subquery)")
+                } else {
+                    write!(f, "{expr} IN (subquery)")
+                }
             }
             Self::Like {
                 expr,
