@@ -1831,8 +1831,12 @@ impl<'a> Binder<'a> {
         let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
         let predicate = self.bind_column_subqueries(&bound_columns, &predicate, input.role_id)?;
         self.validate_predicate_from_columns(&bound_columns, &predicate)?;
-        let (projection, columns) =
-            self.bind_join_projection(input.select_items, &joined_columns, &bound_columns)?;
+        let (projection, columns) = self.bind_join_projection(
+            input.select_items,
+            &joined_columns,
+            &bound_columns,
+            input.role_id,
+        )?;
         let selection = self.bind_join_selection(
             input.selection,
             &joined_columns,
@@ -1891,6 +1895,7 @@ impl<'a> Binder<'a> {
         select_items: &[SelectItem],
         joined_columns: &[LateralColumn],
         bound_columns: &[BoundColumn],
+        role_id: RoleId,
     ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
         let mut projection = Vec::new();
         let mut columns = Vec::new();
@@ -1899,6 +1904,7 @@ impl<'a> Binder<'a> {
                 item,
                 joined_columns,
                 bound_columns,
+                role_id,
                 &mut projection,
                 &mut columns,
             )?;
@@ -1911,6 +1917,7 @@ impl<'a> Binder<'a> {
         item: &SelectItem,
         joined_columns: &[LateralColumn],
         bound_columns: &[BoundColumn],
+        role_id: RoleId,
         projection: &mut Vec<BoundSelectItem>,
         columns: &mut Vec<BoundColumn>,
     ) -> Result<()> {
@@ -1918,6 +1925,9 @@ impl<'a> Binder<'a> {
             SelectItem::Wildcard => self.push_join_wildcard(joined_columns, projection, columns),
             SelectItem::Expr { expr, alias } => {
                 let expr = self.rewrite_lateral_expr(joined_columns, expr)?;
+                let mut infer =
+                    |candidate: &Expr| self.infer_expr_type_from_columns(bound_columns, candidate);
+                let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
                 let column = self.join_projection_column(
                     joined_columns,
                     bound_columns,
