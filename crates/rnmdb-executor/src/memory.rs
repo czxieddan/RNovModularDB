@@ -39,8 +39,8 @@ use rnmdb_sql::{
     parser::parse_expr,
 };
 use rnmdb_types::{
-    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlRange, SqlTimestamp,
-    SqlType, SqlUuid, SqlValue, TextVector, Truth,
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlJson, SqlRange,
+    SqlTimestamp, SqlType, SqlUuid, SqlValue, TextVector, Truth,
 };
 
 use crate::{
@@ -3327,7 +3327,7 @@ fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
         SqlType::Int64 | SqlType::UInt64 | SqlType::Float64 | SqlType::Timestamp => 8.0,
         SqlType::Uuid => 16.0,
         SqlType::Text | SqlType::Bytes => 32.0,
-        SqlType::HStore | SqlType::TextVector => 64.0,
+        SqlType::Json | SqlType::HStore | SqlType::TextVector => 64.0,
         SqlType::Array(_) => 32.0,
         SqlType::Range(_) => 16.0,
     }
@@ -5972,6 +5972,8 @@ fn cast_value(value: SqlValue, data_type: &SqlType) -> Result<SqlValue> {
         (SqlValue::Text(value), SqlType::Timestamp) => {
             SqlTimestamp::parse_str(&value).map(SqlValue::Timestamp)
         }
+        (SqlValue::Json(value), SqlType::Text) => Ok(SqlValue::Text(value.as_str().to_string())),
+        (SqlValue::Text(value), SqlType::Json) => SqlJson::parse_str(&value).map(SqlValue::Json),
         (SqlValue::Bool(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
         (SqlValue::Text(value), SqlType::Bool) => match value.to_ascii_lowercase().as_str() {
             "true" => Ok(SqlValue::Bool(true)),

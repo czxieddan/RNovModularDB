@@ -1471,6 +1471,7 @@ impl Parser {
                 "doubleprecision" => SqlType::Float64,
                 "uuid" => SqlType::Uuid,
                 "timestamp" | "datetime" => SqlType::Timestamp,
+                "json" | "jsonb" => SqlType::Json,
                 "text" | "string" | "varchar" => SqlType::Text,
                 "bytes" | "bytea" => SqlType::Bytes,
                 "hstore" => SqlType::HStore,

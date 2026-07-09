@@ -17,6 +17,7 @@ pub enum SqlType {
     Float64,
     Uuid,
     Timestamp,
+    Json,
     Text,
     Bytes,
     HStore,
@@ -34,6 +35,7 @@ pub enum SqlValue {
     Float64(SqlFloat64),
     Uuid(SqlUuid),
     Timestamp(SqlTimestamp),
+    Json(SqlJson),
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
@@ -392,6 +394,28 @@ fn invalid_timestamp(message: &str) -> RnovError {
     RnovError::new(ErrorKind::InvalidInput, message)
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SqlJson(String);
+
+impl SqlJson {
+    pub fn parse_str(value: &str) -> Result<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(value).map_err(|err| {
+            RnovError::new(ErrorKind::InvalidInput, format!("invalid json text: {err}"))
+        })?;
+        let canonical = serde_json::to_string(&parsed).map_err(|err| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("failed to canonicalize json text: {err}"),
+            )
+        })?;
+        Ok(Self(canonical))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SqlFloat64(u64);
 
@@ -444,6 +468,7 @@ impl SqlValue {
     const TAG_FLOAT64: u8 = 10;
     const TAG_UUID: u8 = 11;
     const TAG_TIMESTAMP: u8 = 12;
+    const TAG_JSON: u8 = 13;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -458,6 +483,7 @@ impl SqlValue {
             Self::Float64(_) => SqlType::Float64,
             Self::Uuid(_) => SqlType::Uuid,
             Self::Timestamp(_) => SqlType::Timestamp,
+            Self::Json(_) => SqlType::Json,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
@@ -500,6 +526,7 @@ impl SqlValue {
             Self::Timestamp(value) => {
                 encoded.extend_from_slice(&value.epoch_micros().to_be_bytes())
             }
+            Self::Json(value) => encode_bytes(value.as_str().as_bytes(), &mut encoded),
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
@@ -558,6 +585,13 @@ impl SqlValue {
             Self::TAG_TIMESTAMP => Ok(Self::Timestamp(SqlTimestamp::from_epoch_micros(
                 i64::from_be_bytes(read_array::<8>(payload, "timestamp")?),
             ))),
+            Self::TAG_JSON => {
+                let bytes = decode_bytes(payload, "json")?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    RnovError::new(ErrorKind::InvalidInput, "json is not valid utf-8")
+                })?;
+                SqlJson::parse_str(&text).map(Self::Json)
+            }
             Self::TAG_TEXT => {
                 let bytes = decode_bytes(payload, "text")?;
                 let text = String::from_utf8(bytes).map_err(|_| {
@@ -586,6 +620,7 @@ impl SqlValue {
             Self::Float64(_) => Self::TAG_FLOAT64,
             Self::Uuid(_) => Self::TAG_UUID,
             Self::Timestamp(_) => Self::TAG_TIMESTAMP,
+            Self::Json(_) => Self::TAG_JSON,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
@@ -610,6 +645,7 @@ impl SqlType {
     const TAG_FLOAT64: u8 = 10;
     const TAG_UUID: u8 = 11;
     const TAG_TIMESTAMP: u8 = 12;
+    const TAG_JSON: u8 = 13;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -620,6 +656,7 @@ impl SqlType {
             Self::Float64 => encoded.push(Self::TAG_FLOAT64),
             Self::Uuid => encoded.push(Self::TAG_UUID),
             Self::Timestamp => encoded.push(Self::TAG_TIMESTAMP),
+            Self::Json => encoded.push(Self::TAG_JSON),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
@@ -644,6 +681,7 @@ impl SqlType {
             Self::TAG_FLOAT64 => Ok(Self::Float64),
             Self::TAG_UUID => Ok(Self::Uuid),
             Self::TAG_TIMESTAMP => Ok(Self::Timestamp),
+            Self::TAG_JSON => Ok(Self::Json),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
