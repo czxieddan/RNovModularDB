@@ -1964,7 +1964,7 @@ impl MemoryExecutor {
             ),
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_sort_cancellable(batch, keys, cancellation)
+                self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
             }
             LogicalPlan::Limit { count, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
@@ -2316,6 +2316,31 @@ impl MemoryExecutor {
                 .map(Some),
             _ => Ok(None),
         })
+    }
+
+    fn apply_sort_with_scalar_subqueries(
+        &self,
+        batch: VectorBatch,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let keys = self.resolve_order_by_scalar_subqueries(keys, cancellation)?;
+        apply_sort_cancellable(batch, &keys, cancellation)
+    }
+
+    fn resolve_order_by_scalar_subqueries(
+        &self,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<OrderByExpr>> {
+        keys.iter()
+            .map(|key| {
+                Ok(OrderByExpr {
+                    expr: self.resolve_scalar_subqueries(&key.expr, cancellation)?,
+                    direction: key.direction,
+                })
+            })
+            .collect()
     }
 
     fn resolve_scalar_subqueries_for_row(
@@ -2710,7 +2735,7 @@ impl MemoryExecutor {
             }
             PhysicalPlan::Sort { keys, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_sort_cancellable(batch, keys, cancellation)
+                self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
             }
             PhysicalPlan::Limit { count, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2896,7 +2921,7 @@ impl MemoryExecutor {
             PhysicalPlan::Sort { keys, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                apply_sort_cancellable(batch, keys, cancellation)
+                self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
             }
             PhysicalPlan::Limit { count, input, .. } => {
                 let batch =
@@ -3308,7 +3333,7 @@ impl MemoryExecutor {
             ),
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_sort_cancellable(batch, keys, cancellation)
+                self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
             }
             LogicalPlan::Limit { count, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;

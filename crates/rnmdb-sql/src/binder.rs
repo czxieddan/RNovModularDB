@@ -1487,6 +1487,7 @@ impl<'a> Binder<'a> {
                         table,
                         &projection,
                         &order_by,
+                        input.role_id,
                     )?);
                 }
             } else {
@@ -2388,6 +2389,7 @@ impl<'a> Binder<'a> {
         table: &Table,
         projection: &[BoundSelectItem],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => self
@@ -2401,6 +2403,7 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
+        let expr = self.bind_scalar_subqueries(&expr, role_id, None)?;
         self.validate_sort_expr(table, &expr)?;
         Ok(OrderByExpr {
             expr,
