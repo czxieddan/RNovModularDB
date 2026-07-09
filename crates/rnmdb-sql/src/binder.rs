@@ -2403,7 +2403,13 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
-        let expr = self.bind_scalar_subqueries(&expr, role_id, Some(OuterQueryScope { table }))?;
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        let expr = self.bind_predicate_subqueries(
+            &expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope { table }),
+        )?;
         self.validate_sort_expr(table, &expr)?;
         Ok(OrderByExpr {
             expr,

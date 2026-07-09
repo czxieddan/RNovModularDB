@@ -2336,7 +2336,7 @@ impl MemoryExecutor {
 
     fn order_by_needs_row_subquery_resolution(&self, keys: &[OrderByExpr]) -> Result<bool> {
         for key in keys {
-            if self.expr_has_correlated_scalar_subquery(&key.expr)? {
+            if self.expr_needs_row_subquery_resolution(&key.expr)? {
                 return Ok(true);
             }
         }
