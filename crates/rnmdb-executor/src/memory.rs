@@ -1811,9 +1811,9 @@ impl MemoryExecutor {
                 })
             }
             LogicalPlan::Filter { predicate, input } => {
-                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                if self.expr_needs_row_subquery_resolution(predicate)? {
                     let batch = self.execute_cancellable(input, cancellation)?;
-                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
@@ -2146,7 +2146,7 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
-    fn apply_correlated_scalar_filter(
+    fn apply_row_subquery_filter(
         &self,
         batch: VectorBatch,
         predicate: &Expr,
@@ -2155,12 +2155,8 @@ impl MemoryExecutor {
         let mut rows = Vec::new();
         for row in batch.rows() {
             cancellation.check()?;
-            let predicate = self.resolve_scalar_subqueries_for_row(
-                predicate,
-                batch.columns(),
-                row,
-                cancellation,
-            )?;
+            let predicate =
+                self.resolve_subqueries_for_row(predicate, batch.columns(), row, cancellation)?;
             if eval_predicate(batch.columns(), row, &predicate)? {
                 rows.push(row.clone());
             }
@@ -2198,6 +2194,28 @@ impl MemoryExecutor {
             }
         }
         Ok(false)
+    }
+
+    fn expr_needs_row_subquery_resolution(&self, expr: &Expr) -> Result<bool> {
+        Ok(self.expr_has_subquery_predicate(expr)?
+            || self.expr_has_correlated_scalar_subquery(expr)?)
+    }
+
+    fn expr_has_subquery_predicate(&self, expr: &Expr) -> Result<bool> {
+        let mut found = false;
+        rewrite_expr_tree(expr, &mut |candidate| {
+            if found {
+                return Ok(Some(candidate.clone()));
+            }
+            match candidate {
+                Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => {
+                    found = true;
+                    Ok(Some(candidate.clone()))
+                }
+                _ => Ok(None),
+            }
+        })?;
+        Ok(found)
     }
 
     fn expr_has_correlated_scalar_subquery(&self, expr: &Expr) -> Result<bool> {
@@ -2256,6 +2274,60 @@ impl MemoryExecutor {
         })
     }
 
+    fn resolve_subqueries_for_row(
+        &self,
+        expr: &Expr,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<Expr> {
+        rewrite_expr_tree(expr, &mut |candidate| match candidate {
+            Expr::ScalarSubquery { query } => self
+                .execute_scalar_subquery_for_row(query, columns, row, cancellation)
+                .map(Expr::RuntimeValue)
+                .map(Some),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self
+                .resolve_in_subquery_for_row(expr, query, *negated, columns, row, cancellation)
+                .map(Expr::RuntimeValue)
+                .map(Some),
+            Expr::ExistsSubquery { query } => self
+                .resolve_exists_subquery_for_row(query, columns, row, cancellation)
+                .map(Expr::RuntimeValue)
+                .map(Some),
+            _ => Ok(None),
+        })
+    }
+
+    fn resolve_in_subquery_for_row(
+        &self,
+        expr: &Expr,
+        query: &SelectSubquery,
+        negated: bool,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<SqlValue> {
+        let expr = self.resolve_subqueries_for_row(expr, columns, row, cancellation)?;
+        let batch = self.execute_select_subquery_for_row(query, columns, row, cancellation)?;
+        let values = collect_in_subquery_values(&batch, cancellation)?;
+        in_subquery_value(columns, row, &expr, &values, negated)
+    }
+
+    fn resolve_exists_subquery_for_row(
+        &self,
+        query: &SelectSubquery,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<SqlValue> {
+        let batch = self.execute_select_subquery_for_row(query, columns, row, cancellation)?;
+        Ok(SqlValue::Bool(exists_subquery_keeps_row(&batch, false)))
+    }
+
     fn execute_scalar_subquery(
         &self,
         query: &SelectSubquery,
@@ -2279,16 +2351,26 @@ impl MemoryExecutor {
         row: &Row,
         cancellation: &CancellationToken,
     ) -> Result<SqlValue> {
+        let batch = self.execute_select_subquery_for_row(query, columns, row, cancellation)?;
+        scalar_subquery_value(&batch)
+    }
+
+    fn execute_select_subquery_for_row(
+        &self,
+        query: &SelectSubquery,
+        columns: &[ColumnSchema],
+        row: &Row,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         let bound = query.bound().ok_or_else(|| {
             RnovError::new(
                 ErrorKind::Internal,
-                "scalar subquery was not bound before execution",
+                "subquery was not bound before execution",
             )
         })?;
         let plan = LogicalPlanner::new().plan(bound)?;
         let plan = replace_logical_outer_refs(&plan, columns, row)?;
-        let batch = self.execute_cancellable(&plan, cancellation)?;
-        scalar_subquery_value(&batch)
+        self.execute_cancellable(&plan, cancellation)
     }
 
     pub fn execute_physical(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
@@ -2487,9 +2569,9 @@ impl MemoryExecutor {
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
-                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                if self.expr_needs_row_subquery_resolution(predicate)? {
                     let batch = self.execute_physical_cancellable(input, cancellation)?;
-                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2654,10 +2736,10 @@ impl MemoryExecutor {
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
-                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                if self.expr_needs_row_subquery_resolution(predicate)? {
                     let batch =
                         self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch =
@@ -2998,9 +3080,9 @@ impl MemoryExecutor {
                     .scan_parallel_cancellable(config, cancellation)
             }
             LogicalPlan::Filter { predicate, input } => {
-                if self.expr_has_correlated_scalar_subquery(predicate)? {
+                if self.expr_needs_row_subquery_resolution(predicate)? {
                     let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                    return self.apply_correlated_scalar_filter(batch, predicate, cancellation);
+                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 if let Some(batch) =
@@ -4521,16 +4603,30 @@ fn in_subquery_keeps_row(
     values: &InSubqueryValues,
     negated: bool,
 ) -> Result<bool> {
+    Ok(matches!(
+        in_subquery_value(columns, row, expr, values, negated)?,
+        SqlValue::Bool(true)
+    ))
+}
+
+fn in_subquery_value(
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+    values: &InSubqueryValues,
+    negated: bool,
+) -> Result<SqlValue> {
     let value = eval_expr(columns, row, expr)?;
     if value.is_null() {
-        return Ok(false);
+        return Ok(SqlValue::Null);
     }
     let matched = values.values.contains(&value);
     Ok(match (matched, values.has_null, negated) {
-        (true, _, false) => true,
-        (true, _, true) => false,
-        (false, false, true) => true,
-        _ => false,
+        (true, _, false) => SqlValue::Bool(true),
+        (true, _, true) => SqlValue::Bool(false),
+        (false, true, _) => SqlValue::Null,
+        (false, false, false) => SqlValue::Bool(false),
+        (false, false, true) => SqlValue::Bool(true),
     })
 }
 

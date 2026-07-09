@@ -855,7 +855,6 @@ impl LogicalPlanner {
             }
             Expr::InSubquery { .. } | Expr::Not(_) => self.plan_bound_predicate(predicate, input),
             Expr::ExistsSubquery { .. } => self.plan_bound_predicate(predicate, input),
-            _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
             _ => plan_selection(relation_id, table, predicate, input),
         }
     }
@@ -875,7 +874,6 @@ impl LogicalPlanner {
             Expr::ExistsSubquery { query } => {
                 self.plan_exists_subquery_filter(query.bound(), false, input)
             }
-            _ if contains_in_subquery(predicate) => Err(unsupported_in_subquery_predicate()),
             _ => Ok(LogicalPlan::Filter {
                 predicate: predicate.clone(),
                 input: Box::new(input),
@@ -893,7 +891,6 @@ impl LogicalPlanner {
             Expr::ExistsSubquery { query } => {
                 self.plan_exists_subquery_filter(query.bound(), true, input)
             }
-            _ if contains_in_subquery(expr) => Err(unsupported_in_subquery_predicate()),
             _ => Ok(LogicalPlan::Filter {
                 predicate: Expr::Not(Box::new(expr.clone())),
                 input: Box::new(input),
@@ -1732,87 +1729,6 @@ fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
     };
 
     Some((column.as_str(), query.as_str()))
-}
-
-fn contains_in_subquery(expr: &Expr) -> bool {
-    matches!(expr, Expr::InSubquery { .. } | Expr::ExistsSubquery { .. })
-        || contains_in_subquery_operator(expr)
-        || contains_in_subquery_predicate(expr)
-        || contains_in_subquery_construct(expr)
-        || contains_in_subquery_collection(expr)
-}
-
-fn contains_in_subquery_operator(expr: &Expr) -> bool {
-    match expr {
-        Expr::Binary { left, right, .. } => {
-            contains_in_subquery(left) || contains_in_subquery(right)
-        }
-        Expr::Unary { expr, .. } | Expr::Not(expr) | Expr::Cast { expr, .. } => {
-            contains_in_subquery(expr)
-        }
-        _ => false,
-    }
-}
-
-fn contains_in_subquery_predicate(expr: &Expr) -> bool {
-    match expr {
-        Expr::IsNull { expr, .. } | Expr::IsTruth { expr, .. } | Expr::IsUnknown { expr, .. } => {
-            contains_in_subquery(expr)
-        }
-        Expr::IsDistinctFrom { left, right, .. } | Expr::NullIf { left, right } => {
-            contains_in_subquery(left) || contains_in_subquery(right)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => contains_in_subquery(expr) || contains_in_subquery(low) || contains_in_subquery(high),
-        Expr::InList { expr, values, .. } => {
-            contains_in_subquery(expr) || values.iter().any(contains_in_subquery)
-        }
-        Expr::Like { expr, pattern, .. } => {
-            contains_in_subquery(expr) || contains_in_subquery(pattern)
-        }
-        _ => false,
-    }
-}
-
-fn contains_in_subquery_construct(expr: &Expr) -> bool {
-    match expr {
-        Expr::Coalesce(values) | Expr::Array(values) => values.iter().any(contains_in_subquery),
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-        } => {
-            operand.as_deref().is_some_and(contains_in_subquery)
-                || whens.iter().any(|arm| {
-                    contains_in_subquery(&arm.condition) || contains_in_subquery(&arm.result)
-                })
-                || else_expr.as_deref().is_some_and(contains_in_subquery)
-        }
-        Expr::Call { args, .. } => args.iter().any(contains_in_subquery),
-        _ => false,
-    }
-}
-
-fn contains_in_subquery_collection(expr: &Expr) -> bool {
-    match expr {
-        Expr::RowNumberOver { order_by }
-        | Expr::RankOver { order_by }
-        | Expr::DenseRankOver { order_by } => {
-            order_by.iter().any(|key| contains_in_subquery(&key.expr))
-        }
-        Expr::Range { lower, upper, .. } => {
-            contains_in_subquery(lower) || contains_in_subquery(upper)
-        }
-        _ => false,
-    }
-}
-
-fn unsupported_in_subquery_predicate() -> RnovError {
-    RnovError::new(
-        ErrorKind::InvalidInput,
-        "subquery predicates currently support top-level terms combined with AND",
-    )
 }
 
 fn bound_select_from_statement(statement: &BoundStatement) -> Result<&rnmdb_sql::ast::BoundSelect> {
