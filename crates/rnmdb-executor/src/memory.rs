@@ -15,7 +15,10 @@ use rnmdb_catalog::{
     IndexMethod, Table as CatalogTable,
 };
 use rnmdb_common::Result;
-use rnmdb_common::{ErrorKind, RnovError, ids::PageId};
+use rnmdb_common::{
+    ErrorKind, RnovError,
+    ids::{PageId, RelationId, RoleId},
+};
 use rnmdb_fts::{SimpleTokenizer, TextPhraseQuery, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
     AxisBounds, BlockRange, BlockSummaryIndex, BoundingBox, CompositeIndexKey, CompositeKeyPattern,
@@ -30,6 +33,7 @@ use rnmdb_planner::{
     },
     physical::{InvertedValueQuery, PhysicalPlan, SetOperationKind},
 };
+use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
     ast::{CaseWhen, ColumnDef, Expr, GeneratedColumn, Ident, IndexKeyDef, OrderByExpr},
     parser::parse_expr,
@@ -40,6 +44,7 @@ use rnmdb_types::{
 };
 
 use crate::{
+    column_crypto::ColumnCryptoState,
     durable::DurableTableRows,
     row::RowCodec,
     vector::{ColumnSchema, Row, VectorBatch, validate_row_against_columns},
@@ -506,6 +511,10 @@ impl MemoryTable {
 
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    fn has_encrypted_columns(&self) -> bool {
+        self.columns.iter().any(ColumnSchema::is_encrypted)
     }
 
     pub fn statistics(&self) -> TableStatistics {
@@ -1587,12 +1596,14 @@ impl Default for ParallelQueryConfig {
 #[derive(Clone, Debug)]
 pub struct MemoryExecutor {
     tables: Arc<RwLock<BTreeMap<String, MemoryTable>>>,
+    column_crypto: ColumnCryptoState,
 }
 
 impl Default for MemoryExecutor {
     fn default() -> Self {
         Self {
             tables: Arc::new(RwLock::new(BTreeMap::new())),
+            column_crypto: ColumnCryptoState::default(),
         }
     }
 }
@@ -1626,6 +1637,31 @@ impl MemoryExecutor {
         Self::default()
     }
 
+    pub fn set_active_role(&mut self, role_id: RoleId) {
+        self.column_crypto.set_active_role(role_id);
+    }
+
+    pub fn configure_column_encryption(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        key: ColumnKeyMaterial,
+        decrypt_roles: impl IntoIterator<Item = RoleId>,
+    ) -> Result<()> {
+        self.column_crypto
+            .configure_column(relation_id, column_name, key, decrypt_roles)
+    }
+
+    pub fn grant_column_decrypt(
+        &mut self,
+        relation_id: RelationId,
+        column_name: impl Into<String>,
+        role_id: RoleId,
+    ) -> Result<()> {
+        self.column_crypto
+            .grant_decrypt(relation_id, column_name, role_id)
+    }
+
     fn read_tables(&self) -> Result<RwLockReadGuard<'_, BTreeMap<String, MemoryTable>>> {
         self.tables
             .read()
@@ -1641,6 +1677,7 @@ impl MemoryExecutor {
     pub fn snapshot(&self) -> Result<Self> {
         Ok(Self {
             tables: Arc::new(RwLock::new(self.read_tables()?.clone())),
+            column_crypto: self.column_crypto.clone(),
         })
     }
 
@@ -1650,6 +1687,19 @@ impl MemoryExecutor {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {name}"))
         })?;
         f(table)
+    }
+
+    fn scan_table(&self, relation_id: RelationId, name: &str) -> Result<VectorBatch> {
+        let batch = self.with_table(name, |table| Ok(table.scan()))?;
+        self.column_crypto.decrypt_batch(relation_id, batch)
+    }
+
+    fn decrypt_physical_scan(
+        &self,
+        relation_id: RelationId,
+        batch: VectorBatch,
+    ) -> Result<VectorBatch> {
+        self.column_crypto.decrypt_batch(relation_id, batch)
     }
 
     pub fn register_table(&mut self, name: impl Into<String>, table: MemoryTable) -> Result<()> {
@@ -1738,12 +1788,7 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            LogicalPlan::Scan { table, .. } => {
-                let tables = self.read_tables()?;
-                tables.get(table).map(MemoryTable::scan).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })
-            }
+            LogicalPlan::Scan { relation_id, table } => self.scan_table(*relation_id, table),
             LogicalPlan::RecursiveScan { name, .. } => {
                 let tables = self.read_tables()?;
                 tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
@@ -1763,6 +1808,7 @@ impl MemoryExecutor {
                 apply_filter_cancellable(batch, predicate, cancellation)
             }
             LogicalPlan::TextSearch {
+                relation_id,
                 table,
                 column,
                 query,
@@ -1774,10 +1820,11 @@ impl MemoryExecutor {
                         RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                     })?;
                     if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                        return Ok(batch);
+                        return self.column_crypto.decrypt_batch(*relation_id, batch);
                     }
                     table.scan()
                 };
+                let batch = self.column_crypto.decrypt_batch(*relation_id, batch)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             LogicalPlan::SidewaysLookup {
@@ -1948,24 +1995,35 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| Ok(table.scan())),
+            PhysicalPlan::SeqScan {
+                relation_id, table, ..
+            } => self.scan_table(*relation_id, table),
             PhysicalPlan::IndexScan {
+                relation_id,
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self.with_table(table, |table| table.index_scan(index, column, value)),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| table.index_scan(index, column, value))?,
+            ),
             PhysicalPlan::ExpressionIndexScan {
+                relation_id,
                 table,
                 index,
                 expr,
                 value,
                 ..
-            } => self.with_table(table, |table| {
-                table.expression_index_scan(index, expr, value)
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.expression_index_scan(index, expr, value)
+                })?,
+            ),
             PhysicalPlan::IndexRangeScan {
+                relation_id,
                 table,
                 index,
                 column,
@@ -1974,51 +2032,69 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self.with_table(table, |table| {
-                table.index_range_scan(
-                    index,
-                    column,
-                    lower.as_ref(),
-                    *lower_inclusive,
-                    upper.as_ref(),
-                    *upper_inclusive,
-                )
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.index_range_scan(
+                        index,
+                        column,
+                        lower.as_ref(),
+                        *lower_inclusive,
+                        upper.as_ref(),
+                        *upper_inclusive,
+                    )
+                })?,
+            ),
             PhysicalPlan::IndexSkipScan {
+                relation_id,
                 table,
                 index,
                 column,
                 value,
                 ..
-            } => self.with_table(table, |table| table.index_skip_scan(index, column, value)),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| table.index_skip_scan(index, column, value))?,
+            ),
             PhysicalPlan::TextSearchScan {
+                relation_id,
                 table,
                 column,
                 query,
                 ..
             } => {
                 let batch = self.with_table(table, |table| Ok(table.scan()))?;
+                let batch = self.decrypt_physical_scan(*relation_id, batch)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::InvertedTextScan {
+                relation_id,
                 table,
                 index,
                 column,
                 query,
                 ..
-            } => self.with_table(table, |table| {
-                table.text_index_scan(index, column, query, cancellation)
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.text_index_scan(index, column, query, cancellation)
+                })?,
+            ),
             PhysicalPlan::InvertedValueScan {
+                relation_id,
                 table,
                 index,
                 column,
                 query,
                 ..
-            } => self.with_table(table, |table| {
-                table.inverted_value_scan(index, column, query)
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.inverted_value_scan(index, column, query)
+                })?,
+            ),
             PhysicalPlan::BlockSummaryScan {
+                relation_id,
                 table,
                 index,
                 column,
@@ -2027,34 +2103,45 @@ impl MemoryExecutor {
                 upper,
                 upper_inclusive,
                 ..
-            } => self.with_table(table, |table| {
-                table.block_summary_scan(
-                    index,
-                    column,
-                    lower,
-                    *lower_inclusive,
-                    upper,
-                    *upper_inclusive,
-                )
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.block_summary_scan(
+                        index,
+                        column,
+                        lower,
+                        *lower_inclusive,
+                        upper,
+                        *upper_inclusive,
+                    )
+                })?,
+            ),
             PhysicalPlan::RangeOverlapScan {
+                relation_id,
                 table,
                 index,
                 column,
                 range,
                 ..
-            } => self.with_table(table, |table| {
-                table.range_overlap_scan(index, column, range)
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.range_overlap_scan(index, column, range)
+                })?,
+            ),
             PhysicalPlan::BoundsOverlapScan {
+                relation_id,
                 table,
                 index,
                 column,
                 bounds,
                 ..
-            } => self.with_table(table, |table| {
-                table.bounds_overlap_scan(index, column, bounds)
-            }),
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.bounds_overlap_scan(index, column, bounds)
+                })?,
+            ),
             PhysicalPlan::SidewaysIndexLookup {
                 outer,
                 inner_table,
@@ -2172,10 +2259,16 @@ impl MemoryExecutor {
         config.validate()?;
         cancellation.check()?;
         match plan {
-            PhysicalPlan::SeqScan { table, .. } => self.with_table(table, |table| {
-                table.scan_parallel_cancellable(config, cancellation)
-            }),
+            PhysicalPlan::SeqScan {
+                relation_id, table, ..
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| {
+                    table.scan_parallel_cancellable(config, cancellation)
+                })?,
+            ),
             PhysicalPlan::TextSearchScan {
+                relation_id,
                 table,
                 column,
                 query,
@@ -2184,6 +2277,7 @@ impl MemoryExecutor {
                 let batch = self.with_table(table, |table| {
                     table.scan_parallel_cancellable(config, cancellation)
                 })?;
+                let batch = self.decrypt_physical_scan(*relation_id, batch)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
             PhysicalPlan::SidewaysIndexLookup {
@@ -2768,34 +2862,48 @@ impl MemoryExecutor {
                 columns,
                 values,
             } => {
+                let column_crypto = self.column_crypto.clone();
                 let mut tables = self.write_tables()?;
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                insert_values(table, columns, values)?;
+                insert_values(table, columns, values, &column_crypto)?;
                 Ok(ExecutionResult::RowsAffected(1))
             }
             LogicalPlan::Update {
+                relation_id,
                 table,
                 assignments,
                 selection,
                 ..
             } => {
+                let column_crypto = self.column_crypto.clone();
                 let mut tables = self.write_tables()?;
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                update_rows(table, assignments, selection.as_ref())
-                    .map(ExecutionResult::RowsAffected)
+                update_rows(
+                    table,
+                    *relation_id,
+                    assignments,
+                    selection.as_ref(),
+                    &column_crypto,
+                )
+                .map(ExecutionResult::RowsAffected)
             }
             LogicalPlan::Delete {
-                table, selection, ..
+                relation_id,
+                table,
+                selection,
+                ..
             } => {
+                let column_crypto = self.column_crypto.clone();
                 let mut tables = self.write_tables()?;
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                delete_rows(table, selection.as_ref()).map(ExecutionResult::RowsAffected)
+                delete_rows(table, *relation_id, selection.as_ref(), &column_crypto)
+                    .map(ExecutionResult::RowsAffected)
             }
             _ => self.execute(plan).map(ExecutionResult::Batch),
         }
@@ -2960,6 +3068,9 @@ impl MemoryExecutor {
         let table = tables.get(table).ok_or_else(|| {
             RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
         })?;
+        if table.has_encrypted_columns() {
+            return Ok(None);
+        }
         if let Some((expr, value)) = indexable_expression_equality(predicate)
             && let Some(batch) = table.try_expression_index_scan(expr, value)?
         {
@@ -3683,8 +3794,10 @@ fn axis_bound_value(bound: &RangeBound, label: &str) -> Result<i64> {
 
 fn update_rows(
     table: &mut MemoryTable,
+    relation_id: RelationId,
     assignments: &[(String, Expr)],
     selection: Option<&Expr>,
+    column_crypto: &ColumnCryptoState,
 ) -> Result<u64> {
     let columns = table.columns.clone();
     let assignments = compile_assignments(&columns, assignments)?;
@@ -3694,14 +3807,16 @@ fn update_rows(
     let mut affected = 0;
 
     for row in &mut rows {
-        if row_matches(&columns, row, selection)? {
-            let mut updated = row.clone();
+        let logical_row = column_crypto.decrypt_row(relation_id, &columns, row)?;
+        if row_matches(&columns, &logical_row, selection)? {
+            let mut updated = logical_row.clone();
             for (index, expr) in &assignments {
-                updated.set_value(*index, eval_expr(&columns, row, expr)?);
+                updated.set_value(*index, eval_expr(&columns, &logical_row, expr)?);
             }
             recompute_generated_values(&columns, &mut updated)?;
-            validate_row_against_columns(&columns, &updated)?;
-            *row = updated;
+            let encrypted = column_crypto.encrypt_row(relation_id, &columns, &updated)?;
+            validate_row_against_columns(&columns, &encrypted)?;
+            *row = encrypted;
             affected += 1;
         }
     }
@@ -3715,7 +3830,12 @@ fn update_rows(
     Ok(affected)
 }
 
-fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64> {
+fn delete_rows(
+    table: &mut MemoryTable,
+    relation_id: RelationId,
+    selection: Option<&Expr>,
+    column_crypto: &ColumnCryptoState,
+) -> Result<u64> {
     let columns = table.columns.clone();
     let original_rows = table.rows.clone();
     let original_indexes = table.indexes.clone();
@@ -3723,7 +3843,8 @@ fn delete_rows(table: &mut MemoryTable, selection: Option<&Expr>) -> Result<u64>
     let mut affected = 0;
 
     for row in original_rows.iter().cloned() {
-        if row_matches(&columns, &row, selection)? {
+        let logical_row = column_crypto.decrypt_row(relation_id, &columns, &row)?;
+        if row_matches(&columns, &logical_row, selection)? {
             affected += 1;
         } else {
             kept.push(row);
@@ -3766,7 +3887,12 @@ fn compile_assignments(
     Ok(compiled)
 }
 
-fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -> Result<()> {
+fn insert_values(
+    table: &mut MemoryTable,
+    columns: &[String],
+    values: &[Expr],
+    column_crypto: &ColumnCryptoState,
+) -> Result<()> {
     if columns.len() != values.len() {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -3808,6 +3934,7 @@ fn insert_values(table: &mut MemoryTable, columns: &[String], values: &[Expr]) -
 
     let mut row = Row::new(row_values);
     recompute_generated_values(table.columns(), &mut row)?;
+    let row = column_crypto.encrypt_insert_row(table.columns(), &row)?;
     table.insert(row)
 }
 

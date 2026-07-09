@@ -477,6 +477,7 @@ dependencies = [
  "rnmdb-fts",
  "rnmdb-index",
  "rnmdb-planner",
+ "rnmdb-security",
  "rnmdb-sql",
  "rnmdb-storage",
  "rnmdb-types",

@@ -338,10 +338,11 @@ impl LocalSession {
     fn from_parts(
         catalog: Catalog,
         role_id: RoleId,
-        executor: MemoryExecutor,
+        mut executor: MemoryExecutor,
         execution: LocalExecutionConfig,
         durable: Option<LocalDurableStore>,
     ) -> Self {
+        executor.set_active_role(role_id);
         Self {
             catalog,
             role_id,
