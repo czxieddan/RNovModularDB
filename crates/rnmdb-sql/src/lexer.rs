@@ -1,4 +1,5 @@
 use rnmdb_common::{ErrorKind, Result, RnovError};
+use rnmdb_types::SqlFloat64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
@@ -94,6 +95,7 @@ pub enum TokenKind {
     Analyze,
     Identifier(String),
     Integer(i64),
+    Float64(SqlFloat64),
     String(String),
     Operator(String),
     Comma,
@@ -258,7 +260,7 @@ impl<'a> Lexer<'a> {
                 b'[' => tokens.push(self.take_single(TokenKind::LeftBracket)),
                 b']' => tokens.push(self.take_single(TokenKind::RightBracket)),
                 b'\'' => tokens.push(self.lex_string()?),
-                b'0'..=b'9' => tokens.push(self.lex_integer()?),
+                b'0'..=b'9' => tokens.push(self.lex_number()?),
                 b'-' if self.peek_next_byte() == Some(b'-') => self.skip_line_comment(),
                 _ if is_identifier_start(byte) => tokens.push(self.lex_identifier_or_keyword()),
                 _ if is_operator_byte(byte) => tokens.push(self.lex_operator()),
@@ -297,11 +299,31 @@ impl<'a> Lexer<'a> {
         Token::new(kind, start, self.position)
     }
 
-    fn lex_integer(&mut self) -> Result<Token> {
+    fn lex_number(&mut self) -> Result<Token> {
         let start = self.position;
-        while let Some(b'0'..=b'9') = self.peek_byte() {
+        self.consume_digits();
+        if self.should_lex_fraction() {
+            self.position += 1;
+            self.consume_digits();
+            return self.float_token(start);
+        }
+        self.integer_token(start)
+    }
+
+    fn consume_digits(&mut self) {
+        while self.peek_byte().is_some_and(|byte| byte.is_ascii_digit()) {
             self.position += 1;
         }
+    }
+
+    fn should_lex_fraction(&self) -> bool {
+        self.peek_byte() == Some(b'.')
+            && self
+                .peek_byte_at(self.position + 1)
+                .is_some_and(|byte| byte.is_ascii_digit())
+    }
+
+    fn integer_token(&self, start: usize) -> Result<Token> {
         let text = &self.input[start..self.position];
         let value = text.parse::<i64>().map_err(|_| {
             RnovError::new(
@@ -310,6 +332,18 @@ impl<'a> Lexer<'a> {
             )
         })?;
         Ok(Token::new(TokenKind::Integer(value), start, self.position))
+    }
+
+    fn float_token(&self, start: usize) -> Result<Token> {
+        let text = &self.input[start..self.position];
+        let parsed = text.parse::<f64>().map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("float64 literal is invalid at {start}"),
+            )
+        })?;
+        let value = SqlFloat64::new(parsed)?;
+        Ok(Token::new(TokenKind::Float64(value), start, self.position))
     }
 
     fn lex_string(&mut self) -> Result<Token> {
@@ -371,10 +405,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn peek_next_byte(&self) -> Option<u8> {
-        self.position
-            .checked_add(1)
-            .and_then(|position| self.input.as_bytes().get(position))
-            .copied()
+        self.peek_byte_at(self.position + 1)
+    }
+
+    fn peek_byte_at(&self, position: usize) -> Option<u8> {
+        self.input.as_bytes().get(position).copied()
     }
 }
 

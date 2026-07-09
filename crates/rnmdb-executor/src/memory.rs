@@ -39,8 +39,8 @@ use rnmdb_sql::{
     parser::parse_expr,
 };
 use rnmdb_types::{
-    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue,
-    TextVector, Truth,
+    ArrayDimension, HStore, HStoreValue, RangeBound, SqlArray, SqlFloat64, SqlRange, SqlType,
+    SqlValue, TextVector, Truth,
 };
 
 use crate::{
@@ -3324,7 +3324,7 @@ fn sql_type_width_bytes(data_type: &SqlType) -> f64 {
     match data_type {
         SqlType::Null => 1.0,
         SqlType::Bool => 1.0,
-        SqlType::Int64 | SqlType::UInt64 => 8.0,
+        SqlType::Int64 | SqlType::UInt64 | SqlType::Float64 => 8.0,
         SqlType::Text | SqlType::Bytes => 32.0,
         SqlType::HStore | SqlType::TextVector => 64.0,
         SqlType::Array(_) => 32.0,
@@ -3576,7 +3576,7 @@ fn indexable_expression_equality(predicate: &Expr) -> Option<(&Expr, &Expr)> {
 fn is_indexable_expression(expr: &Expr) -> bool {
     !matches!(
         expr,
-        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
+        Expr::Integer(_) | Expr::Float64(_) | Expr::String(_) | Expr::Bool(_) | Expr::Null
     )
 }
 
@@ -4823,6 +4823,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             "bound memory projection must not contain qualified column references",
         )),
         Expr::Integer(_) => Ok(SqlType::Int64),
+        Expr::Float64(_) => Ok(SqlType::Float64),
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Bool(_) => Ok(SqlType::Bool),
         Expr::Null => Ok(SqlType::Null),
@@ -4863,13 +4864,17 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
                 .data_type(),
         ),
         Expr::Binary { op, .. } if boolean_operator(op) => Ok(SqlType::Bool),
-        Expr::Binary { op, .. } if arithmetic_operator(op) => Ok(SqlType::Int64),
+        Expr::Binary { left, op, right } if arithmetic_operator(op) => {
+            projection_arithmetic_type(columns, left, op, right)
+        }
         Expr::Binary { op, .. } if text_concat_operator(op) => Ok(SqlType::Text),
         Expr::Binary { op, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support operator {op}"),
         )),
-        Expr::Unary { op, .. } if unary_arithmetic_operator(op) => Ok(SqlType::Int64),
+        Expr::Unary { op, expr } if unary_arithmetic_operator(op) => {
+            projection_unary_arithmetic_type(columns, op, expr)
+        }
         Expr::Unary { op, .. } => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support unary operator {op}"),
@@ -4894,6 +4899,53 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, args } => projection_call_type(columns, name.object(), args),
     }
+}
+
+fn projection_arithmetic_type(
+    columns: &[ColumnSchema],
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlType> {
+    let left_type = projection_type(columns, left)?;
+    let right_type = projection_type(columns, right)?;
+    if !numeric_or_null_type(&left_type) || !numeric_or_null_type(&right_type) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("arithmetic operator {op} requires numeric operands"),
+        ));
+    }
+    if op == "%" && (left_type == SqlType::Float64 || right_type == SqlType::Float64) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "modulo operator requires INT64 operands",
+        ));
+    }
+    if left_type == SqlType::Float64 || right_type == SqlType::Float64 {
+        Ok(SqlType::Float64)
+    } else {
+        Ok(SqlType::Int64)
+    }
+}
+
+fn projection_unary_arithmetic_type(
+    columns: &[ColumnSchema],
+    op: &str,
+    expr: &Expr,
+) -> Result<SqlType> {
+    let data_type = projection_type(columns, expr)?;
+    match data_type {
+        SqlType::Int64 | SqlType::Null => Ok(SqlType::Int64),
+        SqlType::Float64 => Ok(SqlType::Float64),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unary operator {op} requires numeric operand, got {other:?}"),
+        )),
+    }
+}
+
+fn numeric_or_null_type(data_type: &SqlType) -> bool {
+    matches!(data_type, SqlType::Int64 | SqlType::Float64 | SqlType::Null)
 }
 
 fn projection_call_type(columns: &[ColumnSchema], name: &str, args: &[Expr]) -> Result<SqlType> {
@@ -5125,7 +5177,12 @@ fn case_result_type(result_types: &[SqlType], else_type: &SqlType) -> Result<Sql
 fn sortable_type(data_type: &SqlType) -> bool {
     matches!(
         data_type,
-        SqlType::Bool | SqlType::Int64 | SqlType::UInt64 | SqlType::Text | SqlType::Bytes
+        SqlType::Bool
+            | SqlType::Int64
+            | SqlType::UInt64
+            | SqlType::Float64
+            | SqlType::Text
+            | SqlType::Bytes
     )
 }
 
@@ -5140,6 +5197,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             "bound memory expression must not contain qualified column references",
         )),
         Expr::Integer(_)
+        | Expr::Float64(_)
         | Expr::String(_)
         | Expr::Bool(_)
         | Expr::Null
@@ -5476,16 +5534,22 @@ fn eval_arithmetic_expr(
 ) -> Result<SqlValue> {
     let left = eval_expr(columns, row, left)?;
     let right = eval_expr(columns, row, right)?;
-    let (left, right) = match (left, right) {
-        (SqlValue::Null, _) | (_, SqlValue::Null) => return Ok(SqlValue::Null),
-        (SqlValue::Int64(left), SqlValue::Int64(right)) => (left, right),
-        _ => {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("arithmetic operator {op} requires INT64 operands"),
-            ));
-        }
-    };
+    if left.is_null() || right.is_null() {
+        return Ok(SqlValue::Null);
+    }
+    if let (SqlValue::Int64(left), SqlValue::Int64(right)) = (&left, &right) {
+        return eval_int64_arithmetic(*left, op, *right).map(SqlValue::Int64);
+    }
+    if op == "%" {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "modulo operator requires INT64 operands",
+        ));
+    }
+    eval_float64_arithmetic(left, op, right).map(SqlValue::Float64)
+}
+
+fn eval_int64_arithmetic(left: i64, op: &str, right: i64) -> Result<i64> {
     let value = match op {
         "+" => left.checked_add(right),
         "-" => left.checked_sub(right),
@@ -5505,7 +5569,39 @@ fn eval_arithmetic_expr(
         _ => unreachable!("matched arithmetic operator"),
     }
     .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow"))?;
-    Ok(SqlValue::Int64(value))
+    Ok(value)
+}
+
+fn eval_float64_arithmetic(left: SqlValue, op: &str, right: SqlValue) -> Result<SqlFloat64> {
+    let left = numeric_value_as_float(left, op)?;
+    let right = numeric_value_as_float(right, op)?;
+    let value = match op {
+        "+" => left + right,
+        "-" => left - right,
+        "*" => left * right,
+        "/" => {
+            if right == 0.0 {
+                return Err(RnovError::new(ErrorKind::InvalidInput, "division by zero"));
+            }
+            left / right
+        }
+        _ => unreachable!("matched arithmetic operator"),
+    };
+    SqlFloat64::new(value)
+}
+
+fn numeric_value_as_float(value: SqlValue, op: &str) -> Result<f64> {
+    match value {
+        SqlValue::Int64(value) => Ok(value as f64),
+        SqlValue::Float64(value) => Ok(value.get()),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "arithmetic operator {op} requires numeric operands, got {:?}",
+                other.data_type()
+            ),
+        )),
+    }
 }
 
 fn eval_text_concat_expr(
@@ -5540,21 +5636,22 @@ fn eval_unary_arithmetic_expr(
     expr: &Expr,
 ) -> Result<SqlValue> {
     let value = eval_expr(columns, row, expr)?;
-    let SqlValue::Int64(value) = value else {
-        if value.is_null() {
-            return Ok(SqlValue::Null);
-        }
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("unary operator {op} requires INT64 operand"),
-        ));
-    };
-    match op {
-        "+" => Ok(SqlValue::Int64(value)),
-        "-" => value
+    match (op, value) {
+        (_, SqlValue::Null) => Ok(SqlValue::Null),
+        ("+", SqlValue::Int64(value)) => Ok(SqlValue::Int64(value)),
+        ("-", SqlValue::Int64(value)) => value
             .checked_neg()
             .map(SqlValue::Int64)
             .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow")),
+        ("+", SqlValue::Float64(value)) => Ok(SqlValue::Float64(value)),
+        ("-", SqlValue::Float64(value)) => SqlFloat64::new(-value.get()).map(SqlValue::Float64),
+        ("+" | "-", other) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "unary operator {op} requires numeric operand, got {:?}",
+                other.data_type()
+            ),
+        )),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("unsupported unary operator {op}"),
@@ -5833,6 +5930,9 @@ fn eval_cast_expr(
     }
     match (value, data_type) {
         (SqlValue::Int64(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+        (SqlValue::Int64(value), SqlType::Float64) => {
+            SqlFloat64::new(value as f64).map(SqlValue::Float64)
+        }
         (SqlValue::Text(value), SqlType::Int64) => {
             let parsed = value.parse::<i64>().map_err(|_| {
                 RnovError::new(
@@ -5841,6 +5941,16 @@ fn eval_cast_expr(
                 )
             })?;
             Ok(SqlValue::Int64(parsed))
+        }
+        (SqlValue::Float64(value), SqlType::Text) => Ok(SqlValue::Text(value.get().to_string())),
+        (SqlValue::Text(value), SqlType::Float64) => {
+            let parsed = value.parse::<f64>().map_err(|_| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot cast TEXT value '{value}' to FLOAT64"),
+                )
+            })?;
+            SqlFloat64::new(parsed).map(SqlValue::Float64)
         }
         (SqlValue::Bool(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
         (SqlValue::Text(value), SqlType::Bool) => match value.to_ascii_lowercase().as_str() {
@@ -6020,6 +6130,7 @@ fn column_index(columns: &[ColumnSchema], name: &str) -> Result<usize> {
 fn literal_value(expr: &Expr) -> Result<SqlValue> {
     match expr {
         Expr::Integer(value) => Ok(SqlValue::Int64(*value)),
+        Expr::Float64(value) => Ok(SqlValue::Float64(*value)),
         Expr::String(value) => Ok(SqlValue::Text(value.clone())),
         Expr::Bool(value) => Ok(SqlValue::Bool(*value)),
         Expr::Null => Ok(SqlValue::Null),
@@ -6030,9 +6141,35 @@ fn literal_value(expr: &Expr) -> Result<SqlValue> {
             upper,
             bounds,
         } => range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive),
+        Expr::Unary { op, expr } if unary_arithmetic_operator(op) => unary_literal_value(op, expr),
         _ => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("unsupported memory literal: {expr}"),
+        )),
+    }
+}
+
+fn unary_literal_value(op: &str, expr: &Expr) -> Result<SqlValue> {
+    let value = literal_value(expr)?;
+    match (op, value) {
+        (_, SqlValue::Null) => Ok(SqlValue::Null),
+        ("+", SqlValue::Int64(value)) => Ok(SqlValue::Int64(value)),
+        ("-", SqlValue::Int64(value)) => value
+            .checked_neg()
+            .map(SqlValue::Int64)
+            .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "arithmetic overflow")),
+        ("+", SqlValue::Float64(value)) => Ok(SqlValue::Float64(value)),
+        ("-", SqlValue::Float64(value)) => SqlFloat64::new(-value.get()).map(SqlValue::Float64),
+        ("+" | "-", other) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "unary operator {op} requires numeric literal, got {:?}",
+                other.data_type()
+            ),
+        )),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unsupported unary operator {op}"),
         )),
     }
 }

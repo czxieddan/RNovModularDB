@@ -1331,6 +1331,10 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Integer(value))
             }
+            Some(TokenKind::Float64(value)) => {
+                self.bump();
+                Ok(Expr::Float64(value))
+            }
             Some(TokenKind::String(value)) => {
                 self.bump();
                 Ok(Expr::String(value))
@@ -1459,6 +1463,12 @@ impl Parser {
                 "bool" | "boolean" => SqlType::Bool,
                 "int64" | "bigint" | "integer" => SqlType::Int64,
                 "uint64" => SqlType::UInt64,
+                "float" | "float64" => SqlType::Float64,
+                "double" => {
+                    let _ = self.consume_identifier_keyword("precision");
+                    SqlType::Float64
+                }
+                "doubleprecision" => SqlType::Float64,
                 "text" | "string" | "varchar" => SqlType::Text,
                 "bytes" | "bytea" => SqlType::Bytes,
                 "hstore" => SqlType::HStore,

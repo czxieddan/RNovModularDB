@@ -14,6 +14,7 @@ pub enum SqlType {
     Bool,
     Int64,
     UInt64,
+    Float64,
     Text,
     Bytes,
     HStore,
@@ -28,12 +29,49 @@ pub enum SqlValue {
     Bool(bool),
     Int64(i64),
     UInt64(u64),
+    Float64(SqlFloat64),
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
     TextVector(TextVector),
     Array(SqlArray),
     Range(SqlRange),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SqlFloat64(u64);
+
+impl SqlFloat64 {
+    pub fn new(value: f64) -> Result<Self> {
+        if !value.is_finite() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "float64 value must be finite",
+            ));
+        }
+
+        Ok(Self(Self::canonical_bits(value)))
+    }
+
+    pub fn from_bits(bits: u64) -> Result<Self> {
+        Self::new(f64::from_bits(bits))
+    }
+
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    pub fn to_bits(self) -> u64 {
+        self.0
+    }
+
+    fn canonical_bits(value: f64) -> u64 {
+        if value == 0.0 {
+            0.0_f64.to_bits()
+        } else {
+            value.to_bits()
+        }
+    }
 }
 
 impl SqlValue {
@@ -49,6 +87,7 @@ impl SqlValue {
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
+    const TAG_FLOAT64: u8 = 10;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -60,6 +99,7 @@ impl SqlValue {
             Self::Bool(_) => SqlType::Bool,
             Self::Int64(_) => SqlType::Int64,
             Self::UInt64(_) => SqlType::UInt64,
+            Self::Float64(_) => SqlType::Float64,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
@@ -74,7 +114,7 @@ impl SqlValue {
             return Truth::Unknown;
         }
 
-        if self == other {
+        if self == other || numeric_values_are_equal(self, other) {
             Truth::True
         } else {
             Truth::False
@@ -97,6 +137,7 @@ impl SqlValue {
             Self::Bool(value) => encoded.push(u8::from(*value)),
             Self::Int64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::UInt64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
+            Self::Float64(value) => encoded.extend_from_slice(&value.to_bits().to_be_bytes()),
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
@@ -146,6 +187,9 @@ impl SqlValue {
             Self::TAG_UINT64 => Ok(Self::UInt64(u64::from_be_bytes(read_array::<8>(
                 payload, "uint64",
             )?))),
+            Self::TAG_FLOAT64 => Ok(Self::Float64(SqlFloat64::from_bits(u64::from_be_bytes(
+                read_array::<8>(payload, "float64")?,
+            ))?)),
             Self::TAG_TEXT => {
                 let bytes = decode_bytes(payload, "text")?;
                 let text = String::from_utf8(bytes).map_err(|_| {
@@ -171,6 +215,7 @@ impl SqlValue {
             Self::Bool(_) => Self::TAG_BOOL,
             Self::Int64(_) => Self::TAG_INT64,
             Self::UInt64(_) => Self::TAG_UINT64,
+            Self::Float64(_) => Self::TAG_FLOAT64,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
@@ -192,6 +237,7 @@ impl SqlType {
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
+    const TAG_FLOAT64: u8 = 10;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -199,6 +245,7 @@ impl SqlType {
             Self::Bool => encoded.push(Self::TAG_BOOL),
             Self::Int64 => encoded.push(Self::TAG_INT64),
             Self::UInt64 => encoded.push(Self::TAG_UINT64),
+            Self::Float64 => encoded.push(Self::TAG_FLOAT64),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
@@ -220,6 +267,7 @@ impl SqlType {
             Self::TAG_BOOL => Ok(Self::Bool),
             Self::TAG_INT64 => Ok(Self::Int64),
             Self::TAG_UINT64 => Ok(Self::UInt64),
+            Self::TAG_FLOAT64 => Ok(Self::Float64),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
@@ -905,7 +953,12 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
     match (left, right) {
         (SqlValue::Bool(a), SqlValue::Bool(b)) => Ok(a.cmp(b)),
         (SqlValue::Int64(a), SqlValue::Int64(b)) => Ok(a.cmp(b)),
+        (SqlValue::Int64(a), SqlValue::Float64(b)) => compare_int64_float64(*a, *b),
+        (SqlValue::Float64(a), SqlValue::Int64(b)) => {
+            compare_int64_float64(*b, *a).map(Ordering::reverse)
+        }
         (SqlValue::UInt64(a), SqlValue::UInt64(b)) => Ok(a.cmp(b)),
+        (SqlValue::Float64(a), SqlValue::Float64(b)) => compare_float64_values(*a, *b),
         (SqlValue::Text(a), SqlValue::Text(b)) => Ok(a.cmp(b)),
         (SqlValue::Bytes(a), SqlValue::Bytes(b)) => Ok(a.cmp(b)),
         _ => Err(RnovError::new(
@@ -913,6 +966,57 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
             "range comparison only supports matching scalar types",
         )),
     }
+}
+
+fn numeric_values_are_equal(left: &SqlValue, right: &SqlValue) -> bool {
+    matches!(compare_numeric_values(left, right), Some(Ordering::Equal))
+}
+
+fn compare_numeric_values(left: &SqlValue, right: &SqlValue) -> Option<Ordering> {
+    match (left, right) {
+        (SqlValue::Int64(a), SqlValue::Float64(b)) => compare_int64_float64(*a, *b).ok(),
+        (SqlValue::Float64(a), SqlValue::Int64(b)) => {
+            compare_int64_float64(*b, *a).map(Ordering::reverse).ok()
+        }
+        _ => None,
+    }
+}
+
+fn compare_int64_float64(left: i64, right: SqlFloat64) -> Result<Ordering> {
+    let right = right.get();
+    if right >= 9_223_372_036_854_775_808.0 {
+        return Ok(Ordering::Less);
+    }
+    if right < -9_223_372_036_854_775_808.0 {
+        return Ok(Ordering::Greater);
+    }
+
+    let truncated = right.trunc() as i64;
+    match left.cmp(&truncated) {
+        Ordering::Equal => compare_int64_to_fractional_float(right),
+        other => Ok(other),
+    }
+}
+
+fn compare_int64_to_fractional_float(value: f64) -> Result<Ordering> {
+    match value.partial_cmp(&value.trunc()) {
+        Some(Ordering::Greater) => Ok(Ordering::Less),
+        Some(Ordering::Less) => Ok(Ordering::Greater),
+        Some(Ordering::Equal) => Ok(Ordering::Equal),
+        None => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "float64 comparison requires finite values",
+        )),
+    }
+}
+
+fn compare_float64_values(left: SqlFloat64, right: SqlFloat64) -> Result<Ordering> {
+    left.get().partial_cmp(&right.get()).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "float64 comparison requires finite values",
+        )
+    })
 }
 
 fn validate_range_bound_type(element_type: &SqlType, bound: &RangeBound) -> Result<()> {

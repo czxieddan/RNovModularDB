@@ -2003,6 +2003,7 @@ impl<'a> Binder<'a> {
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -2021,6 +2022,7 @@ impl<'a> Binder<'a> {
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -2056,6 +2058,7 @@ impl<'a> Binder<'a> {
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
                 | SqlType::Text
                 | SqlType::Bytes,
             )
@@ -2272,6 +2275,7 @@ impl<'a> Binder<'a> {
                     | SqlType::Bool
                     | SqlType::Int64
                     | SqlType::UInt64
+                    | SqlType::Float64
                     | SqlType::Text
                     | SqlType::Bytes,
                 ) => {}
@@ -2292,6 +2296,7 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_)
             | Expr::QualifiedIdentifier { .. }
             | Expr::Integer(_)
+            | Expr::Float64(_)
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
@@ -2449,6 +2454,7 @@ impl<'a> Binder<'a> {
             | SqlType::Bool
             | SqlType::Int64
             | SqlType::UInt64
+            | SqlType::Float64
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -2853,6 +2859,7 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_)
             | Expr::QualifiedIdentifier { .. }
             | Expr::Integer(_)
+            | Expr::Float64(_)
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
@@ -3026,6 +3033,7 @@ impl<'a> Binder<'a> {
                 "HAVING does not support qualified column references after binding",
             )),
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
@@ -3252,6 +3260,7 @@ impl<'a> Binder<'a> {
             | SqlType::Bool
             | SqlType::Int64
             | SqlType::UInt64
+            | SqlType::Float64
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -3483,6 +3492,7 @@ impl<'a> Binder<'a> {
                 self.validate_cte_identifiers(columns, upper)
             }
             Expr::Integer(_)
+            | Expr::Float64(_)
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
@@ -3710,6 +3720,7 @@ impl<'a> Binder<'a> {
                 Ok(Some(column.data_type))
             }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
@@ -3959,6 +3970,7 @@ impl<'a> Binder<'a> {
                 Ok(Some(column.data_type))
             }
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
@@ -4260,6 +4272,7 @@ impl<'a> Binder<'a> {
                 "bound expressions must not contain qualified column references",
             )),
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
@@ -4421,15 +4434,22 @@ impl<'a> Binder<'a> {
         left_type: &SqlType,
         right_type: &SqlType,
     ) -> Result<Option<SqlType>> {
-        if matches!(left_type, SqlType::Int64 | SqlType::Null)
-            && matches!(right_type, SqlType::Int64 | SqlType::Null)
-        {
-            Ok(Some(SqlType::Int64))
-        } else {
-            Err(RnovError::new(
+        if !is_numeric_or_null(left_type) || !is_numeric_or_null(right_type) {
+            return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                format!("arithmetic operator {op} requires INT64 operands"),
-            ))
+                format!("arithmetic operator {op} requires numeric operands"),
+            ));
+        }
+        if op == "%" && (left_type == &SqlType::Float64 || right_type == &SqlType::Float64) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "modulo operator requires INT64 operands",
+            ));
+        }
+        if left_type == &SqlType::Float64 || right_type == &SqlType::Float64 {
+            Ok(Some(SqlType::Float64))
+        } else {
+            Ok(Some(SqlType::Int64))
         }
     }
 
@@ -4535,10 +4555,12 @@ impl<'a> Binder<'a> {
         }
         if matches!(data_type, SqlType::Int64 | SqlType::Null) {
             Ok(Some(SqlType::Int64))
+        } else if matches!(data_type, SqlType::Float64) {
+            Ok(Some(SqlType::Float64))
         } else {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                format!("unary operator {op} requires INT64 operand"),
+                format!("unary operator {op} requires numeric operand"),
             ))
         }
     }
@@ -4750,7 +4772,10 @@ impl<'a> Binder<'a> {
             || matches!(
                 (source_type, target_type),
                 (SqlType::Int64, SqlType::Text)
+                    | (SqlType::Int64, SqlType::Float64)
                     | (SqlType::Text, SqlType::Int64)
+                    | (SqlType::Float64, SqlType::Text)
+                    | (SqlType::Text, SqlType::Float64)
                     | (SqlType::Bool, SqlType::Text)
                     | (SqlType::Text, SqlType::Bool)
             )
@@ -4821,6 +4846,10 @@ fn is_arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%")
 }
 
+fn is_numeric_or_null(data_type: &SqlType) -> bool {
+    matches!(data_type, SqlType::Int64 | SqlType::Float64 | SqlType::Null)
+}
+
 fn is_text_concat_operator(op: &str) -> bool {
     op == "||"
 }
@@ -4849,7 +4878,7 @@ fn hidden_group_key_nullable(table: &Table, expr: &Expr) -> bool {
             .find(|column| column.name().eq_ignore_ascii_case(identifier.as_str()))
             .map(|column| column.nullable())
             .unwrap_or(true),
-        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) => false,
+        Expr::Integer(_) | Expr::Float64(_) | Expr::String(_) | Expr::Bool(_) => false,
         Expr::Null => true,
         _ => true,
     }
@@ -5143,6 +5172,7 @@ fn validate_sql_procedure_body(body: &str) -> Result<()> {
 fn procedure_argument_type(expr: &Expr) -> Result<SqlType> {
     match expr {
         Expr::Integer(_) => Ok(SqlType::Int64),
+        Expr::Float64(_) => Ok(SqlType::Float64),
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Bool(_) => Ok(SqlType::Bool),
         Expr::Null => Ok(SqlType::Null),
@@ -5185,6 +5215,7 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::Bool => "BOOL".to_string(),
         SqlType::Int64 => "INT64".to_string(),
         SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Float64 => "FLOAT64".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),

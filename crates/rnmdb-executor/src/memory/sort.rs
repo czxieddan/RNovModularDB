@@ -130,6 +130,10 @@ fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirecti
         (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
         (SqlValue::Int64(left), SqlValue::Int64(right)) => left.cmp(right),
         (SqlValue::UInt64(left), SqlValue::UInt64(right)) => left.cmp(right),
+        (SqlValue::Float64(left), SqlValue::Float64(right)) => left
+            .get()
+            .partial_cmp(&right.get())
+            .unwrap_or(Ordering::Equal),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
         (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
         _ => Ordering::Equal,

@@ -2,7 +2,7 @@ use std::fmt;
 
 use rnmdb_catalog::{Column, IndexMethod, OperatorSignature, Privilege};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
-use rnmdb_types::SqlType;
+use rnmdb_types::{SqlFloat64, SqlType};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Ident(String);
@@ -102,6 +102,7 @@ pub enum Expr {
         name: Ident,
     },
     Integer(i64),
+    Float64(SqlFloat64),
     String(String),
     Bool(bool),
     Null,
@@ -243,6 +244,7 @@ impl fmt::Display for Expr {
             Self::Identifier(ident) => write!(f, "{ident}"),
             Self::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
             Self::Integer(value) => write!(f, "{value}"),
+            Self::Float64(value) => write!(f, "{}", value.get()),
             Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
             Self::Bool(true) => f.write_str("TRUE"),
             Self::Bool(false) => f.write_str("FALSE"),
@@ -454,6 +456,7 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::Bool => "BOOL".to_string(),
         SqlType::Int64 => "INT64".to_string(),
         SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Float64 => "FLOAT64".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),
