@@ -2105,6 +2105,163 @@ impl MemoryExecutor {
         VectorBatch::new(input.columns().to_vec(), rows)
     }
 
+    fn apply_physical_exists_subquery_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if physical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_physical_exists_filter(
+                input,
+                subquery,
+                negated,
+                None,
+                cancellation,
+            );
+        }
+        let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
+        apply_exists_subquery_filter(input, &subquery, negated, cancellation)
+    }
+
+    fn apply_physical_exists_subquery_filter_parallel(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if physical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_physical_exists_filter(
+                input,
+                subquery,
+                negated,
+                Some(config),
+                cancellation,
+            );
+        }
+        let subquery =
+            self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
+        apply_exists_subquery_filter(input, &subquery, negated, cancellation)
+    }
+
+    fn apply_physical_in_subquery_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        expr: &Expr,
+        negated: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if physical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_physical_in_filter(
+                input,
+                subquery,
+                expr,
+                negated,
+                None,
+                cancellation,
+            );
+        }
+        let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
+        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+    }
+
+    fn apply_physical_in_subquery_filter_parallel(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        expr: &Expr,
+        negated: bool,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if physical_plan_has_qualified_identifier(subquery) {
+            return self.apply_correlated_physical_in_filter(
+                input,
+                subquery,
+                expr,
+                negated,
+                Some(config),
+                cancellation,
+            );
+        }
+        let subquery =
+            self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
+        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+    }
+
+    fn apply_correlated_physical_in_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        expr: &Expr,
+        negated: bool,
+        config: Option<ParallelQueryConfig>,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut rows = Vec::new();
+        for row in input.rows() {
+            cancellation.check()?;
+            let subquery = self.execute_physical_subquery_for_row(
+                subquery,
+                input.columns(),
+                row,
+                config,
+                cancellation,
+            )?;
+            let values = collect_in_subquery_values(&subquery, cancellation)?;
+            if in_subquery_keeps_row(input.columns(), row, expr, &values, negated)? {
+                rows.push(row.clone());
+            }
+        }
+        VectorBatch::new(input.columns().to_vec(), rows)
+    }
+
+    fn apply_correlated_physical_exists_filter(
+        &self,
+        input: VectorBatch,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        config: Option<ParallelQueryConfig>,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut rows = Vec::new();
+        for row in input.rows() {
+            cancellation.check()?;
+            let subquery = self.execute_physical_subquery_for_row(
+                subquery,
+                input.columns(),
+                row,
+                config,
+                cancellation,
+            )?;
+            if exists_subquery_keeps_row(&subquery, negated) {
+                rows.push(row.clone());
+            }
+        }
+        VectorBatch::new(input.columns().to_vec(), rows)
+    }
+
+    fn execute_physical_subquery_for_row(
+        &self,
+        subquery: &PhysicalPlan,
+        columns: &[ColumnSchema],
+        row: &Row,
+        config: Option<ParallelQueryConfig>,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let subquery = replace_physical_outer_refs(subquery, columns, row)?;
+        match config {
+            Some(config) => {
+                self.execute_physical_parallel_cancellable(&subquery, config, cancellation)
+            }
+            None => self.execute_physical_cancellable(&subquery, cancellation),
+        }
+    }
+
     fn with_recursive_table(&self, name: &str, batch: &VectorBatch) -> Result<Self> {
         let executor = self.snapshot()?;
         executor
@@ -2724,8 +2881,13 @@ impl MemoryExecutor {
                 ..
             } => {
                 let input = self.execute_physical_cancellable(input, cancellation)?;
-                let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
-                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+                self.apply_physical_in_subquery_filter(
+                    input,
+                    subquery,
+                    expr,
+                    *negated,
+                    cancellation,
+                )
             }
             PhysicalPlan::ExistsSubqueryFilter {
                 subquery,
@@ -2734,8 +2896,7 @@ impl MemoryExecutor {
                 ..
             } => {
                 let input = self.execute_physical_cancellable(input, cancellation)?;
-                let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
-                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+                self.apply_physical_exists_subquery_filter(input, subquery, *negated, cancellation)
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
@@ -2894,9 +3055,14 @@ impl MemoryExecutor {
             } => {
                 let input =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                let subquery =
-                    self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
-                apply_in_subquery_filter_cancellable(input, subquery, expr, *negated, cancellation)
+                self.apply_physical_in_subquery_filter_parallel(
+                    input,
+                    subquery,
+                    expr,
+                    *negated,
+                    config,
+                    cancellation,
+                )
             }
             PhysicalPlan::ExistsSubqueryFilter {
                 subquery,
@@ -2906,9 +3072,13 @@ impl MemoryExecutor {
             } => {
                 let input =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                let subquery =
-                    self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
-                apply_exists_subquery_filter(input, &subquery, *negated, cancellation)
+                self.apply_physical_exists_subquery_filter_parallel(
+                    input,
+                    subquery,
+                    *negated,
+                    config,
+                    cancellation,
+                )
             }
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
@@ -4822,6 +4992,87 @@ fn logical_plan_has_qualified_identifier(plan: &LogicalPlan) -> bool {
     }
 }
 
+fn physical_plan_has_qualified_identifier(plan: &PhysicalPlan) -> bool {
+    physical_local_expr_has_qualified_identifier(plan)
+        || physical_child_has_qualified_identifier(plan)
+}
+
+fn physical_local_expr_has_qualified_identifier(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::IndexScan { value, .. }
+        | PhysicalPlan::IndexSkipScan { value, .. }
+        | PhysicalPlan::RangeOverlapScan { range: value, .. }
+        | PhysicalPlan::BoundsOverlapScan { bounds: value, .. } => {
+            expr_contains_qualified_identifier(value)
+        }
+        PhysicalPlan::ExpressionIndexScan { expr, value, .. } => {
+            expr_contains_qualified_identifier(expr) || expr_contains_qualified_identifier(value)
+        }
+        PhysicalPlan::IndexRangeScan { lower, upper, .. } => {
+            optional_expr_contains_qualified_identifier(lower)
+                || optional_expr_contains_qualified_identifier(upper)
+        }
+        PhysicalPlan::BlockSummaryScan { lower, upper, .. } => {
+            expr_contains_qualified_identifier(lower) || expr_contains_qualified_identifier(upper)
+        }
+        PhysicalPlan::NestedLoopJoin { predicate, .. }
+        | PhysicalPlan::Filter { predicate, .. }
+        | PhysicalPlan::InSubqueryFilter {
+            expr: predicate, ..
+        } => expr_contains_qualified_identifier(predicate),
+        PhysicalPlan::Projection { items, .. } => projection_has_qualified_identifier(items),
+        PhysicalPlan::Sort { keys, .. } => order_by_has_qualified_identifier(keys),
+        _ => false,
+    }
+}
+
+fn physical_child_has_qualified_identifier(plan: &PhysicalPlan) -> bool {
+    match plan {
+        PhysicalPlan::SidewaysIndexLookup { outer, .. }
+        | PhysicalPlan::Filter { input: outer, .. }
+        | PhysicalPlan::Projection { input: outer, .. }
+        | PhysicalPlan::Sort { input: outer, .. }
+        | PhysicalPlan::Limit { input: outer, .. }
+        | PhysicalPlan::Offset { input: outer, .. }
+        | PhysicalPlan::Distinct { input: outer, .. }
+        | PhysicalPlan::Parallel { input: outer, .. }
+        | PhysicalPlan::Explain { input: outer, .. } => {
+            physical_plan_has_qualified_identifier(outer)
+        }
+        PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::SetOperation { left, right, .. } => {
+            physical_plan_has_qualified_identifier(left)
+                || physical_plan_has_qualified_identifier(right)
+        }
+        PhysicalPlan::InSubqueryFilter {
+            input, subquery, ..
+        }
+        | PhysicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => {
+            physical_plan_has_qualified_identifier(input)
+                || physical_plan_has_qualified_identifier(subquery)
+        }
+        _ => false,
+    }
+}
+
+fn optional_expr_contains_qualified_identifier(expr: &Option<Expr>) -> bool {
+    expr.as_ref()
+        .is_some_and(expr_contains_qualified_identifier)
+}
+
+fn projection_has_qualified_identifier(items: &[ProjectionItem]) -> bool {
+    items
+        .iter()
+        .any(|item| expr_contains_qualified_identifier(&item.expr))
+}
+
+fn order_by_has_qualified_identifier(keys: &[OrderByExpr]) -> bool {
+    keys.iter()
+        .any(|key| expr_contains_qualified_identifier(&key.expr))
+}
+
 fn replace_logical_outer_refs(
     plan: &LogicalPlan,
     columns: &[ColumnSchema],
@@ -4909,6 +5160,393 @@ fn replace_input_only_outer_refs(
         }),
         _ => Ok(plan.clone()),
     }
+}
+
+fn replace_physical_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::Filter { .. } => replace_physical_filter_outer_refs(plan, columns, row),
+        PhysicalPlan::Projection { .. } => {
+            replace_physical_projection_outer_refs(plan, columns, row)
+        }
+        PhysicalPlan::Sort { .. } => replace_physical_sort_outer_refs(plan, columns, row),
+        PhysicalPlan::NestedLoopJoin { .. } => {
+            replace_physical_nested_join_outer_refs(plan, columns, row)
+        }
+        PhysicalPlan::InSubqueryFilter { .. } => {
+            replace_physical_in_filter_outer_refs(plan, columns, row)
+        }
+        PhysicalPlan::ExistsSubqueryFilter { .. } => {
+            replace_physical_exists_filter_outer_refs(plan, columns, row)
+        }
+        PhysicalPlan::SetOperation { .. } => {
+            replace_physical_set_operation_outer_refs(plan, columns, row)
+        }
+        _ => replace_physical_unary_or_leaf_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_physical_filter_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::Filter {
+        predicate,
+        input,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_filter_outer_refs only accepts filter plans")
+    };
+    Ok(PhysicalPlan::Filter {
+        predicate: replace_outer_refs_expr(predicate, columns, row)?,
+        input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_projection_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::Projection { items, input, cost } = plan else {
+        unreachable!("replace_physical_projection_outer_refs only accepts projection plans")
+    };
+    Ok(PhysicalPlan::Projection {
+        items: replace_projection_outer_refs(items, columns, row)?,
+        input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_sort_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::Sort { keys, input, cost } = plan else {
+        unreachable!("replace_physical_sort_outer_refs only accepts sort plans")
+    };
+    Ok(PhysicalPlan::Sort {
+        keys: replace_order_by_outer_refs(keys, columns, row)?,
+        input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_nested_join_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::NestedLoopJoin {
+        kind,
+        left,
+        right,
+        predicate,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_nested_join_outer_refs only accepts nested join plans")
+    };
+    Ok(PhysicalPlan::NestedLoopJoin {
+        kind: *kind,
+        left: Box::new(replace_physical_outer_refs(left, columns, row)?),
+        right: Box::new(replace_physical_outer_refs(right, columns, row)?),
+        predicate: replace_outer_refs_expr(predicate, columns, row)?,
+        cost: *cost,
+    })
+}
+
+fn replace_physical_in_filter_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::InSubqueryFilter {
+        expr,
+        subquery,
+        negated,
+        input,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_in_filter_outer_refs only accepts IN filters")
+    };
+    Ok(PhysicalPlan::InSubqueryFilter {
+        expr: replace_outer_refs_expr(expr, columns, row)?,
+        subquery: Box::new(replace_physical_outer_refs(subquery, columns, row)?),
+        negated: *negated,
+        input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_exists_filter_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::ExistsSubqueryFilter {
+        subquery,
+        negated,
+        input,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_exists_filter_outer_refs only accepts EXISTS filters")
+    };
+    Ok(PhysicalPlan::ExistsSubqueryFilter {
+        subquery: Box::new(replace_physical_outer_refs(subquery, columns, row)?),
+        negated: *negated,
+        input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_set_operation_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::SetOperation {
+        kind,
+        all,
+        left,
+        right,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_set_operation_outer_refs only accepts set operations")
+    };
+    Ok(PhysicalPlan::SetOperation {
+        kind: *kind,
+        all: *all,
+        left: Box::new(replace_physical_outer_refs(left, columns, row)?),
+        right: Box::new(replace_physical_outer_refs(right, columns, row)?),
+        cost: *cost,
+    })
+}
+
+fn replace_physical_unary_or_leaf_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::Limit { count, input, cost } => Ok(PhysicalPlan::Limit {
+            count: *count,
+            input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+            cost: *cost,
+        }),
+        PhysicalPlan::Offset { count, input, cost } => Ok(PhysicalPlan::Offset {
+            count: *count,
+            input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+            cost: *cost,
+        }),
+        PhysicalPlan::Distinct { input, cost } => Ok(PhysicalPlan::Distinct {
+            input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+            cost: *cost,
+        }),
+        PhysicalPlan::Parallel { hint, input, cost } => Ok(PhysicalPlan::Parallel {
+            hint: hint.clone(),
+            input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+            cost: *cost,
+        }),
+        PhysicalPlan::Explain {
+            analyze,
+            format,
+            input,
+            cost,
+        } => Ok(PhysicalPlan::Explain {
+            analyze: *analyze,
+            format: *format,
+            input: Box::new(replace_physical_outer_refs(input, columns, row)?),
+            cost: *cost,
+        }),
+        _ => replace_physical_leaf_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_physical_leaf_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::IndexScan { .. }
+        | PhysicalPlan::ExpressionIndexScan { .. }
+        | PhysicalPlan::IndexRangeScan { .. }
+        | PhysicalPlan::IndexSkipScan { .. }
+        | PhysicalPlan::BlockSummaryScan { .. }
+        | PhysicalPlan::RangeOverlapScan { .. }
+        | PhysicalPlan::BoundsOverlapScan { .. } => {
+            replace_physical_scan_expr_outer_refs(plan, columns, row)
+        }
+        _ => Ok(plan.clone()),
+    }
+}
+
+fn replace_physical_scan_expr_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::IndexScan {
+            relation_id,
+            table,
+            index,
+            column,
+            value,
+            cost,
+        } => Ok(PhysicalPlan::IndexScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            value: replace_outer_refs_expr(value, columns, row)?,
+            cost: *cost,
+        }),
+        PhysicalPlan::ExpressionIndexScan {
+            relation_id,
+            table,
+            index,
+            expr,
+            value,
+            cost,
+        } => Ok(PhysicalPlan::ExpressionIndexScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            expr: replace_outer_refs_expr(expr, columns, row)?,
+            value: replace_outer_refs_expr(value, columns, row)?,
+            cost: *cost,
+        }),
+        _ => replace_physical_range_scan_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_physical_range_scan_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::IndexRangeScan {
+            relation_id,
+            table,
+            index,
+            column,
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+            cost,
+        } => Ok(PhysicalPlan::IndexRangeScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            lower: replace_optional_outer_refs(lower, columns, row)?,
+            lower_inclusive: *lower_inclusive,
+            upper: replace_optional_outer_refs(upper, columns, row)?,
+            upper_inclusive: *upper_inclusive,
+            cost: *cost,
+        }),
+        PhysicalPlan::IndexSkipScan {
+            relation_id,
+            table,
+            index,
+            column,
+            value,
+            cost,
+        } => Ok(PhysicalPlan::IndexSkipScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            value: replace_outer_refs_expr(value, columns, row)?,
+            cost: *cost,
+        }),
+        _ => replace_physical_overlap_scan_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_physical_overlap_scan_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    match plan {
+        PhysicalPlan::BlockSummaryScan {
+            relation_id,
+            table,
+            index,
+            column,
+            lower,
+            lower_inclusive,
+            upper,
+            upper_inclusive,
+            cost,
+        } => Ok(PhysicalPlan::BlockSummaryScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            lower: replace_outer_refs_expr(lower, columns, row)?,
+            lower_inclusive: *lower_inclusive,
+            upper: replace_outer_refs_expr(upper, columns, row)?,
+            upper_inclusive: *upper_inclusive,
+            cost: *cost,
+        }),
+        PhysicalPlan::RangeOverlapScan {
+            relation_id,
+            table,
+            index,
+            column,
+            range,
+            cost,
+        } => Ok(PhysicalPlan::RangeOverlapScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            range: replace_outer_refs_expr(range, columns, row)?,
+            cost: *cost,
+        }),
+        PhysicalPlan::BoundsOverlapScan {
+            relation_id,
+            table,
+            index,
+            column,
+            bounds,
+            cost,
+        } => Ok(PhysicalPlan::BoundsOverlapScan {
+            relation_id: *relation_id,
+            table: table.clone(),
+            index: index.clone(),
+            column: column.clone(),
+            bounds: replace_outer_refs_expr(bounds, columns, row)?,
+            cost: *cost,
+        }),
+        _ => Ok(plan.clone()),
+    }
+}
+
+fn replace_optional_outer_refs(
+    expr: &Option<Expr>,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<Option<Expr>> {
+    expr.as_ref()
+        .map(|expr| replace_outer_refs_expr(expr, columns, row))
+        .transpose()
 }
 
 fn replace_projection_outer_refs(
