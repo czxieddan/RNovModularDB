@@ -1192,8 +1192,56 @@ pub struct SingleFileBackend {
     file: File,
     page_size: PageSize,
     superblock_generation: u64,
+    catalog_root: u64,
     page_key: Option<PageCryptoKey>,
     write_lock: SingleFileWriteLock,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SuperblockSlot {
+    Primary,
+    Secondary,
+}
+
+impl SuperblockSlot {
+    const fn inactive(self) -> Self {
+        match self {
+            Self::Primary => Self::Secondary,
+            Self::Secondary => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectedSuperblock {
+    generation: u64,
+    catalog_root: u64,
+    free_map_root: u64,
+    slot: SuperblockSlot,
+}
+
+struct SingleFileMetadata {
+    format_version: u16,
+    page_size: PageSize,
+    primary_offset: u64,
+    secondary_offset: u64,
+    superblock: SelectedSuperblock,
+}
+
+struct CatalogPageCommit {
+    file: File,
+    key: PageCryptoKey,
+    root: PageId,
+    metadata: SingleFileMetadata,
+}
+
+impl SingleFileMetadata {
+    const fn superblock_offset(&self, slot: SuperblockSlot) -> u64 {
+        match slot {
+            SuperblockSlot::Primary => self.primary_offset,
+            SuperblockSlot::Secondary => self.secondary_offset,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1820,6 +1868,7 @@ impl SingleFileBackend {
             file,
             page_size: options.page_size(),
             superblock_generation,
+            catalog_root: 0,
             page_key: options.page_key(),
             write_lock,
         })
@@ -1866,15 +1915,15 @@ impl SingleFileBackend {
                     format!("failed to open database file: {err}"),
                 )
             })?;
-        let (_format_version, page_size, superblock_generation) =
-            read_single_file_header(&mut file)?;
+        let metadata = read_single_file_metadata(&mut file)?;
         let write_lock = single_file_write_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             file,
-            page_size,
-            superblock_generation,
+            page_size: metadata.page_size,
+            superblock_generation: metadata.superblock.generation,
+            catalog_root: metadata.superblock.catalog_root,
             page_key,
             write_lock,
         })
@@ -1892,6 +1941,51 @@ impl SingleFileBackend {
         self.superblock_generation
     }
 
+    pub fn catalog_root(&self) -> Option<PageId> {
+        (self.catalog_root != 0).then(|| PageId::new(self.catalog_root))
+    }
+
+    pub fn commit_catalog_pages(&mut self, payloads: &[Vec<u8>]) -> Result<PageId> {
+        validate_catalog_page_payloads(payloads, self.page_size)?;
+        let write_lock = Arc::clone(&self.write_lock);
+        let _write_guard = write_lock.lock().map_err(|_| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "single-file backend write lock poisoned",
+            )
+        })?;
+        let commit = self.prepare_catalog_page_commit()?;
+        let root = commit.root;
+        let next = persist_catalog_page_commit(
+            commit,
+            payloads,
+            self.data_start(),
+            self.page_record_size(),
+        )?;
+        self.superblock_generation = next.generation;
+        self.catalog_root = next.catalog_root;
+        Ok(root)
+    }
+
+    fn prepare_catalog_page_commit(&self) -> Result<CatalogPageCommit> {
+        let key = self.page_key()?;
+        let mut file = self.file.try_clone().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to clone database file handle: {err}"),
+            )
+        })?;
+        let metadata = read_single_file_metadata(&mut file)?;
+        ensure_page_size_matches(self.page_size, metadata.page_size)?;
+        let root = next_append_page_id(&file, self.data_start(), self.page_record_size())?;
+        Ok(CatalogPageCommit {
+            file,
+            key,
+            root,
+            metadata,
+        })
+    }
+
     fn data_start(&self) -> u64 {
         (Self::HEADER_LEN + Self::SUPERBLOCK_LEN * 2) as u64
     }
@@ -1905,13 +1999,7 @@ impl SingleFileBackend {
     }
 
     fn page_offset(&self, page_id: PageId) -> Result<u64> {
-        if page_id.get() == 0 {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "page id must be greater than zero",
-            ));
-        }
-        Ok(self.data_start() + (page_id.get() - 1) * self.page_record_size())
+        single_file_page_offset(page_id, self.data_start(), self.page_record_size())
     }
 
     fn page_key(&self) -> Result<PageCryptoKey> {
@@ -2018,19 +2106,13 @@ impl StorageBackend for SingleFileBackend {
                 format!("failed to clone database file handle: {err}"),
             )
         })?;
-        let offset = self.page_offset(page.id())?;
-        let counter = next_page_counter(read_existing_page_counter(&mut file, offset)?)?;
-        let nonce = PageNonce::from_page_counter(page.id(), counter);
-        let ciphertext = PageCrypto::encrypt(&key, nonce, &page)?;
-
-        file.seek(SeekFrom::Start(offset)).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to seek encrypted page record: {err}"),
-            )
-        })?;
-        write_encrypted_page_record(&mut file, counter, &ciphertext)?;
-        Ok(())
+        write_single_file_page(
+            &mut file,
+            key,
+            page,
+            self.data_start(),
+            self.page_record_size(),
+        )
     }
 
     fn sync(&self) -> Result<SyncStatus> {
@@ -2052,6 +2134,187 @@ impl StorageBackend for SingleFileBackend {
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED
     }
+}
+
+fn validate_catalog_page_payloads(payloads: &[Vec<u8>], page_size: PageSize) -> Result<()> {
+    if payloads.is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "catalog checkpoint must contain at least one page",
+        ));
+    }
+    if payloads
+        .iter()
+        .any(|payload| payload.len() != page_size.bytes())
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "catalog checkpoint page size mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn persist_catalog_page_commit(
+    mut commit: CatalogPageCommit,
+    payloads: &[Vec<u8>],
+    data_start: u64,
+    record_size: u64,
+) -> Result<SelectedSuperblock> {
+    write_catalog_pages(
+        &mut commit.file,
+        commit.key,
+        commit.root,
+        payloads,
+        data_start,
+        record_size,
+    )?;
+    sync_single_file(&commit.file, "catalog checkpoint pages")?;
+    let next = next_catalog_superblock(commit.metadata.superblock, commit.root)?;
+    write_superblock_at(
+        &mut commit.file,
+        commit.metadata.superblock_offset(next.slot),
+        next,
+    )?;
+    sync_single_file(&commit.file, "catalog checkpoint superblock")?;
+    Ok(next)
+}
+
+fn ensure_page_size_matches(expected: PageSize, actual: PageSize) -> Result<()> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Corruption,
+        "database page size changed while catalog checkpoint was open",
+    ))
+}
+
+fn next_append_page_id(file: &File, data_start: u64, record_size: u64) -> Result<PageId> {
+    let file_len = file
+        .metadata()
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to inspect database file length: {err}"),
+            )
+        })?
+        .len();
+    let used_bytes = file_len.saturating_sub(data_start);
+    let used_slots = used_bytes.div_ceil(record_size);
+    let page_id = used_slots.checked_add(1).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "catalog checkpoint page id overflow",
+        )
+    })?;
+    Ok(PageId::new(page_id))
+}
+
+fn write_catalog_pages(
+    file: &mut File,
+    key: PageCryptoKey,
+    root: PageId,
+    payloads: &[Vec<u8>],
+    data_start: u64,
+    record_size: u64,
+) -> Result<()> {
+    for (index, payload) in payloads.iter().enumerate() {
+        let page_id = append_page_id(root, index)?;
+        let page = Page::new(page_id, payload.clone())?;
+        write_single_file_page(file, key, page, data_start, record_size)?;
+    }
+    Ok(())
+}
+
+fn append_page_id(root: PageId, index: usize) -> Result<PageId> {
+    let index = u64::try_from(index).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "catalog checkpoint page count is too large",
+        )
+    })?;
+    root.get()
+        .checked_add(index)
+        .map(PageId::new)
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "catalog checkpoint page id overflow",
+            )
+        })
+}
+
+fn write_single_file_page(
+    file: &mut File,
+    key: PageCryptoKey,
+    page: Page,
+    data_start: u64,
+    record_size: u64,
+) -> Result<()> {
+    let offset = single_file_page_offset(page.id(), data_start, record_size)?;
+    let counter = next_page_counter(read_existing_page_counter(file, offset)?)?;
+    let nonce = PageNonce::from_page_counter(page.id(), counter);
+    let ciphertext = PageCrypto::encrypt(&key, nonce, &page)?;
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek encrypted page record: {err}"),
+        )
+    })?;
+    write_encrypted_page_record(file, counter, &ciphertext)
+}
+
+fn single_file_page_offset(page_id: PageId, data_start: u64, record_size: u64) -> Result<u64> {
+    let slot = page_id.get().checked_sub(1).ok_or_else(|| {
+        RnovError::new(ErrorKind::InvalidInput, "page id must be greater than zero")
+    })?;
+    slot.checked_mul(record_size)
+        .and_then(|offset| data_start.checked_add(offset))
+        .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "page offset overflow"))
+}
+
+fn next_catalog_superblock(
+    current: SelectedSuperblock,
+    catalog_root: PageId,
+) -> Result<SelectedSuperblock> {
+    let generation = current.generation.checked_add(1).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "database superblock generation exhausted",
+        )
+    })?;
+    Ok(SelectedSuperblock {
+        generation,
+        catalog_root: catalog_root.get(),
+        free_map_root: current.free_map_root,
+        slot: current.slot.inactive(),
+    })
+}
+
+fn write_superblock_at(file: &mut File, offset: u64, superblock: SelectedSuperblock) -> Result<()> {
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek database superblock: {err}"),
+        )
+    })?;
+    let encoded = encode_superblock(
+        superblock.generation,
+        superblock.catalog_root,
+        superblock.free_map_root,
+    );
+    file.write_all(&encoded).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to write database superblock: {err}"),
+        )
+    })
+}
+
+fn sync_single_file(file: &File, context: &str) -> Result<()> {
+    file.sync_all()
+        .map_err(|err| RnovError::new(ErrorKind::Io, format!("failed to sync {context}: {err}")))
 }
 
 fn write_encrypted_page_record(file: &mut File, counter: u32, ciphertext: &[u8]) -> Result<()> {
@@ -2520,6 +2783,15 @@ fn write_single_file_header_with_roots(
 }
 
 fn read_single_file_header(file: &mut File) -> Result<(u16, PageSize, u64)> {
+    let metadata = read_single_file_metadata(file)?;
+    Ok((
+        metadata.format_version,
+        metadata.page_size,
+        metadata.superblock.generation,
+    ))
+}
+
+fn read_single_file_metadata(file: &mut File) -> Result<SingleFileMetadata> {
     let header = read_single_file_header_bytes(file)?;
     let format_version = read_single_file_format_version_from_header(&header);
     ensure_single_file_format_supported(format_version)?;
@@ -2527,23 +2799,47 @@ fn read_single_file_header(file: &mut File) -> Result<(u16, PageSize, u64)> {
     let page_size = PageSize::new(u64::from_be_bytes(read_fixed::<8>(&header, 12)?) as usize);
     let primary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 20)?);
     let secondary_offset = u64::from_be_bytes(read_fixed::<8>(&header, 28)?);
-    let primary = read_superblock(file, primary_offset);
-    let secondary = read_superblock(file, secondary_offset);
-    let generation = match (primary, secondary) {
-        (Ok(primary), Ok(secondary)) => primary.0.max(secondary.0),
-        (Ok(primary), Err(_)) => primary.0,
-        (Err(_), Ok(secondary)) => secondary.0,
-        (Err(primary), Err(secondary)) => {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                format!(
-                    "database superblocks are invalid: primary: {primary}; secondary: {secondary}"
-                ),
-            ));
-        }
-    };
+    let primary = read_selected_superblock(file, primary_offset, SuperblockSlot::Primary);
+    let secondary = read_selected_superblock(file, secondary_offset, SuperblockSlot::Secondary);
+    let superblock = select_superblock(primary, secondary)?;
 
-    Ok((format_version, page_size, generation))
+    Ok(SingleFileMetadata {
+        format_version,
+        page_size,
+        primary_offset,
+        secondary_offset,
+        superblock,
+    })
+}
+
+fn read_selected_superblock(
+    file: &mut File,
+    offset: u64,
+    slot: SuperblockSlot,
+) -> Result<SelectedSuperblock> {
+    let (generation, catalog_root, free_map_root) = read_superblock(file, offset)?;
+    Ok(SelectedSuperblock {
+        generation,
+        catalog_root,
+        free_map_root,
+        slot,
+    })
+}
+
+fn select_superblock(
+    primary: Result<SelectedSuperblock>,
+    secondary: Result<SelectedSuperblock>,
+) -> Result<SelectedSuperblock> {
+    match (primary, secondary) {
+        (Ok(primary), Ok(secondary)) if secondary.generation > primary.generation => Ok(secondary),
+        (Ok(primary), Ok(_)) => Ok(primary),
+        (Ok(primary), Err(_)) => Ok(primary),
+        (Err(_), Ok(secondary)) => Ok(secondary),
+        (Err(primary), Err(secondary)) => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("database superblocks are invalid: primary: {primary}; secondary: {secondary}"),
+        )),
+    }
 }
 
 fn read_single_file_format_version(file: &mut File) -> Result<u16> {
