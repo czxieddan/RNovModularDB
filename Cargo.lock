@@ -959,6 +959,7 @@ dependencies = [
  "rnmdb-storage",
  "rnmdb-txn",
  "rnmdb-types",
+ "rnmdb-udf",
  "tempfile",
  "tokio",
 ]

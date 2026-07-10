@@ -1,8 +1,14 @@
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::HashSet,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use rnmdb_catalog::{
-    Catalog, CatalogCodec, ForeignKeyReference, IndexKey, OperatorSignature, Privilege, RowPolicy,
-    Table as CatalogTable, Trigger, TriggerEvent, TriggerTiming,
+    Catalog, CatalogCodec, ForeignKeyReference,
+    FunctionImplementation as CatalogFunctionImplementation, IndexKey, OperatorSignature,
+    Privilege, RowPolicy, Table as CatalogTable, Trigger, TriggerEvent, TriggerTiming,
+    WasmFunctionImplementation,
 };
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
@@ -26,7 +32,7 @@ pub use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
     ast::{
         BoundStatement, ColumnDef, CreateFunctionImplementation, ExplainFormat, Ident, ObjectName,
-        TransactionAction,
+        TransactionAction, WasmFunctionBody,
     },
     binder::Binder,
     parser::parse_statement,
@@ -41,6 +47,7 @@ use rnmdb_storage::{
 };
 use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
 use rnmdb_types::{SqlType, SqlValue};
+use rnmdb_udf::{UdfBudget, UdfDefinition, UdfRegistry, UdfSandboxPolicy, WasmScalarRuntime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
@@ -54,6 +61,8 @@ pub struct LocalSession {
     catalog: Catalog,
     role_id: RoleId,
     executor: MemoryExecutor,
+    udf_registry: UdfRegistry,
+    wasm_runtime: WasmScalarRuntime,
     planner: LogicalPlanner,
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
@@ -72,6 +81,7 @@ struct LocalTransactionState {
     transaction: Transaction,
     catalog_snapshot: Catalog,
     executor_snapshot: MemoryExecutor,
+    udf_registry_snapshot: UdfRegistry,
 }
 
 impl LocalTransactionState {
@@ -79,11 +89,13 @@ impl LocalTransactionState {
         transaction: Transaction,
         catalog: &Catalog,
         executor: &MemoryExecutor,
+        udf_registry: &UdfRegistry,
     ) -> Result<Self> {
         Ok(Self {
             transaction,
             catalog_snapshot: catalog.clone(),
             executor_snapshot: executor.snapshot()?,
+            udf_registry_snapshot: udf_registry.clone(),
         })
     }
 }
@@ -99,13 +111,7 @@ impl LocalSession {
 
     pub fn memory_with_execution(execution: LocalExecutionConfig) -> Result<Self> {
         let (catalog, role_id) = default_catalog()?;
-        Ok(Self::from_parts(
-            catalog,
-            role_id,
-            MemoryExecutor::new(),
-            execution,
-            None,
-        ))
+        Self::from_parts(catalog, role_id, MemoryExecutor::new(), execution, None)
     }
 
     pub fn single_file_with_key(path: impl AsRef<Path>, key: PageCryptoKey) -> Result<Self> {
@@ -425,12 +431,14 @@ impl LocalSession {
         mut executor: MemoryExecutor,
         execution: LocalExecutionConfig,
         durable: Option<LocalDurableStore>,
-    ) -> Self {
+    ) -> Result<Self> {
         executor.set_active_role(role_id);
-        Self {
+        Ok(Self {
             catalog,
             role_id,
             executor,
+            udf_registry: UdfRegistry::new(),
+            wasm_runtime: WasmScalarRuntime::new()?,
             planner: LogicalPlanner::new(),
             optimizer: RuleOptimizer::new(),
             execution,
@@ -439,7 +447,7 @@ impl LocalSession {
             durable,
             transaction_manager: TransactionManager::new(),
             transaction: None,
-        }
+        })
     }
 
     fn encode_durable_image(&self) -> Result<Vec<u8>> {
@@ -640,6 +648,7 @@ impl LocalSession {
             transaction,
             &self.catalog,
             &self.executor,
+            &self.udf_registry,
         )?);
         Ok(CommandOutput::SchemaChanged)
     }
@@ -665,6 +674,7 @@ impl LocalSession {
         })?;
         self.catalog = transaction.catalog_snapshot;
         self.executor = transaction.executor_snapshot;
+        self.udf_registry = transaction.udf_registry_snapshot;
         Ok(CommandOutput::SchemaChanged)
     }
 
@@ -984,14 +994,80 @@ impl LocalSession {
         if self.catalog.get_function(name, argument_types).is_some() && if_not_exists {
             return Ok(());
         }
-        if matches!(implementation, CreateFunctionImplementation::Wasm(_)) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "wasm function registration is not available in this execution path",
-            ));
+        match implementation {
+            CreateFunctionImplementation::MetadataOnly => {
+                self.catalog.register_function(
+                    name,
+                    argument_types.to_vec(),
+                    return_type.clone(),
+                )?;
+                Ok(())
+            }
+            CreateFunctionImplementation::Wasm(body) => {
+                self.apply_catalog_create_wasm_function(name, body)
+            }
         }
-        self.catalog
-            .register_function(name, argument_types.to_vec(), return_type.clone())?;
+    }
+
+    fn apply_catalog_create_wasm_function(
+        &mut self,
+        name: &str,
+        body: &WasmFunctionBody,
+    ) -> Result<()> {
+        let definition = self.prepare_wasm_definition(name, body)?;
+        let implementation = catalog_wasm_implementation(&definition, body)?;
+        let catalog_snapshot = self.catalog.clone();
+        let registry_snapshot = self.udf_registry.clone();
+        let result = self.register_wasm_definition(definition, implementation);
+        if result.is_err() {
+            self.catalog = catalog_snapshot;
+            self.udf_registry = registry_snapshot;
+        }
+        result
+    }
+
+    fn prepare_wasm_definition(
+        &self,
+        name: &str,
+        body: &WasmFunctionBody,
+    ) -> Result<UdfDefinition> {
+        let max_memory_bytes = usize::try_from(body.max_memory_bytes).map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm function memory budget does not fit this platform",
+            )
+        })?;
+        let budget = UdfBudget::new(
+            max_memory_bytes,
+            body.max_instructions,
+            Duration::from_millis(body.timeout_millis),
+        )?;
+        self.wasm_runtime.prepare_i64_unary(
+            name,
+            body.module_bytes.clone(),
+            UdfSandboxPolicy::locked_down(budget),
+        )
+    }
+
+    fn register_wasm_definition(
+        &mut self,
+        definition: UdfDefinition,
+        implementation: WasmFunctionImplementation,
+    ) -> Result<()> {
+        let return_type = definition.return_type().cloned().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "wasm scalar definition has no return type",
+            )
+        })?;
+        let function = self.catalog.register_function_with_implementation(
+            definition.name(),
+            definition.argument_types().to_vec(),
+            return_type,
+            CatalogFunctionImplementation::Wasm(implementation),
+        )?;
+        self.udf_registry
+            .register_with_id(function.function_id(), definition)?;
         Ok(())
     }
 
@@ -1158,6 +1234,28 @@ impl LocalSession {
     }
 }
 
+fn catalog_wasm_implementation(
+    definition: &UdfDefinition,
+    body: &WasmFunctionBody,
+) -> Result<WasmFunctionImplementation> {
+    let module = definition.wasm_module().ok_or_else(|| {
+        RnovError::new(ErrorKind::Internal, "wasm scalar definition has no module")
+    })?;
+    let initial_memory_bytes = u64::try_from(module.initial_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm initial memory does not fit the durable catalog format",
+        )
+    })?;
+    WasmFunctionImplementation::new(
+        module.module_bytes().to_vec(),
+        initial_memory_bytes,
+        body.max_memory_bytes,
+        body.max_instructions,
+        body.timeout_millis,
+    )
+}
+
 #[cfg(feature = "tokio-runtime")]
 pub struct TokioLocalSession {
     runtime: tokio::runtime::Runtime,
@@ -1290,9 +1388,7 @@ fn decode_session_image(image: &[u8], execution: LocalExecutionConfig) -> Result
     let role_id = local_role_id(&catalog)?;
     let mut executor = MemoryExecutor::new();
     executor.restore_tables(&catalog, image.tables())?;
-    Ok(LocalSession::from_parts(
-        catalog, role_id, executor, execution, None,
-    ))
+    LocalSession::from_parts(catalog, role_id, executor, execution, None)
 }
 
 fn default_catalog() -> Result<(Catalog, RoleId)> {

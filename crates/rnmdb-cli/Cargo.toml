@@ -19,6 +19,7 @@ rnmdb-sql.workspace = true
 rnmdb-storage.workspace = true
 rnmdb-txn.workspace = true
 rnmdb-types.workspace = true
+rnmdb-udf.workspace = true
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
