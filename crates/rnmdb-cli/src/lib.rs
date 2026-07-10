@@ -834,14 +834,40 @@ impl LocalSession {
         argument_types: &[SqlType],
         if_exists: bool,
     ) -> Result<()> {
+        let catalog_snapshot = self.catalog.clone();
         match self.catalog.drop_function(name, argument_types)? {
-            Some(_) => Ok(()),
+            Some(function) => self.finish_drop_function(function, catalog_snapshot),
             None if if_exists => Ok(()),
             None => Err(rnmdb_common::RnovError::new(
                 rnmdb_common::ErrorKind::NotFound,
                 format!("function does not exist: {name}"),
             )),
         }
+    }
+
+    fn finish_drop_function(
+        &mut self,
+        function: CatalogFunction,
+        catalog_snapshot: Catalog,
+    ) -> Result<()> {
+        if !matches!(
+            function.implementation(),
+            CatalogFunctionImplementation::Wasm(_)
+        ) {
+            return Ok(());
+        }
+        if self
+            .udf_registry
+            .unregister(function.function_id())
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.catalog = catalog_snapshot;
+        Err(RnovError::new(
+            ErrorKind::Corruption,
+            "wasm function is missing from the session registry",
+        ))
     }
 
     fn apply_catalog_drop_procedure(
