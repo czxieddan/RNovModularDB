@@ -17,7 +17,7 @@ use rnmdb_catalog::{
 use rnmdb_common::Result;
 use rnmdb_common::{
     ErrorKind, RnovError,
-    ids::{PageId, RelationId, RoleId},
+    ids::{FunctionId, PageId, RelationId, RoleId},
 };
 use rnmdb_fts::{SimpleTokenizer, TextPhraseQuery, TextQuery, TextVectorBuilder};
 use rnmdb_index::{
@@ -1609,10 +1609,17 @@ impl Default for ParallelQueryConfig {
     }
 }
 
+pub trait ScalarFunctionRuntime: Send + Sync + std::fmt::Debug {
+    fn return_type(&self, function_id: FunctionId) -> Option<SqlType>;
+
+    fn execute(&self, function_id: FunctionId, arguments: &[SqlValue]) -> Result<Option<SqlValue>>;
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoryExecutor {
     tables: Arc<RwLock<BTreeMap<String, MemoryTable>>>,
     column_crypto: ColumnCryptoState,
+    scalar_function_runtime: Option<Arc<dyn ScalarFunctionRuntime>>,
 }
 
 impl Default for MemoryExecutor {
@@ -1620,6 +1627,7 @@ impl Default for MemoryExecutor {
         Self {
             tables: Arc::new(RwLock::new(BTreeMap::new())),
             column_crypto: ColumnCryptoState::default(),
+            scalar_function_runtime: None,
         }
     }
 }
@@ -1655,6 +1663,10 @@ impl MemoryExecutor {
 
     pub fn set_active_role(&mut self, role_id: RoleId) {
         self.column_crypto.set_active_role(role_id);
+    }
+
+    pub fn set_scalar_function_runtime(&mut self, runtime: Option<Arc<dyn ScalarFunctionRuntime>>) {
+        self.scalar_function_runtime = runtime;
     }
 
     pub fn configure_column_encryption(
@@ -1694,6 +1706,7 @@ impl MemoryExecutor {
         Ok(Self {
             tables: Arc::new(RwLock::new(self.read_tables()?.clone())),
             column_crypto: self.column_crypto.clone(),
+            scalar_function_runtime: self.scalar_function_runtime.clone(),
         })
     }
 
@@ -2316,7 +2329,12 @@ impl MemoryExecutor {
             return self.apply_projection_with_row_subqueries(batch, items, cancellation);
         }
         let items = self.resolve_projection_scalar_subqueries(items, cancellation)?;
-        apply_projection_cancellable(batch, &items, cancellation)
+        apply_projection_cancellable(
+            batch,
+            &items,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
     }
 
     fn apply_projection_with_row_subqueries(
@@ -2325,7 +2343,11 @@ impl MemoryExecutor {
         items: &[ProjectionItem],
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
-        let columns = projection_columns(batch.columns(), items)?;
+        let columns = projection_columns(
+            batch.columns(),
+            items,
+            self.scalar_function_runtime.as_deref(),
+        )?;
         let mut rows = Vec::with_capacity(batch.rows().len());
         for row in batch.rows() {
             cancellation.check()?;
@@ -2421,7 +2443,12 @@ impl MemoryExecutor {
                     row,
                     cancellation,
                 )?;
-                eval_expr(batch.columns(), row, &expr)
+                eval_expr_with_runtime(
+                    self.scalar_function_runtime.as_deref(),
+                    batch.columns(),
+                    row,
+                    &expr,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Row::new(values))
@@ -5858,15 +5885,16 @@ fn null_row(columns: &[ColumnSchema]) -> Row {
 fn apply_projection_cancellable(
     batch: VectorBatch,
     items: &[rnmdb_planner::logical::ProjectionItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
-    let columns = projection_columns(batch.columns(), items)?;
+    let columns = projection_columns(batch.columns(), items, runtime)?;
     let mut rows = Vec::with_capacity(batch.rows().len());
     for row in batch.rows() {
         cancellation.check()?;
         let values = items
             .iter()
-            .map(|item| eval_expr(batch.columns(), row, &item.expr))
+            .map(|item| eval_expr_with_runtime(runtime, batch.columns(), row, &item.expr))
             .collect::<Result<Vec<_>>>()?;
         rows.push(Row::new(values));
     }
@@ -5878,11 +5906,12 @@ fn apply_projection_cancellable(
 fn projection_columns(
     columns: &[ColumnSchema],
     items: &[ProjectionItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<Vec<ColumnSchema>> {
     items
         .iter()
         .map(|item| {
-            projection_type(columns, &item.expr)
+            projection_type_with_runtime(runtime, columns, &item.expr)
                 .map(|data_type| ColumnSchema::new(item.name.as_str(), data_type))
         })
         .collect()
@@ -6655,6 +6684,32 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
     }
 }
 
+fn projection_type_with_runtime(
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    columns: &[ColumnSchema],
+    expr: &Expr,
+) -> Result<SqlType> {
+    let Some(runtime) = runtime else {
+        return projection_type(columns, expr);
+    };
+    let typed = rewrite_expr_tree(expr, &mut |candidate| {
+        let Expr::Call {
+            function_id: Some(function_id),
+            ..
+        } = candidate
+        else {
+            return Ok(None);
+        };
+        Ok(runtime
+            .return_type(*function_id)
+            .map(|data_type| Expr::Cast {
+                expr: Box::new(Expr::Null),
+                data_type,
+            }))
+    })?;
+    projection_type(columns, &typed)
+}
+
 fn projection_arithmetic_type(
     columns: &[ColumnSchema],
     left: &Expr,
@@ -7046,6 +7101,51 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
         Expr::Call { name, args, .. } => eval_call_expr(columns, row, name.object(), args),
     }
+}
+
+fn eval_expr_with_runtime(
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+) -> Result<SqlValue> {
+    let Some(runtime) = runtime else {
+        return eval_expr(columns, row, expr);
+    };
+    let resolved = resolve_runtime_function_calls(runtime, columns, row, expr)?;
+    eval_expr(columns, row, &resolved)
+}
+
+fn resolve_runtime_function_calls(
+    runtime: &dyn ScalarFunctionRuntime,
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+) -> Result<Expr> {
+    rewrite_expr_tree(expr, &mut |candidate| {
+        let Expr::Call {
+            function_id: Some(function_id),
+            args,
+            ..
+        } = candidate
+        else {
+            return Ok(None);
+        };
+        if runtime.return_type(*function_id).is_none() {
+            return Ok(None);
+        }
+        let arguments = args
+            .iter()
+            .map(|arg| eval_expr_with_runtime(Some(runtime), columns, row, arg))
+            .collect::<Result<Vec<_>>>()?;
+        let value = runtime.execute(*function_id, &arguments)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                format!("scalar runtime lost function {function_id}"),
+            )
+        })?;
+        Ok(Some(Expr::RuntimeValue(value)))
+    })
 }
 
 fn eval_call_expr(
