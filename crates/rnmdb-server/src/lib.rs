@@ -245,11 +245,10 @@ fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()>
     loop {
         command.clear();
         if read_sql_command(&mut reader, &mut command)? == 0 {
-            checkpoint_client_session(runtime, &mut session)?;
+            close_client_session(runtime, &mut session)?;
             return Ok(());
         }
         if execute_sql_command_line(runtime, &mut session, &mut writer, command.trim())? {
-            checkpoint_client_session(runtime, &mut session)?;
             return Ok(());
         }
     }
@@ -275,34 +274,87 @@ fn execute_sql_command_line(
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
+    match classify_client_command(command) {
+        ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
+        ClientCommandKind::Empty => execute_empty_command(writer),
+        ClientCommandKind::Auth => execute_auth_command(runtime, session, writer, command),
+        ClientCommandKind::Sql => execute_session_sql(runtime, session, writer, command),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientCommandKind {
+    Quit,
+    Empty,
+    Auth,
+    Sql,
+}
+
+fn classify_client_command(command: &str) -> ClientCommandKind {
     if command.eq_ignore_ascii_case("quit") {
-        write_protocol_line(writer, "OK bye")?;
-        return Ok(true);
+        return ClientCommandKind::Quit;
     }
     if command.is_empty() {
-        write_protocol_line(writer, "ERR empty command")?;
-        return Ok(false);
+        return ClientCommandKind::Empty;
     }
     if auth_command_tail(command).is_some() {
-        return execute_auth_command(runtime, session, writer, command);
+        return ClientCommandKind::Auth;
     }
+    ClientCommandKind::Sql
+}
+
+fn execute_quit_command(
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
+    writer: &mut TcpStream,
+) -> Result<bool> {
+    close_client_session(runtime, session)?;
+    write_protocol_line(writer, "OK bye")?;
+    Ok(true)
+}
+
+fn execute_empty_command(writer: &mut TcpStream) -> Result<bool> {
+    write_protocol_line(writer, "ERR empty command")?;
+    Ok(false)
+}
+
+fn execute_session_sql(
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
+    writer: &mut TcpStream,
+    command: &str,
+) -> Result<bool> {
     let Some(session) = session.as_mut() else {
         write_protocol_line(writer, "ERR authentication required")?;
         return Ok(false);
     };
-    let line = match session.execute(command) {
-        Ok(output) => {
-            let should_checkpoint = command_output_needs_checkpoint(&output);
-            let line = protocol_output_line(output);
-            if should_checkpoint {
-                checkpoint_local_session(runtime, session)?;
-            }
-            line
-        }
-        Err(err) => format!("ERR {}", protocol_text(&err.to_string())),
-    };
+    let line = execute_session_command(runtime, session, command)?;
     write_protocol_line(writer, &line)?;
     Ok(false)
+}
+
+fn execute_session_command(
+    runtime: &EmbeddedRuntime,
+    session: &mut LocalSession,
+    command: &str,
+) -> Result<String> {
+    match session.execute(command) {
+        Ok(output) => successful_command_line(runtime, session, output),
+        Err(err) => Ok(format!("ERR {}", protocol_text(&err.to_string()))),
+    }
+}
+
+fn successful_command_line(
+    runtime: &EmbeddedRuntime,
+    session: &mut LocalSession,
+    output: CommandOutput,
+) -> Result<String> {
+    let should_checkpoint = command_output_needs_checkpoint(&output);
+    let line = protocol_output_line(output);
+    if should_checkpoint {
+        checkpoint_local_session(runtime, session)?;
+    }
+    Ok(line)
 }
 
 fn execute_auth_command(
@@ -344,18 +396,26 @@ fn command_output_needs_checkpoint(output: &CommandOutput) -> bool {
     )
 }
 
-fn checkpoint_client_session(
+fn close_client_session(
     runtime: &EmbeddedRuntime,
     session: &mut Option<LocalSession>,
 ) -> Result<()> {
     let Some(session) = session.as_mut() else {
         return Ok(());
     };
+    rollback_client_transaction(session)?;
     checkpoint_local_session(runtime, session)
 }
 
+fn rollback_client_transaction(session: &mut LocalSession) -> Result<()> {
+    if !session.in_transaction() {
+        return Ok(());
+    }
+    session.execute("ROLLBACK;").map(|_| ())
+}
+
 fn checkpoint_local_session(runtime: &EmbeddedRuntime, session: &mut LocalSession) -> Result<()> {
-    if runtime.config().disk_writes_allowed() {
+    if runtime.config().disk_writes_allowed() && !session.in_transaction() {
         session.checkpoint()?;
     }
     Ok(())

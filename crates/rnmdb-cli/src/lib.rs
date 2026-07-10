@@ -124,6 +124,10 @@ impl LocalSession {
         write_image_to_single_file_backend(&mut durable.backend, page_size, &image)
     }
 
+    pub fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
     pub fn configure_column_encryption(
         &mut self,
         schema_name: &str,
