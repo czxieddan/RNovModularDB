@@ -1,4 +1,13 @@
-use std::{fmt::Display, time::Duration};
+use std::{
+    fmt::Display,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
 use rnmdb_types::{SqlType, SqlValue};
@@ -535,10 +544,25 @@ pub struct WasmScalarRuntime {
     engine: wasmtime::Engine,
 }
 
+struct WasmStoreState {
+    limits: wasmtime::StoreLimits,
+}
+
+struct InvocationDeadline {
+    started: Instant,
+    timed_out: Arc<AtomicBool>,
+}
+
+struct EpochTimer {
+    cancel: mpsc::Sender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
 impl WasmScalarRuntime {
     pub fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
+        config.epoch_interruption(true);
         let engine = wasmtime::Engine::new(&config)
             .map_err(|err| wasm_runtime_error("failed to create wasm engine", err))?;
         Ok(Self { engine })
@@ -562,15 +586,14 @@ impl WasmScalarRuntime {
         argument: i64,
     ) -> Result<i64> {
         let wasm_module = self.compile_module(module)?;
+        ensure_no_compiled_imports(&wasm_module)?;
         let mut store = self.create_store(policy)?;
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[])
             .map_err(|err| wasm_runtime_error("failed to instantiate wasm module", err))?;
         let function = instance
             .get_typed_func::<i64, i64>(&mut store, WASM_SCALAR_ENTRYPOINT)
             .map_err(|err| wasm_runtime_error("failed to resolve wasm scalar entrypoint", err))?;
-        function
-            .call(&mut store, argument)
-            .map_err(|err| wasm_runtime_error("wasm scalar execution failed", err))
+        self.call_i64_with_timeout(&mut store, function, argument, policy.budget().timeout())
     }
 
     fn compile_module(&self, module: &WasmModuleDefinition) -> Result<wasmtime::Module> {
@@ -578,13 +601,101 @@ impl WasmScalarRuntime {
             .map_err(|err| wasm_runtime_error("failed to compile wasm module", err))
     }
 
-    fn create_store(&self, policy: &UdfSandboxPolicy) -> Result<wasmtime::Store<()>> {
-        let mut store = wasmtime::Store::new(&self.engine, ());
+    fn create_store(&self, policy: &UdfSandboxPolicy) -> Result<wasmtime::Store<WasmStoreState>> {
+        let limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(policy.budget().max_memory_bytes())
+            .build();
+        let mut store = wasmtime::Store::new(&self.engine, WasmStoreState { limits });
+        store.limiter(|state| &mut state.limits);
         store
             .set_fuel(policy.budget().max_instructions())
             .map_err(|err| wasm_runtime_error("failed to set wasm fuel budget", err))?;
         Ok(store)
     }
+
+    fn call_i64_with_timeout(
+        &self,
+        store: &mut wasmtime::Store<WasmStoreState>,
+        function: wasmtime::TypedFunc<i64, i64>,
+        argument: i64,
+        timeout: Duration,
+    ) -> Result<i64> {
+        let deadline = configure_epoch_deadline(store, timeout);
+        let timer = EpochTimer::start(self.engine.clone(), deadline.started, timeout)?;
+        let result = function.call(store, argument);
+        drop(timer);
+        if deadline.timed_out.load(Ordering::Acquire) {
+            return Err(wasm_timeout_error(timeout));
+        }
+        result.map_err(|err| wasm_runtime_error("wasm scalar execution failed", err))
+    }
+}
+
+impl EpochTimer {
+    fn start(engine: wasmtime::Engine, started: Instant, timeout: Duration) -> Result<Self> {
+        let (cancel, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("rnmdb-wasm-timeout".to_owned())
+            .spawn(move || wait_for_epoch_timeout(engine, receiver, started, timeout))
+            .map_err(|err| wasm_runtime_error("failed to start wasm timeout worker", err))?;
+        Ok(Self {
+            cancel,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for EpochTimer {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn configure_epoch_deadline(
+    store: &mut wasmtime::Store<WasmStoreState>,
+    timeout: Duration,
+) -> InvocationDeadline {
+    let started = Instant::now();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let callback_timed_out = Arc::clone(&timed_out);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(move |_| {
+        if started.elapsed() < timeout {
+            return Ok(wasmtime::UpdateDeadline::Continue(1));
+        }
+        callback_timed_out.store(true, Ordering::Release);
+        Ok(wasmtime::UpdateDeadline::Interrupt)
+    });
+    InvocationDeadline { started, timed_out }
+}
+
+fn wait_for_epoch_timeout(
+    engine: wasmtime::Engine,
+    cancel: mpsc::Receiver<()>,
+    started: Instant,
+    timeout: Duration,
+) {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if cancel.recv_timeout(remaining) == Err(RecvTimeoutError::Timeout) {
+        engine.increment_epoch();
+    }
+}
+
+fn ensure_no_compiled_imports(module: &wasmtime::Module) -> Result<()> {
+    let Some(import) = module.imports().next() else {
+        return Ok(());
+    };
+    Err(RnovError::new(
+        ErrorKind::Security,
+        format!(
+            "compiled wasm module import {}.{} is not allowed under locked-down policy",
+            import.module(),
+            import.name()
+        ),
+    ))
 }
 
 fn wasm_module_for_scalar(definition: &UdfDefinition) -> Result<&WasmModuleDefinition> {
@@ -628,4 +739,11 @@ fn ensure_i64_unary_signature(definition: &UdfDefinition) -> Result<()> {
 
 fn wasm_runtime_error(context: &str, err: impl Display) -> RnovError {
     RnovError::new(ErrorKind::InvalidInput, format!("{context}: {err}"))
+}
+
+fn wasm_timeout_error(timeout: Duration) -> RnovError {
+    RnovError::new(
+        ErrorKind::Canceled,
+        format!("wasm scalar execution timed out after {timeout:?}"),
+    )
 }
