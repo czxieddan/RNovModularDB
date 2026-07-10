@@ -2555,36 +2555,16 @@ pub fn backup_single_file(
         ));
     }
 
-    let source_inspection = inspect_single_file(source)?;
-    let mut source_file = OpenOptions::new().read(true).open(source).map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to open backup source: {err}"),
-        )
-    })?;
-    let mut destination_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(destination)
-        .map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to create backup destination: {err}"),
-            )
-        })?;
-    let bytes_copied = copy(&mut source_file, &mut destination_file).map_err(|err| {
-        RnovError::new(ErrorKind::Io, format!("failed to copy backup bytes: {err}"))
-    })?;
-    destination_file.sync_all().map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to sync backup destination: {err}"),
-        )
-    })?;
-    drop(destination_file);
-
-    let destination_inspection = inspect_single_file(destination)?;
-    validate_backup_copy(&source_inspection, &destination_inspection)?;
+    let (_, destination_inspection, bytes_copied) = copy_single_file(
+        source,
+        destination,
+        SingleFileCopyMessages {
+            open_source: "failed to open backup source",
+            create_destination: "failed to create backup destination",
+            copy_bytes: "failed to copy backup bytes",
+            sync_destination: "failed to sync backup destination",
+        },
+    )?;
 
     Ok(SingleFileBackupReport {
         source_path: source.to_path_buf(),
@@ -2635,35 +2615,16 @@ pub fn restore_single_file(
         ));
     }
 
-    let source_inspection = inspect_single_file(backup)?;
-    let mut source = OpenOptions::new().read(true).open(backup).map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to open restore backup: {err}"),
-        )
-    })?;
-    let mut destination = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(target)
-        .map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to create restore target: {err}"),
-            )
-        })?;
-    let bytes_restored = copy(&mut source, &mut destination)
-        .map_err(|err| RnovError::new(ErrorKind::Io, format!("failed to restore bytes: {err}")))?;
-    destination.sync_all().map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to sync restore target: {err}"),
-        )
-    })?;
-    drop(destination);
-
-    let target_inspection = inspect_single_file(target)?;
-    validate_backup_copy(&source_inspection, &target_inspection)?;
+    let (_, target_inspection, bytes_restored) = copy_single_file(
+        backup,
+        target,
+        SingleFileCopyMessages {
+            open_source: "failed to open restore backup",
+            create_destination: "failed to create restore target",
+            copy_bytes: "failed to restore bytes",
+            sync_destination: "failed to sync restore target",
+        },
+    )?;
 
     Ok(SingleFileRestoreReport {
         backup_path: backup.to_path_buf(),
@@ -2672,6 +2633,48 @@ pub fn restore_single_file(
         page_record_slots: target_inspection.page_record_slots(),
         present_page_records: target_inspection.present_page_records(),
     })
+}
+
+struct SingleFileCopyMessages {
+    open_source: &'static str,
+    create_destination: &'static str,
+    copy_bytes: &'static str,
+    sync_destination: &'static str,
+}
+
+fn copy_single_file(
+    source: &Path,
+    destination: &Path,
+    messages: SingleFileCopyMessages,
+) -> Result<(SingleFileInspection, SingleFileInspection, u64)> {
+    let source_inspection = inspect_single_file(source)?;
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .open(source)
+        .map_err(|err| RnovError::new(ErrorKind::Io, format!("{}: {err}", messages.open_source)))?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("{}: {err}", messages.create_destination),
+            )
+        })?;
+    let bytes_copied = copy(&mut source_file, &mut destination_file)
+        .map_err(|err| RnovError::new(ErrorKind::Io, format!("{}: {err}", messages.copy_bytes)))?;
+    destination_file.sync_all().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("{}: {err}", messages.sync_destination),
+        )
+    })?;
+    drop(destination_file);
+
+    let destination_inspection = inspect_single_file(destination)?;
+    validate_backup_copy(&source_inspection, &destination_inspection)?;
+    Ok((source_inspection, destination_inspection, bytes_copied))
 }
 
 fn validate_backup_copy(
