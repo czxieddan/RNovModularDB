@@ -6,6 +6,9 @@ use rnmdb_common::{
 };
 use rnmdb_types::SqlType;
 
+pub const MAX_WASM_FUNCTION_MODULE_BYTES: usize = 1024 * 1024;
+const WASM_BINARY_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Column {
     name: String,
@@ -611,6 +614,21 @@ impl Catalog {
         argument_types: Vec<SqlType>,
         return_type: SqlType,
     ) -> Result<Function> {
+        self.register_function_with_implementation(
+            name,
+            argument_types,
+            return_type,
+            FunctionImplementation::MetadataOnly,
+        )
+    }
+
+    pub fn register_function_with_implementation(
+        &mut self,
+        name: impl Into<String>,
+        argument_types: Vec<SqlType>,
+        return_type: SqlType,
+        implementation: FunctionImplementation,
+    ) -> Result<Function> {
         let name = name.into();
         validate_identifier("function", &name)?;
         if self
@@ -629,6 +647,7 @@ impl Catalog {
             name,
             argument_types,
             return_type,
+            implementation,
         };
         self.next_function_id += 1;
         self.functions.push(function.clone());
@@ -1125,11 +1144,106 @@ impl Catalog {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionImplementation {
+    MetadataOnly,
+    Wasm(WasmFunctionImplementation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmFunctionImplementation {
+    module_bytes: Vec<u8>,
+    initial_memory_bytes: u64,
+    max_memory_bytes: u64,
+    max_instructions: u64,
+    timeout_millis: u64,
+}
+
+impl WasmFunctionImplementation {
+    pub fn new(
+        module_bytes: Vec<u8>,
+        initial_memory_bytes: u64,
+        max_memory_bytes: u64,
+        max_instructions: u64,
+        timeout_millis: u64,
+    ) -> Result<Self> {
+        validate_wasm_function_implementation(
+            &module_bytes,
+            initial_memory_bytes,
+            max_memory_bytes,
+            max_instructions,
+            timeout_millis,
+        )?;
+        Ok(Self {
+            module_bytes,
+            initial_memory_bytes,
+            max_memory_bytes,
+            max_instructions,
+            timeout_millis,
+        })
+    }
+
+    pub fn module_bytes(&self) -> &[u8] {
+        &self.module_bytes
+    }
+
+    pub fn initial_memory_bytes(&self) -> u64 {
+        self.initial_memory_bytes
+    }
+
+    pub fn max_memory_bytes(&self) -> u64 {
+        self.max_memory_bytes
+    }
+
+    pub fn max_instructions(&self) -> u64 {
+        self.max_instructions
+    }
+
+    pub fn timeout_millis(&self) -> u64 {
+        self.timeout_millis
+    }
+}
+
+fn validate_wasm_function_implementation(
+    module_bytes: &[u8],
+    initial_memory_bytes: u64,
+    max_memory_bytes: u64,
+    max_instructions: u64,
+    timeout_millis: u64,
+) -> Result<()> {
+    if module_bytes.is_empty() || module_bytes.len() > MAX_WASM_FUNCTION_MODULE_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("wasm function module must contain 1..={MAX_WASM_FUNCTION_MODULE_BYTES} bytes"),
+        ));
+    }
+    if !module_bytes.starts_with(&WASM_BINARY_HEADER) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function module has an invalid binary header",
+        ));
+    }
+    if initial_memory_bytes == 0 || initial_memory_bytes > max_memory_bytes {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function initial memory must be nonzero and fit its memory budget",
+        ));
+    }
+    if max_instructions == 0 || timeout_millis == 0 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function instruction and timeout budgets must be nonzero",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Function {
     function_id: FunctionId,
     name: String,
     argument_types: Vec<SqlType>,
     return_type: SqlType,
+    implementation: FunctionImplementation,
 }
 
 impl Function {
@@ -1147,6 +1261,10 @@ impl Function {
 
     pub fn return_type(&self) -> &SqlType {
         &self.return_type
+    }
+
+    pub fn implementation(&self) -> &FunctionImplementation {
+        &self.implementation
     }
 }
 
@@ -1612,7 +1730,7 @@ pub struct CatalogCodec;
 
 impl CatalogCodec {
     const MAGIC: [u8; 8] = *b"RNOVCAT1";
-    const VERSION: u16 = 12;
+    const VERSION: u16 = 13;
     const MIN_READ_VERSION: u16 = 8;
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
@@ -1655,16 +1773,7 @@ impl CatalogCodec {
             }
         }
 
-        write_u32(&mut out, catalog.functions.len() as u32);
-        for function in &catalog.functions {
-            write_u64(&mut out, function.function_id.get());
-            write_string(&mut out, &function.name)?;
-            write_u32(&mut out, function.argument_types.len() as u32);
-            for argument_type in &function.argument_types {
-                encode_sql_type(&mut out, argument_type);
-            }
-            encode_sql_type(&mut out, &function.return_type);
-        }
+        encode_functions(&mut out, &catalog.functions)?;
 
         write_u32(&mut out, catalog.procedures.len() as u32);
         for procedure in &catalog.procedures {
@@ -1877,23 +1986,7 @@ impl CatalogCodec {
             catalog.schemas.insert(schema_name, schema);
         }
 
-        let function_count = reader.read_u32("function count")? as usize;
-        for _ in 0..function_count {
-            let function_id = FunctionId::new(reader.read_u64("function id")?);
-            let name = reader.read_string("function name")?;
-            let argument_count = reader.read_u32("function argument count")? as usize;
-            let mut argument_types = Vec::with_capacity(argument_count);
-            for _ in 0..argument_count {
-                argument_types.push(decode_sql_type(&mut reader)?);
-            }
-            let return_type = decode_sql_type(&mut reader)?;
-            catalog.functions.push(Function {
-                function_id,
-                name,
-                argument_types,
-                return_type,
-            });
-        }
+        catalog.functions = decode_functions(&mut reader, version)?;
 
         let procedure_count = reader.read_u32("procedure count")? as usize;
         for _ in 0..procedure_count {
@@ -2104,6 +2197,107 @@ impl CatalogCodec {
     }
 }
 
+fn encode_functions(out: &mut Vec<u8>, functions: &[Function]) -> Result<()> {
+    write_u32(out, functions.len() as u32);
+    for function in functions {
+        write_u64(out, function.function_id.get());
+        write_string(out, &function.name)?;
+        write_u32(out, function.argument_types.len() as u32);
+        for argument_type in &function.argument_types {
+            encode_sql_type(out, argument_type);
+        }
+        encode_sql_type(out, &function.return_type);
+        encode_function_implementation(out, &function.implementation)?;
+    }
+    Ok(())
+}
+
+fn encode_function_implementation(
+    out: &mut Vec<u8>,
+    implementation: &FunctionImplementation,
+) -> Result<()> {
+    match implementation {
+        FunctionImplementation::MetadataOnly => out.push(0),
+        FunctionImplementation::Wasm(wasm) => {
+            out.push(1);
+            write_bytes(out, wasm.module_bytes())?;
+            write_u64(out, wasm.initial_memory_bytes());
+            write_u64(out, wasm.max_memory_bytes());
+            write_u64(out, wasm.max_instructions());
+            write_u64(out, wasm.timeout_millis());
+        }
+    }
+    Ok(())
+}
+
+fn decode_functions(reader: &mut CatalogReader<'_>, version: u16) -> Result<Vec<Function>> {
+    let function_count = reader.read_u32("function count")? as usize;
+    let mut functions = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        functions.push(decode_function(reader, version)?);
+    }
+    Ok(functions)
+}
+
+fn decode_function(reader: &mut CatalogReader<'_>, version: u16) -> Result<Function> {
+    Ok(Function {
+        function_id: FunctionId::new(reader.read_u64("function id")?),
+        name: reader.read_string("function name")?,
+        argument_types: decode_function_argument_types(reader)?,
+        return_type: decode_sql_type(reader)?,
+        implementation: decode_function_implementation(reader, version)?,
+    })
+}
+
+fn decode_function_argument_types(reader: &mut CatalogReader<'_>) -> Result<Vec<SqlType>> {
+    let argument_count = reader.read_u32("function argument count")? as usize;
+    let mut argument_types = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        argument_types.push(decode_sql_type(reader)?);
+    }
+    Ok(argument_types)
+}
+
+fn decode_function_implementation(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+) -> Result<FunctionImplementation> {
+    if version < 13 {
+        return Ok(FunctionImplementation::MetadataOnly);
+    }
+    match reader.read_u8("function implementation tag")? {
+        0 => Ok(FunctionImplementation::MetadataOnly),
+        1 => decode_wasm_function_implementation(reader).map(FunctionImplementation::Wasm),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown function implementation tag {unknown}"),
+        )),
+    }
+}
+
+fn decode_wasm_function_implementation(
+    reader: &mut CatalogReader<'_>,
+) -> Result<WasmFunctionImplementation> {
+    let module_bytes = reader.read_bytes("wasm function module", MAX_WASM_FUNCTION_MODULE_BYTES)?;
+    let initial_memory_bytes = reader.read_u64("wasm function initial memory")?;
+    let max_memory_bytes = reader.read_u64("wasm function memory budget")?;
+    let max_instructions = reader.read_u64("wasm function instruction budget")?;
+    let timeout_millis = reader.read_u64("wasm function timeout")?;
+    WasmFunctionImplementation::new(
+        module_bytes,
+        initial_memory_bytes,
+        max_memory_bytes,
+        max_instructions,
+        timeout_millis,
+    )
+    .map_err(|error| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            format!("invalid wasm function implementation: {error}"),
+        )
+    })
+}
+
 fn write_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
 }
@@ -2114,6 +2308,14 @@ fn write_u32(out: &mut Vec<u8>, value: u32) {
 
 fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "catalog bytes are too large"))?;
+    write_u32(out, len);
+    out.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn write_optional_role_id(out: &mut Vec<u8>, value: Option<RoleId>) {
@@ -2361,6 +2563,17 @@ impl<'a> CatalogReader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| {
             RnovError::new(ErrorKind::Corruption, format!("{name} is not valid utf-8"))
         })
+    }
+
+    fn read_bytes(&mut self, name: &'static str, max_len: usize) -> Result<Vec<u8>> {
+        let len = self.read_u32(name)? as usize;
+        if len > max_len {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                format!("{name} exceeds the {max_len}-byte limit"),
+            ));
+        }
+        self.read_exact(len, name).map(<[u8]>::to_vec)
     }
 
     fn read_optional_string(&mut self, name: &'static str) -> Result<Option<String>> {
