@@ -225,6 +225,25 @@ impl PageCodec {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Page> {
+        let header = Self::decode_header(bytes)?;
+        let payload = bytes[Self::HEADER_LEN..].to_vec();
+        Self::validate_payload(&header, &payload)?;
+
+        Page::new_with_header(header, payload)
+    }
+
+    fn decode_header(bytes: &[u8]) -> Result<PageHeader> {
+        Self::validate_encoded_header(bytes)?;
+
+        let page_id = PageId::new(u64::from_be_bytes(read_header_array::<8>(bytes, 9)?));
+        let lsn = u64::from_be_bytes(read_header_array::<8>(bytes, 17)?);
+        let page_size_bytes = u64::from_be_bytes(read_header_array::<8>(bytes, 25)?) as usize;
+        let checksum = u64::from_be_bytes(read_header_array::<8>(bytes, 33)?);
+
+        Ok(PageHeader::new(page_id, lsn, PageSize::new(page_size_bytes)).with_checksum(checksum))
+    }
+
+    fn validate_encoded_header(bytes: &[u8]) -> Result<()> {
         if bytes.len() < Self::HEADER_LEN {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
@@ -244,30 +263,26 @@ impl PageCodec {
             ));
         }
 
-        let page_id = PageId::new(u64::from_be_bytes(read_header_array::<8>(bytes, 9)?));
-        let lsn = u64::from_be_bytes(read_header_array::<8>(bytes, 17)?);
-        let page_size_bytes = u64::from_be_bytes(read_header_array::<8>(bytes, 25)?) as usize;
-        let checksum = u64::from_be_bytes(read_header_array::<8>(bytes, 33)?);
-        let payload = bytes[Self::HEADER_LEN..].to_vec();
+        Ok(())
+    }
 
-        if payload.len() != page_size_bytes {
+    fn validate_payload(header: &PageHeader, payload: &[u8]) -> Result<()> {
+        if payload.len() != header.page_size().bytes() {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "encoded page payload length does not match header page size",
             ));
         }
 
-        let header =
-            PageHeader::new(page_id, lsn, PageSize::new(page_size_bytes)).with_checksum(checksum);
-        let expected = checksum_page(&header, &payload);
-        if checksum != expected {
+        let expected = checksum_page(header, payload);
+        if header.checksum() != expected {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "page checksum mismatch",
             ));
         }
 
-        Page::new_with_header(header, payload)
+        Ok(())
     }
 }
 
