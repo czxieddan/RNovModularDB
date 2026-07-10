@@ -954,6 +954,7 @@ dependencies = [
  "rnmdb-common",
  "rnmdb-executor",
  "rnmdb-planner",
+ "rnmdb-security",
  "rnmdb-sql",
  "rnmdb-storage",
  "rnmdb-txn",

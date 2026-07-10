@@ -19,8 +19,9 @@ use rnmdb_planner::{
     optimizer::RuleOptimizer,
     physical::{IndexAccessPath, IndexCatalog, PhysicalPlanner},
 };
+pub use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
-    ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName, TransactionAction},
+    ast::{BoundStatement, ColumnDef, ExplainFormat, Ident, ObjectName, TransactionAction},
     binder::Binder,
     parser::parse_statement,
 };
@@ -117,6 +118,49 @@ impl LocalSession {
             )
         })?;
         write_image_to_backend(&durable.backend, durable.backend.page_size(), &image)
+    }
+
+    pub fn configure_column_encryption(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        key: ColumnKeyMaterial,
+    ) -> Result<()> {
+        let schema_name = Ident::new(schema_name);
+        let table_name = Ident::new(table_name);
+        let column_name = Ident::new(column_name);
+        let table = self
+            .catalog
+            .get_table(schema_name.as_str(), table_name.as_str())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table does not exist: {schema_name}.{table_name}"),
+                )
+            })?;
+        let column = table
+            .columns()
+            .iter()
+            .find(|column| column.name() == column_name.as_str())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {schema_name}.{table_name}.{column_name}"),
+                )
+            })?;
+        if !column.is_encrypted() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("column is not marked encrypted: {schema_name}.{table_name}.{column_name}"),
+            ));
+        }
+        self.executor.configure_column_encryption(
+            table.relation_id(),
+            column.name(),
+            key,
+            [self.role_id],
+        )
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
