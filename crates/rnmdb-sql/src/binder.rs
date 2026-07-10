@@ -12,7 +12,7 @@ use crate::ast::{
     CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName,
     OrderByExpr, SelectItem, SelectSubquery, Statement, TransactionAction,
 };
-use crate::expr_mutator::rewrite_qualified_expr;
+use crate::expr_mutator::{rewrite_expr_tree, rewrite_qualified_expr};
 use crate::parser::{parse_expr, parse_statement};
 
 const RLS_DENY_DEFAULT_POLICY: &str = "rnmdb_rls_deny_default";
@@ -1484,6 +1484,7 @@ impl<'a> Binder<'a> {
                         &mut hidden_aggregates,
                         &bound_group_by,
                         &order_by,
+                        input.role_id,
                     )?);
                 } else {
                     bound_order_by.push(self.bind_plain_sort_expr(
@@ -1500,6 +1501,7 @@ impl<'a> Binder<'a> {
                     &mut hidden_aggregates,
                     &bound_group_by,
                     &order_by,
+                    input.role_id,
                 )?);
             }
         }
@@ -2263,13 +2265,17 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn infer_bound_in_subquery_type(&self, query: &SelectSubquery) -> Result<Option<SqlType>> {
+    fn infer_bound_predicate_subquery_type(
+        &self,
+        query: &SelectSubquery,
+        context: &str,
+    ) -> Result<Option<SqlType>> {
         if query.bound().is_some() {
             Ok(Some(SqlType::Bool))
         } else {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "IN subquery is only supported in bound SELECT predicates",
+                format!("{context} is only supported after binding"),
             ))
         }
     }
@@ -2528,6 +2534,7 @@ impl<'a> Binder<'a> {
         hidden_aggregates: &mut Vec<BoundSelectItem>,
         group_by: &[Expr],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => Expr::Identifier(Ident::new(
@@ -2557,6 +2564,9 @@ impl<'a> Binder<'a> {
         };
         let mut grouped_outputs = projection.to_vec();
         grouped_outputs.extend(hidden_aggregates.iter().cloned());
+        let mut infer =
+            |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
+        let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
         self.validate_grouped_sort_expr(table, &grouped_outputs, group_by, &expr)?;
         Ok(OrderByExpr {
             expr,
@@ -2806,16 +2816,13 @@ impl<'a> Binder<'a> {
                 None => Ok(()),
             };
         }
-        Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            match expr {
-                Expr::Identifier(identifier) => format!(
-                    "ORDER BY for grouped queries must reference a projected column or GROUP BY expression: {}",
-                    identifier.as_str()
-                ),
-                _ => "ORDER BY for grouped queries must reference a projected column or GROUP BY expression".to_string(),
-            },
-        ))
+        if grouped_sort_expr_references_outputs(projection, expr) {
+            return match self.infer_grouped_output_expr_type(projection, expr)? {
+                Some(data_type) => self.ensure_sortable_type(&data_type),
+                None => Ok(()),
+            };
+        }
+        Err(grouped_sort_reference_error(expr))
     }
 
     fn ensure_sortable_type(&self, data_type: &SqlType) -> Result<()> {
@@ -3539,8 +3546,12 @@ impl<'a> Binder<'a> {
                 }
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
-            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
-            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
+            Expr::InSubquery { query, .. } => {
+                self.infer_bound_predicate_subquery_type(query, "IN subquery")
+            }
+            Expr::ExistsSubquery { query } => {
+                self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
+            }
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
                     return Ok(None);
@@ -4616,8 +4627,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_in_list_result_type(&expr_type, &value_types)
             }
-            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
-            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
+            Expr::InSubquery { query, .. } => {
+                self.infer_bound_predicate_subquery_type(query, "IN subquery")
+            }
+            Expr::ExistsSubquery { query } => {
+                self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
+            }
             Expr::Like { expr, pattern, .. } => {
                 let Some(expr_type) = self.infer_expr_type(table, expr)? else {
                     return Ok(None);
@@ -4868,8 +4883,12 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_nullif_result_type(&left_type, &right_type)
             }
-            Expr::InSubquery { query, .. } => self.infer_bound_in_subquery_type(query),
-            Expr::ExistsSubquery { query } => self.infer_bound_in_subquery_type(query),
+            Expr::InSubquery { query, .. } => {
+                self.infer_bound_predicate_subquery_type(query, "IN subquery")
+            }
+            Expr::ExistsSubquery { query } => {
+                self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
+            }
             other => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!("unsupported generated column expression: {other}"),
@@ -5400,6 +5419,37 @@ fn is_text_concat_operator(op: &str) -> bool {
 
 fn truth_test_name(value: bool) -> &'static str {
     if value { "IS TRUE" } else { "IS FALSE" }
+}
+
+fn grouped_sort_expr_references_outputs(projection: &[BoundSelectItem], expr: &Expr) -> bool {
+    let mut valid = true;
+    let rewritten = rewrite_expr_tree(expr, &mut |candidate| {
+        match candidate {
+            Expr::Identifier(identifier) => {
+                valid &= projection
+                    .iter()
+                    .any(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()));
+            }
+            Expr::QualifiedIdentifier { .. } => valid = false,
+            _ => {}
+        }
+        Ok(None)
+    });
+    rewritten.is_ok() && valid
+}
+
+fn grouped_sort_reference_error(expr: &Expr) -> RnovError {
+    let message = match expr {
+        Expr::Identifier(identifier) => format!(
+            "ORDER BY for grouped queries must reference a projected column or GROUP BY expression: {}",
+            identifier.as_str()
+        ),
+        _ => {
+            "ORDER BY for grouped queries must reference a projected column or GROUP BY expression"
+                .to_string()
+        }
+    };
+    RnovError::new(ErrorKind::InvalidInput, message)
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
