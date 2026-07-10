@@ -2568,7 +2568,36 @@ impl MemoryExecutor {
             return self.apply_sort_with_row_subqueries(batch, keys, cancellation);
         }
         let keys = self.resolve_order_by_scalar_subqueries(keys, cancellation)?;
-        apply_sort_cancellable(batch, &keys, cancellation)
+        if self.scalar_function_runtime.is_none() {
+            return apply_sort_cancellable(batch, &keys, cancellation);
+        }
+        let key_values = self.evaluate_order_by_key_values(&batch, &keys, cancellation)?;
+        apply_sort_with_key_values_cancellable(batch, &keys, key_values, cancellation)
+    }
+
+    fn evaluate_order_by_key_values(
+        &self,
+        batch: &VectorBatch,
+        keys: &[OrderByExpr],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Vec<SqlValue>>> {
+        batch
+            .rows()
+            .iter()
+            .map(|row| {
+                cancellation.check()?;
+                keys.iter()
+                    .map(|key| {
+                        eval_expr_with_runtime(
+                            self.scalar_function_runtime.as_deref(),
+                            batch.columns(),
+                            row,
+                            &key.expr,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     fn order_by_needs_row_subquery_resolution(&self, keys: &[OrderByExpr]) -> Result<bool> {
@@ -2621,7 +2650,7 @@ impl MemoryExecutor {
             .map(|key| {
                 let expr =
                     self.resolve_subqueries_for_row(&key.expr, columns, row, cancellation)?;
-                eval_expr(columns, row, &expr)
+                eval_expr_with_runtime(self.scalar_function_runtime.as_deref(), columns, row, &expr)
             })
             .collect()
     }
