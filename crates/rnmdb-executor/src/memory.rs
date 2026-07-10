@@ -1949,7 +1949,12 @@ impl MemoryExecutor {
             }
             LogicalPlan::Aggregate { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_aggregate_cancellable(batch, items, cancellation)
+                apply_aggregate_cancellable(
+                    batch,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             LogicalPlan::GroupedAggregate {
                 group_by,
@@ -3036,7 +3041,12 @@ impl MemoryExecutor {
             }
             PhysicalPlan::Aggregate { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_aggregate_cancellable(batch, items, cancellation)
+                apply_aggregate_cancellable(
+                    batch,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             PhysicalPlan::GroupedAggregate {
                 group_by,
@@ -3221,7 +3231,12 @@ impl MemoryExecutor {
             PhysicalPlan::Aggregate { items, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                apply_aggregate_cancellable(batch, items, cancellation)
+                apply_aggregate_cancellable(
+                    batch,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             PhysicalPlan::GroupedAggregate {
                 group_by,
@@ -3628,7 +3643,12 @@ impl MemoryExecutor {
             }
             LogicalPlan::Aggregate { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_aggregate_cancellable(batch, items, cancellation)
+                apply_aggregate_cancellable(
+                    batch,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             LogicalPlan::GroupedAggregate {
                 group_by,
@@ -6296,16 +6316,17 @@ fn column_schema_like(column: &ColumnSchema, name: String, nullable: bool) -> Co
 fn apply_aggregate_cancellable(
     batch: VectorBatch,
     items: &[AggregateItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     cancellation.check()?;
     let columns = items
         .iter()
-        .map(|item| aggregate_column_schema(&batch, item))
+        .map(|item| aggregate_column_schema(&batch, item, runtime))
         .collect::<Result<Vec<_>>>()?;
     let values = items
         .iter()
-        .map(|item| aggregate_value(&batch, &item.function))
+        .map(|item| aggregate_value(&batch, &item.function, runtime))
         .collect::<Result<Vec<_>>>()?;
     cancellation.check()?;
     VectorBatch::new(columns, vec![Row::new(values)])
@@ -6527,6 +6548,7 @@ fn grouped_aggregate_column_schema(
                 name: item.name.clone(),
                 function: function.clone(),
             },
+            None,
         ),
     }
 }
@@ -6539,7 +6561,7 @@ fn grouped_aggregate_value(batch: &VectorBatch, item: &GroupedAggregateItem) -> 
             };
             eval_expr(batch.columns(), row, expr)
         }
-        GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function),
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function, None),
     }
 }
 
@@ -6560,7 +6582,11 @@ fn grouping_set_aggregate_value(
     }
 }
 
-fn aggregate_column_schema(batch: &VectorBatch, item: &AggregateItem) -> Result<ColumnSchema> {
+fn aggregate_column_schema(
+    batch: &VectorBatch,
+    item: &AggregateItem,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<ColumnSchema> {
     match &item.function {
         AggregateFunction::CountStar
         | AggregateFunction::Count(_)
@@ -6570,77 +6596,105 @@ fn aggregate_column_schema(batch: &VectorBatch, item: &AggregateItem) -> Result<
         AggregateFunction::Sum(_) => Ok(ColumnSchema::new(item.name.as_str(), SqlType::Int64)),
         AggregateFunction::Min(expr) | AggregateFunction::Max(expr) => Ok(ColumnSchema::new(
             item.name.as_str(),
-            projection_type(batch.columns(), expr)?,
+            projection_type_with_runtime(runtime, batch.columns(), expr)?,
         )),
     }
 }
 
-fn aggregate_value(batch: &VectorBatch, function: &AggregateFunction) -> Result<SqlValue> {
+fn aggregate_value(
+    batch: &VectorBatch,
+    function: &AggregateFunction,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<SqlValue> {
     match function {
-        AggregateFunction::CountStar => {
-            Ok(SqlValue::Int64(i64::try_from(batch.rows().len()).map_err(
-                |_| RnovError::new(ErrorKind::InvalidInput, "COUNT(*) result exceeds int64"),
-            )?))
+        AggregateFunction::CountStar => aggregate_row_count(batch),
+        AggregateFunction::Count(expr) => aggregate_count(batch, expr, runtime),
+        AggregateFunction::CountDistinct(expr) => aggregate_count_distinct(batch, expr, runtime),
+        AggregateFunction::Sum(expr) => aggregate_sum(batch, expr, runtime),
+        AggregateFunction::Min(expr) => {
+            aggregate_ordered_value(batch, expr, OrderedAggregate::Min, runtime)
         }
-        AggregateFunction::Count(expr) => {
-            let mut count = 0_i64;
-            for row in batch.rows() {
-                if !eval_expr(batch.columns(), row, expr)?.is_null() {
-                    count = count.checked_add(1).ok_or_else(|| {
-                        RnovError::new(ErrorKind::InvalidInput, "COUNT(expr) result exceeds int64")
-                    })?;
-                }
-            }
-            Ok(SqlValue::Int64(count))
+        AggregateFunction::Max(expr) => {
+            aggregate_ordered_value(batch, expr, OrderedAggregate::Max, runtime)
         }
-        AggregateFunction::CountDistinct(expr) => {
-            let mut values = Vec::new();
-            for row in batch.rows() {
-                let value = eval_expr(batch.columns(), row, expr)?;
-                if !value.is_null() && !values.contains(&value) {
-                    values.push(value);
-                }
-            }
-            Ok(SqlValue::Int64(i64::try_from(values.len()).map_err(
-                |_| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "COUNT(DISTINCT expr) result exceeds int64",
-                    )
-                },
-            )?))
+    }
+}
+
+fn aggregate_row_count(batch: &VectorBatch) -> Result<SqlValue> {
+    i64::try_from(batch.rows().len())
+        .map(SqlValue::Int64)
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "COUNT(*) result exceeds int64"))
+}
+
+fn aggregate_count(
+    batch: &VectorBatch,
+    expr: &Expr,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<SqlValue> {
+    let mut count = 0_i64;
+    for row in batch.rows() {
+        if !eval_expr_with_runtime(runtime, batch.columns(), row, expr)?.is_null() {
+            count = count.checked_add(1).ok_or_else(|| {
+                RnovError::new(ErrorKind::InvalidInput, "COUNT(expr) result exceeds int64")
+            })?;
         }
-        AggregateFunction::Sum(expr) => {
-            let mut sum: Option<i64> = None;
-            for row in batch.rows() {
-                match eval_expr(batch.columns(), row, expr)? {
-                    SqlValue::Null => {}
-                    SqlValue::Int64(value) => {
-                        sum = Some(match sum {
-                            Some(current) => current.checked_add(value).ok_or_else(|| {
-                                RnovError::new(
-                                    ErrorKind::InvalidInput,
-                                    "SUM(expr) result exceeds int64",
-                                )
-                            })?,
-                            None => value,
-                        });
-                    }
-                    other => {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "SUM(expr) requires INT64 values, got {:?}",
-                                other.data_type()
-                            ),
-                        ));
-                    }
-                }
-            }
-            Ok(sum.map_or(SqlValue::Null, SqlValue::Int64))
+    }
+    Ok(SqlValue::Int64(count))
+}
+
+fn aggregate_count_distinct(
+    batch: &VectorBatch,
+    expr: &Expr,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<SqlValue> {
+    let mut values = Vec::new();
+    for row in batch.rows() {
+        let value = eval_expr_with_runtime(runtime, batch.columns(), row, expr)?;
+        if !value.is_null() && !values.contains(&value) {
+            values.push(value);
         }
-        AggregateFunction::Min(expr) => aggregate_ordered_value(batch, expr, OrderedAggregate::Min),
-        AggregateFunction::Max(expr) => aggregate_ordered_value(batch, expr, OrderedAggregate::Max),
+    }
+    i64::try_from(values.len())
+        .map(SqlValue::Int64)
+        .map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "COUNT(DISTINCT expr) result exceeds int64",
+            )
+        })
+}
+
+fn aggregate_sum(
+    batch: &VectorBatch,
+    expr: &Expr,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<SqlValue> {
+    let mut sum = None;
+    for row in batch.rows() {
+        let value = eval_expr_with_runtime(runtime, batch.columns(), row, expr)?;
+        sum = accumulate_sum(sum, value)?;
+    }
+    Ok(sum.map_or(SqlValue::Null, SqlValue::Int64))
+}
+
+fn accumulate_sum(sum: Option<i64>, value: SqlValue) -> Result<Option<i64>> {
+    match value {
+        SqlValue::Null => Ok(sum),
+        SqlValue::Int64(value) => sum
+            .map(|current| {
+                current.checked_add(value).ok_or_else(|| {
+                    RnovError::new(ErrorKind::InvalidInput, "SUM(expr) result exceeds int64")
+                })
+            })
+            .transpose()
+            .map(|sum| Some(sum.unwrap_or(value))),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "SUM(expr) requires INT64 values, got {:?}",
+                other.data_type()
+            ),
+        )),
     }
 }
 
@@ -6654,39 +6708,59 @@ fn aggregate_ordered_value(
     batch: &VectorBatch,
     expr: &Expr,
     aggregate: OrderedAggregate,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<SqlValue> {
     let mut selected: Option<SqlValue> = None;
     for row in batch.rows() {
-        let value = eval_expr(batch.columns(), row, expr)?;
+        let value = eval_expr_with_runtime(runtime, batch.columns(), row, expr)?;
         if value.is_null() {
             continue;
         }
-        let data_type = value.data_type();
-        if !sortable_type(&data_type) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("ordered aggregate expression type is not sortable: {data_type:?}"),
-            ));
-        }
-        if let Some(current) = &selected {
-            let ordering = value.sql_cmp(current)?.ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "ordered aggregate comparison produced unknown result",
-                )
-            })?;
-            let replace = match aggregate {
-                OrderedAggregate::Min => ordering == Ordering::Less,
-                OrderedAggregate::Max => ordering == Ordering::Greater,
-            };
-            if replace {
-                selected = Some(value);
-            }
-        } else {
-            selected = Some(value);
-        }
+        validate_ordered_aggregate_value(&value)?;
+        selected = select_ordered_aggregate_value(selected, value, aggregate)?;
     }
     Ok(selected.unwrap_or(SqlValue::Null))
+}
+
+fn validate_ordered_aggregate_value(value: &SqlValue) -> Result<()> {
+    let data_type = value.data_type();
+    if sortable_type(&data_type) {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("ordered aggregate expression type is not sortable: {data_type:?}"),
+    ))
+}
+
+fn select_ordered_aggregate_value(
+    selected: Option<SqlValue>,
+    value: SqlValue,
+    aggregate: OrderedAggregate,
+) -> Result<Option<SqlValue>> {
+    let Some(current) = selected else {
+        return Ok(Some(value));
+    };
+    let ordering = value.sql_cmp(&current)?.ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "ordered aggregate comparison produced unknown result",
+        )
+    })?;
+    if aggregate.replaces(ordering) {
+        Ok(Some(value))
+    } else {
+        Ok(Some(current))
+    }
+}
+
+impl OrderedAggregate {
+    fn replaces(self, ordering: Ordering) -> bool {
+        matches!(
+            (self, ordering),
+            (Self::Min, Ordering::Less) | (Self::Max, Ordering::Greater)
+        )
+    }
 }
 
 fn apply_limit_cancellable(
