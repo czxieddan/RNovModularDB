@@ -5,7 +5,7 @@ use std::{
 };
 
 use rnmdb_catalog::{
-    Catalog, CatalogCodec, ForeignKeyReference,
+    Catalog, CatalogCodec, ForeignKeyReference, Function as CatalogFunction,
     FunctionImplementation as CatalogFunctionImplementation, IndexKey, OperatorSignature,
     Privilege, RowPolicy, Table as CatalogTable, Trigger, TriggerEvent, TriggerTiming,
     WasmFunctionImplementation,
@@ -433,12 +433,14 @@ impl LocalSession {
         durable: Option<LocalDurableStore>,
     ) -> Result<Self> {
         executor.set_active_role(role_id);
+        let wasm_runtime = WasmScalarRuntime::new()?;
+        let udf_registry = rebuild_udf_registry(&catalog, &wasm_runtime)?;
         Ok(Self {
             catalog,
             role_id,
             executor,
-            udf_registry: UdfRegistry::new(),
-            wasm_runtime: WasmScalarRuntime::new()?,
+            udf_registry,
+            wasm_runtime,
             planner: LogicalPlanner::new(),
             optimizer: RuleOptimizer::new(),
             execution,
@@ -1254,6 +1256,77 @@ fn catalog_wasm_implementation(
         body.max_instructions,
         body.timeout_millis,
     )
+}
+
+fn rebuild_udf_registry(
+    catalog: &Catalog,
+    wasm_runtime: &WasmScalarRuntime,
+) -> Result<UdfRegistry> {
+    let mut registry = UdfRegistry::new();
+    for function in catalog.functions() {
+        let CatalogFunctionImplementation::Wasm(implementation) = function.implementation() else {
+            continue;
+        };
+        let definition = prepare_persisted_wasm_definition(wasm_runtime, function, implementation)?;
+        registry.register_with_id(function.function_id(), definition)?;
+    }
+    Ok(registry)
+}
+
+fn prepare_persisted_wasm_definition(
+    wasm_runtime: &WasmScalarRuntime,
+    function: &CatalogFunction,
+    implementation: &WasmFunctionImplementation,
+) -> Result<UdfDefinition> {
+    if function.argument_types() != [SqlType::Int64] || function.return_type() != &SqlType::Int64 {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm scalar signature must be INT64 -> INT64",
+        ));
+    }
+    let max_memory_bytes = usize::try_from(implementation.max_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm memory budget does not fit this platform",
+        )
+    })?;
+    let budget = UdfBudget::new(
+        max_memory_bytes,
+        implementation.max_instructions(),
+        Duration::from_millis(implementation.timeout_millis()),
+    )?;
+    let definition = wasm_runtime.prepare_i64_unary(
+        function.name(),
+        implementation.module_bytes().to_vec(),
+        UdfSandboxPolicy::locked_down(budget),
+    )?;
+    validate_persisted_wasm_memory(&definition, implementation)?;
+    Ok(definition)
+}
+
+fn validate_persisted_wasm_memory(
+    definition: &UdfDefinition,
+    implementation: &WasmFunctionImplementation,
+) -> Result<()> {
+    let module = definition.wasm_module().ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm definition has no validated module",
+        )
+    })?;
+    let initial_memory_bytes = u64::try_from(module.initial_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "validated wasm initial memory does not fit the durable catalog format",
+        )
+    })?;
+    if initial_memory_bytes != implementation.initial_memory_bytes() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm initial memory does not match the module",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tokio-runtime")]
