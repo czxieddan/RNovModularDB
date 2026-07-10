@@ -3783,12 +3783,13 @@ impl MemoryExecutor {
                 columns,
                 values,
             } => {
+                let values = self.evaluate_insert_values(values)?;
                 let column_crypto = self.column_crypto.clone();
                 let mut tables = self.write_tables()?;
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                insert_values(table, *relation_id, columns, values, &column_crypto)?;
+                insert_values(table, *relation_id, columns, &values, &column_crypto)?;
                 Ok(ExecutionResult::RowsAffected(1))
             }
             LogicalPlan::Update {
@@ -3809,6 +3810,7 @@ impl MemoryExecutor {
                     assignments,
                     selection.as_ref(),
                     &column_crypto,
+                    self.scalar_function_runtime.as_deref(),
                 )
                 .map(ExecutionResult::RowsAffected)
             }
@@ -3823,11 +3825,27 @@ impl MemoryExecutor {
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                delete_rows(table, *relation_id, selection.as_ref(), &column_crypto)
-                    .map(ExecutionResult::RowsAffected)
+                delete_rows(
+                    table,
+                    *relation_id,
+                    selection.as_ref(),
+                    &column_crypto,
+                    self.scalar_function_runtime.as_deref(),
+                )
+                .map(ExecutionResult::RowsAffected)
             }
             _ => self.execute(plan).map(ExecutionResult::Batch),
         }
+    }
+
+    fn evaluate_insert_values(&self, values: &[Expr]) -> Result<Vec<SqlValue>> {
+        let row = Row::new(Vec::new());
+        values
+            .iter()
+            .map(|expr| {
+                eval_expr_with_runtime(self.scalar_function_runtime.as_deref(), &[], &row, expr)
+            })
+            .collect()
     }
 
     pub fn execute_mut_async<'a>(
@@ -4736,36 +4754,88 @@ fn update_rows(
     assignments: &[(String, Expr)],
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<u64> {
     let columns = table.columns.clone();
     let assignments = compile_assignments(&columns, assignments)?;
     let original_rows = table.rows.clone();
     let original_indexes = table.indexes.clone();
-    let mut rows = original_rows.clone();
-    let mut affected = 0;
+    let (rows, affected) = build_updated_rows(
+        &original_rows,
+        &columns,
+        relation_id,
+        &assignments,
+        selection,
+        column_crypto,
+        runtime,
+    )?;
+    replace_rows_and_rebuild_indexes(table, rows, original_rows, original_indexes)?;
+    Ok(affected)
+}
 
+fn build_updated_rows(
+    original_rows: &[Row],
+    columns: &[ColumnSchema],
+    relation_id: RelationId,
+    assignments: &[(usize, Expr)],
+    selection: Option<&Expr>,
+    column_crypto: &ColumnCryptoState,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<(Vec<Row>, u64)> {
+    let mut rows = original_rows.to_vec();
+    let mut affected = 0;
     for row in &mut rows {
-        let logical_row = column_crypto.decrypt_row(relation_id, &columns, row)?;
-        if row_matches(&columns, &logical_row, selection)? {
-            let mut updated = logical_row.clone();
-            for (index, expr) in &assignments {
-                updated.set_value(*index, eval_expr(&columns, &logical_row, expr)?);
-            }
-            recompute_generated_values(&columns, &mut updated)?;
-            let encrypted = column_crypto.encrypt_row(relation_id, &columns, &updated)?;
-            validate_row_against_columns(&columns, &encrypted)?;
-            *row = encrypted;
+        if update_row(
+            row,
+            columns,
+            relation_id,
+            assignments,
+            selection,
+            column_crypto,
+            runtime,
+        )? {
             affected += 1;
         }
     }
+    Ok((rows, affected))
+}
 
-    table.rows = rows;
-    if let Err(err) = table.rebuild_indexes() {
-        table.rows = original_rows;
-        table.indexes = original_indexes;
-        return Err(err);
+fn update_row(
+    row: &mut Row,
+    columns: &[ColumnSchema],
+    relation_id: RelationId,
+    assignments: &[(usize, Expr)],
+    selection: Option<&Expr>,
+    column_crypto: &ColumnCryptoState,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<bool> {
+    let logical_row = column_crypto.decrypt_row(relation_id, columns, row)?;
+    if !row_matches(columns, &logical_row, selection, runtime)? {
+        return Ok(false);
     }
-    Ok(affected)
+    let mut updated = logical_row.clone();
+    apply_update_assignments(runtime, columns, &logical_row, assignments, &mut updated)?;
+    recompute_generated_values(columns, &mut updated)?;
+    let encrypted = column_crypto.encrypt_row(relation_id, columns, &updated)?;
+    validate_row_against_columns(columns, &encrypted)?;
+    *row = encrypted;
+    Ok(true)
+}
+
+fn apply_update_assignments(
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    columns: &[ColumnSchema],
+    source: &Row,
+    assignments: &[(usize, Expr)],
+    target: &mut Row,
+) -> Result<()> {
+    for (index, expr) in assignments {
+        target.set_value(
+            *index,
+            eval_expr_with_runtime(runtime, columns, source, expr)?,
+        );
+    }
+    Ok(())
 }
 
 fn delete_rows(
@@ -4773,6 +4843,7 @@ fn delete_rows(
     relation_id: RelationId,
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<u64> {
     let columns = table.columns.clone();
     let original_rows = table.rows.clone();
@@ -4782,20 +4853,30 @@ fn delete_rows(
 
     for row in original_rows.iter().cloned() {
         let logical_row = column_crypto.decrypt_row(relation_id, &columns, &row)?;
-        if row_matches(&columns, &logical_row, selection)? {
+        if row_matches(&columns, &logical_row, selection, runtime)? {
             affected += 1;
         } else {
             kept.push(row);
         }
     }
 
-    table.rows = kept;
-    if let Err(err) = table.rebuild_indexes() {
+    replace_rows_and_rebuild_indexes(table, kept, original_rows, original_indexes)?;
+    Ok(affected)
+}
+
+fn replace_rows_and_rebuild_indexes(
+    table: &mut MemoryTable,
+    rows: Vec<Row>,
+    original_rows: Vec<Row>,
+    original_indexes: BTreeMap<String, MemoryTableIndex>,
+) -> Result<()> {
+    table.rows = rows;
+    if let Err(error) = table.rebuild_indexes() {
         table.rows = original_rows;
         table.indexes = original_indexes;
-        return Err(err);
+        return Err(error);
     }
-    Ok(affected)
+    Ok(())
 }
 
 fn compile_assignments(
@@ -4829,52 +4910,73 @@ fn insert_values(
     table: &mut MemoryTable,
     relation_id: RelationId,
     columns: &[String],
-    values: &[Expr],
+    values: &[SqlValue],
     column_crypto: &ColumnCryptoState,
 ) -> Result<()> {
-    if columns.len() != values.len() {
+    validate_insert_inputs(table.columns(), columns, values.len())?;
+    let row_values = table
+        .columns()
+        .iter()
+        .map(|column| insert_value_for_column(column, columns, values))
+        .collect();
+    let mut row = Row::new(row_values);
+    recompute_generated_values(table.columns(), &mut row)?;
+    let row = column_crypto.encrypt_insert_row(relation_id, table.columns(), &row)?;
+    table.insert(row)
+}
+
+fn validate_insert_inputs(
+    table_columns: &[ColumnSchema],
+    columns: &[String],
+    value_count: usize,
+) -> Result<()> {
+    if columns.len() != value_count {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!(
                 "insert column count {} does not match value count {}",
                 columns.len(),
-                values.len()
+                value_count
             ),
         ));
     }
-
     for (index, column) in columns.iter().enumerate() {
-        if columns[..index].iter().any(|existing| existing == column) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("duplicate insert column: {column}"),
-            ));
-        }
-        let column_index = column_index(table.columns(), column)?;
-        if table.columns()[column_index].generated().is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("cannot insert explicit value for generated column {column}"),
-            ));
-        }
+        validate_insert_column(table_columns, columns, index, column)?;
     }
+    Ok(())
+}
 
-    let mut row_values = Vec::with_capacity(table.columns().len());
-    for table_column in table.columns() {
-        let value = match columns
-            .iter()
-            .position(|column| column == table_column.name())
-        {
-            Some(index) => literal_value(&values[index])?,
-            None => SqlValue::Null,
-        };
-        row_values.push(value);
+fn validate_insert_column(
+    table_columns: &[ColumnSchema],
+    columns: &[String],
+    index: usize,
+    column: &str,
+) -> Result<()> {
+    if columns[..index].iter().any(|existing| existing == column) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("duplicate insert column: {column}"),
+        ));
     }
+    let column_index = column_index(table_columns, column)?;
+    if table_columns[column_index].generated().is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("cannot insert explicit value for generated column {column}"),
+        ));
+    }
+    Ok(())
+}
 
-    let mut row = Row::new(row_values);
-    recompute_generated_values(table.columns(), &mut row)?;
-    let row = column_crypto.encrypt_insert_row(relation_id, table.columns(), &row)?;
-    table.insert(row)
+fn insert_value_for_column(
+    table_column: &ColumnSchema,
+    columns: &[String],
+    values: &[SqlValue],
+) -> SqlValue {
+    columns
+        .iter()
+        .position(|column| column == table_column.name())
+        .map_or(SqlValue::Null, |index| values[index].clone())
 }
 
 fn join_sideways_lookup_rows(
@@ -8057,11 +8159,16 @@ fn text_vector_from_search_value(value: SqlValue, function: &str) -> Result<Opti
     }
 }
 
-fn row_matches(columns: &[ColumnSchema], row: &Row, selection: Option<&Expr>) -> Result<bool> {
+fn row_matches(
+    columns: &[ColumnSchema],
+    row: &Row,
+    selection: Option<&Expr>,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<bool> {
     let Some(selection) = selection else {
         return Ok(true);
     };
-    eval_predicate(columns, row, selection)
+    eval_predicate_with_runtime(runtime, columns, row, selection)
 }
 
 fn column_index(columns: &[ColumnSchema], name: &str) -> Result<usize> {
