@@ -3,8 +3,9 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundIndexKey, BoundJoin, BoundStatement, ColumnDef, CreateFunctionImplementation,
-    ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName, OrderByExpr, TransactionAction,
+    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundStatement, BoundUnion, ColumnDef,
+    CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName,
+    OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -533,66 +534,11 @@ impl LogicalPlanner {
                 };
                 self.plan_select_join(&join_select.select, &join_select.join, input)
             }
-            BoundStatement::Union(union) => Ok(LogicalPlan::Union {
-                all: union.all,
-                left: Box::new(self.plan(&union.left)?),
-                right: Box::new(self.plan(&union.right)?),
-            }),
-            BoundStatement::Intersect(intersect) => Ok(LogicalPlan::Intersect {
-                all: intersect.all,
-                left: Box::new(self.plan(&intersect.left)?),
-                right: Box::new(self.plan(&intersect.right)?),
-            }),
-            BoundStatement::Except(except) => Ok(LogicalPlan::Except {
-                all: except.all,
-                left: Box::new(self.plan(&except.left)?),
-                right: Box::new(self.plan(&except.right)?),
-            }),
-            BoundStatement::RecursiveCte(cte) => {
-                let seed = self.plan(&cte.seed)?;
-                let recursive_input = LogicalPlan::RecursiveScan {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                };
-                let recursive = self.plan_select_with_input(
-                    bound_select_from_statement(&cte.recursive)?,
-                    recursive_input,
-                    false,
-                )?;
-                let query_input = LogicalPlan::RecursiveScan {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                };
-                let query = self.plan_select_with_input(&cte.query, query_input, false)?;
-                Ok(LogicalPlan::RecursiveCte {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                    seed: Box::new(seed),
-                    recursive: Box::new(recursive),
-                    query: Box::new(query),
-                })
-            }
-            BoundStatement::Query(query) => {
-                let plan = self.plan(&query.input)?;
-                Ok(apply_query_tail(
-                    plan,
-                    &query.order_by,
-                    query.limit,
-                    query.offset,
-                ))
-            }
+            BoundStatement::Union(union) => self.plan_union(union),
+            BoundStatement::Intersect(intersect) => self.plan_intersect(intersect),
+            BoundStatement::Except(except) => self.plan_except(except),
+            BoundStatement::RecursiveCte(cte) => self.plan_recursive_cte(cte),
+            BoundStatement::Query(query) => self.plan_query(query),
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -676,12 +622,92 @@ impl LogicalPlanner {
                 analyze,
                 format,
                 statement,
-            } => Ok(LogicalPlan::Explain {
-                analyze: *analyze,
-                format: *format,
-                input: Box::new(self.plan(statement)?),
-            }),
+            } => self.plan_explain(*analyze, *format, statement),
         }
+    }
+
+    fn plan_union(&self, union: &BoundUnion) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Union {
+            all: union.all,
+            left: Box::new(self.plan(&union.left)?),
+            right: Box::new(self.plan(&union.right)?),
+        })
+    }
+
+    fn plan_intersect(&self, intersect: &BoundIntersect) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Intersect {
+            all: intersect.all,
+            left: Box::new(self.plan(&intersect.left)?),
+            right: Box::new(self.plan(&intersect.right)?),
+        })
+    }
+
+    fn plan_except(&self, except: &BoundExcept) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Except {
+            all: except.all,
+            left: Box::new(self.plan(&except.left)?),
+            right: Box::new(self.plan(&except.right)?),
+        })
+    }
+
+    fn plan_recursive_cte(&self, cte: &rnmdb_sql::ast::BoundRecursiveCte) -> Result<LogicalPlan> {
+        let seed = self.plan(&cte.seed)?;
+        let recursive_input = LogicalPlan::RecursiveScan {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+        };
+        let recursive = self.plan_select_with_input(
+            bound_select_from_statement(&cte.recursive)?,
+            recursive_input,
+            false,
+        )?;
+        let query_input = LogicalPlan::RecursiveScan {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+        };
+        let query = self.plan_select_with_input(&cte.query, query_input, false)?;
+        Ok(LogicalPlan::RecursiveCte {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query: Box::new(query),
+        })
+    }
+
+    fn plan_query(&self, query: &rnmdb_sql::ast::BoundQuery) -> Result<LogicalPlan> {
+        let plan = self.plan(&query.input)?;
+        Ok(apply_query_tail(
+            plan,
+            &query.order_by,
+            query.limit,
+            query.offset,
+        ))
+    }
+
+    fn plan_explain(
+        &self,
+        analyze: bool,
+        format: ExplainFormat,
+        statement: &BoundStatement,
+    ) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Explain {
+            analyze,
+            format,
+            input: Box::new(self.plan(statement)?),
+        })
     }
 
     fn plan_select_with_input(
