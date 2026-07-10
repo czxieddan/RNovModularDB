@@ -1568,7 +1568,11 @@ impl Parser {
                             right: Box::new(right),
                         });
                     }
-                    Ok(Expr::Call { name, args })
+                    Ok(Expr::Call {
+                        function_id: None,
+                        name,
+                        args,
+                    })
                 } else {
                     match name.schema() {
                         Some(qualifier) => Ok(Expr::QualifiedIdentifier {

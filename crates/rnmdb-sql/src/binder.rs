@@ -972,6 +972,7 @@ impl<'a> Binder<'a> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Insert)?;
         let mut bound_columns = Vec::with_capacity(columns.len());
+        let mut bound_values = Vec::with_capacity(values.len());
         for (ident, value) in columns.iter().zip(values) {
             let column = self.resolve_column(table, ident.as_str())?;
             if column.generated.is_some() {
@@ -983,14 +984,17 @@ impl<'a> Binder<'a> {
                     ),
                 ));
             }
-            self.ensure_expr_assignable(table, &column, value)?;
+            let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+            let value = self.bind_function_calls(value, &mut infer)?;
+            self.ensure_expr_assignable(table, &column, &value)?;
             bound_columns.push(column);
+            bound_values.push(value);
         }
         Ok(BoundStatement::Insert {
             relation_id: table.relation_id(),
             table: table_name.clone(),
             columns: bound_columns,
-            values: values.to_vec(),
+            values: bound_values,
         })
     }
 
@@ -1003,34 +1007,49 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Update)?;
-
-        let mut bound_assignments = Vec::with_capacity(assignments.len());
-        for assignment in assignments {
-            let column = self.resolve_column(table, assignment.column.as_str())?;
-            if column.generated.is_some() {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("cannot update generated column {}", column.name),
-                ));
-            }
-            self.ensure_expr_assignable(table, &column, &assignment.value)?;
-            bound_assignments.push(BoundAssignment {
-                column,
-                value: assignment.value.clone(),
-            });
-        }
-        if let Some(selection) = selection {
-            self.validate_predicate(table, selection)?;
-        }
-
+        let bound_assignments = assignments
+            .iter()
+            .map(|assignment| self.bind_update_assignment(table, assignment))
+            .collect::<Result<Vec<_>>>()?;
+        let selection = self.bind_table_selection(table, selection)?;
         Ok(BoundStatement::Update(BoundUpdate {
             relation_id: table.relation_id(),
             table: table_name.clone(),
             assignments: bound_assignments,
-            selection: selection.clone(),
+            selection,
             applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
             row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
+    }
+
+    fn bind_update_assignment(
+        &self,
+        table: &Table,
+        assignment: &Assignment,
+    ) -> Result<BoundAssignment> {
+        let column = self.resolve_column(table, assignment.column.as_str())?;
+        if column.generated.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot update generated column {}", column.name),
+            ));
+        }
+        let value = self.rewrite_table_qualified_expr(table, &assignment.value)?;
+        self.ensure_expr_assignable(table, &column, &value)?;
+        Ok(BoundAssignment { column, value })
+    }
+
+    fn bind_table_selection(
+        &self,
+        table: &Table,
+        selection: &Option<Expr>,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.rewrite_table_qualified_expr(table, selection)?;
+        self.validate_predicate(table, &selection)?;
+        Ok(Some(selection))
     }
 
     fn bind_except(
@@ -1060,14 +1079,12 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Delete)?;
-        if let Some(selection) = selection {
-            self.validate_predicate(table, selection)?;
-        }
+        let selection = self.bind_table_selection(table, selection)?;
 
         Ok(BoundStatement::Delete(BoundDelete {
             relation_id: table.relation_id(),
             table: table_name.clone(),
-            selection: selection.clone(),
+            selection,
             applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
             row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
@@ -3270,7 +3287,11 @@ impl<'a> Binder<'a> {
                 )?),
                 bounds: *bounds,
             }),
-            Expr::Call { name, args } => args
+            Expr::Call {
+                function_id,
+                name,
+                args,
+            } => args
                 .iter()
                 .map(|arg| {
                     self.rewrite_grouped_having_expr(
@@ -3284,6 +3305,7 @@ impl<'a> Binder<'a> {
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(|args| Expr::Call {
+                    function_id: *function_id,
                     name: name.clone(),
                     args,
                 }),
@@ -3805,10 +3827,45 @@ impl<'a> Binder<'a> {
     }
 
     fn rewrite_table_qualified_expr(&self, table: &Table, expr: &Expr) -> Result<Expr> {
-        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             self.ensure_table_qualifier(table, qualifier)?;
             let _ = self.resolve_column(table, name.as_str())?;
             Ok(Expr::Identifier(name.clone()))
+        })?;
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
+    }
+
+    fn bind_function_calls<F>(&self, expr: &Expr, infer: &mut F) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        rewrite_expr_tree(expr, &mut |candidate| {
+            let Expr::Call { name, args, .. } = candidate else {
+                return Ok(None);
+            };
+            let mut bound_args = Vec::with_capacity(args.len());
+            for arg in args {
+                bound_args.push(self.bind_function_calls(arg, infer)?);
+            }
+            let Some(argument_types) = self.infer_expr_type_list(&bound_args, |arg| infer(arg))?
+            else {
+                return Ok(None);
+            };
+            let function = self
+                .catalog
+                .get_function(name.object(), &argument_types)
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("function does not exist: {name}"),
+                    )
+                })?;
+            Ok(Some(Expr::Call {
+                function_id: Some(function.function_id()),
+                name: name.clone(),
+                args: bound_args,
+            }))
         })
     }
 
@@ -3818,9 +3875,14 @@ impl<'a> Binder<'a> {
         expr: &Expr,
         outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<Expr> {
-        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             self.rewrite_table_qualified_identifier(table, outer_scope, qualifier, name)
-        })
+        })?;
+        let mut infer = |candidate: &Expr| {
+            let typed = self.replace_outer_refs_for_type_validation(candidate, outer_scope)?;
+            self.infer_expr_type(table, &typed)
+        };
+        self.bind_function_calls(&rewritten, &mut infer)
     }
 
     fn rewrite_table_qualified_identifier(
@@ -3916,7 +3978,7 @@ impl<'a> Binder<'a> {
     }
 
     fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
-        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             let matches = columns
                 .iter()
                 .filter(|column| {
@@ -3935,7 +3997,11 @@ impl<'a> Binder<'a> {
                     format!("ambiguous qualified column reference: {qualifier}.{name}"),
                 )),
             }
-        })
+        })?;
+        let bound_columns = lateral_columns_to_bound(columns);
+        let mut infer =
+            |candidate: &Expr| self.infer_expr_type_from_columns(&bound_columns, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
     }
 
     fn rewrite_cte_expr(&self, columns: &[BoundColumn], expr: &Expr) -> Result<Expr> {
@@ -3951,7 +4017,8 @@ impl<'a> Binder<'a> {
             }
         })?;
         self.validate_cte_identifiers(columns, &rewritten)?;
-        Ok(rewritten)
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
     }
 
     fn validate_cte_identifiers(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
@@ -4476,7 +4543,7 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_cast_result_type(&source_type, data_type)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 let Some(argument_types) =
                     self.infer_expr_type_list(args, |arg| self.infer_policy_expr_type(table, arg))?
                 else {
@@ -4730,7 +4797,7 @@ impl<'a> Binder<'a> {
                 };
                 self.infer_cast_result_type(&source_type, data_type)
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 let Some(argument_types) =
                     self.infer_expr_type_list(args, |arg| self.infer_expr_type(table, arg))?
                 else {

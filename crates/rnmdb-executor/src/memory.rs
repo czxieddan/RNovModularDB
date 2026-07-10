@@ -6651,7 +6651,7 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             else_expr,
         } => projection_case_type(columns, operand.as_deref(), whens, else_expr.as_deref()),
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
-        Expr::Call { name, args } => projection_call_type(columns, name.object(), args),
+        Expr::Call { name, args, .. } => projection_call_type(columns, name.object(), args),
     }
 }
 
@@ -7044,7 +7044,7 @@ fn eval_expr(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<SqlValu
             else_expr.as_deref(),
         ),
         Expr::Cast { expr, data_type } => eval_cast_expr(columns, row, expr, data_type),
-        Expr::Call { name, args } => eval_call_expr(columns, row, name.object(), args),
+        Expr::Call { name, args, .. } => eval_call_expr(columns, row, name.object(), args),
     }
 }
 

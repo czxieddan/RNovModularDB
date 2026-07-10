@@ -239,6 +239,7 @@ pub enum Expr {
         data_type: SqlType,
     },
     Call {
+        function_id: Option<FunctionId>,
         name: ObjectName,
         args: Vec<Expr>,
     },
@@ -462,7 +463,7 @@ impl fmt::Display for Expr {
             Self::Cast { expr, data_type } => {
                 write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
             }
-            Self::Call { name, args } => {
+            Self::Call { name, args, .. } => {
                 write!(f, "{name}(")?;
                 for (index, arg) in args.iter().enumerate() {
                     if index > 0 {

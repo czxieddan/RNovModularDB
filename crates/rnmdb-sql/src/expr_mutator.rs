@@ -222,11 +222,16 @@ where
                 data_type: data_type.clone(),
             }
             .into()),
-            Expr::Call { name, args } => args
+            Expr::Call {
+                function_id,
+                name,
+                args,
+            } => args
                 .iter()
                 .map(|arg| self.rewrite_expr(arg))
                 .collect::<Result<Vec<_>>>()
                 .map(|args| Expr::Call {
+                    function_id: *function_id,
                     name: name.clone(),
                     args,
                 })
