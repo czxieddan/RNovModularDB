@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
+    fmt,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -12,14 +14,14 @@ use rnmdb_catalog::{
 };
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
-    ids::{DatabaseId, RelationId, RoleId},
+    ids::{DatabaseId, FunctionId, RelationId, RoleId},
 };
 use rnmdb_executor::{
     durable::{
         DurableExecutorImage, read_image_from_single_file_backend,
         write_image_to_single_file_backend,
     },
-    memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
+    memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig, ScalarFunctionRuntime},
     vector::VectorBatch,
 };
 use rnmdb_planner::{
@@ -82,6 +84,36 @@ struct LocalTransactionState {
     catalog_snapshot: Catalog,
     executor_snapshot: MemoryExecutor,
     udf_registry_snapshot: UdfRegistry,
+}
+
+struct SessionWasmRuntime {
+    registry: UdfRegistry,
+    runtime: WasmScalarRuntime,
+}
+
+impl fmt::Debug for SessionWasmRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionWasmRuntime")
+            .field("registered_functions", &self.registry.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScalarFunctionRuntime for SessionWasmRuntime {
+    fn return_type(&self, function_id: FunctionId) -> Option<SqlType> {
+        self.registry
+            .resolve_by_id(function_id)
+            .and_then(UdfDefinition::return_type)
+            .cloned()
+    }
+
+    fn execute(&self, function_id: FunctionId, arguments: &[SqlValue]) -> Result<Option<SqlValue>> {
+        let Some(definition) = self.registry.resolve_by_id(function_id) else {
+            return Ok(None);
+        };
+        self.runtime.execute_scalar(definition, arguments).map(Some)
+    }
 }
 
 impl LocalTransactionState {
@@ -435,7 +467,7 @@ impl LocalSession {
         executor.set_active_role(role_id);
         let wasm_runtime = WasmScalarRuntime::new()?;
         let udf_registry = rebuild_udf_registry(&catalog, &wasm_runtime)?;
-        Ok(Self {
+        let mut session = Self {
             catalog,
             role_id,
             executor,
@@ -449,7 +481,17 @@ impl LocalSession {
             durable,
             transaction_manager: TransactionManager::new(),
             transaction: None,
-        })
+        };
+        session.refresh_scalar_function_runtime();
+        Ok(session)
+    }
+
+    fn refresh_scalar_function_runtime(&mut self) {
+        self.executor
+            .set_scalar_function_runtime(Some(Arc::new(SessionWasmRuntime {
+                registry: self.udf_registry.clone(),
+                runtime: self.wasm_runtime.clone(),
+            })));
     }
 
     fn encode_durable_image(&self) -> Result<Vec<u8>> {
@@ -677,6 +719,7 @@ impl LocalSession {
         self.catalog = transaction.catalog_snapshot;
         self.executor = transaction.executor_snapshot;
         self.udf_registry = transaction.udf_registry_snapshot;
+        self.refresh_scalar_function_runtime();
         Ok(CommandOutput::SchemaChanged)
     }
 
@@ -861,6 +904,7 @@ impl LocalSession {
             .unregister(function.function_id())
             .is_some()
         {
+            self.refresh_scalar_function_runtime();
             return Ok(());
         }
         self.catalog = catalog_snapshot;
@@ -1096,6 +1140,7 @@ impl LocalSession {
         )?;
         self.udf_registry
             .register_with_id(function.function_id(), definition)?;
+        self.refresh_scalar_function_runtime();
         Ok(())
     }
 
