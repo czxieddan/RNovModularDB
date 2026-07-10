@@ -131,7 +131,13 @@ impl ColumnCryptoState {
             return Ok(value.clone());
         }
         let SqlValue::Bytes(encrypted) = value else {
-            return Ok(value.clone());
+            return Err(RnovError::new(
+                ErrorKind::Security,
+                format!(
+                    "encrypted column value is not ciphertext: {relation_id}.{}",
+                    column.name()
+                ),
+            ));
         };
         let key = self.encrypted_column(relation_id, column.name())?;
         self.ensure_decrypt_authorized(relation_id, column.name(), key)?;
