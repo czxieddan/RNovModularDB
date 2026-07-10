@@ -1642,53 +1642,74 @@ fn validate_index_keys(table: &Table, keys: &[IndexKey], method: IndexMethod) ->
 
     let mut seen = BTreeMap::new();
     for key in keys {
-        match key {
-            IndexKey::Column(column) => {
-                validate_identifier("index column", column)?;
-                if seen.insert(format!("column:{column}"), ()).is_some() {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("duplicate index column: {column}"),
-                    ));
-                }
-                if table
-                    .columns
-                    .iter()
-                    .all(|existing| existing.name != *column)
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("index column does not exist: {column}"),
-                    ));
-                }
-            }
-            IndexKey::Expression(expr) => {
-                if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "expression indexes support only btree and hash methods",
-                    ));
-                }
-                if keys.len() != 1 {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "expression indexes support exactly one expression",
-                    ));
-                }
-                if expr.trim().is_empty() {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "index expression cannot be empty",
-                    ));
-                }
-                if seen.insert(format!("expr:{expr}"), ()).is_some() {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("duplicate index expression: {expr}"),
-                    ));
-                }
-            }
-        }
+        validate_index_key(table, key, keys.len(), method, &mut seen)?;
+    }
+    Ok(())
+}
+
+fn validate_index_key(
+    table: &Table,
+    key: &IndexKey,
+    key_count: usize,
+    method: IndexMethod,
+    seen: &mut BTreeMap<String, ()>,
+) -> Result<()> {
+    match key {
+        IndexKey::Column(column) => validate_index_column(table, column, seen),
+        IndexKey::Expression(expr) => validate_index_expression(expr, key_count, method, seen),
+    }
+}
+
+fn validate_index_column(
+    table: &Table,
+    column: &str,
+    seen: &mut BTreeMap<String, ()>,
+) -> Result<()> {
+    validate_identifier("index column", column)?;
+    if seen.insert(format!("column:{column}"), ()).is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("duplicate index column: {column}"),
+        ));
+    }
+    if table.columns.iter().any(|existing| existing.name == column) {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::NotFound,
+        format!("index column does not exist: {column}"),
+    ))
+}
+
+fn validate_index_expression(
+    expr: &str,
+    key_count: usize,
+    method: IndexMethod,
+    seen: &mut BTreeMap<String, ()>,
+) -> Result<()> {
+    if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "expression indexes support only btree and hash methods",
+        ));
+    }
+    if key_count != 1 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "expression indexes support exactly one expression",
+        ));
+    }
+    if expr.trim().is_empty() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "index expression cannot be empty",
+        ));
+    }
+    if seen.insert(format!("expr:{expr}"), ()).is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("duplicate index expression: {expr}"),
+        ));
     }
     Ok(())
 }
