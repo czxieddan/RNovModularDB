@@ -289,11 +289,7 @@ impl LocalSession {
                 column,
                 encrypted,
                 ..
-            } => {
-                self.apply_catalog_set_column_encrypted(table, column.as_str(), *encrypted)?;
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
+            } => self.execute_alter_column_encryption(&bound, table, column.as_str(), *encrypted),
             BoundStatement::DropTable {
                 name, if_exists, ..
             } => {
@@ -931,6 +927,25 @@ impl LocalSession {
         self.catalog
             .set_column_encrypted(schema, table.object(), column, encrypted)?;
         Ok(())
+    }
+
+    fn execute_alter_column_encryption(
+        &mut self,
+        statement: &BoundStatement,
+        table: &ObjectName,
+        column: &str,
+        encrypted: bool,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(statement)?;
+        let catalog_snapshot = self.catalog.clone();
+        self.apply_catalog_set_column_encrypted(table, column, encrypted)?;
+        match self.executor.execute_mut(&plan) {
+            Ok(output) => Ok(CommandOutput::from(output)),
+            Err(error) => {
+                self.catalog = catalog_snapshot;
+                Err(error)
+            }
+        }
     }
 
     fn apply_catalog_drop_table(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {

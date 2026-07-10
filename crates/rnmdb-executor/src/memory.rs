@@ -603,6 +603,15 @@ impl MemoryTable {
     fn set_column_encrypted(&mut self, column: &str, encrypted: bool) -> Result<()> {
         let mut columns = self.columns.clone();
         let column_index = column_index(&columns, column)?;
+        if columns[column_index].is_encrypted() == encrypted {
+            return Ok(());
+        }
+        if !self.rows.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot change encryption metadata for non-empty table column: {column}"),
+            ));
+        }
         columns[column_index] = columns[column_index].clone().with_encrypted(encrypted);
         let _ = VectorBatch::new(columns.clone(), self.rows.clone())?;
         self.columns = columns;
