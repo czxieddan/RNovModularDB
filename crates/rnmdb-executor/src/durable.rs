@@ -1,6 +1,6 @@
 use crc::{CRC_32_ISCSI, Crc};
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::PageId};
-use rnmdb_storage::{Page, PageSize, StorageBackend};
+use rnmdb_storage::{Page, PageSize, SingleFileBackend, StorageBackend};
 
 const IMAGE_MAGIC: [u8; 8] = *b"RNOVSQL1";
 const IMAGE_VERSION: u16 = 1;
@@ -93,14 +93,39 @@ pub fn write_image_to_backend(
     Ok(())
 }
 
+pub fn write_image_to_single_file_backend(
+    backend: &mut SingleFileBackend,
+    page_size: PageSize,
+    image: &[u8],
+) -> Result<()> {
+    let frame = encode_page_frame(page_size, image)?;
+    let payloads = frame
+        .chunks(page_size.bytes())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    backend.commit_catalog_pages(&payloads)?;
+    Ok(())
+}
+
 pub fn read_image_from_backend(backend: &dyn StorageBackend) -> Result<Option<Vec<u8>>> {
-    let Some(first_page) = backend.read_page(PageId::new(FIRST_IMAGE_PAGE_ID))? else {
+    read_image_from_root(backend, PageId::new(FIRST_IMAGE_PAGE_ID))
+}
+
+pub fn read_image_from_single_file_backend(backend: &SingleFileBackend) -> Result<Option<Vec<u8>>> {
+    let root = backend
+        .catalog_root()
+        .unwrap_or_else(|| PageId::new(FIRST_IMAGE_PAGE_ID));
+    read_image_from_root(backend, root)
+}
+
+fn read_image_from_root(backend: &dyn StorageBackend, root: PageId) -> Result<Option<Vec<u8>>> {
+    let Some(first_page) = backend.read_page(root)? else {
         return Ok(None);
     };
     let metadata = FrameMetadata::decode(first_page.payload())?;
     let mut frame = first_page.payload().to_vec();
     for index in 1..metadata.page_count {
-        frame.extend_from_slice(read_frame_page(backend, index)?.payload());
+        frame.extend_from_slice(read_frame_page(backend, root, index)?.payload());
     }
     metadata.extract_image(&frame).map(Some)
 }
@@ -160,8 +185,8 @@ fn page_count_for_image(page_size: PageSize, image_len: usize) -> Result<usize> 
     Ok(frame_len.div_ceil(page_size.bytes()))
 }
 
-fn read_frame_page(backend: &dyn StorageBackend, index: usize) -> Result<Page> {
-    let page_id = page_id_for_chunk(index)?;
+fn read_frame_page(backend: &dyn StorageBackend, root: PageId, index: usize) -> Result<Page> {
+    let page_id = page_id_for_root_chunk(root, index)?;
     backend.read_page(page_id)?.ok_or_else(|| {
         RnovError::new(
             ErrorKind::Corruption,
@@ -171,13 +196,20 @@ fn read_frame_page(backend: &dyn StorageBackend, index: usize) -> Result<Page> {
 }
 
 fn page_id_for_chunk(index: usize) -> Result<PageId> {
+    page_id_for_root_chunk(PageId::new(FIRST_IMAGE_PAGE_ID), index)
+}
+
+fn page_id_for_root_chunk(root: PageId, index: usize) -> Result<PageId> {
     let offset = u64::try_from(index).map_err(|_| {
         RnovError::new(
             ErrorKind::InvalidInput,
             "durable image page index is too large",
         )
     })?;
-    Ok(PageId::new(FIRST_IMAGE_PAGE_ID + offset))
+    root.get()
+        .checked_add(offset)
+        .map(PageId::new)
+        .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "durable image page id overflow"))
 }
 
 fn ensure_image_magic(bytes: &[u8]) -> Result<()> {

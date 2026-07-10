@@ -9,7 +9,10 @@ use rnmdb_common::{
     ids::{DatabaseId, RelationId, RoleId},
 };
 use rnmdb_executor::{
-    durable::{DurableExecutorImage, read_image_from_backend, write_image_to_backend},
+    durable::{
+        DurableExecutorImage, read_image_from_single_file_backend,
+        write_image_to_single_file_backend,
+    },
     memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
     vector::VectorBatch,
 };
@@ -111,13 +114,14 @@ impl LocalSession {
 
     pub fn checkpoint(&mut self) -> Result<()> {
         let image = self.encode_durable_image()?;
-        let durable = self.durable.as_ref().ok_or_else(|| {
+        let durable = self.durable.as_mut().ok_or_else(|| {
             RnovError::new(
                 ErrorKind::InvalidInput,
                 "local session has no durable storage backend",
             )
         })?;
-        write_image_to_backend(&durable.backend, durable.backend.page_size(), &image)
+        let page_size = durable.backend.page_size();
+        write_image_to_single_file_backend(&mut durable.backend, page_size, &image)
     }
 
     pub fn configure_column_encryption(
@@ -1258,7 +1262,7 @@ fn load_session_from_backend(
     backend: &SingleFileBackend,
     execution: LocalExecutionConfig,
 ) -> Result<LocalSession> {
-    match read_image_from_backend(backend)? {
+    match read_image_from_single_file_backend(backend)? {
         Some(image) => decode_session_image(&image, execution),
         None => LocalSession::memory_with_execution(execution),
     }
