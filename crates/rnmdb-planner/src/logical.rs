@@ -945,8 +945,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             negated,
             input,
         } => {
-            let op = if *negated { "NOT IN" } else { "IN" };
-            out.push_str(&format!("{prefix}InSubqueryFilter expr={expr} op={op}\n"));
+            out.push_str(&format!(
+                "{prefix}InSubqueryFilter expr={expr} op={}\n",
+                subquery_operator(*negated, "IN")
+            ));
             write_plan(input, indent + 1, out);
             write_plan(subquery, indent + 1, out);
         }
@@ -955,8 +957,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             negated,
             input,
         } => {
-            let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
-            out.push_str(&format!("{prefix}ExistsSubqueryFilter op={op}\n"));
+            out.push_str(&format!(
+                "{prefix}ExistsSubqueryFilter op={}\n",
+                subquery_operator(*negated, "EXISTS")
+            ));
             write_plan(input, indent + 1, out);
             write_plan(subquery, indent + 1, out);
         }
@@ -1054,14 +1058,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             let items = items
                 .iter()
-                .map(|item| match &item.kind {
-                    GroupedAggregateItemKind::GroupKey(expr) => {
-                        format!("{} := {}", item.name, expr)
-                    }
-                    GroupedAggregateItemKind::Aggregate(function) => {
-                        format!("{} := {}", item.name, aggregate_function_name(function))
-                    }
-                })
+                .map(grouped_aggregate_item_name)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
@@ -1082,32 +1079,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             let grouping_sets = grouping_sets
                 .iter()
-                .map(|grouping_set| {
-                    if grouping_set.is_empty() {
-                        "()".to_string()
-                    } else {
-                        format!(
-                            "({})",
-                            grouping_set
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    }
-                })
+                .map(|grouping_set| grouping_set_name(grouping_set))
                 .collect::<Vec<_>>()
                 .join(", ");
             let items = items
                 .iter()
-                .map(|item| match &item.kind {
-                    GroupedAggregateItemKind::GroupKey(expr) => {
-                        format!("{} := {}", item.name, expr)
-                    }
-                    GroupedAggregateItemKind::Aggregate(function) => {
-                        format!("{} := {}", item.name, aggregate_function_name(function))
-                    }
-                })
+                .map(grouped_aggregate_item_name)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
@@ -1120,20 +1097,17 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Union { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Union {mode}\n"));
+            out.push_str(&format!("{prefix}Union {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
         LogicalPlan::Intersect { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Intersect {mode}\n"));
+            out.push_str(&format!("{prefix}Intersect {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
         LogicalPlan::Except { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Except {mode}\n"));
+            out.push_str(&format!("{prefix}Except {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
@@ -1190,31 +1164,24 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .map(|(column, expr)| format!("{column} = {expr}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push_str(&format!("{prefix}Update table={table} set={assignments}"));
-            if let Some(selection) = selection {
-                out.push_str(&format!(" where={selection}"));
-            }
-            out.push('\n');
+            out.push_str(&format!(
+                "{prefix}Update table={table} set={assignments}{}\n",
+                selection_suffix(selection.as_ref())
+            ));
         }
         LogicalPlan::Delete {
             table, selection, ..
         } => {
-            out.push_str(&format!("{prefix}Delete table={table}"));
-            if let Some(selection) = selection {
-                out.push_str(&format!(" where={selection}"));
-            }
-            out.push('\n');
+            out.push_str(&format!(
+                "{prefix}Delete table={table}{}\n",
+                selection_suffix(selection.as_ref())
+            ));
         }
         LogicalPlan::CreateTable {
             table,
             columns,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateTable table={table} columns={}{}\n",
                 columns
@@ -1222,7 +1189,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .map(|column| column.name.as_str().to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
-                exists
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::CreateIndex {
@@ -1234,12 +1201,6 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let mode = if *unique { "unique " } else { "" };
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateIndex {mode}name={name} table={table} method={} keys={}{}\n",
                 method.as_str(),
@@ -1247,7 +1208,8 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", "),
-                exists
+                if_not_exists_suffix(*if_not_exists),
+                mode = unique_prefix(*unique)
             ));
         }
         LogicalPlan::CreateTrigger {
@@ -1258,13 +1220,9 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
-                "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{exists}\n"
+                "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{}\n",
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::AlterTableAddColumn {
@@ -1273,14 +1231,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}AlterTableAddColumn table={table} column={}{}\n",
-                column.name, exists
+                column.name,
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::AlterColumnEncryption {
@@ -1366,15 +1320,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             implementation,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateFunction name={name} args={} returns={return_type:?}{} language={}\n",
                 sql_type_list(argument_types),
-                exists,
+                if_not_exists_suffix(*if_not_exists),
                 create_function_language(implementation)
             ));
         }
@@ -1384,15 +1333,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateProcedure name={name} args={}{}\n",
                 sql_type_list(argument_types),
-                exists
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::CreateOperator {
@@ -1428,12 +1372,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
-            out.push_str(&format!("{prefix}CreateRole name={name}{exists}\n"));
+            out.push_str(&format!(
+                "{prefix}CreateRole name={name}{}\n",
+                if_not_exists_suffix(*if_not_exists)
+            ));
         }
         LogicalPlan::CreatePolicy {
             name,
@@ -1441,13 +1383,9 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             predicate,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
-                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{exists}\n"
+                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{}\n",
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::GrantTablePrivilege {
@@ -1482,12 +1420,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             format,
             input,
         } => {
-            let format = if *format == ExplainFormat::Logical {
-                ""
-            } else {
+            out.push_str(&format!(
+                "{prefix}Explain analyze={analyze}{}\n",
                 explain_format_suffix(*format)
-            };
-            out.push_str(&format!("{prefix}Explain analyze={analyze}{format}\n"));
+            ));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Parallel { hint, input } => {
@@ -1497,6 +1433,57 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             write_plan(input, indent + 1, out);
         }
+    }
+}
+
+fn subquery_operator(negated: bool, operator: &str) -> String {
+    match negated {
+        true => format!("NOT {operator}"),
+        false => operator.to_string(),
+    }
+}
+
+fn grouped_aggregate_item_name(item: &GroupedAggregateItem) -> String {
+    let value = match &item.kind {
+        GroupedAggregateItemKind::GroupKey(expr) => expr.to_string(),
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_function_name(function),
+    };
+    format!("{} := {value}", item.name)
+}
+
+fn grouping_set_name(grouping_set: &[Expr]) -> String {
+    let label = grouping_set
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({label})")
+}
+
+fn set_operation_mode(all: bool) -> &'static str {
+    match all {
+        true => "ALL",
+        false => "DISTINCT",
+    }
+}
+
+fn selection_suffix(selection: Option<&Expr>) -> String {
+    selection
+        .map(|selection| format!(" where={selection}"))
+        .unwrap_or_default()
+}
+
+fn if_not_exists_suffix(if_not_exists: bool) -> &'static str {
+    match if_not_exists {
+        true => " if_not_exists=true",
+        false => "",
+    }
+}
+
+fn unique_prefix(unique: bool) -> &'static str {
+    match unique {
+        true => "unique ",
+        false => "",
     }
 }
 
