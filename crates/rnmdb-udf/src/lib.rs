@@ -121,13 +121,6 @@ impl WasmModuleDefinition {
                 ),
             ));
         }
-        if initial_memory_bytes == 0 {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "wasm module initial memory must be greater than zero",
-            ));
-        }
-
         Ok(Self {
             module_bytes,
             initial_memory_bytes,

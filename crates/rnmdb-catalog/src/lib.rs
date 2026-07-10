@@ -1222,10 +1222,10 @@ fn validate_wasm_function_implementation(
             "wasm function module has an invalid binary header",
         ));
     }
-    if initial_memory_bytes == 0 || initial_memory_bytes > max_memory_bytes {
+    if initial_memory_bytes > max_memory_bytes {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
-            "wasm function initial memory must be nonzero and fit its memory budget",
+            "wasm function initial memory must fit its memory budget",
         ));
     }
     if max_instructions == 0 || timeout_millis == 0 {
