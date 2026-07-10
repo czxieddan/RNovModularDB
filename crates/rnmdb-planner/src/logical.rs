@@ -716,6 +716,24 @@ impl LogicalPlanner {
         mut plan: LogicalPlan,
         include_table_dependent_rewrites: bool,
     ) -> Result<LogicalPlan> {
+        plan = self.plan_select_rewrites(select, plan, include_table_dependent_rewrites)?;
+        plan = self.plan_select_selection(select, plan, include_table_dependent_rewrites)?;
+
+        let mut state = SelectPlanningState::new(select);
+        plan = plan_select_pre_output_sort(plan, &state);
+        plan = self.plan_select_output(select, plan, &mut state);
+        plan = plan_select_having(select, plan);
+        plan = plan_select_post_output_sort(plan, &state);
+        plan = plan_select_internal_outputs(select, plan, state.project_internal_outputs);
+        Ok(plan_select_tail(select, plan))
+    }
+
+    fn plan_select_rewrites(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        mut plan: LogicalPlan,
+        include_table_dependent_rewrites: bool,
+    ) -> Result<LogicalPlan> {
         if include_table_dependent_rewrites {
             for policy in &select.row_policy_predicates {
                 plan = plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
@@ -730,136 +748,39 @@ impl LogicalPlanner {
                 };
             }
         }
+        Ok(plan)
+    }
+
+    fn plan_select_selection(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        plan: LogicalPlan,
+        include_table_dependent_rewrites: bool,
+    ) -> Result<LogicalPlan> {
         if let Some(predicate) = &select.selection {
-            plan = if include_table_dependent_rewrites {
-                self.plan_select_predicate(select.relation_id, &select.table, predicate, plan)?
+            if include_table_dependent_rewrites {
+                self.plan_select_predicate(select.relation_id, &select.table, predicate, plan)
             } else {
-                self.plan_bound_predicate(predicate, plan)?
-            };
-        }
-        let grouping_sets = !select.grouping_sets.is_empty();
-        let grouped = !select.group_by.is_empty() || grouping_sets;
-        let aggregate_functions = select_aggregate_functions(select);
-        let mut order_by = select.order_by.clone();
-        let mut project_internal_outputs =
-            !select.hidden_group_keys.is_empty() || !select.hidden_aggregates.is_empty();
-        if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        let mut plan = if grouped {
-            let mut items = select
-                .projection
-                .iter()
-                .chain(select.hidden_group_keys.iter())
-                .chain(select.hidden_aggregates.iter())
-                .map(|item| GroupedAggregateItem {
-                    name: item.column.name.clone(),
-                    kind: grouped_aggregate_item_kind(&item.expr),
-                })
-                .collect::<Vec<_>>();
-            project_internal_outputs |=
-                add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
-            if grouping_sets {
-                LogicalPlan::GroupingSetsAggregate {
-                    group_by: select.group_by.clone(),
-                    grouping_sets: select.grouping_sets.clone(),
-                    items,
-                    input: Box::new(plan),
-                }
-            } else {
-                LogicalPlan::GroupedAggregate {
-                    group_by: select.group_by.clone(),
-                    items,
-                    input: Box::new(plan),
-                }
+                self.plan_bound_predicate(predicate, plan)
             }
-        } else if let Some(functions) = select_aggregate_functions(select) {
-            LogicalPlan::Aggregate {
-                items: select
-                    .projection
-                    .iter()
-                    .chain(select.hidden_aggregates.iter())
-                    .zip(functions)
-                    .map(|(item, function)| AggregateItem {
-                        name: item.column.name.clone(),
-                        function,
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            }
-        } else {
-            let window_items = select_window_items(select);
-            if !window_items.is_empty() {
-                plan = LogicalPlan::Window {
-                    items: window_items,
-                    input: Box::new(plan),
-                };
-            }
-            LogicalPlan::Project {
-                items: select
-                    .projection
-                    .iter()
-                    .map(|item| ProjectionItem {
-                        name: item.column.name.clone(),
-                        expr: projection_expr_after_windows(item),
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            }
-        };
-        if let Some(predicate) = &select.having {
-            plan = LogicalPlan::Filter {
-                predicate: predicate.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if !grouped && aggregate_functions.is_some() && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if grouped && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if project_internal_outputs {
-            plan = LogicalPlan::Project {
-                items: select
-                    .projection
-                    .iter()
-                    .map(|item| ProjectionItem {
-                        name: item.column.name.clone(),
-                        expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            };
-        }
-        if select.distinct {
-            plan = LogicalPlan::Distinct {
-                input: Box::new(plan),
-            };
-        }
-        if let Some(count) = select.offset {
-            plan = LogicalPlan::Offset {
-                count,
-                input: Box::new(plan),
-            };
-        }
-        if let Some(count) = select.limit {
-            Ok(LogicalPlan::Limit {
-                count,
-                input: Box::new(plan),
-            })
         } else {
             Ok(plan)
         }
+    }
+
+    fn plan_select_output(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        plan: LogicalPlan,
+        state: &mut SelectPlanningState,
+    ) -> LogicalPlan {
+        if state.grouped {
+            return plan_grouped_output(select, plan, state);
+        }
+        if let Some(functions) = &state.aggregate_functions {
+            return plan_scalar_aggregate(select, plan, functions.clone());
+        }
+        plan_window_projection(select, plan)
     }
 
     fn plan_select_join(
@@ -1702,6 +1623,177 @@ fn explain_format_suffix(format: ExplainFormat) -> &'static str {
         ExplainFormat::Costs => " format=costs",
         ExplainFormat::Physical => " format=physical",
     }
+}
+
+struct SelectPlanningState {
+    grouped: bool,
+    aggregate_functions: Option<Vec<AggregateFunction>>,
+    order_by: Vec<OrderByExpr>,
+    project_internal_outputs: bool,
+}
+
+impl SelectPlanningState {
+    fn new(select: &rnmdb_sql::ast::BoundSelect) -> Self {
+        Self {
+            grouped: !select.group_by.is_empty() || !select.grouping_sets.is_empty(),
+            aggregate_functions: select_aggregate_functions(select),
+            order_by: select.order_by.clone(),
+            project_internal_outputs: !select.hidden_group_keys.is_empty()
+                || !select.hidden_aggregates.is_empty(),
+        }
+    }
+}
+
+fn plan_select_pre_output_sort(plan: LogicalPlan, state: &SelectPlanningState) -> LogicalPlan {
+    if !state.grouped && state.aggregate_functions.is_none() && !state.order_by.is_empty() {
+        LogicalPlan::Sort {
+            keys: state.order_by.clone(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_grouped_output(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    state: &mut SelectPlanningState,
+) -> LogicalPlan {
+    let mut items = select
+        .projection
+        .iter()
+        .chain(select.hidden_group_keys.iter())
+        .chain(select.hidden_aggregates.iter())
+        .map(|item| GroupedAggregateItem {
+            name: item.column.name.clone(),
+            kind: grouped_aggregate_item_kind(&item.expr),
+        })
+        .collect::<Vec<_>>();
+    state.project_internal_outputs |=
+        add_grouped_sort_keys(&mut items, &mut state.order_by, &select.group_by);
+    if select.grouping_sets.is_empty() {
+        LogicalPlan::GroupedAggregate {
+            group_by: select.group_by.clone(),
+            items,
+            input: Box::new(plan),
+        }
+    } else {
+        LogicalPlan::GroupingSetsAggregate {
+            group_by: select.group_by.clone(),
+            grouping_sets: select.grouping_sets.clone(),
+            items,
+            input: Box::new(plan),
+        }
+    }
+}
+
+fn plan_scalar_aggregate(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    functions: Vec<AggregateFunction>,
+) -> LogicalPlan {
+    LogicalPlan::Aggregate {
+        items: select
+            .projection
+            .iter()
+            .chain(select.hidden_aggregates.iter())
+            .zip(functions)
+            .map(|(item, function)| AggregateItem {
+                name: item.column.name.clone(),
+                function,
+            })
+            .collect(),
+        input: Box::new(plan),
+    }
+}
+
+fn plan_window_projection(
+    select: &rnmdb_sql::ast::BoundSelect,
+    mut plan: LogicalPlan,
+) -> LogicalPlan {
+    let window_items = select_window_items(select);
+    if !window_items.is_empty() {
+        plan = LogicalPlan::Window {
+            items: window_items,
+            input: Box::new(plan),
+        };
+    }
+    LogicalPlan::Project {
+        items: select
+            .projection
+            .iter()
+            .map(|item| ProjectionItem {
+                name: item.column.name.clone(),
+                expr: projection_expr_after_windows(item),
+            })
+            .collect(),
+        input: Box::new(plan),
+    }
+}
+
+fn plan_select_having(select: &rnmdb_sql::ast::BoundSelect, plan: LogicalPlan) -> LogicalPlan {
+    match &select.having {
+        Some(predicate) => LogicalPlan::Filter {
+            predicate: predicate.clone(),
+            input: Box::new(plan),
+        },
+        None => plan,
+    }
+}
+
+fn plan_select_post_output_sort(plan: LogicalPlan, state: &SelectPlanningState) -> LogicalPlan {
+    if (state.grouped || state.aggregate_functions.is_some()) && !state.order_by.is_empty() {
+        LogicalPlan::Sort {
+            keys: state.order_by.clone(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_select_internal_outputs(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    project_internal_outputs: bool,
+) -> LogicalPlan {
+    if project_internal_outputs {
+        LogicalPlan::Project {
+            items: select
+                .projection
+                .iter()
+                .map(|item| ProjectionItem {
+                    name: item.column.name.clone(),
+                    expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
+                })
+                .collect(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_select_tail(select: &rnmdb_sql::ast::BoundSelect, mut plan: LogicalPlan) -> LogicalPlan {
+    if select.distinct {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = select.offset {
+        plan = LogicalPlan::Offset {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = select.limit {
+        plan = LogicalPlan::Limit {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    plan
 }
 
 fn plan_selection(
