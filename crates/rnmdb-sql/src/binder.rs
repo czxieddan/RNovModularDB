@@ -4906,6 +4906,47 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
         match expr {
+            Expr::Identifier(_) | Expr::QualifiedIdentifier { .. } => {
+                self.infer_column_reference_type(columns, expr)
+            }
+            Expr::Integer(_)
+            | Expr::Float64(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::RuntimeValue(_) => Self::infer_bound_literal_type(expr),
+            Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => {
+                self.infer_column_subquery_type(expr)
+            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_)
+            | Expr::RowNumberOver { .. }
+            | Expr::RankOver { .. }
+            | Expr::DenseRankOver { .. } => Self::reject_column_special_expression(expr),
+            Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. } => {
+                self.infer_column_operator_type(columns, expr)
+            }
+            Expr::Coalesce(_) | Expr::NullIf { .. } => {
+                self.infer_column_null_function_type(columns, expr)
+            }
+            Expr::Call { .. } => self.infer_column_call_type(columns, expr),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported generated column expression: {other}"),
+            )),
+        }
+    }
+
+    fn infer_column_reference_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Identifier(identifier) => columns
                 .iter()
                 .find(|column| column.name.eq_ignore_ascii_case(identifier.as_str()))
@@ -4920,80 +4961,178 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "bound expressions must not contain qualified column references",
             )),
+            _ => Err(column_type_inference_error("column reference")),
+        }
+    }
+
+    fn infer_bound_literal_type(expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
             Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
             Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            _ => Err(column_type_inference_error("literal")),
+        }
+    }
+
+    fn infer_column_subquery_type(&self, expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
             Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
-            Expr::CountStar
-            | Expr::Count(_)
-            | Expr::CountDistinct(_)
-            | Expr::Sum(_)
-            | Expr::Min(_)
-            | Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "aggregate expressions are only supported as SELECT projections",
-            )),
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "window expressions are only supported as SELECT projections",
-                ))
-            }
-            Expr::Binary { left, right, .. } => {
-                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
-                    return Ok(None);
-                };
-                self.infer_operator_result_type(expr, &left_type, &right_type)
-            }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_expr_type_from_columns(columns, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_expr_type_from_columns(columns, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Coalesce(values) => {
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_expr_type_from_columns(columns, value)?
-                    else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
             Expr::InSubquery { query, .. } => {
                 self.infer_bound_predicate_subquery_type(query, "IN subquery")
             }
             Expr::ExistsSubquery { query } => {
                 self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
             }
-            other => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("unsupported generated column expression: {other}"),
-            )),
+            _ => Err(column_type_inference_error("subquery")),
         }
+    }
+
+    fn reject_column_special_expression(expr: &Expr) -> Result<Option<SqlType>> {
+        let message = match expr {
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_) => "aggregate expressions are only supported as SELECT projections",
+            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
+                "window expressions are only supported as SELECT projections"
+            }
+            _ => {
+                return Err(column_type_inference_error(
+                    "aggregate or window expression",
+                ));
+            }
+        };
+        Err(RnovError::new(ErrorKind::InvalidInput, message))
+    }
+
+    fn infer_column_operator_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Binary { left, right, .. } => {
+                self.infer_column_binary_type(columns, expr, left, right)
+            }
+            Expr::Unary { op, expr } => self.infer_column_unary_type(columns, op, expr),
+            Expr::Cast { expr, data_type } => self.infer_column_cast_type(columns, expr, data_type),
+            _ => Err(column_type_inference_error("operator")),
+        }
+    }
+
+    fn infer_column_binary_type(
+        &self,
+        columns: &[BoundColumn],
+        binary: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+            return Ok(None);
+        };
+        self.infer_operator_result_type(binary, &left_type, &right_type)
+    }
+
+    fn infer_column_unary_type(
+        &self,
+        columns: &[BoundColumn],
+        op: &str,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(data_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+            return Ok(None);
+        };
+        self.infer_unary_arithmetic_result_type(op, &data_type)
+    }
+
+    fn infer_column_cast_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+        data_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        let Some(source_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+            return Ok(None);
+        };
+        self.infer_cast_result_type(&source_type, data_type)
+    }
+
+    fn infer_column_null_function_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Coalesce(values) => self.infer_column_coalesce_type(columns, values),
+            Expr::NullIf { left, right } => self.infer_column_nullif_type(columns, left, right),
+            _ => Err(column_type_inference_error("null-handling function")),
+        }
+    }
+
+    fn infer_column_coalesce_type(
+        &self,
+        columns: &[BoundColumn],
+        values: &[Expr],
+    ) -> Result<Option<SqlType>> {
+        let Some(value_types) = self.infer_expr_type_list(values, |value| {
+            self.infer_expr_type_from_columns(columns, value)
+        })?
+        else {
+            return Ok(None);
+        };
+        self.infer_coalesce_result_type(&value_types)
+    }
+
+    fn infer_column_nullif_type(
+        &self,
+        columns: &[BoundColumn],
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+            return Ok(None);
+        };
+        self.infer_nullif_result_type(&left_type, &right_type)
+    }
+
+    fn infer_column_call_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Expr::Call { name, args, .. } = expr else {
+            return Err(column_type_inference_error("function call"));
+        };
+        let Some(argument_types) =
+            self.infer_expr_type_list(args, |arg| self.infer_expr_type_from_columns(columns, arg))?
+        else {
+            return Ok(None);
+        };
+        let function = self
+            .catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name.object() && function.argument_types() == argument_types
+            })
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("function does not exist: {name}"),
+                )
+            })?;
+        Ok(Some(function.return_type().clone()))
     }
 
     fn infer_operator_result_type(
@@ -5474,6 +5613,13 @@ fn policy_unknown_side_operator_type(expr: &Expr) -> Option<SqlType> {
 
 fn deny_default_row_policy_predicate() -> Expr {
     Expr::Bool(false)
+}
+
+fn column_type_inference_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("column type inference received a non-{category} expression"),
+    )
 }
 
 fn operator_signature_with_metadata(

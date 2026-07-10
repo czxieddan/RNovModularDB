@@ -1919,7 +1919,14 @@ impl MemoryExecutor {
                     );
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
+                apply_nested_loop_join_cancellable(
+                    left,
+                    right,
+                    *kind,
+                    &predicate,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             LogicalPlan::HashJoin {
                 kind,
@@ -2933,7 +2940,14 @@ impl MemoryExecutor {
                     );
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
+                apply_nested_loop_join_cancellable(
+                    left,
+                    right,
+                    *kind,
+                    &predicate,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             PhysicalPlan::HashJoin {
                 kind,
@@ -3555,7 +3569,14 @@ impl MemoryExecutor {
                     );
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
+                apply_nested_loop_join_cancellable(
+                    left,
+                    right,
+                    *kind,
+                    &predicate,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             LogicalPlan::HashJoin {
                 kind,
@@ -5974,6 +5995,7 @@ fn apply_nested_loop_join_cancellable(
     right: VectorBatch,
     kind: JoinKind,
     predicate: &Expr,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let columns = joined_columns_for_join(left.columns(), right.columns(), kind)?;
@@ -5987,6 +6009,7 @@ fn apply_nested_loop_join_cancellable(
             &right,
             predicate,
             &mut rows,
+            runtime,
             cancellation,
         )?;
         if kind == JoinKind::Left && !matched {
@@ -6002,13 +6025,14 @@ fn push_matching_join_rows(
     right: &VectorBatch,
     predicate: &Expr,
     rows: &mut Vec<Row>,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<bool> {
     let mut matched = false;
     for right_row in right.rows() {
         cancellation.check()?;
         let row = join_rows(left_row, right_row);
-        if eval_predicate(columns, &row, predicate)? {
+        if eval_predicate_with_runtime(runtime, columns, &row, predicate)? {
             rows.push(row);
             matched = true;
         }
@@ -8043,10 +8067,6 @@ fn bool_truth(value: SqlValue) -> Result<Truth> {
             ),
         )),
     }
-}
-
-fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bool> {
-    predicate_result(eval_expr(columns, row, expr)?)
 }
 
 fn eval_predicate_with_runtime(
