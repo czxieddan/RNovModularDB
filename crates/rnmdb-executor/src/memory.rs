@@ -286,6 +286,7 @@ impl MemoryTable {
         apply_filter_cancellable(
             batch,
             &between_predicate(column, lower, lower_inclusive, upper, upper_inclusive),
+            None,
             &CancellationToken::default(),
         )
     }
@@ -437,6 +438,7 @@ impl MemoryTable {
         apply_filter_cancellable(
             batch,
             &between_predicate(column, lower, lower_inclusive, upper, upper_inclusive),
+            None,
             &CancellationToken::default(),
         )
         .map(Some)
@@ -1847,7 +1849,7 @@ impl MemoryExecutor {
                     return Ok(batch);
                 }
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_filter_cancellable(batch, &predicate, cancellation)
+                self.apply_filter_batch(batch, &predicate, cancellation)
             }
             LogicalPlan::InSubqueryFilter {
                 expr,
@@ -2357,6 +2359,20 @@ impl MemoryExecutor {
         VectorBatch::new(columns, rows)
     }
 
+    fn apply_filter_batch(
+        &self,
+        batch: VectorBatch,
+        predicate: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        apply_filter_cancellable(
+            batch,
+            predicate,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
     fn apply_row_subquery_filter(
         &self,
         batch: VectorBatch,
@@ -2368,7 +2384,12 @@ impl MemoryExecutor {
             cancellation.check()?;
             let predicate =
                 self.resolve_subqueries_for_row(predicate, batch.columns(), row, cancellation)?;
-            if eval_predicate(batch.columns(), row, &predicate)? {
+            if eval_predicate_with_runtime(
+                self.scalar_function_runtime.as_deref(),
+                batch.columns(),
+                row,
+                &predicate,
+            )? {
                 rows.push(row.clone());
             }
         }
@@ -2419,7 +2440,12 @@ impl MemoryExecutor {
             let row = join_rows(left_row, right_row);
             let predicate =
                 self.resolve_subqueries_for_row(predicate, columns, &row, cancellation)?;
-            if eval_predicate(columns, &row, &predicate)? {
+            if eval_predicate_with_runtime(
+                self.scalar_function_runtime.as_deref(),
+                columns,
+                &row,
+                &predicate,
+            )? {
                 rows.push(row);
                 matched = true;
             }
@@ -2930,7 +2956,7 @@ impl MemoryExecutor {
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_filter_cancellable(batch, &predicate, cancellation)
+                self.apply_filter_batch(batch, &predicate, cancellation)
             }
             PhysicalPlan::InSubqueryFilter {
                 expr,
@@ -3103,7 +3129,7 @@ impl MemoryExecutor {
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                apply_filter_cancellable(batch, &predicate, cancellation)
+                self.apply_filter_batch(batch, &predicate, cancellation)
             }
             PhysicalPlan::InSubqueryFilter {
                 expr,
@@ -3459,7 +3485,7 @@ impl MemoryExecutor {
                     return Ok(batch);
                 }
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                apply_filter_cancellable(batch, &predicate, cancellation)
+                self.apply_filter_batch(batch, &predicate, cancellation)
             }
             LogicalPlan::InSubqueryFilter {
                 expr,
@@ -3969,30 +3995,42 @@ impl MemoryExecutor {
         if let Some((expr, value)) = indexable_expression_equality(predicate)
             && let Some(batch) = table.try_expression_index_scan(expr, value)?
         {
-            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            return self
+                .apply_filter_batch(batch, predicate, cancellation)
+                .map(Some);
         }
         if let Some((column, value)) = indexable_equality(predicate) {
             if let Some(batch) = table.try_index_scan(column, value)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+                return self
+                    .apply_filter_batch(batch, predicate, cancellation)
+                    .map(Some);
             }
             if let Some(batch) = table.try_index_skip_scan(column, value)? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+                return self
+                    .apply_filter_batch(batch, predicate, cancellation)
+                    .map(Some);
             }
         }
         if let Some((column, range)) = indexable_range_overlap(predicate)
             && let Some(batch) = table.try_range_overlap_scan(column, range)?
         {
-            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            return self
+                .apply_filter_batch(batch, predicate, cancellation)
+                .map(Some);
         }
         if let Some((column, bounds)) = indexable_bounds_overlap(predicate)
             && let Some(batch) = table.try_bounds_overlap_scan(column, bounds)?
         {
-            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            return self
+                .apply_filter_batch(batch, predicate, cancellation)
+                .map(Some);
         }
         if let Some((column, query)) = indexable_inverted_value(predicate)
             && let Some(batch) = table.try_inverted_value_scan(column, &query)?
         {
-            return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+            return self
+                .apply_filter_batch(batch, predicate, cancellation)
+                .map(Some);
         }
         if let Some(range) = indexable_range(predicate) {
             if let Some(batch) = table.try_block_summary_scan(
@@ -4002,7 +4040,9 @@ impl MemoryExecutor {
                 range.upper,
                 range.upper_inclusive,
             )? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+                return self
+                    .apply_filter_batch(batch, predicate, cancellation)
+                    .map(Some);
             }
             if let Some(batch) = table.try_index_range_scan(
                 range.column,
@@ -4011,7 +4051,9 @@ impl MemoryExecutor {
                 range.upper,
                 range.upper_inclusive,
             )? {
-                return apply_filter_cancellable(batch, predicate, cancellation).map(Some);
+                return self
+                    .apply_filter_batch(batch, predicate, cancellation)
+                    .map(Some);
             }
         }
         Ok(None)
@@ -4902,12 +4944,13 @@ fn recompute_generated_values(columns: &[ColumnSchema], row: &mut Row) -> Result
 fn apply_filter_cancellable(
     batch: VectorBatch,
     predicate: &Expr,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let mut rows = Vec::new();
     for row in batch.rows() {
         cancellation.check()?;
-        if eval_predicate(batch.columns(), row, predicate)? {
+        if eval_predicate_with_runtime(runtime, batch.columns(), row, predicate)? {
             rows.push(row.clone());
         }
     }
@@ -7901,7 +7944,20 @@ fn bool_truth(value: SqlValue) -> Result<Truth> {
 }
 
 fn eval_predicate(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<bool> {
-    match eval_expr(columns, row, expr)? {
+    predicate_result(eval_expr(columns, row, expr)?)
+}
+
+fn eval_predicate_with_runtime(
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    columns: &[ColumnSchema],
+    row: &Row,
+    expr: &Expr,
+) -> Result<bool> {
+    predicate_result(eval_expr_with_runtime(runtime, columns, row, expr)?)
+}
+
+fn predicate_result(value: SqlValue) -> Result<bool> {
+    match value {
         SqlValue::Bool(value) => Ok(value),
         SqlValue::Null => Ok(false),
         other => Err(RnovError::new(
