@@ -592,31 +592,39 @@ impl LocalSession {
     }
 
     fn commit_transaction(&mut self) -> Result<CommandOutput> {
-        let transaction = self.take_transaction("commit")?;
-        self.transaction_manager
-            .commit(transaction.transaction.id())?;
+        let transaction = self.active_transaction("commit")?;
         if self.durable.is_some() {
             self.checkpoint()?;
         }
+        self.transaction_manager.commit(transaction.id())?;
+        self.transaction = None;
         Ok(CommandOutput::SchemaChanged)
     }
 
     fn rollback_transaction(&mut self) -> Result<CommandOutput> {
-        let transaction = self.take_transaction("rollback")?;
-        self.transaction_manager
-            .abort(transaction.transaction.id())?;
+        let active = self.active_transaction("rollback")?;
+        self.transaction_manager.abort(active.id())?;
+        let transaction = self.transaction.take().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "active local transaction disappeared during rollback",
+            )
+        })?;
         self.catalog = transaction.catalog_snapshot;
         self.executor = transaction.executor_snapshot;
         Ok(CommandOutput::SchemaChanged)
     }
 
-    fn take_transaction(&mut self, action: &str) -> Result<LocalTransactionState> {
-        self.transaction.take().ok_or_else(|| {
-            RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("cannot {action} without an active local transaction"),
-            )
-        })
+    fn active_transaction(&self, action: &str) -> Result<Transaction> {
+        self.transaction
+            .as_ref()
+            .map(|state| state.transaction)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot {action} without an active local transaction"),
+                )
+            })
     }
 
     fn apply_catalog_create_table(
