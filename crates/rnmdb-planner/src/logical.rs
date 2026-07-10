@@ -116,6 +116,7 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
     },
     Insert {
+        relation_id: RelationId,
         table: String,
         columns: Vec<String>,
         values: Vec<Expr>,
@@ -485,10 +486,12 @@ impl LogicalPlanner {
                 if_exists: *if_exists,
             }),
             BoundStatement::Insert {
+                relation_id,
                 table,
                 columns,
                 values,
             } => Ok(LogicalPlan::Insert {
+                relation_id: *relation_id,
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
                 values: values.clone(),

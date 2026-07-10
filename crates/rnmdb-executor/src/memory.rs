@@ -3682,6 +3682,7 @@ impl MemoryExecutor {
                 }
             }
             LogicalPlan::Insert {
+                relation_id,
                 table,
                 columns,
                 values,
@@ -3691,7 +3692,7 @@ impl MemoryExecutor {
                 let table = tables.get_mut(table).ok_or_else(|| {
                     RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
                 })?;
-                insert_values(table, columns, values, &column_crypto)?;
+                insert_values(table, *relation_id, columns, values, &column_crypto)?;
                 Ok(ExecutionResult::RowsAffected(1))
             }
             LogicalPlan::Update {
@@ -4714,6 +4715,7 @@ fn compile_assignments(
 
 fn insert_values(
     table: &mut MemoryTable,
+    relation_id: RelationId,
     columns: &[String],
     values: &[Expr],
     column_crypto: &ColumnCryptoState,
@@ -4759,7 +4761,7 @@ fn insert_values(
 
     let mut row = Row::new(row_values);
     recompute_generated_values(table.columns(), &mut row)?;
-    let row = column_crypto.encrypt_insert_row(table.columns(), &row)?;
+    let row = column_crypto.encrypt_insert_row(relation_id, table.columns(), &row)?;
     table.insert(row)
 }
 

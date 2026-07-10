@@ -1111,6 +1111,7 @@ pub enum BoundStatement {
         args: Vec<Expr>,
     },
     Insert {
+        relation_id: RelationId,
         table: ObjectName,
         columns: Vec<BoundColumn>,
         values: Vec<Expr>,

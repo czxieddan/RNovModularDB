@@ -64,11 +64,16 @@ impl ColumnCryptoState {
         Ok(Row::new(values))
     }
 
-    pub fn encrypt_insert_row(&self, columns: &[ColumnSchema], row: &Row) -> Result<Row> {
+    pub fn encrypt_insert_row(
+        &self,
+        relation_id: RelationId,
+        columns: &[ColumnSchema],
+        row: &Row,
+    ) -> Result<Row> {
         let values = columns
             .iter()
             .zip(row.values())
-            .map(|(column, value)| self.encrypt_insert_value(column, value))
+            .map(|(column, value)| self.encrypt_value(relation_id, column, value))
             .collect::<Result<Vec<_>>>()?;
         Ok(Row::new(values))
     }
@@ -110,22 +115,7 @@ impl ColumnCryptoState {
             return Ok(value.clone());
         }
         ensure_plaintext_type(column, value)?;
-        let Some(key) = self.maybe_encrypted_column(relation_id, column.name())? else {
-            return Ok(value.clone());
-        };
-        let encrypted =
-            encrypt_column_value(&key.key, relation_id, column.name(), &value.encode())?;
-        Ok(SqlValue::Bytes(encrypted))
-    }
-
-    fn encrypt_insert_value(&self, column: &ColumnSchema, value: &SqlValue) -> Result<SqlValue> {
-        if !column.is_encrypted() || value.is_null() {
-            return Ok(value.clone());
-        }
-        ensure_plaintext_type(column, value)?;
-        let Some((relation_id, key)) = self.unique_column_key(column.name())? else {
-            return Ok(value.clone());
-        };
+        let key = self.encrypted_column(relation_id, column.name())?;
         let encrypted =
             encrypt_column_value(&key.key, relation_id, column.name(), &value.encode())?;
         Ok(SqlValue::Bytes(encrypted))
@@ -187,25 +177,6 @@ impl ColumnCryptoState {
                 ),
             )
         })
-    }
-
-    fn unique_column_key(
-        &self,
-        column_name: &str,
-    ) -> Result<Option<(RelationId, &EncryptedColumnKey)>> {
-        let matches = self
-            .columns
-            .iter()
-            .filter(|(column, _)| column.column_name == column_name)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [(column, key)] => Ok(Some((column.relation_id, key))),
-            [] => Ok(None),
-            _ => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("encrypted insert column is ambiguous: {column_name}"),
-            )),
-        }
     }
 
     fn ensure_decrypt_authorized(

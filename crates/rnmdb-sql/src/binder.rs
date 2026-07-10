@@ -960,6 +960,7 @@ impl<'a> Binder<'a> {
             bound_columns.push(column);
         }
         Ok(BoundStatement::Insert {
+            relation_id: table.relation_id(),
             table: table_name.clone(),
             columns: bound_columns,
             values: values.to_vec(),
