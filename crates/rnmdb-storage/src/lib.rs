@@ -816,6 +816,25 @@ struct HybridLsnStatus {
     last_mirrored_lsn: u64,
 }
 
+#[derive(Default)]
+struct HybridWarmupProgress {
+    warmed_pages: usize,
+    missing_pages: usize,
+    max_warmed_lsn: u64,
+}
+
+impl HybridWarmupProgress {
+    fn record(&mut self, warmed_lsn: Option<u64>) {
+        match warmed_lsn {
+            Some(page_lsn) => {
+                self.warmed_pages += 1;
+                self.max_warmed_lsn = self.max_warmed_lsn.max(page_lsn);
+            }
+            None => self.missing_pages += 1,
+        }
+    }
+}
+
 impl HybridBackend {
     pub fn new(memory: MemoryBackend, disk: Arc<dyn StorageBackend>) -> Result<Self> {
         if !disk
@@ -897,49 +916,18 @@ impl HybridBackend {
         I: IntoIterator<Item = PageId>,
     {
         let requested_pages = page_ids.into_iter().collect::<BTreeSet<_>>();
+        self.ensure_warmup_pages_are_clean(&requested_pages)?;
 
-        {
-            let dirty_pages = self.read_dirty_pages()?;
-            if let Some(page_id) = requested_pages
-                .iter()
-                .find(|page_id| dirty_pages.contains(page_id))
-            {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("cannot warm up dirty page {}", page_id.get()),
-                ));
-            }
-        }
-
-        let mut warmed_pages = 0_usize;
-        let mut missing_pages = 0_usize;
-        let mut max_warmed_lsn = 0_u64;
-
+        let mut progress = HybridWarmupProgress::default();
         for page_id in &requested_pages {
-            let Some(page) = self.disk.read_page(*page_id)? else {
-                missing_pages += 1;
-                continue;
-            };
-            let page_lsn = page.header().lsn();
-            self.memory.write_page(page)?;
-            self.memory.mark_clean(*page_id)?;
-            self.write_dirty_pages()?.remove(page_id);
-            self.write_mirrored_pages()?.insert(*page_id);
-            max_warmed_lsn = max_warmed_lsn.max(page_lsn);
-            warmed_pages += 1;
+            progress.record(self.warmup_page(*page_id)?);
         }
-
-        if warmed_pages > 0 {
-            let mut lsn_status = self.write_lsn_status()?;
-            lsn_status.memory_lsn = lsn_status.memory_lsn.max(max_warmed_lsn);
-            lsn_status.disk_lsn = lsn_status.disk_lsn.max(max_warmed_lsn);
-            lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(max_warmed_lsn);
-        }
+        self.advance_warmup_lsns(progress.warmed_pages, progress.max_warmed_lsn)?;
 
         Ok(HybridWarmupReport::new(
             requested_pages.len(),
-            warmed_pages,
-            missing_pages,
+            progress.warmed_pages,
+            progress.missing_pages,
             self.read_mirrored_pages()?.len(),
         ))
     }
@@ -975,6 +963,111 @@ impl HybridBackend {
             disk_lsn: lsn_status.disk_lsn,
             last_mirrored_lsn: lsn_status.last_mirrored_lsn,
         }))
+    }
+
+    fn ensure_warmup_pages_are_clean(&self, requested_pages: &BTreeSet<PageId>) -> Result<()> {
+        let dirty_pages = self.read_dirty_pages()?;
+        if let Some(page_id) = requested_pages
+            .iter()
+            .find(|page_id| dirty_pages.contains(page_id))
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot warm up dirty page {}", page_id.get()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn warmup_page(&self, page_id: PageId) -> Result<Option<u64>> {
+        let Some(page) = self.disk.read_page(page_id)? else {
+            return Ok(None);
+        };
+        let page_lsn = page.header().lsn();
+        self.store_warmed_page(page_id, page)?;
+        Ok(Some(page_lsn))
+    }
+
+    fn store_warmed_page(&self, page_id: PageId, page: Page) -> Result<()> {
+        self.memory.write_page(page)?;
+        self.memory.mark_clean(page_id)?;
+        self.write_dirty_pages()?.remove(&page_id);
+        self.write_mirrored_pages()?.insert(page_id);
+        Ok(())
+    }
+
+    fn advance_warmup_lsns(&self, warmed_pages: usize, max_warmed_lsn: u64) -> Result<()> {
+        if warmed_pages == 0 {
+            return Ok(());
+        }
+        let mut lsn_status = self.write_lsn_status()?;
+        lsn_status.memory_lsn = lsn_status.memory_lsn.max(max_warmed_lsn);
+        lsn_status.disk_lsn = lsn_status.disk_lsn.max(max_warmed_lsn);
+        lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(max_warmed_lsn);
+        Ok(())
+    }
+
+    fn write_memory_active_page(&self, page_id: PageId, page: Page) -> Result<()> {
+        self.memory.write_page(page)?;
+        self.write_dirty_pages()?.insert(page_id);
+        Ok(())
+    }
+
+    fn write_disk_active_page(&self, page_id: PageId, page_lsn: u64, page: Page) -> Result<()> {
+        self.disk.write_page(page.clone())?;
+        self.memory.write_page(page)?;
+        self.memory.mark_clean(page_id)?;
+        self.write_mirrored_pages()?.insert(page_id);
+        self.advance_disk_lsn(page_lsn)
+    }
+
+    fn advance_disk_lsn(&self, page_lsn: u64) -> Result<()> {
+        let mut lsn_status = self.write_lsn_status()?;
+        lsn_status.disk_lsn = lsn_status.disk_lsn.max(page_lsn);
+        lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(page_lsn);
+        Ok(())
+    }
+
+    fn advance_memory_lsn(&self, page_lsn: u64) -> Result<()> {
+        let mut lsn_status = self.write_lsn_status()?;
+        lsn_status.memory_lsn = lsn_status.memory_lsn.max(page_lsn);
+        Ok(())
+    }
+
+    fn pending_dirty_pages(&self) -> Result<Vec<PageId>> {
+        Ok(self.read_dirty_pages()?.iter().copied().collect::<Vec<_>>())
+    }
+
+    fn mirror_pending_pages(&self, pending: &[PageId]) -> Result<()> {
+        for page_id in pending {
+            self.mirror_pending_page(*page_id)?;
+        }
+        Ok(())
+    }
+
+    fn mirror_pending_page(&self, page_id: PageId) -> Result<()> {
+        if let Some(page) = self.memory.read_page(page_id)? {
+            self.disk.write_page(page)?;
+        }
+        Ok(())
+    }
+
+    fn mark_pending_pages_mirrored(&self, pending: &[PageId]) -> Result<()> {
+        let mut dirty_pages = self.write_dirty_pages()?;
+        let mut mirrored_pages = self.write_mirrored_pages()?;
+        for page_id in pending {
+            dirty_pages.remove(page_id);
+            mirrored_pages.insert(*page_id);
+            self.memory.mark_clean(*page_id)?;
+        }
+        Ok(())
+    }
+
+    fn advance_synced_lsns(&self) -> Result<()> {
+        let mut lsn_status = self.write_lsn_status()?;
+        lsn_status.disk_lsn = lsn_status.memory_lsn;
+        lsn_status.last_mirrored_lsn = lsn_status.memory_lsn;
+        Ok(())
     }
 
     fn read_dirty_pages(&self) -> Result<std::sync::RwLockReadGuard<'_, BTreeSet<PageId>>> {
@@ -1070,49 +1163,18 @@ impl StorageBackend for HybridBackend {
         let page_id = page.id();
         let page_lsn = page.header().lsn();
         match self.read_active_target()? {
-            HybridSyncTarget::Memory => {
-                self.memory.write_page(page)?;
-                self.write_dirty_pages()?.insert(page_id);
-            }
-            HybridSyncTarget::Disk => {
-                self.disk.write_page(page.clone())?;
-                self.memory.write_page(page)?;
-                self.memory.mark_clean(page_id)?;
-                self.write_mirrored_pages()?.insert(page_id);
-                let mut lsn_status = self.write_lsn_status()?;
-                lsn_status.disk_lsn = lsn_status.disk_lsn.max(page_lsn);
-                lsn_status.last_mirrored_lsn = lsn_status.last_mirrored_lsn.max(page_lsn);
-            }
+            HybridSyncTarget::Memory => self.write_memory_active_page(page_id, page)?,
+            HybridSyncTarget::Disk => self.write_disk_active_page(page_id, page_lsn, page)?,
         }
-        let mut lsn_status = self.write_lsn_status()?;
-        lsn_status.memory_lsn = lsn_status.memory_lsn.max(page_lsn);
-        Ok(())
+        self.advance_memory_lsn(page_lsn)
     }
 
     fn sync(&self) -> Result<SyncStatus> {
-        let pending = self.read_dirty_pages()?.iter().copied().collect::<Vec<_>>();
-
-        for page_id in &pending {
-            if let Some(page) = self.memory.read_page(*page_id)? {
-                self.disk.write_page(page)?;
-            }
-        }
+        let pending = self.pending_dirty_pages()?;
+        self.mirror_pending_pages(&pending)?;
         self.disk.sync()?;
-
-        {
-            let mut dirty_pages = self.write_dirty_pages()?;
-            let mut mirrored_pages = self.write_mirrored_pages()?;
-            for page_id in &pending {
-                dirty_pages.remove(page_id);
-                mirrored_pages.insert(*page_id);
-                self.memory.mark_clean(*page_id)?;
-            }
-        }
-        {
-            let mut lsn_status = self.write_lsn_status()?;
-            lsn_status.disk_lsn = lsn_status.memory_lsn;
-            lsn_status.last_mirrored_lsn = lsn_status.memory_lsn;
-        }
+        self.mark_pending_pages_mirrored(&pending)?;
+        self.advance_synced_lsns()?;
 
         Ok(SyncStatus::new(
             pending.len(),
