@@ -1465,8 +1465,9 @@ impl<'a> Binder<'a> {
             .iter()
             .filter(|item| is_aggregate_expr(&item.expr))
             .count();
-        let bound_group_by = self.bind_group_by_exprs(&projection, input.group_by)?;
-        let bound_grouping_sets = self.bind_grouping_sets(&projection, input.grouping_sets)?;
+        let bound_group_by = self.bind_group_by_exprs(table, &projection, input.group_by)?;
+        let bound_grouping_sets =
+            self.bind_grouping_sets(table, &projection, input.grouping_sets)?;
         if !bound_group_by.is_empty() {
             self.validate_group_by_exprs(table, &bound_group_by)?;
         }
@@ -2650,34 +2651,46 @@ impl<'a> Binder<'a> {
 
     fn bind_group_by_exprs(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
         group_by: &[Expr],
     ) -> Result<Vec<Expr>> {
         group_by
             .iter()
-            .map(|expr| match expr {
-                Expr::Integer(value) => Ok(self
-                    .projection_ordinal_item(projection, *value, "GROUP BY")?
-                    .expr
-                    .clone()),
-                Expr::Identifier(identifier) => Ok(projection
-                    .iter()
-                    .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
-                    .map(|item| item.expr.clone())
-                    .unwrap_or_else(|| expr.clone())),
-                _ => Ok(expr.clone()),
-            })
+            .map(|expr| self.bind_group_by_expr(table, projection, expr))
             .collect()
+    }
+
+    fn bind_group_by_expr(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<Expr> {
+        let expr = match expr {
+            Expr::Integer(value) => self
+                .projection_ordinal_item(projection, *value, "GROUP BY")?
+                .expr
+                .clone(),
+            Expr::Identifier(identifier) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| item.expr.clone())
+                .unwrap_or_else(|| expr.clone()),
+            _ => expr.clone(),
+        };
+        self.rewrite_table_qualified_expr(table, &expr)
     }
 
     fn bind_grouping_sets(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
         grouping_sets: &[Vec<Expr>],
     ) -> Result<Vec<Vec<Expr>>> {
         grouping_sets
             .iter()
-            .map(|grouping_set| self.bind_group_by_exprs(projection, grouping_set))
+            .map(|grouping_set| self.bind_group_by_exprs(table, projection, grouping_set))
             .collect()
     }
 
@@ -2719,111 +2732,38 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::RuntimeValue(_)
             | Expr::HStore(_) => Ok(()),
-            Expr::Array(values) => values
-                .iter()
-                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
-            Expr::Range { lower, upper, .. } => {
-                self.validate_group_by_expr_shape(lower)?;
-                self.validate_group_by_expr_shape(upper)
+            Expr::Array(values) | Expr::Coalesce(values) | Expr::Call { args: values, .. } => {
+                self.validate_group_by_expr_list(values)
             }
-            Expr::Binary { left, op, right } => {
-                if !matches!(
-                    op.as_str(),
-                    "=" | "<>"
-                        | "!="
-                        | "<"
-                        | "<="
-                        | ">"
-                        | ">="
-                        | "@@"
-                        | "AND"
-                        | "OR"
-                        | "||"
-                        | "+"
-                        | "-"
-                        | "*"
-                        | "/"
-                        | "%"
-                ) {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("GROUP BY does not support operator {op} yet"),
-                    ));
-                }
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
+            Expr::Range { lower, upper, .. } => self.validate_group_by_pair(lower, upper),
+            Expr::Binary { left, op, right } => self.validate_group_by_binary(left, op, right),
+            Expr::Unary { op, expr } => self.validate_group_by_unary(op, expr),
+            Expr::Not(expr)
+            | Expr::IsNull { expr, .. }
+            | Expr::IsTruth { expr, .. }
+            | Expr::IsUnknown { expr, .. }
+            | Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::IsDistinctFrom { left, right, .. }
+            | Expr::Like {
+                expr: left,
+                pattern: right,
+                ..
             }
-            Expr::Unary { op, expr } => {
-                if !matches!(op.as_str(), "+" | "-") {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("GROUP BY does not support unary operator {op} yet"),
-                    ));
-                }
-                self.validate_group_by_expr_shape(expr)
-            }
-            Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
-            Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsTruth { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsUnknown { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsDistinctFrom { left, right, .. } => {
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
-            }
+            | Expr::NullIf { left, right } => self.validate_group_by_pair(left, right),
             Expr::Between {
                 expr, low, high, ..
-            } => {
-                self.validate_group_by_expr_shape(expr)?;
-                self.validate_group_by_expr_shape(low)?;
-                self.validate_group_by_expr_shape(high)
-            }
+            } => self.validate_group_by_triple(expr, low, high),
             Expr::InList { expr, values, .. } => {
                 self.validate_group_by_expr_shape(expr)?;
-                values
-                    .iter()
-                    .try_for_each(|value| self.validate_group_by_expr_shape(value))
+                self.validate_group_by_expr_list(values)
             }
-            Expr::InSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "GROUP BY does not support subqueries",
-            )),
-            Expr::ExistsSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "GROUP BY does not support subqueries",
-            )),
-            Expr::ScalarSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "GROUP BY does not support subqueries",
-            )),
-            Expr::Like { expr, pattern, .. } => {
-                self.validate_group_by_expr_shape(expr)?;
-                self.validate_group_by_expr_shape(pattern)
+            Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::ScalarSubquery { .. } => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "GROUP BY does not support subqueries",
+                ))
             }
-            Expr::Coalesce(values) => values
-                .iter()
-                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
-            Expr::NullIf { left, right } => {
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                if let Some(operand) = operand {
-                    self.validate_group_by_expr_shape(operand)?;
-                }
-                for arm in whens {
-                    self.validate_group_by_expr_shape(&arm.condition)?;
-                    self.validate_group_by_expr_shape(&arm.result)?;
-                }
-                if let Some(else_expr) = else_expr {
-                    self.validate_group_by_expr_shape(else_expr)?;
-                }
-                Ok(())
-            }
-            Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::Case { .. } => self.validate_group_by_case(expr),
             Expr::CountStar
             | Expr::Count(_)
             | Expr::CountDistinct(_)
@@ -2839,11 +2779,85 @@ impl<'a> Binder<'a> {
                     "GROUP BY does not support window expressions",
                 ))
             }
-            Expr::Call { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "GROUP BY does not support function calls yet",
-            )),
         }
+    }
+
+    fn validate_group_by_expr_list(&self, values: &[Expr]) -> Result<()> {
+        values
+            .iter()
+            .try_for_each(|value| self.validate_group_by_expr_shape(value))
+    }
+
+    fn validate_group_by_pair(&self, left: &Expr, right: &Expr) -> Result<()> {
+        self.validate_group_by_expr_shape(left)?;
+        self.validate_group_by_expr_shape(right)
+    }
+
+    fn validate_group_by_triple(&self, first: &Expr, second: &Expr, third: &Expr) -> Result<()> {
+        self.validate_group_by_expr_shape(first)?;
+        self.validate_group_by_expr_shape(second)?;
+        self.validate_group_by_expr_shape(third)
+    }
+
+    fn validate_group_by_binary(&self, left: &Expr, op: &str, right: &Expr) -> Result<()> {
+        if !matches!(
+            op,
+            "=" | "<>"
+                | "!="
+                | "<"
+                | "<="
+                | ">"
+                | ">="
+                | "@@"
+                | "AND"
+                | "OR"
+                | "||"
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+        ) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("GROUP BY does not support operator {op} yet"),
+            ));
+        }
+        self.validate_group_by_pair(left, right)
+    }
+
+    fn validate_group_by_unary(&self, op: &str, expr: &Expr) -> Result<()> {
+        if !matches!(op, "+" | "-") {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("GROUP BY does not support unary operator {op} yet"),
+            ));
+        }
+        self.validate_group_by_expr_shape(expr)
+    }
+
+    fn validate_group_by_case(&self, expr: &Expr) -> Result<()> {
+        let Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } = expr
+        else {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "GROUP BY case validator received a non-CASE expression",
+            ));
+        };
+        if let Some(operand) = operand {
+            self.validate_group_by_expr_shape(operand)?;
+        }
+        for arm in whens {
+            self.validate_group_by_pair(&arm.condition, &arm.result)?;
+        }
+        if let Some(else_expr) = else_expr {
+            self.validate_group_by_expr_shape(else_expr)?;
+        }
+        Ok(())
     }
 
     fn validate_grouped_sort_expr(

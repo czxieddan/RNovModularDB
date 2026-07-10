@@ -1962,7 +1962,13 @@ impl MemoryExecutor {
                 input,
             } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
-                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+                apply_grouped_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             LogicalPlan::GroupingSetsAggregate {
                 group_by,
@@ -1976,6 +1982,7 @@ impl MemoryExecutor {
                     group_by,
                     grouping_sets,
                     items,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -3055,7 +3062,13 @@ impl MemoryExecutor {
                 ..
             } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation)
+                apply_grouped_aggregate_cancellable(
+                    batch,
+                    group_by,
+                    items,
+                    self.scalar_function_runtime.as_deref(),
+                    cancellation,
+                )
             }
             PhysicalPlan::GroupingSetsAggregate {
                 group_by,
@@ -3070,6 +3083,7 @@ impl MemoryExecutor {
                     group_by,
                     grouping_sets,
                     items,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -3251,6 +3265,7 @@ impl MemoryExecutor {
                     group_by,
                     items,
                     config,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -3268,6 +3283,7 @@ impl MemoryExecutor {
                     group_by,
                     grouping_sets,
                     items,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -3661,6 +3677,7 @@ impl MemoryExecutor {
                     group_by,
                     items,
                     config,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -3676,6 +3693,7 @@ impl MemoryExecutor {
                     group_by,
                     grouping_sets,
                     items,
+                    self.scalar_function_runtime.as_deref(),
                     cancellation,
                 )
             }
@@ -6336,15 +6354,29 @@ fn apply_grouped_aggregate_cancellable(
     batch: VectorBatch,
     group_by: &[Expr],
     items: &[GroupedAggregateItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     cancellation.check()?;
     let columns = items
         .iter()
-        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .map(|item| grouped_aggregate_column_schema(&batch, item, runtime))
         .collect::<Result<Vec<_>>>()?;
-    let groups = group_states_from_rows(batch.columns(), batch.rows(), group_by, cancellation)?;
-    grouped_aggregate_batch(batch.columns(), columns, groups, items, cancellation)
+    let groups = group_states_from_rows(
+        batch.columns(),
+        batch.rows(),
+        group_by,
+        runtime,
+        cancellation,
+    )?;
+    grouped_aggregate_batch(
+        batch.columns(),
+        columns,
+        groups,
+        items,
+        runtime,
+        cancellation,
+    )
 }
 
 fn apply_grouped_aggregate_parallel_cancellable(
@@ -6352,55 +6384,86 @@ fn apply_grouped_aggregate_parallel_cancellable(
     group_by: &[Expr],
     items: &[GroupedAggregateItem],
     config: ParallelQueryConfig,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     config.validate()?;
     cancellation.check()?;
-    if batch.rows().is_empty()
-        || config.worker_threads() == 1
-        || batch.rows().len() < config.min_parallel_rows()
-    {
-        return apply_grouped_aggregate_cancellable(batch, group_by, items, cancellation);
+    if grouped_aggregate_runs_sequentially(&batch, config) {
+        return apply_grouped_aggregate_cancellable(batch, group_by, items, runtime, cancellation);
     }
 
     let output_columns = items
         .iter()
-        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .map(|item| grouped_aggregate_column_schema(&batch, item, runtime))
         .collect::<Result<Vec<_>>>()?;
     let input_columns = batch.columns();
     let input_rows = batch.rows();
+    let groups = parallel_group_states(
+        input_columns,
+        input_rows,
+        group_by,
+        config,
+        runtime,
+        cancellation,
+    )?;
+    grouped_aggregate_batch(
+        input_columns,
+        output_columns,
+        groups,
+        items,
+        runtime,
+        cancellation,
+    )
+}
+
+fn grouped_aggregate_runs_sequentially(batch: &VectorBatch, config: ParallelQueryConfig) -> bool {
+    batch.rows().is_empty()
+        || config.worker_threads() == 1
+        || batch.rows().len() < config.min_parallel_rows()
+}
+
+fn parallel_group_states(
+    input_columns: &[ColumnSchema],
+    input_rows: &[Row],
+    group_by: &[Expr],
+    config: ParallelQueryConfig,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<GroupState>> {
     let worker_count = config.worker_threads().min(input_rows.len());
     let chunk_size = input_rows.len().div_ceil(worker_count);
-    let mut groups: Vec<GroupState> = Vec::new();
-
     thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for chunk in input_rows.chunks(chunk_size) {
-            let cancellation = cancellation.clone();
-            handles.push(scope.spawn(move || {
-                group_states_from_rows(input_columns, chunk, group_by, &cancellation)
-            }));
-        }
-
-        for handle in handles {
-            let local_groups = handle.join().map_err(|_| {
-                RnovError::new(
-                    ErrorKind::Internal,
-                    "parallel grouped aggregate worker panicked",
-                )
-            })??;
-            merge_group_states(&mut groups, local_groups);
-        }
-        Ok::<(), RnovError>(())
-    })?;
-
-    grouped_aggregate_batch(input_columns, output_columns, groups, items, cancellation)
+        let handles = input_rows
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let cancellation = cancellation.clone();
+                scope.spawn(move || {
+                    group_states_from_rows(input_columns, chunk, group_by, runtime, &cancellation)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles.into_iter().try_fold(
+            Vec::new(),
+            |mut groups, handle| -> Result<Vec<GroupState>> {
+                let local_groups = handle.join().map_err(|_| {
+                    RnovError::new(
+                        ErrorKind::Internal,
+                        "parallel grouped aggregate worker panicked",
+                    )
+                })??;
+                merge_group_states(&mut groups, local_groups);
+                Ok(groups)
+            },
+        )
+    })
 }
 
 fn group_states_from_rows(
     columns: &[ColumnSchema],
     rows: &[Row],
     group_by: &[Expr],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
@@ -6409,7 +6472,7 @@ fn group_states_from_rows(
         cancellation.check()?;
         let key = group_by
             .iter()
-            .map(|expr| eval_expr(columns, row, expr))
+            .map(|expr| eval_expr_with_runtime(runtime, columns, row, expr))
             .collect::<Result<Vec<_>>>()?;
         if let Some(index) = group_indexes.get(&key).copied() {
             groups[index].rows.push(row.clone());
@@ -6446,6 +6509,7 @@ fn grouped_aggregate_batch(
     output_columns: Vec<ColumnSchema>,
     groups: Vec<GroupState>,
     items: &[GroupedAggregateItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let mut rows = Vec::with_capacity(groups.len());
@@ -6454,7 +6518,7 @@ fn grouped_aggregate_batch(
         let group_batch = VectorBatch::new(input_columns.to_vec(), group.rows)?;
         let values = items
             .iter()
-            .map(|item| grouped_aggregate_value(&group_batch, item))
+            .map(|item| grouped_aggregate_value(&group_batch, item, runtime))
             .collect::<Result<Vec<_>>>()?;
         rows.push(Row::new(values));
     }
@@ -6467,36 +6531,78 @@ fn apply_grouping_sets_aggregate_cancellable(
     group_by: &[Expr],
     grouping_sets: &[Vec<Expr>],
     items: &[GroupedAggregateItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     cancellation.check()?;
     let columns = items
         .iter()
-        .map(|item| grouped_aggregate_column_schema(&batch, item))
+        .map(|item| grouped_aggregate_column_schema(&batch, item, runtime))
         .collect::<Result<Vec<_>>>()?;
     let mut rows = Vec::new();
     for grouping_set in grouping_sets {
         cancellation.check()?;
-        let groups = grouping_set_states(&batch, grouping_set, cancellation)?;
-        for group in groups {
-            cancellation.check()?;
-            let group_batch = VectorBatch::new(batch.columns().to_vec(), group.rows)?;
-            let values = items
-                .iter()
-                .map(|item| {
-                    grouping_set_aggregate_value(&group_batch, group_by, grouping_set, item)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            rows.push(Row::new(values));
-        }
+        rows.extend(grouping_set_rows(
+            &batch,
+            group_by,
+            grouping_set,
+            items,
+            runtime,
+            cancellation,
+        )?);
     }
     cancellation.check()?;
     VectorBatch::new(columns, rows)
 }
 
+fn grouping_set_rows(
+    batch: &VectorBatch,
+    group_by: &[Expr],
+    grouping_set: &[Expr],
+    items: &[GroupedAggregateItem],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
+    grouping_set_states(batch, grouping_set, runtime, cancellation)?
+        .into_iter()
+        .map(|group| {
+            grouping_set_row(
+                batch.columns(),
+                group_by,
+                grouping_set,
+                items,
+                group,
+                runtime,
+                cancellation,
+            )
+        })
+        .collect()
+}
+
+fn grouping_set_row(
+    columns: &[ColumnSchema],
+    group_by: &[Expr],
+    grouping_set: &[Expr],
+    items: &[GroupedAggregateItem],
+    group: GroupState,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+    cancellation: &CancellationToken,
+) -> Result<Row> {
+    cancellation.check()?;
+    let group_batch = VectorBatch::new(columns.to_vec(), group.rows)?;
+    items
+        .iter()
+        .map(|item| {
+            grouping_set_aggregate_value(&group_batch, group_by, grouping_set, item, runtime)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Row::new)
+}
+
 fn grouping_set_states(
     batch: &VectorBatch,
     grouping_set: &[Expr],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<Vec<GroupState>> {
     let mut groups: Vec<GroupState> = Vec::new();
@@ -6505,7 +6611,7 @@ fn grouping_set_states(
         cancellation.check()?;
         let key = grouping_set
             .iter()
-            .map(|expr| eval_expr(batch.columns(), row, expr))
+            .map(|expr| eval_expr_with_runtime(runtime, batch.columns(), row, expr))
             .collect::<Result<Vec<_>>>()?;
         if let Some(index) = group_indexes.get(&key).copied() {
             groups[index].rows.push(row.clone());
@@ -6536,11 +6642,12 @@ struct GroupState {
 fn grouped_aggregate_column_schema(
     batch: &VectorBatch,
     item: &GroupedAggregateItem,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<ColumnSchema> {
     match &item.kind {
         GroupedAggregateItemKind::GroupKey(expr) => Ok(ColumnSchema::new(
             item.name.as_str(),
-            projection_type(batch.columns(), expr)?,
+            projection_type_with_runtime(runtime, batch.columns(), expr)?,
         )),
         GroupedAggregateItemKind::Aggregate(function) => aggregate_column_schema(
             batch,
@@ -6548,20 +6655,24 @@ fn grouped_aggregate_column_schema(
                 name: item.name.clone(),
                 function: function.clone(),
             },
-            None,
+            runtime,
         ),
     }
 }
 
-fn grouped_aggregate_value(batch: &VectorBatch, item: &GroupedAggregateItem) -> Result<SqlValue> {
+fn grouped_aggregate_value(
+    batch: &VectorBatch,
+    item: &GroupedAggregateItem,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<SqlValue> {
     match &item.kind {
         GroupedAggregateItemKind::GroupKey(expr) => {
             let Some(row) = batch.rows().first() else {
                 return Ok(SqlValue::Null);
             };
-            eval_expr(batch.columns(), row, expr)
+            eval_expr_with_runtime(runtime, batch.columns(), row, expr)
         }
-        GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function, None),
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_value(batch, function, runtime),
     }
 }
 
@@ -6570,6 +6681,7 @@ fn grouping_set_aggregate_value(
     group_by: &[Expr],
     grouping_set: &[Expr],
     item: &GroupedAggregateItem,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<SqlValue> {
     match &item.kind {
         GroupedAggregateItemKind::GroupKey(expr)
@@ -6578,7 +6690,7 @@ fn grouping_set_aggregate_value(
         {
             Ok(SqlValue::Null)
         }
-        _ => grouped_aggregate_value(batch, item),
+        _ => grouped_aggregate_value(batch, item, runtime),
     }
 }
 
