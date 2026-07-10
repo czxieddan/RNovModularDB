@@ -55,6 +55,13 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         predicate: Expr,
     },
+    HashJoin {
+        kind: JoinKind,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        left_key: String,
+        right_key: String,
+    },
     Project {
         items: Vec<ProjectionItem>,
         input: Box<LogicalPlan>,
@@ -835,11 +842,21 @@ impl LogicalPlanner {
         for policy in &select.row_policy_predicates {
             plan = plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
         }
-        plan = LogicalPlan::NestedLoopJoin {
-            kind: join.kind,
-            left: Box::new(plan),
-            right: Box::new(join_right_plan(join)?),
-            predicate: join.predicate.clone(),
+        let right = join_right_plan(join)?;
+        plan = match &join.hash_keys {
+            Some(keys) => LogicalPlan::HashJoin {
+                kind: join.kind,
+                left: Box::new(plan),
+                right: Box::new(right),
+                left_key: keys.left_column.clone(),
+                right_key: keys.right_column.clone(),
+            },
+            None => LogicalPlan::NestedLoopJoin {
+                kind: join.kind,
+                left: Box::new(plan),
+                right: Box::new(right),
+                predicate: join.predicate.clone(),
+            },
         };
         self.plan_select_with_input(select, plan, false)
     }
@@ -1023,6 +1040,20 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}NestedLoopJoin kind={} predicate={predicate}\n",
+                join_kind_name(*kind)
+            ));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
+        }
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
+            out.push_str(&format!(
+                "{prefix}HashJoin kind={} left_key={left_key} right_key={right_key}\n",
                 join_kind_name(*kind)
             ));
             write_plan(left, indent + 1, out);
@@ -1565,6 +1596,7 @@ fn write_plan_with_costs(
             write_plan_with_costs(outer, indent + 1, cost_model, out);
         }
         LogicalPlan::NestedLoopJoin { left, right, .. }
+        | LogicalPlan::HashJoin { left, right, .. }
         | LogicalPlan::Union { left, right, .. }
         | LogicalPlan::Intersect { left, right, .. }
         | LogicalPlan::Except { left, right, .. } => {

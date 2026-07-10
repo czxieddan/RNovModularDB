@@ -6,11 +6,11 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
-    BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery, BoundRecursiveCte,
-    BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate,
-    CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName,
-    OrderByExpr, SelectItem, SelectSubquery, Statement, TransactionAction,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundHashJoinKeys,
+    BoundIndexKey, BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery,
+    BoundRecursiveCte, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion,
+    BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin,
+    ObjectName, OrderByExpr, SelectItem, SelectSubquery, Statement, TransactionAction,
 };
 use crate::expr_mutator::{rewrite_expr_tree, rewrite_qualified_expr};
 use crate::parser::{parse_expr, parse_statement};
@@ -1833,6 +1833,7 @@ impl<'a> Binder<'a> {
 
         let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
         let bound_columns = lateral_columns_to_bound(&joined_columns);
+        let hash_keys = hash_join_keys(&joined_columns, &join.on);
         let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
         let predicate = self.bind_join_predicate_subqueries(
             &joined_columns,
@@ -1888,6 +1889,7 @@ impl<'a> Binder<'a> {
                 right_relation_id: right_table.relation_id(),
                 right_table: join.table.clone(),
                 predicate,
+                hash_keys,
                 applied_row_policies: self
                     .applied_row_policy_names(input.role_id, right_table.relation_id()),
                 row_policy_predicates: self.bind_row_policies(input.role_id, right_table)?,
@@ -5610,6 +5612,7 @@ fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LateralColumn {
+    side: LateralSide,
     table_name: String,
     source_name: String,
     output_name: String,
@@ -5636,6 +5639,7 @@ fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<V
     let mut columns = Vec::new();
     for column in bound_columns_for_table(outer)? {
         columns.push(LateralColumn {
+            side: LateralSide::Outer,
             table_name: outer.name().to_string(),
             source_name: column.name.clone(),
             output_name: column.name.clone(),
@@ -5656,6 +5660,7 @@ fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<V
         }
         column.name = output_name.clone();
         columns.push(LateralColumn {
+            side: LateralSide::Inner,
             table_name: inner.name().to_string(),
             source_name,
             output_name,
@@ -5663,6 +5668,54 @@ fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<V
         });
     }
     Ok(columns)
+}
+
+fn hash_join_keys(columns: &[LateralColumn], expr: &Expr) -> Option<BoundHashJoinKeys> {
+    let Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    let left = hash_join_column(columns, left)?;
+    let right = hash_join_column(columns, right)?;
+    if left.column.data_type != right.column.data_type {
+        return None;
+    }
+    match (left.side, right.side) {
+        (LateralSide::Outer, LateralSide::Inner) => Some(oriented_hash_join_keys(left, right)),
+        (LateralSide::Inner, LateralSide::Outer) => Some(oriented_hash_join_keys(right, left)),
+        _ => None,
+    }
+}
+
+fn hash_join_column<'a>(columns: &'a [LateralColumn], expr: &Expr) -> Option<&'a LateralColumn> {
+    let matches = columns
+        .iter()
+        .filter(|column| hash_join_column_matches(column, expr))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Some(*column),
+        _ => None,
+    }
+}
+
+fn hash_join_column_matches(column: &LateralColumn, expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(name) => column.output_name.eq_ignore_ascii_case(name.as_str()),
+        Expr::QualifiedIdentifier { qualifier, name } => {
+            column.table_name.eq_ignore_ascii_case(qualifier.as_str())
+                && column.source_name.eq_ignore_ascii_case(name.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn oriented_hash_join_keys(left: &LateralColumn, right: &LateralColumn) -> BoundHashJoinKeys {
+    BoundHashJoinKeys {
+        left_column: left.source_name.clone(),
+        right_column: right.source_name.clone(),
+    }
 }
 
 fn lateral_columns_to_bound(columns: &[LateralColumn]) -> Vec<BoundColumn> {

@@ -1906,6 +1906,17 @@ impl MemoryExecutor {
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
+            LogicalPlan::HashJoin {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+            } => {
+                let left = self.execute_cancellable(left, cancellation)?;
+                let right = self.execute_cancellable(right, cancellation)?;
+                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
+            }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 self.apply_projection_with_subqueries(batch, items, cancellation)
@@ -2871,6 +2882,18 @@ impl MemoryExecutor {
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
             }
+            PhysicalPlan::HashJoin {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+                ..
+            } => {
+                let left = self.execute_physical_cancellable(left, cancellation)?;
+                let right = self.execute_physical_cancellable(right, cancellation)?;
+                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
+            }
             PhysicalPlan::Filter {
                 predicate, input, ..
             } => {
@@ -3480,6 +3503,17 @@ impl MemoryExecutor {
                 }
                 let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
                 apply_nested_loop_join_cancellable(left, right, *kind, &predicate, cancellation)
+            }
+            LogicalPlan::HashJoin {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+            } => {
+                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
             }
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
@@ -4999,6 +5033,10 @@ fn logical_plan_has_qualified_identifier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Parallel { input, .. }
         | LogicalPlan::Explain { input, .. } => logical_plan_has_qualified_identifier(input),
+        LogicalPlan::HashJoin { left, right, .. } => {
+            logical_plan_has_qualified_identifier(left)
+                || logical_plan_has_qualified_identifier(right)
+        }
         _ => false,
     }
 }
@@ -5051,6 +5089,7 @@ fn physical_child_has_qualified_identifier(plan: &PhysicalPlan) -> bool {
             physical_plan_has_qualified_identifier(outer)
         }
         PhysicalPlan::NestedLoopJoin { left, right, .. }
+        | PhysicalPlan::HashJoin { left, right, .. }
         | PhysicalPlan::SetOperation { left, right, .. } => {
             physical_plan_has_qualified_identifier(left)
                 || physical_plan_has_qualified_identifier(right)
@@ -5169,6 +5208,19 @@ fn replace_input_only_outer_refs(
             format: *format,
             input: Box::new(replace_logical_outer_refs(input, columns, row)?),
         }),
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => Ok(LogicalPlan::HashJoin {
+            kind: *kind,
+            left: Box::new(replace_logical_outer_refs(left, columns, row)?),
+            right: Box::new(replace_logical_outer_refs(right, columns, row)?),
+            left_key: left_key.clone(),
+            right_key: right_key.clone(),
+        }),
         _ => Ok(plan.clone()),
     }
 }
@@ -5187,6 +5239,7 @@ fn replace_physical_outer_refs(
         PhysicalPlan::NestedLoopJoin { .. } => {
             replace_physical_nested_join_outer_refs(plan, columns, row)
         }
+        PhysicalPlan::HashJoin { .. } => replace_physical_hash_join_outer_refs(plan, columns, row),
         PhysicalPlan::InSubqueryFilter { .. } => {
             replace_physical_in_filter_outer_refs(plan, columns, row)
         }
@@ -5270,6 +5323,32 @@ fn replace_physical_nested_join_outer_refs(
         left: Box::new(replace_physical_outer_refs(left, columns, row)?),
         right: Box::new(replace_physical_outer_refs(right, columns, row)?),
         predicate: replace_outer_refs_expr(predicate, columns, row)?,
+        cost: *cost,
+    })
+}
+
+fn replace_physical_hash_join_outer_refs(
+    plan: &PhysicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<PhysicalPlan> {
+    let PhysicalPlan::HashJoin {
+        kind,
+        left,
+        right,
+        left_key,
+        right_key,
+        cost,
+    } = plan
+    else {
+        unreachable!("replace_physical_hash_join_outer_refs only accepts hash join plans")
+    };
+    Ok(PhysicalPlan::HashJoin {
+        kind: *kind,
+        left: Box::new(replace_physical_outer_refs(left, columns, row)?),
+        right: Box::new(replace_physical_outer_refs(right, columns, row)?),
+        left_key: left_key.clone(),
+        right_key: right_key.clone(),
         cost: *cost,
     })
 }
@@ -5612,6 +5691,78 @@ fn replace_outer_refs_expr(expr: &Expr, columns: &[ColumnSchema], row: &Row) -> 
 fn outer_runtime_value(columns: &[ColumnSchema], row: &Row, name: &str) -> Result<SqlValue> {
     let index = column_index(columns, name)?;
     Ok(row.values()[index].clone())
+}
+
+fn apply_hash_join_cancellable(
+    left: VectorBatch,
+    right: VectorBatch,
+    kind: JoinKind,
+    left_key: &str,
+    right_key: &str,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    let columns = joined_columns_for_join(left.columns(), right.columns(), kind)?;
+    let left_key = column_index(left.columns(), left_key)?;
+    let right_key = column_index(right.columns(), right_key)?;
+    let index = build_join_hash_index(&right, right_key, cancellation)?;
+    let rows = probe_join_hash_index(&left, &right, kind, left_key, &index, cancellation)?;
+    VectorBatch::new(columns, rows)
+}
+
+fn build_join_hash_index(
+    right: &VectorBatch,
+    right_key: usize,
+    cancellation: &CancellationToken,
+) -> Result<HashMap<SqlValue, Vec<usize>>> {
+    let mut index = HashMap::<SqlValue, Vec<usize>>::new();
+    for (row_index, row) in right.rows().iter().enumerate() {
+        cancellation.check()?;
+        let key = &row.values()[right_key];
+        if !key.is_null() {
+            index.entry(key.clone()).or_default().push(row_index);
+        }
+    }
+    Ok(index)
+}
+
+fn probe_join_hash_index(
+    left: &VectorBatch,
+    right: &VectorBatch,
+    kind: JoinKind,
+    left_key: usize,
+    index: &HashMap<SqlValue, Vec<usize>>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
+    let null_right = null_row(right.columns());
+    let mut rows = Vec::new();
+    for left_row in left.rows() {
+        cancellation.check()?;
+        let matched =
+            push_hash_join_matches(left_row, right, left_key, index, &mut rows, cancellation)?;
+        if kind == JoinKind::Left && !matched {
+            rows.push(join_rows(left_row, &null_right));
+        }
+    }
+    Ok(rows)
+}
+
+fn push_hash_join_matches(
+    left_row: &Row,
+    right: &VectorBatch,
+    left_key: usize,
+    index: &HashMap<SqlValue, Vec<usize>>,
+    rows: &mut Vec<Row>,
+    cancellation: &CancellationToken,
+) -> Result<bool> {
+    let key = &left_row.values()[left_key];
+    let Some(matches) = (!key.is_null()).then(|| index.get(key)).flatten() else {
+        return Ok(false);
+    };
+    for row_index in matches {
+        cancellation.check()?;
+        rows.push(join_rows(left_row, &right.rows()[*row_index]));
+    }
+    Ok(true)
 }
 
 fn apply_nested_loop_join_cancellable(

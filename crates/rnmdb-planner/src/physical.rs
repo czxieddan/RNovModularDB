@@ -119,6 +119,14 @@ pub enum PhysicalPlan {
         predicate: Expr,
         cost: PlanCost,
     },
+    HashJoin {
+        kind: JoinKind,
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        left_key: String,
+        right_key: String,
+        cost: PlanCost,
+    },
     Filter {
         predicate: Expr,
         input: Box<PhysicalPlan>,
@@ -567,6 +575,20 @@ impl PhysicalPlanner {
                 predicate: predicate.clone(),
                 cost,
             },
+            LogicalPlan::HashJoin {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+            } => PhysicalPlan::HashJoin {
+                kind: *kind,
+                left: Box::new(self.plan(left)),
+                right: Box::new(self.plan(right)),
+                left_key: left_key.clone(),
+                right_key: right_key.clone(),
+                cost,
+            },
             LogicalPlan::Filter { predicate, input } => {
                 if let Some(scan) = self.index_scan(predicate, input, cost) {
                     return scan;
@@ -778,6 +800,7 @@ impl PhysicalPlan {
             | PhysicalPlan::BoundsOverlapScan { cost, .. }
             | PhysicalPlan::SidewaysIndexLookup { cost, .. }
             | PhysicalPlan::NestedLoopJoin { cost, .. }
+            | PhysicalPlan::HashJoin { cost, .. }
             | PhysicalPlan::Filter { cost, .. }
             | PhysicalPlan::InSubqueryFilter { cost, .. }
             | PhysicalPlan::ExistsSubqueryFilter { cost, .. }
@@ -981,6 +1004,22 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}NestedLoopJoin kind={} predicate={predicate}{}\n",
+                join_kind_name(*kind),
+                cost_suffix(*cost)
+            ));
+            write_physical_plan(left, indent + 1, out);
+            write_physical_plan(right, indent + 1, out);
+        }
+        PhysicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            cost,
+        } => {
+            out.push_str(&format!(
+                "{prefix}HashJoin kind={} left_key={left_key} right_key={right_key}{}\n",
                 join_kind_name(*kind),
                 cost_suffix(*cost)
             ));

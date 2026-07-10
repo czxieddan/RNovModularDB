@@ -279,6 +279,18 @@ impl CostModel {
                     left.io + right.io,
                 )
             }
+            LogicalPlan::HashJoin { left, right, .. } => {
+                let left = self.estimate(left);
+                let right = self.estimate(right);
+                PlanCost::new(
+                    (left.rows * right.rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
+                    left.row_width_bytes + right.row_width_bytes,
+                    left.cpu
+                        + right.cpu
+                        + (left.rows + right.rows) * self.parameters.cpu_operator_cost,
+                    left.io + right.io,
+                )
+            }
             LogicalPlan::Filter { input, .. } => {
                 let input = self.estimate(input);
                 input

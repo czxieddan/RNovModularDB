@@ -164,6 +164,19 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             right: Box::new(optimize_plan(*right)),
             predicate,
         },
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => LogicalPlan::HashJoin {
+            kind,
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+            left_key,
+            right_key,
+        },
         other => other,
     }
 }
@@ -310,6 +323,19 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             left: Box::new(annotate_parallel(*left, workers)),
             right: Box::new(annotate_parallel(*right, workers)),
             predicate,
+        },
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => LogicalPlan::HashJoin {
+            kind,
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
+            left_key,
+            right_key,
         },
         other => other,
     }

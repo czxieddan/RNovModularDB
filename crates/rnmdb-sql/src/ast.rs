@@ -899,11 +899,18 @@ pub struct BoundLateralJoin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundHashJoinKeys {
+    pub left_column: String,
+    pub right_column: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundJoin {
     pub kind: JoinKind,
     pub right_relation_id: RelationId,
     pub right_table: ObjectName,
     pub predicate: Expr,
+    pub hash_keys: Option<BoundHashJoinKeys>,
     pub applied_row_policies: Vec<String>,
     pub row_policy_predicates: Vec<BoundRowPolicy>,
 }
