@@ -2087,11 +2087,8 @@ impl SingleFileBackend {
             )
         })
     }
-}
 
-impl StorageBackend for SingleFileBackend {
-    fn read_page(&self, id: PageId) -> Result<Option<Page>> {
-        let key = self.page_key()?;
+    fn page_reader(&self, id: PageId) -> Result<File> {
         let mut file = self.file.try_clone().map_err(|err| {
             RnovError::new(
                 ErrorKind::Io,
@@ -2105,7 +2102,10 @@ impl StorageBackend for SingleFileBackend {
                 format!("failed to seek encrypted page record: {err}"),
             )
         })?;
+        Ok(file)
+    }
 
+    fn read_page_record_header(&self, file: &mut File) -> Result<Option<PageRecordHeader>> {
         let mut header = [0_u8; Self::PAGE_RECORD_HEADER_LEN];
         let read = file.read(&mut header).map_err(|err| {
             RnovError::new(
@@ -2113,6 +2113,14 @@ impl StorageBackend for SingleFileBackend {
                 format!("failed to read encrypted page record header: {err}"),
             )
         })?;
+        Self::classify_page_record_header(read, &header, self.max_page_ciphertext_len())
+    }
+
+    fn classify_page_record_header(
+        read: usize,
+        header: &[u8; Self::PAGE_RECORD_HEADER_LEN],
+        max_page_ciphertext_len: usize,
+    ) -> Result<Option<PageRecordHeader>> {
         if read == 0 {
             return Ok(None);
         }
@@ -2132,15 +2140,21 @@ impl StorageBackend for SingleFileBackend {
             ));
         }
 
-        let counter = u32::from_be_bytes(read_fixed::<4>(&header, 8)?);
-        let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as usize;
-        if ciphertext_len > self.max_page_ciphertext_len() {
+        let counter = u32::from_be_bytes(read_fixed::<4>(header, 8)?);
+        let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(header, 12)?) as usize;
+        if ciphertext_len > max_page_ciphertext_len {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 "encrypted page record length is too large",
             ));
         }
+        Ok(Some(PageRecordHeader {
+            counter,
+            ciphertext_len,
+        }))
+    }
 
+    fn read_page_ciphertext(file: &mut File, ciphertext_len: usize) -> Result<Vec<u8>> {
         let mut ciphertext = vec![0_u8; ciphertext_len];
         file.read_exact(&mut ciphertext).map_err(|err| {
             RnovError::new(
@@ -2148,10 +2162,27 @@ impl StorageBackend for SingleFileBackend {
                 format!("failed to read encrypted page payload: {err}"),
             )
         })?;
+        Ok(ciphertext)
+    }
+}
+
+struct PageRecordHeader {
+    counter: u32,
+    ciphertext_len: usize,
+}
+
+impl StorageBackend for SingleFileBackend {
+    fn read_page(&self, id: PageId) -> Result<Option<Page>> {
+        let key = self.page_key()?;
+        let mut file = self.page_reader(id)?;
+        let Some(header) = self.read_page_record_header(&mut file)? else {
+            return Ok(None);
+        };
+        let ciphertext = Self::read_page_ciphertext(&mut file, header.ciphertext_len)?;
 
         PageCrypto::decrypt(
             &key,
-            PageNonce::from_page_counter(id, counter),
+            PageNonce::from_page_counter(id, header.counter),
             id,
             &ciphertext,
         )
