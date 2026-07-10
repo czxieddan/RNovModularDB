@@ -523,6 +523,14 @@ impl UdfRegistry {
         Ok(function_id)
     }
 
+    pub fn unregister(&mut self, function_id: FunctionId) -> Option<UdfDefinition> {
+        let position = self
+            .functions
+            .iter()
+            .position(|function| function.function_id == function_id)?;
+        Some(self.functions.remove(position))
+    }
+
     fn validate_registration(
         &self,
         function_id: FunctionId,
