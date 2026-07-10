@@ -1742,313 +1742,568 @@ impl CatalogCodec {
 
     pub fn decode(bytes: &[u8]) -> Result<Catalog> {
         let mut reader = CatalogReader::new(bytes);
-        if reader.read_exact(8, "catalog magic")? != Self::MAGIC {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "invalid catalog magic",
-            ));
-        }
-        let version = reader.read_u16("catalog version")?;
-        if !(Self::MIN_READ_VERSION..=Self::VERSION).contains(&version) {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                format!("unsupported catalog version {version}"),
-            ));
-        }
-
-        let database_id = DatabaseId::new(reader.read_u64("database id")?);
-        let mut catalog = Catalog {
-            database_id,
-            next_relation_id: reader.read_u64("next relation id")?,
-            next_function_id: reader.read_u64("next function id")?,
-            next_operator_id: reader.read_u64("next operator id")?,
-            next_role_id: reader.read_u64("next role id")?,
-            next_policy_id: reader.read_u64("next policy id")?,
-            schemas: BTreeMap::new(),
-            functions: Vec::new(),
-            procedures: Vec::new(),
-            operators: Vec::new(),
-            triggers: Vec::new(),
-            indexes: Vec::new(),
-            roles: BTreeMap::new(),
-            grants: Vec::new(),
-            procedure_grants: Vec::new(),
-            row_policies: BTreeMap::new(),
-            row_security: BTreeMap::new(),
-        };
-
-        let schema_count = reader.read_u32("schema count")? as usize;
-        for _ in 0..schema_count {
-            let schema_name = reader.read_string("schema name")?;
-            let table_count = reader.read_u32("table count")? as usize;
-            let mut schema = Schema {
-                name: schema_name.clone(),
-                tables: BTreeMap::new(),
-            };
-            for _ in 0..table_count {
-                let relation_id = RelationId::new(reader.read_u64("relation id")?);
-                let table_schema = reader.read_string("table schema")?;
-                let table_name = reader.read_string("table name")?;
-                let table_version = reader.read_u64("table version")?;
-                let owner_role_id = if version >= 10 {
-                    read_optional_role_id(&mut reader, "table owner role id")?
-                } else {
-                    None
-                };
-                let column_count = reader.read_u32("column count")? as usize;
-                let mut columns = Vec::with_capacity(column_count);
-                for _ in 0..column_count {
-                    let name = reader.read_string("column name")?;
-                    let data_type = decode_sql_type(&mut reader)?;
-                    let nullable = reader.read_bool("column nullable")?;
-                    let encrypted = reader.read_bool("column encrypted")?;
-                    let has_generated = reader.read_bool("column generated")?;
-                    let (generated_expr, generated_stored) = if has_generated {
-                        (
-                            Some(reader.read_string("column generated expression")?),
-                            reader.read_bool("column generated stored")?,
-                        )
-                    } else {
-                        (None, false)
-                    };
-                    columns.push(Column {
-                        name,
-                        data_type,
-                        nullable,
-                        encrypted,
-                        generated_expr,
-                        generated_stored,
-                        foreign_key: if version >= 11 {
-                            read_foreign_key_reference(&mut reader)?
-                        } else {
-                            None
-                        },
-                    });
-                }
-                schema.tables.insert(
-                    table_name.clone(),
-                    Table {
-                        relation_id,
-                        schema_name: table_schema,
-                        name: table_name,
-                        columns,
-                        version: table_version,
-                        owner_role_id,
-                    },
-                );
-            }
-            catalog.schemas.insert(schema_name, schema);
-        }
-
-        catalog.functions = decode_functions(&mut reader, version)?;
-
-        let procedure_count = reader.read_u32("procedure count")? as usize;
-        for _ in 0..procedure_count {
-            let procedure_id = FunctionId::new(reader.read_u64("procedure id")?);
-            let name = reader.read_string("procedure name")?;
-            let argument_count = reader.read_u32("procedure argument count")? as usize;
-            let mut argument_types = Vec::with_capacity(argument_count);
-            for _ in 0..argument_count {
-                argument_types.push(decode_sql_type(&mut reader)?);
-            }
-            let body = reader.read_string("procedure body")?;
-            catalog.procedures.push(Procedure {
-                procedure_id,
-                name,
-                argument_types,
-                body,
-            });
-        }
-
-        let operator_count = reader.read_u32("operator count")? as usize;
-        for _ in 0..operator_count {
-            let operator_id = OperatorId::new(reader.read_u64("operator id")?);
-            let symbol = reader.read_string("operator symbol")?;
-            let left_type = decode_sql_type(&mut reader)?;
-            let right_type = decode_sql_type(&mut reader)?;
-            let result_type = decode_sql_type(&mut reader)?;
-            let function_id = FunctionId::new(reader.read_u64("operator function id")?);
-            let precedence = if reader.read_bool("operator precedence present")? {
-                Some(reader.read_u8("operator precedence")?)
-            } else {
-                None
-            };
-            let commutator = reader.read_optional_string("operator commutator")?;
-            let negator = reader.read_optional_string("operator negator")?;
-            let selectivity_function_id =
-                if reader.read_bool("operator selectivity function present")? {
-                    Some(FunctionId::new(
-                        reader.read_u64("operator selectivity function id")?,
-                    ))
-                } else {
-                    None
-                };
-            catalog.operators.push(Operator {
-                operator_id,
-                signature: OperatorSignature {
-                    symbol,
-                    left_type,
-                    right_type,
-                    result_type,
-                    function_id,
-                    precedence,
-                    commutator,
-                    negator,
-                    selectivity_function_id,
-                },
-            });
-        }
-
-        if version >= 12 {
-            let trigger_count = reader.read_u32("trigger count")? as usize;
-            for _ in 0..trigger_count {
-                let trigger = Trigger {
-                    name: reader.read_string("trigger name")?,
-                    relation_id: RelationId::new(reader.read_u64("trigger relation id")?),
-                    table_name: reader.read_string("trigger table")?,
-                    timing: decode_trigger_timing(reader.read_u8("trigger timing")?)?,
-                    event: decode_trigger_event(reader.read_u8("trigger event")?)?,
-                    body: reader.read_string("trigger body")?,
-                };
-                validate_trigger_body(&trigger.body)?;
-                catalog.ensure_relation_exists(trigger.relation_id)?;
-                catalog.triggers.push(trigger);
-            }
-        }
-
-        let index_count = reader.read_u32("index count")? as usize;
-        for _ in 0..index_count {
-            let schema_name = reader.read_string("index schema")?;
-            let name = reader.read_string("index name")?;
-            let relation_id = RelationId::new(reader.read_u64("index relation id")?);
-            let table_name = reader.read_string("index table")?;
-            let unique = reader.read_bool("index unique")?;
-            let method = decode_index_method(reader.read_u8("index method")?)?;
-            let key_count = reader.read_u32("index key count")? as usize;
-            let mut keys = Vec::with_capacity(key_count);
-            for _ in 0..key_count {
-                let tag = reader.read_u8("index key tag")?;
-                let value = reader.read_string("index key")?;
-                let key = match tag {
-                    0 => IndexKey::Column(value),
-                    1 => IndexKey::Expression(value),
-                    unknown => {
-                        return Err(RnovError::new(
-                            ErrorKind::Corruption,
-                            format!("unknown index key tag {unknown}"),
-                        ));
-                    }
-                };
-                keys.push(key);
-            }
-            let columns = keys
-                .iter()
-                .filter_map(|key| key.as_column().map(str::to_string))
-                .collect::<Vec<_>>();
-            catalog.indexes.push(Index {
-                schema_name,
-                name,
-                relation_id,
-                table_name,
-                keys,
-                columns,
-                method,
-                unique,
-            });
-        }
-
-        let role_count = reader.read_u32("role count")? as usize;
-        for _ in 0..role_count {
-            let role_id = RoleId::new(reader.read_u64("role id")?);
-            let name = reader.read_string("role name")?;
-            let superuser = if version >= 10 {
-                reader.read_bool("role superuser")?
-            } else {
-                false
-            };
-            catalog.roles.insert(
-                name.clone(),
-                Role {
-                    role_id,
-                    name,
-                    superuser,
-                },
-            );
-        }
-
-        for table in catalog
-            .schemas
-            .values()
-            .flat_map(|schema| schema.tables.values())
-        {
-            if let Some(owner_role_id) = table.owner_role_id {
-                catalog.ensure_role_exists(owner_role_id)?;
-            }
-        }
-
-        let grant_count = reader.read_u32("grant count")? as usize;
-        for _ in 0..grant_count {
-            catalog.grants.push(TableGrant {
-                role_id: RoleId::new(reader.read_u64("grant role id")?),
-                relation_id: RelationId::new(reader.read_u64("grant relation id")?),
-                privilege: decode_privilege(reader.read_u8("grant privilege")?)?,
-            });
-        }
-
-        if version >= 9 {
-            let procedure_grant_count = reader.read_u32("procedure grant count")? as usize;
-            for _ in 0..procedure_grant_count {
-                let grant = ProcedureGrant {
-                    role_id: RoleId::new(reader.read_u64("procedure grant role id")?),
-                    procedure_id: FunctionId::new(reader.read_u64("procedure grant procedure id")?),
-                    privilege: decode_privilege(reader.read_u8("procedure grant privilege")?)?,
-                };
-                if grant.privilege != Privilege::Execute {
-                    return Err(RnovError::new(
-                        ErrorKind::Corruption,
-                        "procedure grant uses non-Execute privilege",
-                    ));
-                }
-                catalog.ensure_role_exists(grant.role_id)?;
-                catalog.ensure_procedure_exists(grant.procedure_id)?;
-                catalog.procedure_grants.push(grant);
-            }
-        }
-
-        let policy_count = reader.read_u32("policy count")? as usize;
-        for _ in 0..policy_count {
-            let policy = RowPolicy {
-                policy_id: PolicyId::new(reader.read_u64("policy id")?),
-                name: reader.read_string("policy name")?,
-                relation_id: RelationId::new(reader.read_u64("policy relation id")?),
-                predicate: reader.read_string("policy predicate")?,
-            };
-            catalog
-                .row_policies
-                .entry(policy.relation_id)
-                .or_default()
-                .push(policy);
-        }
-
-        let row_security_count = reader.read_u32("row security count")? as usize;
-        for _ in 0..row_security_count {
-            let relation_id = RelationId::new(reader.read_u64("row security relation id")?);
-            let deny_by_default = reader.read_bool("row security deny by default")?;
-            catalog.ensure_relation_exists(relation_id)?;
-            catalog
-                .row_security
-                .insert(relation_id, RowSecurityMode { deny_by_default });
-        }
-
-        if !reader.is_complete() {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "catalog payload has trailing bytes",
-            ));
-        }
-
+        let version = decode_catalog_version(&mut reader)?;
+        let mut catalog = decode_catalog_header(&mut reader)?;
+        decode_catalog_body(&mut reader, version, &mut catalog)?;
+        ensure_catalog_reader_complete(&reader)?;
         Ok(catalog)
     }
+}
+
+fn decode_catalog_version(reader: &mut CatalogReader<'_>) -> Result<u16> {
+    if reader.read_exact(8, "catalog magic")? != CatalogCodec::MAGIC {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "invalid catalog magic",
+        ));
+    }
+    let version = reader.read_u16("catalog version")?;
+    if !(CatalogCodec::MIN_READ_VERSION..=CatalogCodec::VERSION).contains(&version) {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unsupported catalog version {version}"),
+        ));
+    }
+    Ok(version)
+}
+
+fn decode_catalog_header(reader: &mut CatalogReader<'_>) -> Result<Catalog> {
+    Ok(Catalog {
+        database_id: DatabaseId::new(reader.read_u64("database id")?),
+        next_relation_id: reader.read_u64("next relation id")?,
+        next_function_id: reader.read_u64("next function id")?,
+        next_operator_id: reader.read_u64("next operator id")?,
+        next_role_id: reader.read_u64("next role id")?,
+        next_policy_id: reader.read_u64("next policy id")?,
+        schemas: BTreeMap::new(),
+        functions: Vec::new(),
+        procedures: Vec::new(),
+        operators: Vec::new(),
+        triggers: Vec::new(),
+        indexes: Vec::new(),
+        roles: BTreeMap::new(),
+        grants: Vec::new(),
+        procedure_grants: Vec::new(),
+        row_policies: BTreeMap::new(),
+        row_security: BTreeMap::new(),
+    })
+}
+
+fn decode_catalog_body(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &mut Catalog,
+) -> Result<()> {
+    decode_schema_and_routines(reader, version, catalog)?;
+    decode_extensions(reader, version, catalog)?;
+    decode_access_control(reader, version, catalog)?;
+    decode_policy_metadata(reader, catalog)
+}
+
+fn decode_schema_and_routines(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &mut Catalog,
+) -> Result<()> {
+    catalog.schemas = decode_schemas(reader, version)?;
+    catalog.functions = decode_functions(reader, version)?;
+    catalog.procedures = decode_procedures(reader)?;
+    Ok(())
+}
+
+fn decode_extensions(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &mut Catalog,
+) -> Result<()> {
+    catalog.operators = decode_operators(reader)?;
+    let triggers = decode_triggers(reader, version, catalog)?;
+    catalog.triggers = triggers;
+    catalog.indexes = decode_indexes(reader)?;
+    Ok(())
+}
+
+fn decode_access_control(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &mut Catalog,
+) -> Result<()> {
+    catalog.roles = decode_roles(reader, version)?;
+    validate_table_owners(catalog)?;
+    catalog.grants = decode_table_grants(reader)?;
+    let procedure_grants = decode_procedure_grants(reader, version, catalog)?;
+    catalog.procedure_grants = procedure_grants;
+    Ok(())
+}
+
+fn decode_policy_metadata(reader: &mut CatalogReader<'_>, catalog: &mut Catalog) -> Result<()> {
+    catalog.row_policies = decode_row_policies(reader)?;
+    let row_security = decode_row_security(reader, catalog)?;
+    catalog.row_security = row_security;
+    Ok(())
+}
+
+fn decode_schemas(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+) -> Result<BTreeMap<String, Schema>> {
+    let schema_count = reader.read_u32("schema count")? as usize;
+    let mut schemas = BTreeMap::new();
+    for _ in 0..schema_count {
+        let schema = decode_schema(reader, version)?;
+        schemas.insert(schema.name.clone(), schema);
+    }
+    Ok(schemas)
+}
+
+fn decode_schema(reader: &mut CatalogReader<'_>, version: u16) -> Result<Schema> {
+    let name = reader.read_string("schema name")?;
+    let table_count = reader.read_u32("table count")? as usize;
+    let mut tables = BTreeMap::new();
+    for _ in 0..table_count {
+        let table = decode_table(reader, version)?;
+        tables.insert(table.name.clone(), table);
+    }
+    Ok(Schema { name, tables })
+}
+
+struct DecodedTableHeader {
+    relation_id: RelationId,
+    schema_name: String,
+    name: String,
+    version: u64,
+    owner_role_id: Option<RoleId>,
+}
+
+fn decode_table(reader: &mut CatalogReader<'_>, version: u16) -> Result<Table> {
+    let header = decode_table_header(reader, version)?;
+    Ok(Table {
+        relation_id: header.relation_id,
+        schema_name: header.schema_name,
+        name: header.name,
+        columns: decode_columns(reader, version)?,
+        version: header.version,
+        owner_role_id: header.owner_role_id,
+    })
+}
+
+fn decode_table_header(reader: &mut CatalogReader<'_>, version: u16) -> Result<DecodedTableHeader> {
+    Ok(DecodedTableHeader {
+        relation_id: RelationId::new(reader.read_u64("relation id")?),
+        schema_name: reader.read_string("table schema")?,
+        name: reader.read_string("table name")?,
+        version: reader.read_u64("table version")?,
+        owner_role_id: decode_table_owner(reader, version)?,
+    })
+}
+
+fn decode_table_owner(reader: &mut CatalogReader<'_>, version: u16) -> Result<Option<RoleId>> {
+    if version >= 10 {
+        read_optional_role_id(reader, "table owner role id")
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_columns(reader: &mut CatalogReader<'_>, version: u16) -> Result<Vec<Column>> {
+    let column_count = reader.read_u32("column count")? as usize;
+    let mut columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        columns.push(decode_column(reader, version)?);
+    }
+    Ok(columns)
+}
+
+struct DecodedColumnHeader {
+    name: String,
+    data_type: SqlType,
+    nullable: bool,
+    encrypted: bool,
+}
+
+fn decode_column(reader: &mut CatalogReader<'_>, version: u16) -> Result<Column> {
+    let header = decode_column_header(reader)?;
+    let (generated_expr, generated_stored) = decode_generated_column(reader)?;
+    Ok(Column {
+        name: header.name,
+        data_type: header.data_type,
+        nullable: header.nullable,
+        encrypted: header.encrypted,
+        generated_expr,
+        generated_stored,
+        foreign_key: decode_column_foreign_key(reader, version)?,
+    })
+}
+
+fn decode_column_header(reader: &mut CatalogReader<'_>) -> Result<DecodedColumnHeader> {
+    Ok(DecodedColumnHeader {
+        name: reader.read_string("column name")?,
+        data_type: decode_sql_type(reader)?,
+        nullable: reader.read_bool("column nullable")?,
+        encrypted: reader.read_bool("column encrypted")?,
+    })
+}
+
+fn decode_generated_column(reader: &mut CatalogReader<'_>) -> Result<(Option<String>, bool)> {
+    if reader.read_bool("column generated")? {
+        Ok((
+            Some(reader.read_string("column generated expression")?),
+            reader.read_bool("column generated stored")?,
+        ))
+    } else {
+        Ok((None, false))
+    }
+}
+
+fn decode_column_foreign_key(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+) -> Result<Option<ForeignKeyReference>> {
+    if version >= 11 {
+        read_foreign_key_reference(reader)
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_procedures(reader: &mut CatalogReader<'_>) -> Result<Vec<Procedure>> {
+    let procedure_count = reader.read_u32("procedure count")? as usize;
+    let mut procedures = Vec::with_capacity(procedure_count);
+    for _ in 0..procedure_count {
+        procedures.push(decode_procedure(reader)?);
+    }
+    Ok(procedures)
+}
+
+fn decode_procedure(reader: &mut CatalogReader<'_>) -> Result<Procedure> {
+    Ok(Procedure {
+        procedure_id: FunctionId::new(reader.read_u64("procedure id")?),
+        name: reader.read_string("procedure name")?,
+        argument_types: decode_procedure_argument_types(reader)?,
+        body: reader.read_string("procedure body")?,
+    })
+}
+
+fn decode_procedure_argument_types(reader: &mut CatalogReader<'_>) -> Result<Vec<SqlType>> {
+    let argument_count = reader.read_u32("procedure argument count")? as usize;
+    let mut argument_types = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        argument_types.push(decode_sql_type(reader)?);
+    }
+    Ok(argument_types)
+}
+
+fn decode_operators(reader: &mut CatalogReader<'_>) -> Result<Vec<Operator>> {
+    let operator_count = reader.read_u32("operator count")? as usize;
+    let mut operators = Vec::with_capacity(operator_count);
+    for _ in 0..operator_count {
+        operators.push(decode_operator(reader)?);
+    }
+    Ok(operators)
+}
+
+fn decode_operator(reader: &mut CatalogReader<'_>) -> Result<Operator> {
+    let operator_id = OperatorId::new(reader.read_u64("operator id")?);
+    let symbol = reader.read_string("operator symbol")?;
+    Ok(Operator {
+        operator_id,
+        signature: decode_operator_signature(reader, symbol)?,
+    })
+}
+
+fn decode_operator_signature(
+    reader: &mut CatalogReader<'_>,
+    symbol: String,
+) -> Result<OperatorSignature> {
+    let (left_type, right_type, result_type, function_id) = decode_operator_base(reader)?;
+    Ok(OperatorSignature {
+        symbol,
+        left_type,
+        right_type,
+        result_type,
+        function_id,
+        precedence: decode_operator_precedence(reader)?,
+        commutator: reader.read_optional_string("operator commutator")?,
+        negator: reader.read_optional_string("operator negator")?,
+        selectivity_function_id: decode_operator_selectivity_function(reader)?,
+    })
+}
+
+fn decode_operator_base(
+    reader: &mut CatalogReader<'_>,
+) -> Result<(SqlType, SqlType, SqlType, FunctionId)> {
+    Ok((
+        decode_sql_type(reader)?,
+        decode_sql_type(reader)?,
+        decode_sql_type(reader)?,
+        FunctionId::new(reader.read_u64("operator function id")?),
+    ))
+}
+
+fn decode_operator_precedence(reader: &mut CatalogReader<'_>) -> Result<Option<u8>> {
+    if reader.read_bool("operator precedence present")? {
+        reader.read_u8("operator precedence").map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_operator_selectivity_function(
+    reader: &mut CatalogReader<'_>,
+) -> Result<Option<FunctionId>> {
+    if reader.read_bool("operator selectivity function present")? {
+        reader
+            .read_u64("operator selectivity function id")
+            .map(FunctionId::new)
+            .map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_triggers(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &Catalog,
+) -> Result<Vec<Trigger>> {
+    if version < 12 {
+        return Ok(Vec::new());
+    }
+    let trigger_count = reader.read_u32("trigger count")? as usize;
+    let mut triggers = Vec::with_capacity(trigger_count);
+    for _ in 0..trigger_count {
+        let trigger = decode_trigger(reader)?;
+        validate_trigger_body(&trigger.body)?;
+        catalog.ensure_relation_exists(trigger.relation_id)?;
+        triggers.push(trigger);
+    }
+    Ok(triggers)
+}
+
+fn decode_trigger(reader: &mut CatalogReader<'_>) -> Result<Trigger> {
+    let name = reader.read_string("trigger name")?;
+    let relation_id = RelationId::new(reader.read_u64("trigger relation id")?);
+    let table_name = reader.read_string("trigger table")?;
+    let (timing, event) = decode_trigger_kind(reader)?;
+    Ok(Trigger {
+        name,
+        relation_id,
+        table_name,
+        timing,
+        event,
+        body: reader.read_string("trigger body")?,
+    })
+}
+
+fn decode_trigger_kind(reader: &mut CatalogReader<'_>) -> Result<(TriggerTiming, TriggerEvent)> {
+    Ok((
+        decode_trigger_timing(reader.read_u8("trigger timing")?)?,
+        decode_trigger_event(reader.read_u8("trigger event")?)?,
+    ))
+}
+
+fn decode_indexes(reader: &mut CatalogReader<'_>) -> Result<Vec<Index>> {
+    let index_count = reader.read_u32("index count")? as usize;
+    let mut indexes = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        indexes.push(decode_index(reader)?);
+    }
+    Ok(indexes)
+}
+
+struct DecodedIndexHeader {
+    schema_name: String,
+    name: String,
+    relation_id: RelationId,
+    table_name: String,
+    unique: bool,
+    method: IndexMethod,
+}
+
+fn decode_index(reader: &mut CatalogReader<'_>) -> Result<Index> {
+    let header = decode_index_header(reader)?;
+    let keys = decode_index_keys(reader)?;
+    let columns = keys
+        .iter()
+        .filter_map(|key| key.as_column().map(str::to_string))
+        .collect();
+    Ok(Index {
+        schema_name: header.schema_name,
+        name: header.name,
+        relation_id: header.relation_id,
+        table_name: header.table_name,
+        keys,
+        columns,
+        method: header.method,
+        unique: header.unique,
+    })
+}
+
+fn decode_index_header(reader: &mut CatalogReader<'_>) -> Result<DecodedIndexHeader> {
+    Ok(DecodedIndexHeader {
+        schema_name: reader.read_string("index schema")?,
+        name: reader.read_string("index name")?,
+        relation_id: RelationId::new(reader.read_u64("index relation id")?),
+        table_name: reader.read_string("index table")?,
+        unique: reader.read_bool("index unique")?,
+        method: decode_index_method(reader.read_u8("index method")?)?,
+    })
+}
+
+fn decode_index_keys(reader: &mut CatalogReader<'_>) -> Result<Vec<IndexKey>> {
+    let key_count = reader.read_u32("index key count")? as usize;
+    let mut keys = Vec::with_capacity(key_count);
+    for _ in 0..key_count {
+        keys.push(decode_index_key(reader)?);
+    }
+    Ok(keys)
+}
+
+fn decode_index_key(reader: &mut CatalogReader<'_>) -> Result<IndexKey> {
+    let tag = reader.read_u8("index key tag")?;
+    let value = reader.read_string("index key")?;
+    match tag {
+        0 => Ok(IndexKey::Column(value)),
+        1 => Ok(IndexKey::Expression(value)),
+        unknown => Err(RnovError::new(
+            ErrorKind::Corruption,
+            format!("unknown index key tag {unknown}"),
+        )),
+    }
+}
+
+fn decode_roles(reader: &mut CatalogReader<'_>, version: u16) -> Result<BTreeMap<String, Role>> {
+    let role_count = reader.read_u32("role count")? as usize;
+    let mut roles = BTreeMap::new();
+    for _ in 0..role_count {
+        let role = decode_role(reader, version)?;
+        roles.insert(role.name.clone(), role);
+    }
+    Ok(roles)
+}
+
+fn decode_role(reader: &mut CatalogReader<'_>, version: u16) -> Result<Role> {
+    Ok(Role {
+        role_id: RoleId::new(reader.read_u64("role id")?),
+        name: reader.read_string("role name")?,
+        superuser: decode_role_superuser(reader, version)?,
+    })
+}
+
+fn decode_role_superuser(reader: &mut CatalogReader<'_>, version: u16) -> Result<bool> {
+    if version >= 10 {
+        reader.read_bool("role superuser")
+    } else {
+        Ok(false)
+    }
+}
+
+fn validate_table_owners(catalog: &Catalog) -> Result<()> {
+    for table in catalog
+        .schemas
+        .values()
+        .flat_map(|schema| schema.tables.values())
+    {
+        if let Some(owner_role_id) = table.owner_role_id {
+            catalog.ensure_role_exists(owner_role_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_table_grants(reader: &mut CatalogReader<'_>) -> Result<Vec<TableGrant>> {
+    let grant_count = reader.read_u32("grant count")? as usize;
+    let mut grants = Vec::with_capacity(grant_count);
+    for _ in 0..grant_count {
+        grants.push(TableGrant {
+            role_id: RoleId::new(reader.read_u64("grant role id")?),
+            relation_id: RelationId::new(reader.read_u64("grant relation id")?),
+            privilege: decode_privilege(reader.read_u8("grant privilege")?)?,
+        });
+    }
+    Ok(grants)
+}
+
+fn decode_procedure_grants(
+    reader: &mut CatalogReader<'_>,
+    version: u16,
+    catalog: &Catalog,
+) -> Result<Vec<ProcedureGrant>> {
+    if version < 9 {
+        return Ok(Vec::new());
+    }
+    let grant_count = reader.read_u32("procedure grant count")? as usize;
+    let mut grants = Vec::with_capacity(grant_count);
+    for _ in 0..grant_count {
+        grants.push(decode_procedure_grant(reader, catalog)?);
+    }
+    Ok(grants)
+}
+
+fn decode_procedure_grant(
+    reader: &mut CatalogReader<'_>,
+    catalog: &Catalog,
+) -> Result<ProcedureGrant> {
+    let grant = ProcedureGrant {
+        role_id: RoleId::new(reader.read_u64("procedure grant role id")?),
+        procedure_id: FunctionId::new(reader.read_u64("procedure grant procedure id")?),
+        privilege: decode_privilege(reader.read_u8("procedure grant privilege")?)?,
+    };
+    validate_procedure_grant(catalog, &grant)?;
+    Ok(grant)
+}
+
+fn validate_procedure_grant(catalog: &Catalog, grant: &ProcedureGrant) -> Result<()> {
+    if grant.privilege != Privilege::Execute {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "procedure grant uses non-Execute privilege",
+        ));
+    }
+    catalog.ensure_role_exists(grant.role_id)?;
+    catalog.ensure_procedure_exists(grant.procedure_id)
+}
+
+fn decode_row_policies(
+    reader: &mut CatalogReader<'_>,
+) -> Result<BTreeMap<RelationId, Vec<RowPolicy>>> {
+    let policy_count = reader.read_u32("policy count")? as usize;
+    let mut policies = BTreeMap::<RelationId, Vec<RowPolicy>>::new();
+    for _ in 0..policy_count {
+        let policy = RowPolicy {
+            policy_id: PolicyId::new(reader.read_u64("policy id")?),
+            name: reader.read_string("policy name")?,
+            relation_id: RelationId::new(reader.read_u64("policy relation id")?),
+            predicate: reader.read_string("policy predicate")?,
+        };
+        policies.entry(policy.relation_id).or_default().push(policy);
+    }
+    Ok(policies)
+}
+
+fn decode_row_security(
+    reader: &mut CatalogReader<'_>,
+    catalog: &Catalog,
+) -> Result<BTreeMap<RelationId, RowSecurityMode>> {
+    let row_security_count = reader.read_u32("row security count")? as usize;
+    let mut row_security = BTreeMap::new();
+    for _ in 0..row_security_count {
+        let relation_id = RelationId::new(reader.read_u64("row security relation id")?);
+        let deny_by_default = reader.read_bool("row security deny by default")?;
+        catalog.ensure_relation_exists(relation_id)?;
+        row_security.insert(relation_id, RowSecurityMode { deny_by_default });
+    }
+    Ok(row_security)
+}
+
+fn ensure_catalog_reader_complete(reader: &CatalogReader<'_>) -> Result<()> {
+    if !reader.is_complete() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "catalog payload has trailing bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn encode_catalog_header(out: &mut Vec<u8>, catalog: &Catalog) {
