@@ -363,21 +363,27 @@ fn execute_auth_command(
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
+    let response = auth_command_response(runtime, session, command)?;
+    write_protocol_line(writer, response)?;
+    Ok(false)
+}
+
+fn auth_command_response(
+    runtime: &EmbeddedRuntime,
+    session: &mut Option<LocalSession>,
+    command: &str,
+) -> Result<&'static str> {
     if session.is_some() {
-        write_protocol_line(writer, "OK authenticated")?;
-        return Ok(false);
+        return Ok("OK authenticated");
     }
     let Some((username, password)) = parse_auth_command(command) else {
-        write_protocol_line(writer, "ERR usage: AUTH <username> <password>")?;
-        return Ok(false);
+        return Ok("ERR usage: AUTH <username> <password>");
     };
     if authenticate_client(runtime, username, password)? {
         *session = Some(runtime.open_session()?);
-        write_protocol_line(writer, "OK authenticated")?;
-    } else {
-        write_protocol_line(writer, "ERR authentication failed")?;
+        return Ok("OK authenticated");
     }
-    Ok(false)
+    Ok("ERR authentication failed")
 }
 
 fn authenticate_client(runtime: &EmbeddedRuntime, username: &str, password: &str) -> Result<bool> {
