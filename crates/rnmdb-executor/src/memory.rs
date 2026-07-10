@@ -5033,7 +5033,10 @@ fn logical_plan_has_qualified_identifier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Parallel { input, .. }
         | LogicalPlan::Explain { input, .. } => logical_plan_has_qualified_identifier(input),
-        LogicalPlan::HashJoin { left, right, .. } => {
+        LogicalPlan::HashJoin { left, right, .. }
+        | LogicalPlan::Union { left, right, .. }
+        | LogicalPlan::Intersect { left, right, .. }
+        | LogicalPlan::Except { left, right, .. } => {
             logical_plan_has_qualified_identifier(left)
                 || logical_plan_has_qualified_identifier(right)
         }
@@ -5132,7 +5135,36 @@ fn replace_logical_outer_refs(
         LogicalPlan::Filter { .. } => replace_filter_outer_refs(plan, columns, row),
         LogicalPlan::Project { .. } => replace_project_outer_refs(plan, columns, row),
         LogicalPlan::Sort { .. } => replace_sort_outer_refs(plan, columns, row),
+        LogicalPlan::Union { .. } | LogicalPlan::Intersect { .. } | LogicalPlan::Except { .. } => {
+            replace_logical_set_outer_refs(plan, columns, row)
+        }
         _ => replace_input_only_outer_refs(plan, columns, row),
+    }
+}
+
+fn replace_logical_set_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    let replace = |input: &LogicalPlan| replace_logical_outer_refs(input, columns, row);
+    match plan {
+        LogicalPlan::Union { all, left, right } => Ok(LogicalPlan::Union {
+            all: *all,
+            left: Box::new(replace(left)?),
+            right: Box::new(replace(right)?),
+        }),
+        LogicalPlan::Intersect { all, left, right } => Ok(LogicalPlan::Intersect {
+            all: *all,
+            left: Box::new(replace(left)?),
+            right: Box::new(replace(right)?),
+        }),
+        LogicalPlan::Except { all, left, right } => Ok(LogicalPlan::Except {
+            all: *all,
+            left: Box::new(replace(left)?),
+            right: Box::new(replace(right)?),
+        }),
+        _ => unreachable!("replace_logical_set_outer_refs only accepts set operations"),
     }
 }
 

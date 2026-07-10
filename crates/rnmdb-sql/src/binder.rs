@@ -468,11 +468,15 @@ impl<'a> Binder<'a> {
                 },
                 outer_scope,
             ),
-            Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
-            Statement::Intersect { all, left, right } => {
-                self.bind_intersect(*all, left, right, role_id)
+            Statement::Union { all, left, right } => {
+                self.bind_union(*all, left, right, role_id, outer_scope)
             }
-            Statement::Except { all, left, right } => self.bind_except(*all, left, right, role_id),
+            Statement::Intersect { all, left, right } => {
+                self.bind_intersect(*all, left, right, role_id, outer_scope)
+            }
+            Statement::Except { all, left, right } => {
+                self.bind_except(*all, left, right, role_id, outer_scope)
+            }
             Statement::RecursiveCte {
                 name,
                 columns,
@@ -485,7 +489,7 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_query(input, order_by, *limit, *offset, role_id),
+            } => self.bind_query(input, order_by, *limit, *offset, role_id, outer_scope),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -753,8 +757,9 @@ impl<'a> Binder<'a> {
         limit: Option<usize>,
         offset: Option<usize>,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let input = self.bind_for_role(input, role_id)?;
+        let input = self.bind_for_role_with_outer(input, role_id, outer_scope)?;
         let columns = query_output_columns(&input)?.to_vec();
         let order_by = self.bind_query_output_order_by(&columns, order_by)?;
         Ok(BoundStatement::Query(BoundQuery {
@@ -1012,9 +1017,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("EXCEPT", &left, &right)?;
         Ok(BoundStatement::Except(BoundExcept {
             all,
@@ -1051,9 +1057,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("UNION", &left, &right)?;
         Ok(BoundStatement::Union(BoundUnion {
             all,
@@ -1141,9 +1148,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("INTERSECT", &left, &right)?;
         Ok(BoundStatement::Intersect(BoundIntersect {
             all,
