@@ -14,6 +14,7 @@ use rnmdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
 use rnmdb_types::{SqlType, SqlValue};
 
 const WASM_SCALAR_ENTRYPOINT: &str = "run";
+const WASM_PAGE_BYTES: u64 = 64 * 1024;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_CACHED_WASM_MODULES: usize = 32;
 
@@ -625,6 +626,13 @@ struct InvocationDeadline {
     timed_out: Arc<AtomicBool>,
 }
 
+struct PreparedInvocation {
+    store: wasmtime::Store<WasmStoreState>,
+    function: wasmtime::TypedFunc<i64, i64>,
+    deadline: InvocationDeadline,
+    timeout: Duration,
+}
+
 struct EpochTicker {
     shutdown: mpsc::Sender<()>,
     worker: Option<JoinHandle<()>>,
@@ -654,14 +662,60 @@ impl WasmScalarRuntime {
         Ok(SqlValue::Int64(result))
     }
 
+    pub fn prepare_i64_unary(
+        &self,
+        name: impl Into<String>,
+        module_bytes: Vec<u8>,
+        sandbox_policy: UdfSandboxPolicy,
+    ) -> Result<UdfDefinition> {
+        let provisional = WasmModuleDefinition::new(module_bytes, 0, Vec::new())?;
+        let compiled = self.compile_module(&provisional)?;
+        ensure_no_compiled_imports(&compiled)?;
+        let initial_memory_bytes = ensure_compiled_resources(&compiled, sandbox_policy.budget())?;
+        let module =
+            WasmModuleDefinition::new(provisional.module_bytes, initial_memory_bytes, Vec::new())?;
+        let definition = UdfDefinition::new_wasm(
+            name,
+            vec![SqlType::Int64],
+            SqlType::Int64,
+            module,
+            sandbox_policy,
+        )?;
+        self.validate_scalar(&definition)?;
+        Ok(definition)
+    }
+
+    pub fn validate_scalar(&self, definition: &UdfDefinition) -> Result<()> {
+        let module = wasm_module_for_scalar(definition)?;
+        ensure_i64_unary_signature(definition)?;
+        let _ = self.prepare_invocation(module, definition.sandbox_policy())?;
+        Ok(())
+    }
+
     fn execute_i64_unary(
         &self,
         module: &WasmModuleDefinition,
         policy: &UdfSandboxPolicy,
         argument: i64,
     ) -> Result<i64> {
+        let mut invocation = self.prepare_invocation(module, policy)?;
+        call_i64_with_deadline(
+            &mut invocation.store,
+            invocation.function,
+            argument,
+            &invocation.deadline,
+            invocation.timeout,
+        )
+    }
+
+    fn prepare_invocation(
+        &self,
+        module: &WasmModuleDefinition,
+        policy: &UdfSandboxPolicy,
+    ) -> Result<PreparedInvocation> {
         let wasm_module = self.compile_module(module)?;
         ensure_no_compiled_imports(&wasm_module)?;
+        let _ = ensure_compiled_resources(&wasm_module, policy.budget())?;
         let mut store = self.create_store(policy)?;
         let timeout = policy.budget().timeout();
         let deadline = configure_epoch_deadline(&mut store, timeout);
@@ -671,7 +725,12 @@ impl WasmScalarRuntime {
             .map_err(|err| {
                 wasm_invalid_guest_error("failed to resolve wasm scalar entrypoint", err)
             })?;
-        call_i64_with_deadline(&mut store, function, argument, &deadline, timeout)
+        Ok(PreparedInvocation {
+            store,
+            function,
+            deadline,
+            timeout,
+        })
     }
 
     fn compile_module(&self, module: &WasmModuleDefinition) -> Result<wasmtime::Module> {
@@ -851,6 +910,46 @@ fn ensure_no_compiled_imports(module: &wasmtime::Module) -> Result<()> {
             import.name()
         ),
     ))
+}
+
+fn ensure_compiled_resources(module: &wasmtime::Module, budget: UdfBudget) -> Result<usize> {
+    let resources = module.resources_required();
+    if resources.num_memories > 1 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar modules may define at most one linear memory",
+        ));
+    }
+    if resources.num_tables > 0 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm scalar modules may not define tables",
+        ));
+    }
+    let initial_memory_bytes = compiled_initial_memory_bytes(&resources)?;
+    if initial_memory_bytes > budget.max_memory_bytes() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm module initial memory exceeds udf memory budget",
+        ));
+    }
+    Ok(initial_memory_bytes)
+}
+
+fn compiled_initial_memory_bytes(resources: &wasmtime::ResourcesRequired) -> Result<usize> {
+    let pages = resources.max_initial_memory_size.unwrap_or(0);
+    let bytes = pages.checked_mul(WASM_PAGE_BYTES).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm module initial memory size overflows u64",
+        )
+    })?;
+    usize::try_from(bytes).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm module initial memory does not fit this platform",
+        )
+    })
 }
 
 fn wasm_module_for_scalar(definition: &UdfDefinition) -> Result<&WasmModuleDefinition> {
