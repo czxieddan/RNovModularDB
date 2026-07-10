@@ -2729,103 +2729,20 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
         })?
         .len();
     let (format_version, page_size, superblock_generation) = read_single_file_header(&mut file)?;
-    let data_start_bytes =
-        (SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN * 2) as u64;
-    let max_page_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
-    let page_record_size_bytes =
-        (SingleFileBackend::PAGE_RECORD_HEADER_LEN + max_page_ciphertext_len) as u64;
-    let page_record_slots = if file_len_bytes <= data_start_bytes {
-        0
-    } else {
-        (file_len_bytes - data_start_bytes).div_ceil(page_record_size_bytes)
-    };
-    let mut present_page_records = 0_u64;
-    let mut empty_page_slots = 0_u64;
-    let mut page_records = Vec::new();
-
-    for slot in 0..page_record_slots {
-        let offset = data_start_bytes + slot * page_record_size_bytes;
-        let page_id = PageId::new(slot + 1);
-        let Some(header_end) = offset.checked_add(SingleFileBackend::PAGE_RECORD_HEADER_LEN as u64)
-        else {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "encrypted page record offset overflow",
-            ));
-        };
-        if header_end > file_len_bytes {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "truncated encrypted page record header",
-            ));
-        }
-
-        file.seek(SeekFrom::Start(offset)).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to seek encrypted page record during inspection: {err}"),
-            )
-        })?;
-        let mut header = [0_u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN];
-        file.read_exact(&mut header).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Corruption,
-                format!("failed to read encrypted page record header: {err}"),
-            )
-        })?;
-
-        if header[..8].iter().all(|byte| *byte == 0) {
-            empty_page_slots += 1;
-            page_records.push(SingleFilePageRecordInspection::empty(slot, page_id, offset));
-            continue;
-        }
-        if header[..8] != SingleFileBackend::PAGE_RECORD_MAGIC {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "invalid encrypted page record magic",
-            ));
-        }
-
-        let counter = u32::from_be_bytes(read_fixed::<4>(&header, 8)?);
-        let ciphertext_len = u32::from_be_bytes(read_fixed::<4>(&header, 12)?) as u64;
-        if ciphertext_len > max_page_ciphertext_len as u64 {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "encrypted page record length is too large",
-            ));
-        }
-        let Some(payload_end) = header_end.checked_add(ciphertext_len) else {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "encrypted page record length overflow",
-            ));
-        };
-        if payload_end > file_len_bytes {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "truncated encrypted page record payload",
-            ));
-        }
-        present_page_records += 1;
-        page_records.push(SingleFilePageRecordInspection::encrypted(
-            slot,
-            page_id,
-            offset,
-            counter,
-            ciphertext_len,
-        ));
-    }
+    let layout = SingleFileInspectionLayout::new(page_size, file_len_bytes);
+    let (page_records, present_page_records, empty_page_slots) =
+        inspect_single_file_page_records(&mut file, file_len_bytes, &layout)?;
 
     Ok(SingleFileInspection {
         path: path.to_path_buf(),
         file_len_bytes,
-        data_start_bytes,
+        data_start_bytes: layout.data_start_bytes,
         page_size,
-        page_record_size_bytes,
+        page_record_size_bytes: layout.page_record_size_bytes,
         format_version,
         superblock_generation,
         superblock_checksum_verified: true,
-        page_record_slots,
+        page_record_slots: layout.page_record_slots,
         present_page_records,
         empty_page_slots,
         authenticated_page_records: 0,
@@ -2835,6 +2752,159 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
             | StorageCapability::SINGLE_FILE
             | StorageCapability::ENCRYPTED,
     })
+}
+
+struct SingleFileInspectionLayout {
+    data_start_bytes: u64,
+    max_page_ciphertext_len: usize,
+    page_record_size_bytes: u64,
+    page_record_slots: u64,
+}
+
+impl SingleFileInspectionLayout {
+    fn new(page_size: PageSize, file_len_bytes: u64) -> Self {
+        let data_start_bytes =
+            (SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN * 2) as u64;
+        let max_page_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
+        let page_record_size_bytes =
+            (SingleFileBackend::PAGE_RECORD_HEADER_LEN + max_page_ciphertext_len) as u64;
+        let page_record_slots = if file_len_bytes <= data_start_bytes {
+            0
+        } else {
+            (file_len_bytes - data_start_bytes).div_ceil(page_record_size_bytes)
+        };
+        Self {
+            data_start_bytes,
+            max_page_ciphertext_len,
+            page_record_size_bytes,
+            page_record_slots,
+        }
+    }
+}
+
+fn inspect_single_file_page_records(
+    file: &mut File,
+    file_len_bytes: u64,
+    layout: &SingleFileInspectionLayout,
+) -> Result<(Vec<SingleFilePageRecordInspection>, u64, u64)> {
+    let mut present_page_records = 0_u64;
+    let mut empty_page_slots = 0_u64;
+    let mut page_records = Vec::new();
+    for slot in 0..layout.page_record_slots {
+        let (record, present) =
+            inspect_single_file_page_record(file, file_len_bytes, layout, slot)?;
+        present_page_records += u64::from(present);
+        empty_page_slots += u64::from(!present);
+        page_records.push(record);
+    }
+    Ok((page_records, present_page_records, empty_page_slots))
+}
+
+fn inspect_single_file_page_record(
+    file: &mut File,
+    file_len_bytes: u64,
+    layout: &SingleFileInspectionLayout,
+    slot: u64,
+) -> Result<(SingleFilePageRecordInspection, bool)> {
+    let (offset, header_end) = inspection_page_record_bounds(file_len_bytes, layout, slot)?;
+    let header = read_inspection_page_record_header(file, offset)?;
+    inspect_page_record_header(header, slot, offset, header_end, file_len_bytes, layout)
+}
+
+fn inspection_page_record_bounds(
+    file_len_bytes: u64,
+    layout: &SingleFileInspectionLayout,
+    slot: u64,
+) -> Result<(u64, u64)> {
+    let offset = layout
+        .data_start_bytes
+        .checked_add(
+            slot.checked_mul(layout.page_record_size_bytes)
+                .ok_or_else(inspection_offset_overflow)?,
+        )
+        .ok_or_else(inspection_offset_overflow)?;
+    let header_end = offset
+        .checked_add(SingleFileBackend::PAGE_RECORD_HEADER_LEN as u64)
+        .ok_or_else(inspection_offset_overflow)?;
+    if header_end > file_len_bytes {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "truncated encrypted page record header",
+        ));
+    }
+    Ok((offset, header_end))
+}
+
+fn inspection_offset_overflow() -> RnovError {
+    RnovError::new(
+        ErrorKind::Corruption,
+        "encrypted page record offset overflow",
+    )
+}
+
+fn read_inspection_page_record_header(
+    file: &mut File,
+    offset: u64,
+) -> Result<[u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN]> {
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek encrypted page record during inspection: {err}"),
+        )
+    })?;
+    let mut header = [0_u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN];
+    file.read_exact(&mut header).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            format!("failed to read encrypted page record header: {err}"),
+        )
+    })?;
+    Ok(header)
+}
+
+fn inspect_page_record_header(
+    header: [u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN],
+    slot: u64,
+    offset: u64,
+    header_end: u64,
+    file_len_bytes: u64,
+    layout: &SingleFileInspectionLayout,
+) -> Result<(SingleFilePageRecordInspection, bool)> {
+    let page_id = PageId::new(slot + 1);
+    let Some(record_header) = SingleFileBackend::classify_page_record_header(
+        header.len(),
+        &header,
+        layout.max_page_ciphertext_len,
+    )?
+    else {
+        return Ok((
+            SingleFilePageRecordInspection::empty(slot, page_id, offset),
+            false,
+        ));
+    };
+    let ciphertext_len = record_header.ciphertext_len as u64;
+    let payload_end = header_end.checked_add(ciphertext_len).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "encrypted page record length overflow",
+        )
+    })?;
+    if payload_end > file_len_bytes {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "truncated encrypted page record payload",
+        ));
+    }
+    Ok((
+        SingleFilePageRecordInspection::encrypted(
+            slot,
+            page_id,
+            offset,
+            record_header.counter,
+            ciphertext_len,
+        ),
+        true,
+    ))
 }
 
 fn write_single_file_header(
