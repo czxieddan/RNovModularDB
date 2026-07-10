@@ -628,6 +628,20 @@ pub enum ExplainFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateFunctionImplementation {
+    MetadataOnly,
+    Wasm(WasmFunctionBody),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmFunctionBody {
+    pub module_bytes: Vec<u8>,
+    pub max_memory_bytes: u64,
+    pub max_instructions: u64,
+    pub timeout_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     CreateTable {
         name: ObjectName,
@@ -702,6 +716,7 @@ pub enum Statement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {
@@ -1081,6 +1096,7 @@ pub enum BoundStatement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {

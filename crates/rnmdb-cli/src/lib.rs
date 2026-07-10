@@ -24,7 +24,10 @@ use rnmdb_planner::{
 };
 pub use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
-    ast::{BoundStatement, ColumnDef, ExplainFormat, Ident, ObjectName, TransactionAction},
+    ast::{
+        BoundStatement, ColumnDef, CreateFunctionImplementation, ExplainFormat, Ident, ObjectName,
+        TransactionAction,
+    },
     binder::Binder,
     parser::parse_statement,
 };
@@ -309,12 +312,14 @@ impl LocalSession {
                 name,
                 argument_types,
                 return_type,
+                implementation,
                 if_not_exists,
             } => {
                 self.apply_catalog_create_function(
                     name.as_str(),
                     argument_types,
                     return_type,
+                    implementation,
                     *if_not_exists,
                 )?;
                 Ok(CommandOutput::SchemaChanged)
@@ -973,10 +978,17 @@ impl LocalSession {
         name: &str,
         argument_types: &[SqlType],
         return_type: &SqlType,
+        implementation: &CreateFunctionImplementation,
         if_not_exists: bool,
     ) -> Result<()> {
         if self.catalog.get_function(name, argument_types).is_some() && if_not_exists {
             return Ok(());
+        }
+        if matches!(implementation, CreateFunctionImplementation::Wasm(_)) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm function registration is not available in this execution path",
+            ));
         }
         self.catalog
             .register_function(name, argument_types.to_vec(), return_type.clone())?;

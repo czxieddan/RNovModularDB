@@ -3,8 +3,8 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundIndexKey, BoundJoin, BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, IndexKeyDef,
-    JoinKind, ObjectName, OrderByExpr, TransactionAction,
+    BoundIndexKey, BoundJoin, BoundStatement, ColumnDef, CreateFunctionImplementation,
+    ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName, OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -218,6 +218,7 @@ pub enum LogicalPlan {
         name: String,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {
@@ -596,11 +597,13 @@ impl LogicalPlanner {
                 name,
                 argument_types,
                 return_type,
+                implementation,
                 if_not_exists,
             } => Ok(LogicalPlan::CreateFunction {
                 name: name.as_str().to_string(),
                 argument_types: argument_types.clone(),
                 return_type: return_type.clone(),
+                implementation: implementation.clone(),
                 if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreateProcedure {
@@ -1413,6 +1416,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             argument_types,
             return_type,
+            implementation,
             if_not_exists,
         } => {
             let exists = if *if_not_exists {
@@ -1421,9 +1425,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 ""
             };
             out.push_str(&format!(
-                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{}\n",
+                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{} language={}\n",
                 sql_type_list(argument_types),
-                exists
+                exists,
+                create_function_language(implementation)
             ));
         }
         LogicalPlan::CreateProcedure {
@@ -1820,6 +1825,13 @@ fn sql_type_list(types: &[SqlType]) -> String {
         .map(|data_type| format!("{data_type:?}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn create_function_language(implementation: &CreateFunctionImplementation) -> &'static str {
+    match implementation {
+        CreateFunctionImplementation::MetadataOnly => "metadata",
+        CreateFunctionImplementation::Wasm(_) => "wasm",
+    }
 }
 
 fn select_aggregate_functions(

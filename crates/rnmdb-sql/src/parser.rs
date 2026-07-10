@@ -1,13 +1,15 @@
-use rnmdb_catalog::{IndexMethod, Privilege, TriggerEvent, TriggerTiming};
+use rnmdb_catalog::{
+    IndexMethod, MAX_WASM_FUNCTION_MODULE_BYTES, Privilege, TriggerEvent, TriggerTiming,
+};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, ColumnReference, ExplainFormat, Expr, GeneratedColumn,
-        Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr,
-        RangeLiteralBounds, SelectItem, SelectSubquery, SortDirection, Statement,
-        TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ColumnReference, CreateFunctionImplementation,
+        ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef, JoinClause, JoinKind,
+        LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SelectSubquery,
+        SortDirection, Statement, TransactionAction, WasmFunctionBody,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -36,6 +38,45 @@ pub fn parse_expr(input: &str) -> Result<Expr> {
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
+}
+
+#[derive(Default)]
+struct WasmFunctionOptions {
+    max_memory_bytes: Option<u64>,
+    max_instructions: Option<u64>,
+    timeout_millis: Option<u64>,
+}
+
+impl WasmFunctionOptions {
+    fn set(&mut self, name: &str, value: u64) -> Result<()> {
+        let slot = match name {
+            "max_memory_bytes" => &mut self.max_memory_bytes,
+            "max_instructions" => &mut self.max_instructions,
+            "timeout_ms" => &mut self.timeout_millis,
+            unknown => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown wasm function option {unknown}"),
+                ));
+            }
+        };
+        if slot.replace(value).is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate wasm function option {name}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_body(self, module_bytes: Vec<u8>) -> Result<WasmFunctionBody> {
+        Ok(WasmFunctionBody {
+            module_bytes,
+            max_memory_bytes: required_wasm_option(self.max_memory_bytes, "max_memory_bytes")?,
+            max_instructions: required_wasm_option(self.max_instructions, "max_instructions")?,
+            timeout_millis: required_wasm_option(self.timeout_millis, "timeout_ms")?,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -559,7 +600,26 @@ impl Parser {
     fn parse_create_function_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Function)?;
         let if_not_exists = self.parse_if_not_exists()?;
+        let (name, argument_types, return_type) = self.parse_function_signature()?;
+        let implementation = self.parse_create_function_implementation()?;
+        Ok(Statement::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+            implementation,
+            if_not_exists,
+        })
+    }
+
+    fn parse_function_signature(&mut self) -> Result<(Ident, Vec<SqlType>, SqlType)> {
         let name = self.parse_ident()?;
+        let argument_types = self.parse_function_argument_types()?;
+        self.expect_keyword(TokenKind::Returns)?;
+        let return_type = self.parse_type()?;
+        Ok((name, argument_types, return_type))
+    }
+
+    fn parse_function_argument_types(&mut self) -> Result<Vec<SqlType>> {
         self.expect_keyword(TokenKind::LeftParen)?;
         let argument_types = if self.consume_if(&TokenKind::RightParen) {
             Vec::new()
@@ -568,14 +628,69 @@ impl Parser {
             self.expect_keyword(TokenKind::RightParen)?;
             types
         };
-        self.expect_keyword(TokenKind::Returns)?;
-        let return_type = self.parse_type()?;
-        Ok(Statement::CreateFunction {
-            name,
-            argument_types,
-            return_type,
-            if_not_exists,
-        })
+        Ok(argument_types)
+    }
+
+    fn parse_create_function_implementation(&mut self) -> Result<CreateFunctionImplementation> {
+        if !self.next_is_identifier_keyword("language") {
+            return Ok(CreateFunctionImplementation::MetadataOnly);
+        }
+        self.parse_wasm_function_implementation()
+    }
+
+    fn parse_wasm_function_implementation(&mut self) -> Result<CreateFunctionImplementation> {
+        self.parse_wasm_language()?;
+        let module_bytes = self.parse_wasm_module_bytes()?;
+        self.parse_wasm_options_clause(module_bytes)
+            .map(CreateFunctionImplementation::Wasm)
+    }
+
+    fn parse_wasm_language(&mut self) -> Result<()> {
+        self.expect_option_label("language")?;
+        let language = self.parse_ident()?;
+        if language.as_str() != "wasm" {
+            return Err(self.error(format!(
+                "unsupported function language {}",
+                language.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_wasm_module_bytes(&mut self) -> Result<Vec<u8>> {
+        self.expect_keyword(TokenKind::As)?;
+        let encoded = self.parse_string_literal("wasm module hex")?;
+        decode_wasm_module_hex(&encoded)
+    }
+
+    fn parse_wasm_options_clause(&mut self, module_bytes: Vec<u8>) -> Result<WasmFunctionBody> {
+        self.expect_keyword(TokenKind::With)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let options = self.parse_wasm_function_options()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        options.into_body(module_bytes)
+    }
+
+    fn parse_wasm_function_options(&mut self) -> Result<WasmFunctionOptions> {
+        let mut options = WasmFunctionOptions::default();
+        loop {
+            let name = self.parse_ident()?;
+            self.expect_operator("=")?;
+            let value = self.parse_positive_wasm_option(name.as_str())?;
+            options.set(name.as_str(), value)?;
+            if !self.consume_if(&TokenKind::Comma) {
+                return Ok(options);
+            }
+        }
+    }
+
+    fn parse_positive_wasm_option(&mut self, name: &str) -> Result<u64> {
+        let value = self.parse_row_count("wasm function option")?;
+        if value == 0 {
+            return Err(self.error(format!("wasm function option {name} must be positive")));
+        }
+        u64::try_from(value)
+            .map_err(|_| self.error(format!("wasm function option {name} is too large")))
     }
 
     fn parse_create_procedure_tail(&mut self) -> Result<Statement> {
@@ -1913,6 +2028,55 @@ impl Parser {
 
     fn error(&self, message: impl Into<String>) -> RnovError {
         RnovError::new(ErrorKind::InvalidInput, message)
+    }
+}
+
+fn required_wasm_option(value: Option<u64>, name: &str) -> Result<u64> {
+    value.ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("missing wasm function option {name}"),
+        )
+    })
+}
+
+fn decode_wasm_module_hex(encoded: &str) -> Result<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm module hex must contain an even number of digits",
+        ));
+    }
+    let byte_len = encoded.len() / 2;
+    if byte_len > MAX_WASM_FUNCTION_MODULE_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("wasm module exceeds the {MAX_WASM_FUNCTION_MODULE_BYTES}-byte input limit"),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(index, pair)| decode_hex_pair(pair, index * 2))
+        .collect()
+}
+
+fn decode_hex_pair(pair: &[u8], offset: usize) -> Result<u8> {
+    let high = decode_hex_nibble(pair[0], offset)?;
+    let low = decode_hex_nibble(pair[1], offset + 1)?;
+    Ok((high << 4) | low)
+}
+
+fn decode_hex_nibble(byte: u8, offset: usize) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid wasm module hex digit at offset {offset}"),
+        )),
     }
 }
 

@@ -1,4 +1,6 @@
-use rnmdb_catalog::{Catalog, IndexMethod, OperatorSignature, Privilege, Table};
+use rnmdb_catalog::{
+    Catalog, IndexMethod, OperatorSignature, Privilege, Table, WasmFunctionImplementation,
+};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{RelationId, RoleId},
@@ -9,8 +11,9 @@ use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundHashJoinKeys,
     BoundIndexKey, BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery,
     BoundRecursiveCte, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion,
-    BoundUpdate, CaseWhen, ColumnDef, Expr, Ident, IndexKeyDef, JoinClause, JoinKind, LateralJoin,
-    ObjectName, OrderByExpr, SelectItem, SelectSubquery, Statement, TransactionAction,
+    BoundUpdate, CaseWhen, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef,
+    JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, SelectItem, SelectSubquery,
+    Statement, TransactionAction, WasmFunctionBody,
 };
 use crate::expr_mutator::{rewrite_expr_tree, rewrite_qualified_expr};
 use crate::parser::{parse_expr, parse_statement};
@@ -182,25 +185,15 @@ impl<'a> Binder<'a> {
                 name,
                 argument_types,
                 return_type,
+                implementation,
                 if_not_exists,
-            } => {
-                if self.catalog.functions().iter().any(|function| {
-                    function.name() == name.as_str()
-                        && function.argument_types() == argument_types.as_slice()
-                }) && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("function already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateFunction {
-                    name: name.clone(),
-                    argument_types: argument_types.clone(),
-                    return_type: return_type.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_function(
+                name,
+                argument_types,
+                return_type,
+                implementation,
+                *if_not_exists,
+            ),
             Statement::CreateProcedure {
                 name,
                 argument_types,
@@ -516,6 +509,35 @@ impl<'a> Binder<'a> {
             relation_id,
             name: name.clone(),
             if_exists,
+        })
+    }
+
+    fn bind_create_function(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        return_type: &SqlType,
+        implementation: &CreateFunctionImplementation,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        if self
+            .catalog
+            .get_function(name.as_str(), argument_types)
+            .is_some()
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("function already exists: {}", name.as_str()),
+            ));
+        }
+        validate_create_function_implementation(argument_types, return_type, implementation)?;
+        Ok(BoundStatement::CreateFunction {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            return_type: return_type.clone(),
+            implementation: implementation.clone(),
+            if_not_exists,
         })
     }
 
@@ -5501,6 +5523,54 @@ fn mark_grouping_set_projection_columns_nullable(
             column.nullable = true;
         }
     }
+}
+
+fn validate_create_function_implementation(
+    argument_types: &[SqlType],
+    return_type: &SqlType,
+    implementation: &CreateFunctionImplementation,
+) -> Result<()> {
+    let CreateFunctionImplementation::Wasm(body) = implementation else {
+        return Ok(());
+    };
+    validate_wasm_function_signature(argument_types, return_type)?;
+    validate_wasm_function_body(body)
+}
+
+fn validate_wasm_function_signature(
+    argument_types: &[SqlType],
+    return_type: &SqlType,
+) -> Result<()> {
+    if argument_types == [SqlType::Int64] && return_type == &SqlType::Int64 {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "wasm scalar functions currently require an INT64 argument and INT64 return type",
+    ))
+}
+
+fn validate_wasm_function_body(body: &WasmFunctionBody) -> Result<()> {
+    if body.max_memory_bytes == 0 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function memory budget must be greater than zero",
+        ));
+    }
+    let _ = usize::try_from(body.max_memory_bytes).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function memory budget does not fit this platform",
+        )
+    })?;
+    let _ = WasmFunctionImplementation::new(
+        body.module_bytes.clone(),
+        0,
+        body.max_memory_bytes,
+        body.max_instructions,
+        body.timeout_millis,
+    )?;
+    Ok(())
 }
 
 fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
