@@ -1735,154 +1735,8 @@ impl CatalogCodec {
 
     pub fn encode(catalog: &Catalog) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        out.extend_from_slice(&Self::MAGIC);
-        write_u16(&mut out, Self::VERSION);
-        write_u64(&mut out, catalog.database_id.get());
-        write_u64(&mut out, catalog.next_relation_id);
-        write_u64(&mut out, catalog.next_function_id);
-        write_u64(&mut out, catalog.next_operator_id);
-        write_u64(&mut out, catalog.next_role_id);
-        write_u64(&mut out, catalog.next_policy_id);
-
-        write_u32(&mut out, catalog.schemas.len() as u32);
-        for schema in catalog.schemas.values() {
-            write_string(&mut out, &schema.name)?;
-            write_u32(&mut out, schema.tables.len() as u32);
-            for table in schema.tables.values() {
-                write_u64(&mut out, table.relation_id.get());
-                write_string(&mut out, &table.schema_name)?;
-                write_string(&mut out, &table.name)?;
-                write_u64(&mut out, table.version);
-                write_optional_role_id(&mut out, table.owner_role_id);
-                write_u32(&mut out, table.columns.len() as u32);
-                for column in &table.columns {
-                    write_string(&mut out, &column.name)?;
-                    encode_sql_type(&mut out, &column.data_type);
-                    out.push(u8::from(column.nullable));
-                    out.push(u8::from(column.encrypted));
-                    match &column.generated_expr {
-                        Some(expr) => {
-                            out.push(1);
-                            write_string(&mut out, expr)?;
-                            out.push(u8::from(column.generated_stored));
-                        }
-                        None => out.push(0),
-                    }
-                    write_foreign_key_reference(&mut out, column.foreign_key())?;
-                }
-            }
-        }
-
-        encode_functions(&mut out, &catalog.functions)?;
-
-        write_u32(&mut out, catalog.procedures.len() as u32);
-        for procedure in &catalog.procedures {
-            write_u64(&mut out, procedure.procedure_id.get());
-            write_string(&mut out, &procedure.name)?;
-            write_u32(&mut out, procedure.argument_types.len() as u32);
-            for argument_type in &procedure.argument_types {
-                encode_sql_type(&mut out, argument_type);
-            }
-            write_string(&mut out, &procedure.body)?;
-        }
-
-        write_u32(&mut out, catalog.operators.len() as u32);
-        for operator in &catalog.operators {
-            write_u64(&mut out, operator.operator_id.get());
-            write_string(&mut out, &operator.signature.symbol)?;
-            encode_sql_type(&mut out, &operator.signature.left_type);
-            encode_sql_type(&mut out, &operator.signature.right_type);
-            encode_sql_type(&mut out, &operator.signature.result_type);
-            write_u64(&mut out, operator.signature.function_id.get());
-            match operator.signature.precedence {
-                Some(precedence) => {
-                    out.push(1);
-                    out.push(precedence);
-                }
-                None => out.push(0),
-            }
-            write_optional_string(&mut out, operator.signature.commutator.as_deref())?;
-            write_optional_string(&mut out, operator.signature.negator.as_deref())?;
-            match operator.signature.selectivity_function_id {
-                Some(function_id) => {
-                    out.push(1);
-                    write_u64(&mut out, function_id.get());
-                }
-                None => out.push(0),
-            }
-        }
-
-        write_u32(&mut out, catalog.triggers.len() as u32);
-        for trigger in &catalog.triggers {
-            write_string(&mut out, &trigger.name)?;
-            write_u64(&mut out, trigger.relation_id.get());
-            write_string(&mut out, &trigger.table_name)?;
-            out.push(encode_trigger_timing(trigger.timing));
-            out.push(encode_trigger_event(trigger.event));
-            write_string(&mut out, &trigger.body)?;
-        }
-
-        write_u32(&mut out, catalog.indexes.len() as u32);
-        for index in &catalog.indexes {
-            write_string(&mut out, &index.schema_name)?;
-            write_string(&mut out, &index.name)?;
-            write_u64(&mut out, index.relation_id.get());
-            write_string(&mut out, &index.table_name)?;
-            out.push(u8::from(index.unique));
-            out.push(encode_index_method(index.method));
-            write_u32(&mut out, index.keys.len() as u32);
-            for key in &index.keys {
-                match key {
-                    IndexKey::Column(column) => {
-                        out.push(0);
-                        write_string(&mut out, column)?;
-                    }
-                    IndexKey::Expression(expr) => {
-                        out.push(1);
-                        write_string(&mut out, expr)?;
-                    }
-                }
-            }
-        }
-
-        write_u32(&mut out, catalog.roles.len() as u32);
-        for role in catalog.roles.values() {
-            write_u64(&mut out, role.role_id.get());
-            write_string(&mut out, &role.name)?;
-            out.push(u8::from(role.superuser));
-        }
-
-        write_u32(&mut out, catalog.grants.len() as u32);
-        for grant in &catalog.grants {
-            write_u64(&mut out, grant.role_id.get());
-            write_u64(&mut out, grant.relation_id.get());
-            out.push(encode_privilege(grant.privilege));
-        }
-
-        write_u32(&mut out, catalog.procedure_grants.len() as u32);
-        for grant in &catalog.procedure_grants {
-            write_u64(&mut out, grant.role_id.get());
-            write_u64(&mut out, grant.procedure_id.get());
-            out.push(encode_privilege(grant.privilege));
-        }
-
-        let policy_count: usize = catalog.row_policies.values().map(Vec::len).sum();
-        write_u32(&mut out, policy_count as u32);
-        for policies in catalog.row_policies.values() {
-            for policy in policies {
-                write_u64(&mut out, policy.policy_id.get());
-                write_string(&mut out, &policy.name)?;
-                write_u64(&mut out, policy.relation_id.get());
-                write_string(&mut out, &policy.predicate)?;
-            }
-        }
-
-        write_u32(&mut out, catalog.row_security.len() as u32);
-        for (relation_id, mode) in &catalog.row_security {
-            write_u64(&mut out, relation_id.get());
-            out.push(u8::from(mode.deny_by_default));
-        }
-
+        encode_catalog_header(&mut out, catalog);
+        encode_catalog_body(&mut out, catalog)?;
         Ok(out)
     }
 
@@ -2194,6 +2048,247 @@ impl CatalogCodec {
         }
 
         Ok(catalog)
+    }
+}
+
+fn encode_catalog_header(out: &mut Vec<u8>, catalog: &Catalog) {
+    out.extend_from_slice(&CatalogCodec::MAGIC);
+    write_u16(out, CatalogCodec::VERSION);
+    write_u64(out, catalog.database_id.get());
+    write_u64(out, catalog.next_relation_id);
+    write_u64(out, catalog.next_function_id);
+    write_u64(out, catalog.next_operator_id);
+    write_u64(out, catalog.next_role_id);
+    write_u64(out, catalog.next_policy_id);
+}
+
+fn encode_catalog_body(out: &mut Vec<u8>, catalog: &Catalog) -> Result<()> {
+    encode_schema_and_routines(out, catalog)?;
+    encode_extensions(out, catalog)?;
+    encode_security_metadata(out, catalog)
+}
+
+fn encode_schema_and_routines(out: &mut Vec<u8>, catalog: &Catalog) -> Result<()> {
+    encode_schemas(out, catalog)?;
+    encode_functions(out, &catalog.functions)?;
+    encode_procedures(out, &catalog.procedures)
+}
+
+fn encode_extensions(out: &mut Vec<u8>, catalog: &Catalog) -> Result<()> {
+    encode_operators(out, &catalog.operators)?;
+    encode_triggers(out, &catalog.triggers)?;
+    encode_indexes(out, &catalog.indexes)
+}
+
+fn encode_security_metadata(out: &mut Vec<u8>, catalog: &Catalog) -> Result<()> {
+    encode_roles(out, &catalog.roles)?;
+    encode_table_grants(out, &catalog.grants);
+    encode_procedure_grants(out, &catalog.procedure_grants);
+    encode_row_policies(out, &catalog.row_policies)?;
+    encode_row_security(out, &catalog.row_security);
+    Ok(())
+}
+
+fn encode_schemas(out: &mut Vec<u8>, catalog: &Catalog) -> Result<()> {
+    write_u32(out, catalog.schemas.len() as u32);
+    for schema in catalog.schemas.values() {
+        encode_schema(out, schema)?;
+    }
+    Ok(())
+}
+
+fn encode_schema(out: &mut Vec<u8>, schema: &Schema) -> Result<()> {
+    write_string(out, &schema.name)?;
+    write_u32(out, schema.tables.len() as u32);
+    for table in schema.tables.values() {
+        encode_table(out, table)?;
+    }
+    Ok(())
+}
+
+fn encode_table(out: &mut Vec<u8>, table: &Table) -> Result<()> {
+    write_u64(out, table.relation_id.get());
+    write_string(out, &table.schema_name)?;
+    write_string(out, &table.name)?;
+    write_u64(out, table.version);
+    write_optional_role_id(out, table.owner_role_id);
+    write_u32(out, table.columns.len() as u32);
+    for column in &table.columns {
+        encode_column(out, column)?;
+    }
+    Ok(())
+}
+
+fn encode_column(out: &mut Vec<u8>, column: &Column) -> Result<()> {
+    write_string(out, &column.name)?;
+    encode_sql_type(out, &column.data_type);
+    out.push(u8::from(column.nullable));
+    out.push(u8::from(column.encrypted));
+    match &column.generated_expr {
+        Some(expr) => {
+            out.push(1);
+            write_string(out, expr)?;
+            out.push(u8::from(column.generated_stored));
+        }
+        None => out.push(0),
+    }
+    write_foreign_key_reference(out, column.foreign_key())
+}
+
+fn encode_procedures(out: &mut Vec<u8>, procedures: &[Procedure]) -> Result<()> {
+    write_u32(out, procedures.len() as u32);
+    for procedure in procedures {
+        write_u64(out, procedure.procedure_id.get());
+        write_string(out, &procedure.name)?;
+        write_u32(out, procedure.argument_types.len() as u32);
+        for argument_type in &procedure.argument_types {
+            encode_sql_type(out, argument_type);
+        }
+        write_string(out, &procedure.body)?;
+    }
+    Ok(())
+}
+
+fn encode_operators(out: &mut Vec<u8>, operators: &[Operator]) -> Result<()> {
+    write_u32(out, operators.len() as u32);
+    for operator in operators {
+        encode_operator(out, operator)?;
+    }
+    Ok(())
+}
+
+fn encode_operator(out: &mut Vec<u8>, operator: &Operator) -> Result<()> {
+    write_u64(out, operator.operator_id.get());
+    write_string(out, &operator.signature.symbol)?;
+    encode_sql_type(out, &operator.signature.left_type);
+    encode_sql_type(out, &operator.signature.right_type);
+    encode_sql_type(out, &operator.signature.result_type);
+    write_u64(out, operator.signature.function_id.get());
+    encode_operator_precedence(out, operator.signature.precedence);
+    write_optional_string(out, operator.signature.commutator.as_deref())?;
+    write_optional_string(out, operator.signature.negator.as_deref())?;
+    encode_optional_function_id(out, operator.signature.selectivity_function_id);
+    Ok(())
+}
+
+fn encode_operator_precedence(out: &mut Vec<u8>, precedence: Option<u8>) {
+    match precedence {
+        Some(precedence) => {
+            out.push(1);
+            out.push(precedence);
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_optional_function_id(out: &mut Vec<u8>, function_id: Option<FunctionId>) {
+    match function_id {
+        Some(function_id) => {
+            out.push(1);
+            write_u64(out, function_id.get());
+        }
+        None => out.push(0),
+    }
+}
+
+fn encode_triggers(out: &mut Vec<u8>, triggers: &[Trigger]) -> Result<()> {
+    write_u32(out, triggers.len() as u32);
+    for trigger in triggers {
+        write_string(out, &trigger.name)?;
+        write_u64(out, trigger.relation_id.get());
+        write_string(out, &trigger.table_name)?;
+        out.push(encode_trigger_timing(trigger.timing));
+        out.push(encode_trigger_event(trigger.event));
+        write_string(out, &trigger.body)?;
+    }
+    Ok(())
+}
+
+fn encode_indexes(out: &mut Vec<u8>, indexes: &[Index]) -> Result<()> {
+    write_u32(out, indexes.len() as u32);
+    for index in indexes {
+        encode_index(out, index)?;
+    }
+    Ok(())
+}
+
+fn encode_index(out: &mut Vec<u8>, index: &Index) -> Result<()> {
+    write_string(out, &index.schema_name)?;
+    write_string(out, &index.name)?;
+    write_u64(out, index.relation_id.get());
+    write_string(out, &index.table_name)?;
+    out.push(u8::from(index.unique));
+    out.push(encode_index_method(index.method));
+    write_u32(out, index.keys.len() as u32);
+    for key in &index.keys {
+        encode_index_key(out, key)?;
+    }
+    Ok(())
+}
+
+fn encode_index_key(out: &mut Vec<u8>, key: &IndexKey) -> Result<()> {
+    match key {
+        IndexKey::Column(column) => {
+            out.push(0);
+            write_string(out, column)
+        }
+        IndexKey::Expression(expr) => {
+            out.push(1);
+            write_string(out, expr)
+        }
+    }
+}
+
+fn encode_roles(out: &mut Vec<u8>, roles: &BTreeMap<String, Role>) -> Result<()> {
+    write_u32(out, roles.len() as u32);
+    for role in roles.values() {
+        write_u64(out, role.role_id.get());
+        write_string(out, &role.name)?;
+        out.push(u8::from(role.superuser));
+    }
+    Ok(())
+}
+
+fn encode_table_grants(out: &mut Vec<u8>, grants: &[TableGrant]) {
+    write_u32(out, grants.len() as u32);
+    for grant in grants {
+        write_u64(out, grant.role_id.get());
+        write_u64(out, grant.relation_id.get());
+        out.push(encode_privilege(grant.privilege));
+    }
+}
+
+fn encode_procedure_grants(out: &mut Vec<u8>, grants: &[ProcedureGrant]) {
+    write_u32(out, grants.len() as u32);
+    for grant in grants {
+        write_u64(out, grant.role_id.get());
+        write_u64(out, grant.procedure_id.get());
+        out.push(encode_privilege(grant.privilege));
+    }
+}
+
+fn encode_row_policies(
+    out: &mut Vec<u8>,
+    policies_by_relation: &BTreeMap<RelationId, Vec<RowPolicy>>,
+) -> Result<()> {
+    let policy_count: usize = policies_by_relation.values().map(Vec::len).sum();
+    write_u32(out, policy_count as u32);
+    for policies in policies_by_relation.values() {
+        for policy in policies {
+            write_u64(out, policy.policy_id.get());
+            write_string(out, &policy.name)?;
+            write_u64(out, policy.relation_id.get());
+            write_string(out, &policy.predicate)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_row_security(out: &mut Vec<u8>, row_security: &BTreeMap<RelationId, RowSecurityMode>) {
+    write_u32(out, row_security.len() as u32);
+    for (relation_id, mode) in row_security {
+        write_u64(out, relation_id.get());
+        out.push(u8::from(mode.deny_by_default));
     }
 }
 
