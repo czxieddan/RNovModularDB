@@ -1076,22 +1076,8 @@ impl SqlRange {
         if value.is_null() || value.data_type() != self.element_type {
             return Ok(false);
         }
-
-        let above_lower = match self.lower() {
-            RangeBound::Unbounded => true,
-            RangeBound::Included(bound) => compare_scalar_values(value, bound)? != Ordering::Less,
-            RangeBound::Excluded(bound) => {
-                compare_scalar_values(value, bound)? == Ordering::Greater
-            }
-        };
-        let below_upper = match self.upper() {
-            RangeBound::Unbounded => true,
-            RangeBound::Included(bound) => {
-                compare_scalar_values(value, bound)? != Ordering::Greater
-            }
-            RangeBound::Excluded(bound) => compare_scalar_values(value, bound)? == Ordering::Less,
-        };
-
+        let above_lower = value_satisfies_lower_bound(value, self.lower())?;
+        let below_upper = value_satisfies_upper_bound(value, self.upper())?;
         Ok(above_lower && below_upper)
     }
 
@@ -1102,12 +1088,13 @@ impl SqlRange {
 
     pub fn adjacent(&self, other: &Self) -> Result<bool> {
         self.ensure_same_element_type(other)?;
-        if self.empty || other.empty || self.overlaps(other)? {
+        if self.empty || other.empty {
             return Ok(false);
         }
-
-        Ok(bounds_touch_without_gap(self.upper(), other.lower())?
-            || bounds_touch_without_gap(other.upper(), self.lower())?)
+        if self.overlaps(other)? {
+            return Ok(false);
+        }
+        ranges_touch_at_boundary(self, other)
     }
 
     pub fn intersection(&self, other: &Self) -> Result<Self> {
@@ -1129,16 +1116,20 @@ impl SqlRange {
         if other.empty {
             return Ok(self.clone());
         }
-        if !self.overlaps(other)? && !self.adjacent(other)? {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "ranges are disjoint and cannot be represented as one range",
-            ));
-        }
-
+        self.ensure_unionable(other)?;
         let lower = min_lower_bound(self.lower(), other.lower())?;
         let upper = max_upper_bound(self.upper(), other.upper())?;
         Self::new(self.element_type.clone(), lower, upper)
+    }
+
+    fn ensure_unionable(&self, other: &Self) -> Result<()> {
+        if self.overlaps(other)? || self.adjacent(other)? {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "ranges are disjoint and cannot be represented as one range",
+        ))
     }
 
     fn ensure_same_element_type(&self, other: &Self) -> Result<()> {
@@ -1212,96 +1203,110 @@ fn decode_array(payload: &[u8]) -> Result<SqlArray> {
     let mut cursor = Cursor::new(payload);
     let element_type = SqlType::decode_from(&mut cursor)?;
     let dimension_count = cursor.read_u32("array dimension count")? as usize;
-    let mut dimensions = Vec::with_capacity(dimension_count);
+    let dimensions = decode_array_dimensions(&mut cursor, dimension_count)?;
+    let value_count = cursor.read_u32("array value count")? as usize;
+    let values = decode_array_values(&mut cursor, value_count)?;
+    ensure_cursor_complete(&cursor, "array")?;
+    SqlArray::new(element_type, dimensions, values)
+}
 
+fn decode_array_dimensions(
+    cursor: &mut Cursor<'_>,
+    dimension_count: usize,
+) -> Result<Vec<ArrayDimension>> {
+    let mut dimensions = Vec::with_capacity(dimension_count);
     for _ in 0..dimension_count {
         let lower_bound = cursor.read_i64("array lower bound")?;
         let len = cursor.read_u32("array dimension length")? as usize;
         dimensions.push(ArrayDimension::new(lower_bound, len)?);
     }
+    Ok(dimensions)
+}
 
-    let value_count = cursor.read_u32("array value count")? as usize;
+fn decode_array_values(cursor: &mut Cursor<'_>, value_count: usize) -> Result<Vec<SqlValue>> {
     let mut values = Vec::with_capacity(value_count);
     for _ in 0..value_count {
         let len = cursor.read_u32("array value length")? as usize;
         let bytes = cursor.read_exact(len, "array value payload")?;
         values.push(SqlValue::decode(bytes)?);
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "array payload has trailing bytes",
-        ));
-    }
-
-    SqlArray::new(element_type, dimensions, values)
+    Ok(values)
 }
 
 fn decode_hstore(payload: &[u8]) -> Result<HStore> {
     let mut cursor = Cursor::new(payload);
     let entry_count = cursor.read_u32("hstore entry count")? as usize;
     let mut hstore = HStore::new();
-
     for _ in 0..entry_count {
-        let key_bytes = cursor.read_len_prefixed_bytes("hstore key")?;
-        let key = String::from_utf8(key_bytes)
-            .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "hstore key is not utf-8"))?;
-        let value = match cursor.read_u8("hstore value tag")? {
-            0 => HStoreValue::Null,
-            1 => {
-                let value_bytes = cursor.read_len_prefixed_bytes("hstore value")?;
-                HStoreValue::Text(String::from_utf8(value_bytes).map_err(|_| {
-                    RnovError::new(ErrorKind::InvalidInput, "hstore value is not utf-8")
-                })?)
-            }
-            unknown => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("unknown hstore value tag {unknown}"),
-                ));
-            }
-        };
+        let (key, value) = decode_hstore_entry(&mut cursor)?;
         hstore.insert(key, value)?;
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "hstore payload has trailing bytes",
-        ));
-    }
-
+    ensure_cursor_complete(&cursor, "hstore")?;
     Ok(hstore)
+}
+
+fn decode_hstore_entry(cursor: &mut Cursor<'_>) -> Result<(String, HStoreValue)> {
+    let key_bytes = cursor.read_len_prefixed_bytes("hstore key")?;
+    let key = decode_utf8(key_bytes, "hstore key")?;
+    let value = decode_hstore_value(cursor)?;
+    Ok((key, value))
+}
+
+fn decode_hstore_value(cursor: &mut Cursor<'_>) -> Result<HStoreValue> {
+    match cursor.read_u8("hstore value tag")? {
+        0 => Ok(HStoreValue::Null),
+        1 => {
+            let value_bytes = cursor.read_len_prefixed_bytes("hstore value")?;
+            decode_utf8(value_bytes, "hstore value").map(HStoreValue::Text)
+        }
+        unknown => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unknown hstore value tag {unknown}"),
+        )),
+    }
 }
 
 fn decode_text_vector(payload: &[u8]) -> Result<TextVector> {
     let mut cursor = Cursor::new(payload);
     let lexeme_count = cursor.read_u32("text vector lexeme count")? as usize;
     let mut lexemes = Vec::with_capacity(lexeme_count);
-
     for _ in 0..lexeme_count {
-        let term_bytes = cursor.read_len_prefixed_bytes("text vector lexeme term")?;
-        let term = String::from_utf8(term_bytes).map_err(|_| {
-            RnovError::new(ErrorKind::InvalidInput, "text vector term is not utf-8")
-        })?;
-        let weight = LexemeWeight::from_u8(cursor.read_u8("text vector weight")?)?;
-        let position_count = cursor.read_u32("text vector position count")? as usize;
-        let mut positions = Vec::with_capacity(position_count);
-        for _ in 0..position_count {
-            positions.push(cursor.read_u32("text vector position")?);
-        }
-        lexemes.push(TextLexeme::new(term, positions, weight)?);
+        lexemes.push(decode_text_lexeme(&mut cursor)?);
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "text vector payload has trailing bytes",
-        ));
-    }
-
+    ensure_cursor_complete(&cursor, "text vector")?;
     TextVector::from_lexemes(lexemes)
+}
+
+fn decode_text_lexeme(cursor: &mut Cursor<'_>) -> Result<TextLexeme> {
+    let term_bytes = cursor.read_len_prefixed_bytes("text vector lexeme term")?;
+    let term = decode_utf8(term_bytes, "text vector term")?;
+    let weight = LexemeWeight::from_u8(cursor.read_u8("text vector weight")?)?;
+    let position_count = cursor.read_u32("text vector position count")? as usize;
+    let positions = decode_text_positions(cursor, position_count)?;
+    TextLexeme::new(term, positions, weight)
+}
+
+fn decode_text_positions(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<u32>> {
+    let mut positions = Vec::with_capacity(count);
+    for _ in 0..count {
+        positions.push(cursor.read_u32("text vector position")?);
+    }
+    Ok(positions)
+}
+
+fn decode_utf8(bytes: Vec<u8>, name: &str) -> Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, format!("{name} is not utf-8")))
+}
+
+fn ensure_cursor_complete(cursor: &Cursor<'_>, payload_name: &str) -> Result<()> {
+    if cursor.is_complete() {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("{payload_name} payload has trailing bytes"),
+    ))
 }
 
 fn decode_range(payload: &[u8]) -> Result<SqlRange> {
@@ -1520,6 +1525,33 @@ fn compare_upper_bounds(left: &RangeBound, right: &RangeBound) -> Result<Orderin
             other => Ok(other),
         },
     }
+}
+
+fn value_satisfies_lower_bound(value: &SqlValue, bound: &RangeBound) -> Result<bool> {
+    match bound {
+        RangeBound::Unbounded => Ok(true),
+        RangeBound::Included(bound) => Ok(compare_scalar_values(value, bound)? != Ordering::Less),
+        RangeBound::Excluded(bound) => {
+            Ok(compare_scalar_values(value, bound)? == Ordering::Greater)
+        }
+    }
+}
+
+fn value_satisfies_upper_bound(value: &SqlValue, bound: &RangeBound) -> Result<bool> {
+    match bound {
+        RangeBound::Unbounded => Ok(true),
+        RangeBound::Included(bound) => {
+            Ok(compare_scalar_values(value, bound)? != Ordering::Greater)
+        }
+        RangeBound::Excluded(bound) => Ok(compare_scalar_values(value, bound)? == Ordering::Less),
+    }
+}
+
+fn ranges_touch_at_boundary(left: &SqlRange, right: &SqlRange) -> Result<bool> {
+    if bounds_touch_without_gap(left.upper(), right.lower())? {
+        return Ok(true);
+    }
+    bounds_touch_without_gap(right.upper(), left.lower())
 }
 
 fn bounds_touch_without_gap(left_upper: &RangeBound, right_lower: &RangeBound) -> Result<bool> {
