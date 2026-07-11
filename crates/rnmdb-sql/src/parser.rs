@@ -131,6 +131,22 @@ struct CreateTableElements {
     foreign_keys: Vec<(Ident, ColumnReference)>,
 }
 
+struct CreateOperatorSignature {
+    symbol: String,
+    left_type: SqlType,
+    right_type: SqlType,
+    result_type: SqlType,
+    function: Ident,
+}
+
+#[derive(Default)]
+struct CreateOperatorOptions {
+    precedence: Option<u8>,
+    commutator: Option<String>,
+    negator: Option<String>,
+    selectivity: Option<Ident>,
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -780,16 +796,51 @@ impl Parser {
 
     fn parse_create_operator_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::OperatorKeyword)?;
+        let signature = self.parse_create_operator_signature()?;
+        let options = self.parse_create_operator_options()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::CreateOperator {
+            symbol: signature.symbol,
+            left_type: signature.left_type,
+            right_type: signature.right_type,
+            result_type: signature.result_type,
+            function: signature.function,
+            precedence: options.precedence,
+            commutator: options.commutator,
+            negator: options.negator,
+            selectivity: options.selectivity,
+        })
+    }
+
+    fn parse_create_operator_signature(&mut self) -> Result<CreateOperatorSignature> {
+        let (symbol, left_type, right_type) = self.parse_operator_operand_types()?;
+        let (result_type, function) = self.parse_operator_result_and_function()?;
+        Ok(CreateOperatorSignature {
+            symbol,
+            left_type,
+            right_type,
+            result_type,
+            function,
+        })
+    }
+
+    fn parse_operator_operand_types(&mut self) -> Result<(String, SqlType, SqlType)> {
         let symbol = self.parse_operator_symbol()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        self.expect_option_label("leftarg")?;
-        self.expect_operator("=")?;
-        let left_type = self.parse_type()?;
+        let left_type = self.parse_labeled_operator_type("leftarg")?;
         self.expect_keyword(TokenKind::Comma)?;
-        self.expect_option_label("rightarg")?;
-        self.expect_operator("=")?;
-        let right_type = self.parse_type()?;
+        let right_type = self.parse_labeled_operator_type("rightarg")?;
         self.expect_keyword(TokenKind::Comma)?;
+        Ok((symbol, left_type, right_type))
+    }
+
+    fn parse_labeled_operator_type(&mut self, label: &str) -> Result<SqlType> {
+        self.expect_option_label(label)?;
+        self.expect_operator("=")?;
+        self.parse_type()
+    }
+
+    fn parse_operator_result_and_function(&mut self) -> Result<(SqlType, Ident)> {
         self.expect_keyword(TokenKind::Returns)?;
         self.expect_operator("=")?;
         let result_type = self.parse_type()?;
@@ -797,40 +848,34 @@ impl Parser {
         self.expect_keyword(TokenKind::Function)?;
         self.expect_operator("=")?;
         let function = self.parse_ident()?;
-        let mut precedence = None;
-        let mut commutator = None;
-        let mut negator = None;
-        let mut selectivity = None;
+        Ok((result_type, function))
+    }
+
+    fn parse_create_operator_options(&mut self) -> Result<CreateOperatorOptions> {
+        let mut options = CreateOperatorOptions::default();
         while self.consume_if(&TokenKind::Comma) {
-            let option = self.parse_ident()?;
-            self.expect_operator("=")?;
-            match option.as_str() {
-                "precedence" => {
-                    let value = self.parse_row_count("PRECEDENCE")?;
-                    precedence = Some(u8::try_from(value).map_err(|_| {
-                        self.error("operator precedence must fit in an unsigned byte")
-                    })?);
-                }
-                "commutator" => commutator = Some(self.parse_operator_symbol()?),
-                "negator" => negator = Some(self.parse_operator_symbol()?),
-                "selectivity" => selectivity = Some(self.parse_ident()?),
-                unknown => {
-                    return Err(self.error(format!("unknown operator option {unknown}")));
-                }
-            }
+            self.parse_create_operator_option(&mut options)?;
         }
-        self.expect_keyword(TokenKind::RightParen)?;
-        Ok(Statement::CreateOperator {
-            symbol,
-            left_type,
-            right_type,
-            result_type,
-            function,
-            precedence,
-            commutator,
-            negator,
-            selectivity,
-        })
+        Ok(options)
+    }
+
+    fn parse_create_operator_option(&mut self, options: &mut CreateOperatorOptions) -> Result<()> {
+        let option = self.parse_ident()?;
+        self.expect_operator("=")?;
+        match option.as_str() {
+            "precedence" => options.precedence = Some(self.parse_operator_precedence()?),
+            "commutator" => options.commutator = Some(self.parse_operator_symbol()?),
+            "negator" => options.negator = Some(self.parse_operator_symbol()?),
+            "selectivity" => options.selectivity = Some(self.parse_ident()?),
+            unknown => return Err(self.error(format!("unknown operator option {unknown}"))),
+        }
+        Ok(())
+    }
+
+    fn parse_operator_precedence(&mut self) -> Result<u8> {
+        let value = self.parse_row_count("PRECEDENCE")?;
+        u8::try_from(value)
+            .map_err(|_| self.error("operator precedence must fit in an unsigned byte"))
     }
 
     fn parse_create_role_tail(&mut self) -> Result<Statement> {
