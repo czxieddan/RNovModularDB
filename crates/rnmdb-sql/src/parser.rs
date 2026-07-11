@@ -147,6 +147,24 @@ struct CreateOperatorOptions {
     selectivity: Option<Ident>,
 }
 
+struct ColumnOptions {
+    nullable: bool,
+    encrypted: bool,
+    generated: Option<GeneratedColumn>,
+    references: Option<ColumnReference>,
+}
+
+impl Default for ColumnOptions {
+    fn default() -> Self {
+        Self {
+            nullable: true,
+            encrypted: false,
+            generated: None,
+            references: None,
+        }
+    }
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -576,53 +594,76 @@ impl Parser {
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.parse_ident()?;
         let data_type = self.parse_type()?;
-        let mut nullable = true;
-        let mut encrypted = false;
-        let mut generated = None;
-        let mut references = None;
-
-        loop {
-            match self.peek_kind() {
-                Some(TokenKind::Not) => {
-                    self.bump();
-                    self.expect_keyword(TokenKind::Null)?;
-                    nullable = false;
-                }
-                Some(TokenKind::Encrypted) => {
-                    self.bump();
-                    encrypted = true;
-                }
-                Some(TokenKind::Generated) => {
-                    if generated.is_some() {
-                        return Err(self.error("column has duplicate generated expression"));
-                    }
-                    self.bump();
-                    self.expect_keyword(TokenKind::Always)?;
-                    self.expect_keyword(TokenKind::As)?;
-                    self.expect_keyword(TokenKind::LeftParen)?;
-                    let expr = self.parse_expr()?;
-                    self.expect_keyword(TokenKind::RightParen)?;
-                    self.expect_keyword(TokenKind::Stored)?;
-                    generated = Some(GeneratedColumn { expr, stored: true });
-                }
-                Some(TokenKind::References) => {
-                    if references.is_some() {
-                        return Err(self.error("column has duplicate references clause"));
-                    }
-                    references = Some(self.parse_column_reference()?);
-                }
-                _ => break,
-            }
-        }
+        let options = self.parse_column_options()?;
 
         Ok(ColumnDef {
             name,
             data_type,
-            nullable,
-            encrypted,
-            generated,
-            references,
+            nullable: options.nullable,
+            encrypted: options.encrypted,
+            generated: options.generated,
+            references: options.references,
         })
+    }
+
+    fn parse_column_options(&mut self) -> Result<ColumnOptions> {
+        let mut options = ColumnOptions::default();
+        while self.parse_column_option(&mut options)? {}
+        Ok(options)
+    }
+
+    fn parse_column_option(&mut self, options: &mut ColumnOptions) -> Result<bool> {
+        match self.peek_kind() {
+            Some(TokenKind::Not) => {
+                self.bump();
+                self.expect_keyword(TokenKind::Null)?;
+                options.nullable = false;
+            }
+            Some(TokenKind::Encrypted) => {
+                self.bump();
+                options.encrypted = true;
+            }
+            Some(TokenKind::Generated) => self.parse_generated_column_option(options)?,
+            Some(TokenKind::References) => self.parse_column_reference_option(options)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn parse_generated_column_option(&mut self, options: &mut ColumnOptions) -> Result<()> {
+        self.ensure_column_option_absent(
+            options.generated.is_some(),
+            "column has duplicate generated expression",
+        )?;
+        self.bump();
+        options.generated = Some(self.parse_stored_generated_column()?);
+        Ok(())
+    }
+
+    fn parse_stored_generated_column(&mut self) -> Result<GeneratedColumn> {
+        self.expect_keyword(TokenKind::Always)?;
+        self.expect_keyword(TokenKind::As)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let expr = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.expect_keyword(TokenKind::Stored)?;
+        Ok(GeneratedColumn { expr, stored: true })
+    }
+
+    fn parse_column_reference_option(&mut self, options: &mut ColumnOptions) -> Result<()> {
+        self.ensure_column_option_absent(
+            options.references.is_some(),
+            "column has duplicate references clause",
+        )?;
+        options.references = Some(self.parse_column_reference()?);
+        Ok(())
+    }
+
+    fn ensure_column_option_absent(&self, duplicate: bool, message: &str) -> Result<()> {
+        if duplicate {
+            return Err(self.error(message));
+        }
+        Ok(())
     }
 
     fn parse_column_reference(&mut self) -> Result<ColumnReference> {
