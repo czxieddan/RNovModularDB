@@ -165,6 +165,86 @@ impl Default for ColumnOptions {
     }
 }
 
+struct SelectCoreParts {
+    distinct: bool,
+    projection: Vec<SelectItem>,
+    from: ObjectName,
+    join: Option<JoinClause>,
+    lateral_join: Option<LateralJoin>,
+    selection: Option<Expr>,
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    having: Option<Expr>,
+}
+
+struct SelectSourceClauses {
+    from: ObjectName,
+    join: Option<JoinClause>,
+    lateral_join: Option<LateralJoin>,
+    selection: Option<Expr>,
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    having: Option<Expr>,
+}
+
+impl SelectCoreParts {
+    fn into_statement(self) -> Statement {
+        if !self.grouping_sets.is_empty() {
+            return Statement::SelectGroupingSets {
+                distinct: self.distinct,
+                projection: self.projection,
+                from: self.from,
+                selection: self.selection,
+                group_by: self.group_by,
+                grouping_sets: self.grouping_sets,
+                having: self.having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        if let Some(lateral_join) = self.lateral_join {
+            return Statement::SelectLateral {
+                distinct: self.distinct,
+                projection: self.projection,
+                from: self.from,
+                lateral_join,
+                selection: self.selection,
+                group_by: self.group_by,
+                having: self.having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        if let Some(join) = self.join {
+            return Statement::SelectJoin {
+                distinct: self.distinct,
+                projection: self.projection,
+                from: self.from,
+                join,
+                selection: self.selection,
+                group_by: self.group_by,
+                having: self.having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        Statement::Select {
+            distinct: self.distinct,
+            projection: self.projection,
+            from: self.from,
+            selection: self.selection,
+            group_by: self.group_by,
+            having: self.having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -1097,118 +1177,128 @@ impl Parser {
 
     fn parse_select_core(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
+        let distinct = self.parse_select_quantifier();
+        let projection = self.parse_select_projection()?;
+        let source = self.parse_select_source_clauses()?;
+        let parts = SelectCoreParts {
+            distinct,
+            projection,
+            from: source.from,
+            join: source.join,
+            lateral_join: source.lateral_join,
+            selection: source.selection,
+            group_by: source.group_by,
+            grouping_sets: source.grouping_sets,
+            having: source.having,
+        };
+        self.validate_select_grouping(&parts)?;
+        Ok(parts.into_statement())
+    }
+
+    fn parse_select_source_clauses(&mut self) -> Result<SelectSourceClauses> {
+        self.expect_keyword(TokenKind::From)?;
+        let from = self.parse_object_name()?;
+        let (join, lateral_join) = self.parse_select_join()?;
+        let selection = self.parse_optional_expr_clause(&TokenKind::Where)?;
+        let (group_by, grouping_sets) = self.parse_group_by_clause()?;
+        let having = self.parse_optional_expr_clause(&TokenKind::Having)?;
+        Ok(SelectSourceClauses {
+            from,
+            join,
+            lateral_join,
+            selection,
+            group_by,
+            grouping_sets,
+            having,
+        })
+    }
+
+    fn parse_select_quantifier(&mut self) -> bool {
         let distinct = self.consume_if(&TokenKind::Distinct);
         if !distinct {
             let _ = self.consume_if(&TokenKind::All);
         }
+        distinct
+    }
+
+    fn parse_select_projection(&mut self) -> Result<Vec<SelectItem>> {
         let mut projection = Vec::new();
         loop {
-            if self.consume_if(&TokenKind::Star) {
-                projection.push(SelectItem::Wildcard);
-            } else {
-                let expr = self.parse_expr()?;
-                let alias = if self.consume_if(&TokenKind::As) {
-                    Some(self.parse_ident()?)
-                } else {
-                    None
-                };
-                projection.push(SelectItem::Expr { expr, alias });
+            projection.push(self.parse_select_item()?);
+            if !self.consume_if(&TokenKind::Comma) {
+                break;
             }
-            if self.consume_if(&TokenKind::Comma) {
-                continue;
-            }
-            break;
         }
-        self.expect_keyword(TokenKind::From)?;
-        let from = self.parse_object_name()?;
-        let (join, lateral_join) = self.parse_select_join()?;
-        let selection = if self.consume_if(&TokenKind::Where) {
-            Some(self.parse_expr()?)
+        Ok(projection)
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        if self.consume_if(&TokenKind::Star) {
+            return Ok(SelectItem::Wildcard);
+        }
+        let expr = self.parse_expr()?;
+        let alias = if self.consume_if(&TokenKind::As) {
+            Some(self.parse_ident()?)
         } else {
             None
         };
-        let (group_by, grouping_sets) = if self.consume_if(&TokenKind::Group) {
-            self.expect_keyword(TokenKind::By)?;
-            if self.consume_if(&TokenKind::Grouping) {
-                self.expect_keyword(TokenKind::Sets)?;
-                let grouping_sets = self.parse_grouping_sets()?;
-                let group_by = grouping_sets_union(&grouping_sets);
-                (group_by, grouping_sets)
-            } else if self.consume_if(&TokenKind::Rollup) {
-                let group_by = self.parse_parenthesized_expr_list()?;
-                let grouping_sets = rollup_grouping_sets(&group_by);
-                (group_by, grouping_sets)
-            } else if self.consume_if(&TokenKind::Cube) {
-                let group_by = self.parse_parenthesized_expr_list()?;
-                let grouping_sets = cube_grouping_sets(&group_by)?;
-                (group_by, grouping_sets)
-            } else {
-                (self.parse_expr_list()?, Vec::new())
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let having = if self.consume_if(&TokenKind::Having) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-        if (join.is_some() || lateral_join.is_some()) && !grouping_sets.is_empty() {
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    fn parse_optional_expr_clause(&mut self, keyword: &TokenKind) -> Result<Option<Expr>> {
+        if self.consume_if(keyword) {
+            return self.parse_expr().map(Some);
+        }
+        Ok(None)
+    }
+
+    fn parse_group_by_clause(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        if !self.consume_if(&TokenKind::Group) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        self.expect_keyword(TokenKind::By)?;
+        self.parse_group_by_body()
+    }
+
+    fn parse_group_by_body(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        if self.consume_if(&TokenKind::Grouping) {
+            return self.parse_explicit_grouping_sets();
+        }
+        if self.consume_if(&TokenKind::Rollup) {
+            return self.parse_rollup_grouping_sets();
+        }
+        if self.consume_if(&TokenKind::Cube) {
+            return self.parse_cube_grouping_sets();
+        }
+        self.parse_expr_list()
+            .map(|group_by| (group_by, Vec::new()))
+    }
+
+    fn parse_explicit_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        self.expect_keyword(TokenKind::Sets)?;
+        let grouping_sets = self.parse_grouping_sets()?;
+        let group_by = grouping_sets_union(&grouping_sets);
+        Ok((group_by, grouping_sets))
+    }
+
+    fn parse_rollup_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.parse_parenthesized_expr_list()?;
+        let grouping_sets = rollup_grouping_sets(&group_by);
+        Ok((group_by, grouping_sets))
+    }
+
+    fn parse_cube_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.parse_parenthesized_expr_list()?;
+        let grouping_sets = cube_grouping_sets(&group_by)?;
+        Ok((group_by, grouping_sets))
+    }
+
+    fn validate_select_grouping(&self, parts: &SelectCoreParts) -> Result<()> {
+        if (parts.join.is_some() || parts.lateral_join.is_some()) && !parts.grouping_sets.is_empty()
+        {
             return Err(self.error("JOIN does not support GROUPING SETS yet"));
         }
-        if !grouping_sets.is_empty() {
-            return Ok(Statement::SelectGroupingSets {
-                distinct,
-                projection,
-                from,
-                selection,
-                group_by,
-                grouping_sets,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            });
-        }
-        if let Some(lateral_join) = lateral_join {
-            Ok(Statement::SelectLateral {
-                distinct,
-                projection,
-                from,
-                lateral_join,
-                selection,
-                group_by,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            })
-        } else if let Some(join) = join {
-            Ok(Statement::SelectJoin {
-                distinct,
-                projection,
-                from,
-                join,
-                selection,
-                group_by,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            })
-        } else {
-            Ok(Statement::Select {
-                distinct,
-                projection,
-                from,
-                selection,
-                group_by,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            })
-        }
+        Ok(())
     }
 
     fn parse_select_join(&mut self) -> Result<(Option<JoinClause>, Option<LateralJoin>)> {
