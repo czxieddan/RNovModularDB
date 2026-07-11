@@ -1954,14 +1954,28 @@ impl Parser {
 
     fn parse_case_expr(&mut self) -> Result<Expr> {
         self.expect_keyword(TokenKind::Case)?;
-        let operand = if self.consume_if(&TokenKind::When) {
-            None
-        } else {
-            let operand = self.parse_expr()?;
-            self.expect_keyword(TokenKind::When)?;
-            Some(Box::new(operand))
-        };
+        let operand = self.parse_case_operand()?;
+        let whens = self.parse_case_when_arms()?;
+        let else_expr = self.parse_case_else()?;
+        self.expect_keyword(TokenKind::End)?;
 
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        })
+    }
+
+    fn parse_case_operand(&mut self) -> Result<Option<Box<Expr>>> {
+        if self.consume_if(&TokenKind::When) {
+            return Ok(None);
+        }
+        let operand = self.parse_expr()?;
+        self.expect_keyword(TokenKind::When)?;
+        Ok(Some(Box::new(operand)))
+    }
+
+    fn parse_case_when_arms(&mut self) -> Result<Vec<CaseWhen>> {
         let mut whens = Vec::new();
         loop {
             let condition = self.parse_expr()?;
@@ -1973,19 +1987,14 @@ impl Parser {
                 break;
             }
         }
+        Ok(whens)
+    }
 
-        let else_expr = if self.consume_if(&TokenKind::Else) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-        self.expect_keyword(TokenKind::End)?;
-
-        Ok(Expr::Case {
-            operand,
-            whens,
-            else_expr,
-        })
+    fn parse_case_else(&mut self) -> Result<Option<Box<Expr>>> {
+        if self.consume_if(&TokenKind::Else) {
+            return self.parse_expr().map(Box::new).map(Some);
+        }
+        Ok(None)
     }
 
     fn parse_hstore_literal_tail(&mut self) -> Result<Expr> {
@@ -2019,15 +2028,19 @@ impl Parser {
         self.expect_keyword(TokenKind::Comma)?;
         let upper = self.parse_expr()?;
         self.expect_keyword(TokenKind::Comma)?;
-        let raw_bounds = self.parse_string_literal("range bounds")?;
-        let bounds = RangeLiteralBounds::parse(&raw_bounds)
-            .ok_or_else(|| self.error("range bounds must be one of [], [), (], ()"))?;
+        let bounds = self.parse_range_bounds()?;
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(Expr::Range {
             lower: Box::new(lower),
             upper: Box::new(upper),
             bounds,
         })
+    }
+
+    fn parse_range_bounds(&mut self) -> Result<RangeLiteralBounds> {
+        let raw_bounds = self.parse_string_literal("range bounds")?;
+        RangeLiteralBounds::parse(&raw_bounds)
+            .ok_or_else(|| self.error("range bounds must be one of [], [), (], ()"))
     }
 
     fn parse_cast_expr_tail(&mut self) -> Result<Expr> {
@@ -2043,38 +2056,49 @@ impl Parser {
 
     fn parse_type(&mut self) -> Result<SqlType> {
         let type_name = self.parse_ident()?;
-        let mut data_type = if type_name.as_str() == "range" {
-            self.expect_operator("<")?;
-            let element_type = self.parse_type()?;
-            self.expect_operator(">")?;
-            SqlType::Range(Box::new(element_type))
+        let data_type = if type_name.as_str() == "range" {
+            self.parse_range_type()?
         } else {
-            match type_name.as_str() {
-                "bool" | "boolean" => SqlType::Bool,
-                "int64" | "bigint" | "integer" => SqlType::Int64,
-                "uint64" => SqlType::UInt64,
-                "float" | "float64" => SqlType::Float64,
-                "double" => {
-                    let _ = self.consume_identifier_keyword("precision");
-                    SqlType::Float64
-                }
-                "doubleprecision" => SqlType::Float64,
-                "uuid" => SqlType::Uuid,
-                "timestamp" | "datetime" => SqlType::Timestamp,
-                "json" | "jsonb" => SqlType::Json,
-                "text" | "string" | "varchar" => SqlType::Text,
-                "bytes" | "bytea" => SqlType::Bytes,
-                "hstore" => SqlType::HStore,
-                "textvector" | "tsvector" => SqlType::TextVector,
-                unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
-            }
+            self.parse_named_type(type_name.as_str())?
         };
+        self.parse_array_type_suffixes(data_type)
+    }
 
+    fn parse_range_type(&mut self) -> Result<SqlType> {
+        self.expect_operator("<")?;
+        let element_type = self.parse_type()?;
+        self.expect_operator(">")?;
+        Ok(SqlType::Range(Box::new(element_type)))
+    }
+
+    fn parse_named_type(&mut self, type_name: &str) -> Result<SqlType> {
+        let data_type = match type_name {
+            "bool" | "boolean" => SqlType::Bool,
+            "int64" | "bigint" | "integer" => SqlType::Int64,
+            "uint64" => SqlType::UInt64,
+            "float" | "float64" => SqlType::Float64,
+            "double" => {
+                let _ = self.consume_identifier_keyword("precision");
+                SqlType::Float64
+            }
+            "doubleprecision" => SqlType::Float64,
+            "uuid" => SqlType::Uuid,
+            "timestamp" | "datetime" => SqlType::Timestamp,
+            "json" | "jsonb" => SqlType::Json,
+            "text" | "string" | "varchar" => SqlType::Text,
+            "bytes" | "bytea" => SqlType::Bytes,
+            "hstore" => SqlType::HStore,
+            "textvector" | "tsvector" => SqlType::TextVector,
+            unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
+        };
+        Ok(data_type)
+    }
+
+    fn parse_array_type_suffixes(&mut self, mut data_type: SqlType) -> Result<SqlType> {
         while self.consume_if(&TokenKind::LeftBracket) {
             self.expect_keyword(TokenKind::RightBracket)?;
             data_type = SqlType::Array(Box::new(data_type));
         }
-
         Ok(data_type)
     }
 
