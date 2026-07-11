@@ -507,18 +507,23 @@ impl Parser {
     fn parse_drop_operator_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::OperatorKeyword)?;
         let if_exists = self.parse_if_exists()?;
-        let symbol = self.parse_operator_symbol()?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let left_type = self.parse_type()?;
-        self.expect_keyword(TokenKind::Comma)?;
-        let right_type = self.parse_type()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let (symbol, left_type, right_type) = self.parse_drop_operator_signature()?;
         Ok(Statement::DropOperator {
             symbol,
             left_type,
             right_type,
             if_exists,
         })
+    }
+
+    fn parse_drop_operator_signature(&mut self) -> Result<(String, SqlType, SqlType)> {
+        let symbol = self.parse_operator_symbol()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let left_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        let right_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok((symbol, left_type, right_type))
     }
 
     fn parse_drop_role_tail(&mut self) -> Result<Statement> {
@@ -753,13 +758,7 @@ impl Parser {
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        let argument_types = if self.consume_if(&TokenKind::RightParen) {
-            Vec::new()
-        } else {
-            let types = self.parse_type_list()?;
-            self.expect_keyword(TokenKind::RightParen)?;
-            types
-        };
+        let argument_types = self.parse_optional_type_list_body()?;
         self.expect_keyword(TokenKind::As)?;
         let body = self.parse_string_literal("procedure body")?;
         Ok(Statement::CreateProcedure {
@@ -768,6 +767,15 @@ impl Parser {
             body,
             if_not_exists,
         })
+    }
+
+    fn parse_optional_type_list_body(&mut self) -> Result<Vec<SqlType>> {
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(Vec::new());
+        }
+        let types = self.parse_type_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(types)
     }
 
     fn parse_create_operator_tail(&mut self) -> Result<Statement> {
@@ -841,15 +849,20 @@ impl Parser {
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_object_name()?;
         self.expect_keyword(TokenKind::Using)?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let predicate = self.parse_expr()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let predicate = self.parse_parenthesized_expr()?;
         Ok(Statement::CreatePolicy {
             name,
             table,
             predicate,
             if_not_exists,
         })
+    }
+
+    fn parse_parenthesized_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let predicate = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(predicate)
     }
 
     fn parse_if_not_exists(&mut self) -> Result<bool> {
@@ -916,24 +929,39 @@ impl Parser {
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
+        let (table, columns) = self.parse_insert_target()?;
+        let values = self.parse_insert_values()?;
+        self.validate_insert_arity(&columns, &values)?;
+        Ok(Statement::Insert {
+            table,
+            columns,
+            values,
+        })
+    }
+
+    fn parse_insert_target(&mut self) -> Result<(ObjectName, Vec<Ident>)> {
         self.expect_keyword(TokenKind::Insert)?;
         self.expect_keyword(TokenKind::Into)?;
         let table = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let columns = self.parse_ident_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((table, columns))
+    }
+
+    fn parse_insert_values(&mut self) -> Result<Vec<Expr>> {
         self.expect_keyword(TokenKind::Values)?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let values = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok(values)
+    }
+
+    fn validate_insert_arity(&self, columns: &[Ident], values: &[Expr]) -> Result<()> {
         if columns.len() != values.len() {
             return Err(self.error("insert column count does not match value count"));
         }
-        Ok(Statement::Insert {
-            table,
-            columns,
-            values,
-        })
+        Ok(())
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
