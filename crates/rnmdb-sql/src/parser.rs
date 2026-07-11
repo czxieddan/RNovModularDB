@@ -1598,43 +1598,9 @@ impl Parser {
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_concat_expr()?;
+        let expr = self.parse_concat_expr()?;
         if self.consume_if(&TokenKind::Is) {
-            let negated = self.consume_if(&TokenKind::Not);
-            if self.consume_if(&TokenKind::Distinct) {
-                self.expect_keyword(TokenKind::From)?;
-                let right = self.parse_additive_expr()?;
-                return Ok(Expr::IsDistinctFrom {
-                    left: Box::new(expr),
-                    right: Box::new(right),
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::True) {
-                return Ok(Expr::IsTruth {
-                    expr: Box::new(expr),
-                    value: true,
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::False) {
-                return Ok(Expr::IsTruth {
-                    expr: Box::new(expr),
-                    value: false,
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::Unknown) {
-                return Ok(Expr::IsUnknown {
-                    expr: Box::new(expr),
-                    negated,
-                });
-            }
-            self.expect_keyword(TokenKind::Null)?;
-            return Ok(Expr::IsNull {
-                expr: Box::new(expr),
-                negated,
-            });
+            return self.parse_is_predicate(expr);
         }
         if self.consume_if(&TokenKind::Between) {
             return self.parse_between_tail(expr, false);
@@ -1646,23 +1612,69 @@ impl Parser {
             return self.parse_like_tail(expr, false);
         }
         if self.consume_if(&TokenKind::Not) {
-            if self.consume_if(&TokenKind::Between) {
-                return self.parse_between_tail(expr, true);
-            }
-            if self.consume_if(&TokenKind::In) {
-                return self.parse_in_list_tail(expr, true);
-            }
-            self.expect_keyword(TokenKind::Like)?;
-            return self.parse_like_tail(expr, true);
+            return self.parse_negated_comparison_tail(expr);
         }
+        self.parse_binary_comparison_tail(expr)
+    }
+
+    fn parse_is_predicate(&mut self, expr: Expr) -> Result<Expr> {
+        let negated = self.consume_if(&TokenKind::Not);
+        if self.consume_if(&TokenKind::Distinct) {
+            self.expect_keyword(TokenKind::From)?;
+            let right = self.parse_additive_expr()?;
+            return Ok(Expr::IsDistinctFrom {
+                left: Box::new(expr),
+                right: Box::new(right),
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::True) {
+            return Ok(Expr::IsTruth {
+                expr: Box::new(expr),
+                value: true,
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::False) {
+            return Ok(Expr::IsTruth {
+                expr: Box::new(expr),
+                value: false,
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::Unknown) {
+            return Ok(Expr::IsUnknown {
+                expr: Box::new(expr),
+                negated,
+            });
+        }
+        self.expect_keyword(TokenKind::Null)?;
+        Ok(Expr::IsNull {
+            expr: Box::new(expr),
+            negated,
+        })
+    }
+
+    fn parse_negated_comparison_tail(&mut self, expr: Expr) -> Result<Expr> {
+        if self.consume_if(&TokenKind::Between) {
+            return self.parse_between_tail(expr, true);
+        }
+        if self.consume_if(&TokenKind::In) {
+            return self.parse_in_list_tail(expr, true);
+        }
+        self.expect_keyword(TokenKind::Like)?;
+        self.parse_like_tail(expr, true)
+    }
+
+    fn parse_binary_comparison_tail(&mut self, expr: Expr) -> Result<Expr> {
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
             let right = self.parse_concat_expr()?;
-            expr = Expr::Binary {
+            return Ok(Expr::Binary {
                 left: Box::new(expr),
                 op,
                 right: Box::new(right),
-            };
+            });
         }
         Ok(expr)
     }
