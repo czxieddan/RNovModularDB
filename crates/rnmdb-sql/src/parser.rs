@@ -2132,31 +2132,49 @@ impl Parser {
     }
 
     fn parse_query_tail(&mut self) -> Result<QueryTail> {
-        let order_by = if self.consume_if(&TokenKind::Order) {
-            self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_list()?
-        } else {
-            Vec::new()
-        };
-        let limit = if self.consume_if(&TokenKind::Limit) {
-            self.parse_limit_count()?
-        } else {
-            None
-        };
-        let offset = if self.consume_if(&TokenKind::Offset) {
-            Some(self.parse_offset_count()?)
-        } else {
-            None
-        };
+        let order_by = self.parse_optional_order_by()?;
+        let limit = self.parse_optional_limit()?;
+        let offset = self.parse_optional_offset()?;
         let fetch = self.parse_fetch_count()?;
-        if limit.is_some() && fetch.is_some() {
-            return Err(self.error("LIMIT and FETCH cannot be used together"));
-        }
+        self.ensure_limit_fetch_compatible(limit, fetch)?;
         Ok(QueryTail {
             order_by,
             limit: limit.or(fetch),
             offset,
         })
+    }
+
+    fn parse_optional_order_by(&mut self) -> Result<Vec<OrderByExpr>> {
+        if !self.consume_if(&TokenKind::Order) {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword(TokenKind::By)?;
+        self.parse_order_by_list()
+    }
+
+    fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
+        if self.consume_if(&TokenKind::Limit) {
+            return self.parse_limit_count();
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_offset(&mut self) -> Result<Option<usize>> {
+        if self.consume_if(&TokenKind::Offset) {
+            return self.parse_offset_count().map(Some);
+        }
+        Ok(None)
+    }
+
+    fn ensure_limit_fetch_compatible(
+        &self,
+        limit: Option<usize>,
+        fetch: Option<usize>,
+    ) -> Result<()> {
+        if limit.is_some() && fetch.is_some() {
+            return Err(self.error("LIMIT and FETCH cannot be used together"));
+        }
+        Ok(())
     }
 
     fn parse_limit_count(&mut self) -> Result<Option<usize>> {
@@ -2171,19 +2189,32 @@ impl Parser {
         if !self.consume_if(&TokenKind::Fetch) {
             return Ok(None);
         }
+        self.parse_fetch_direction()?;
+        let count = self.parse_fetch_row_count()?;
+        self.parse_fetch_suffix()?;
+        Ok(Some(count))
+    }
+
+    fn parse_fetch_direction(&mut self) -> Result<()> {
         if !self.consume_if(&TokenKind::First) {
             self.expect_keyword(TokenKind::Next)?;
         }
-        let count = if matches!(self.peek_kind(), Some(TokenKind::Row | TokenKind::Rows)) {
-            1
-        } else {
-            self.parse_row_count("FETCH")?
-        };
+        Ok(())
+    }
+
+    fn parse_fetch_row_count(&mut self) -> Result<usize> {
+        if matches!(self.peek_kind(), Some(TokenKind::Row | TokenKind::Rows)) {
+            return Ok(1);
+        }
+        self.parse_row_count("FETCH")
+    }
+
+    fn parse_fetch_suffix(&mut self) -> Result<()> {
         if !self.consume_if(&TokenKind::Row) {
             self.expect_keyword(TokenKind::Rows)?;
         }
         self.expect_keyword(TokenKind::Only)?;
-        Ok(Some(count))
+        Ok(())
     }
 
     fn parse_offset_count(&mut self) -> Result<usize> {
