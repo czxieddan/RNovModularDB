@@ -1543,94 +1543,82 @@ fn is_indexable_expression(expr: &Expr) -> bool {
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
-    if let Expr::Between {
+    if let Some(range) = indexable_between(predicate) {
+        return Some(range);
+    }
+    let (column, op, value) = indexable_comparison(predicate)?;
+    indexable_comparison_range(column, op, value)
+}
+
+fn indexable_between(predicate: &Expr) -> Option<IndexableRange<'_>> {
+    let Expr::Between {
         expr,
         low,
         high,
         negated: false,
     } = predicate
-        && let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref())
-        && is_index_literal(low)
-        && is_index_literal(high)
-    {
-        return Some(IndexableRange {
-            column: column.as_str(),
-            lower: Some(low),
-            lower_inclusive: true,
-            upper: Some(high),
-            upper_inclusive: true,
-        });
+    else {
+        return None;
+    };
+    let (Expr::Identifier(column), low, high) = (expr.as_ref(), low.as_ref(), high.as_ref()) else {
+        return None;
+    };
+    if !is_index_literal(low) || !is_index_literal(high) {
+        return None;
     }
+    Some(IndexableRange {
+        column: column.as_str(),
+        lower: Some(low),
+        lower_inclusive: true,
+        upper: Some(high),
+        upper_inclusive: true,
+    })
+}
+
+fn indexable_comparison(predicate: &Expr) -> Option<(&str, &str, &Expr)> {
     let Expr::Binary { left, op, right } = predicate else {
         return None;
     };
-    match (left.as_ref(), op.as_str(), right.as_ref()) {
-        (Expr::Identifier(column), ">", value) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: Some(value),
-            lower_inclusive: false,
-            upper: None,
-            upper_inclusive: true,
-        }),
-        (Expr::Identifier(column), ">=", value) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: Some(value),
-                lower_inclusive: true,
-                upper: None,
-                upper_inclusive: true,
-            })
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), value) if is_index_literal(value) => {
+            Some((column.as_str(), op.as_str(), value))
         }
-        (Expr::Identifier(column), "<", value) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: None,
-            lower_inclusive: true,
-            upper: Some(value),
-            upper_inclusive: false,
-        }),
-        (Expr::Identifier(column), "<=", value) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: None,
-                lower_inclusive: true,
-                upper: Some(value),
-                upper_inclusive: true,
-            })
-        }
-        (value, "<", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: Some(value),
-            lower_inclusive: false,
-            upper: None,
-            upper_inclusive: true,
-        }),
-        (value, "<=", Expr::Identifier(column)) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: Some(value),
-                lower_inclusive: true,
-                upper: None,
-                upper_inclusive: true,
-            })
-        }
-        (value, ">", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: None,
-            lower_inclusive: true,
-            upper: Some(value),
-            upper_inclusive: false,
-        }),
-        (value, ">=", Expr::Identifier(column)) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: None,
-                lower_inclusive: true,
-                upper: Some(value),
-                upper_inclusive: true,
-            })
+        (value, Expr::Identifier(column)) if is_index_literal(value) => {
+            Some((column.as_str(), normalize_literal_left_operator(op)?, value))
         }
         _ => None,
     }
+}
+
+fn normalize_literal_left_operator(op: &str) -> Option<&str> {
+    match op {
+        "<" => Some(">"),
+        "<=" => Some(">="),
+        ">" => Some("<"),
+        ">=" => Some("<="),
+        _ => None,
+    }
+}
+
+fn indexable_comparison_range<'a>(
+    column: &'a str,
+    op: &str,
+    value: &'a Expr,
+) -> Option<IndexableRange<'a>> {
+    let (lower, lower_inclusive, upper, upper_inclusive) = match op {
+        ">" => (Some(value), false, None, true),
+        ">=" => (Some(value), true, None, true),
+        "<" => (None, true, Some(value), false),
+        "<=" => (None, true, Some(value), true),
+        _ => return None,
+    };
+    Some(IndexableRange {
+        column,
+        lower,
+        lower_inclusive,
+        upper,
+        upper_inclusive,
+    })
 }
 
 fn indexable_range_overlap(predicate: &Expr) -> Option<(&str, &Expr)> {
