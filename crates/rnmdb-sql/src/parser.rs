@@ -924,39 +924,50 @@ impl Parser {
         self.expect_keyword(TokenKind::Grant)?;
         let privilege = self.parse_privilege()?;
         self.expect_keyword(TokenKind::On)?;
+        self.parse_grant_target(privilege)
+    }
+
+    fn parse_grant_target(&mut self, privilege: Privilege) -> Result<Statement> {
         if self.consume_if(&TokenKind::Table) {
-            let table = self.parse_object_name()?;
-            self.expect_keyword(TokenKind::To)?;
-            let role = self.parse_ident()?;
-            return Ok(Statement::GrantTablePrivilege {
-                privilege,
-                table,
-                role,
-            });
+            return self.parse_grant_table(privilege);
         }
         if self.consume_if(&TokenKind::Procedure) {
-            if privilege != Privilege::Execute {
-                return Err(self.error("expected EXECUTE privilege for procedure grant"));
-            }
-            let name = self.parse_ident()?;
-            self.expect_keyword(TokenKind::LeftParen)?;
-            let argument_types = if self.consume_if(&TokenKind::RightParen) {
-                Vec::new()
-            } else {
-                let types = self.parse_type_list()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                types
-            };
-            self.expect_keyword(TokenKind::To)?;
-            let role = self.parse_ident()?;
-            return Ok(Statement::GrantProcedurePrivilege {
-                privilege,
-                name,
-                argument_types,
-                role,
-            });
+            return self.parse_grant_procedure(privilege);
         }
         Err(self.error("expected TABLE or PROCEDURE after GRANT privilege ON"))
+    }
+
+    fn parse_grant_table(&mut self, privilege: Privilege) -> Result<Statement> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::To)?;
+        let role = self.parse_ident()?;
+        Ok(Statement::GrantTablePrivilege {
+            privilege,
+            table,
+            role,
+        })
+    }
+
+    fn parse_grant_procedure(&mut self, privilege: Privilege) -> Result<Statement> {
+        self.ensure_procedure_grant_privilege(privilege)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = self.parse_optional_type_list_body()?;
+        self.expect_keyword(TokenKind::To)?;
+        let role = self.parse_ident()?;
+        Ok(Statement::GrantProcedurePrivilege {
+            privilege,
+            name,
+            argument_types,
+            role,
+        })
+    }
+
+    fn ensure_procedure_grant_privilege(&self, privilege: Privilege) -> Result<()> {
+        if privilege != Privilege::Execute {
+            return Err(self.error("expected EXECUTE privilege for procedure grant"));
+        }
+        Ok(())
     }
 
     fn parse_call_procedure(&mut self) -> Result<Statement> {
