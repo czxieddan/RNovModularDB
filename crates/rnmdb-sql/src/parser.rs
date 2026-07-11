@@ -40,6 +40,14 @@ struct Parser {
     position: usize,
 }
 
+enum FunctionArguments {
+    Regular(Vec<Expr>),
+    CountDistinct(Expr),
+}
+
+type SingleArgumentConstructor = fn(Box<Expr>) -> Expr;
+type NamedSingleArgumentFunction = (&'static str, SingleArgumentConstructor);
+
 #[derive(Default)]
 struct WasmFunctionOptions {
     max_memory_bytes: Option<u64>,
@@ -1797,161 +1805,173 @@ impl Parser {
         match self.peek_kind().cloned() {
             Some(TokenKind::Case) => self.parse_case_expr(),
             Some(TokenKind::Exists) => self.parse_exists_subquery_expr(),
-            Some(TokenKind::Identifier(_)) => {
-                let first = self.parse_ident()?;
-                if first.as_str() == "array" && self.consume_if(&TokenKind::LeftBracket) {
-                    let values = if self.consume_if(&TokenKind::RightBracket) {
-                        Vec::new()
-                    } else {
-                        let values = self.parse_expr_list()?;
-                        self.expect_keyword(TokenKind::RightBracket)?;
-                        values
-                    };
-                    return Ok(Expr::Array(values));
-                }
-                if first.as_str() == "hstore" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_hstore_literal_tail();
-                }
-                if first.as_str() == "range" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_range_literal_tail();
-                }
-                if first.as_str() == "cast" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_cast_expr_tail();
-                }
-
-                let name = self.parse_object_name_from_first(first)?;
-                if self.consume_if(&TokenKind::LeftParen) {
-                    if name.schema().is_none()
-                        && name.object() == "count"
-                        && self.consume_if(&TokenKind::Star)
-                    {
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        return Ok(Expr::CountStar);
-                    }
-                    let args = if self.consume_if(&TokenKind::RightParen) {
-                        Vec::new()
-                    } else if self.consume_if(&TokenKind::Distinct) {
-                        let expr = self.parse_expr()?;
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        if name.schema().is_none() && name.object() == "count" {
-                            return Ok(Expr::CountDistinct(Box::new(expr)));
-                        }
-                        return Err(self.error(format!(
-                            "DISTINCT arguments are not supported for function {name}"
-                        )));
-                    } else {
-                        let args = self.parse_expr_list()?;
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        args
-                    };
-                    if name.schema().is_none() && ranking_window_function(name.object()).is_some() {
-                        if !args.is_empty() {
-                            return Err(self
-                                .error(format!("{}() does not accept arguments", name.object())));
-                        }
-                        let order_by = self.parse_window_order_by(name.object())?;
-                        return Ok(ranking_window_function(name.object())
-                            .expect("checked ranking window function")(
-                            order_by
-                        ));
-                    }
-                    if name.schema().is_none() && name.object() == "count" {
-                        let mut args = args;
-                        return Ok(Expr::Count(Box::new(
-                            self.single_function_arg("count", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "sum" {
-                        let mut args = args;
-                        return Ok(Expr::Sum(Box::new(
-                            self.single_function_arg("sum", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "min" {
-                        let mut args = args;
-                        return Ok(Expr::Min(Box::new(
-                            self.single_function_arg("min", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "max" {
-                        let mut args = args;
-                        return Ok(Expr::Max(Box::new(
-                            self.single_function_arg("max", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "coalesce" {
-                        if args.is_empty() {
-                            return Err(self.error("COALESCE requires at least one expression"));
-                        }
-                        return Ok(Expr::Coalesce(args));
-                    }
-                    if name.schema().is_none() && name.object() == "nullif" {
-                        if args.len() != 2 {
-                            return Err(self.error("NULLIF requires exactly two expressions"));
-                        }
-                        let mut args = args.into_iter();
-                        let left = args.next().expect("NULLIF argument length checked");
-                        let right = args.next().expect("NULLIF argument length checked");
-                        return Ok(Expr::NullIf {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        });
-                    }
-                    Ok(Expr::Call {
-                        function_id: None,
-                        name,
-                        args,
-                    })
-                } else {
-                    match name.schema() {
-                        Some(qualifier) => Ok(Expr::QualifiedIdentifier {
-                            qualifier: Ident::new(qualifier),
-                            name: Ident::new(name.object()),
-                        }),
-                        None => Ok(Expr::Identifier(Ident::new(name.object()))),
-                    }
-                }
-            }
-            Some(TokenKind::Integer(value)) => {
-                self.bump();
-                Ok(Expr::Integer(value))
-            }
-            Some(TokenKind::Float64(value)) => {
-                self.bump();
-                Ok(Expr::Float64(value))
-            }
-            Some(TokenKind::String(value)) => {
-                self.bump();
-                Ok(Expr::String(value))
-            }
-            Some(TokenKind::True) => {
-                self.bump();
-                Ok(Expr::Bool(true))
-            }
-            Some(TokenKind::False) => {
-                self.bump();
-                Ok(Expr::Bool(false))
-            }
-            Some(TokenKind::Null) => {
-                self.bump();
-                Ok(Expr::Null)
-            }
-            Some(TokenKind::LeftParen) => {
-                self.bump();
-                if self.peek_kind() == Some(&TokenKind::Select) {
-                    let query = self.parse_query()?;
-                    self.expect_keyword(TokenKind::RightParen)?;
-                    return Ok(Expr::ScalarSubquery {
-                        query: SelectSubquery::Parsed(Box::new(query)),
-                    });
-                }
-                let expr = self.parse_expr()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                Ok(expr)
-            }
-            Some(kind) => Err(self.error(format!("unexpected expression token {kind:?}"))),
+            Some(TokenKind::Identifier(_)) => self.parse_identifier_expr(),
+            Some(TokenKind::LeftParen) => self.parse_parenthesized_primary_expr(),
+            Some(kind) => self.parse_literal_expr(kind),
             None => Err(self.error("expected expression")),
         }
+    }
+
+    fn parse_identifier_expr(&mut self) -> Result<Expr> {
+        let first = self.parse_ident()?;
+        if self.consume_named_token(first.as_str(), "array", &TokenKind::LeftBracket) {
+            return self.parse_array_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "hstore", &TokenKind::LeftParen) {
+            return self.parse_hstore_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "range", &TokenKind::LeftParen) {
+            return self.parse_range_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "cast", &TokenKind::LeftParen) {
+            return self.parse_cast_expr_tail();
+        }
+
+        let name = self.parse_object_name_from_first(first)?;
+        if self.consume_if(&TokenKind::LeftParen) {
+            return self.parse_function_call(name);
+        }
+        Ok(object_name_into_identifier(name))
+    }
+
+    fn consume_named_token(&mut self, actual: &str, expected: &str, token: &TokenKind) -> bool {
+        actual == expected && self.consume_if(token)
+    }
+
+    fn parse_array_literal_tail(&mut self) -> Result<Expr> {
+        if self.consume_if(&TokenKind::RightBracket) {
+            return Ok(Expr::Array(Vec::new()));
+        }
+        let values = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightBracket)?;
+        Ok(Expr::Array(values))
+    }
+
+    fn parse_function_call(&mut self, name: ObjectName) -> Result<Expr> {
+        if let Some(count_star) = self.parse_count_star(&name)? {
+            return Ok(count_star);
+        }
+        match self.parse_function_arguments(&name)? {
+            FunctionArguments::Regular(args) => self.build_function_call(name, args),
+            FunctionArguments::CountDistinct(expr) => Ok(Expr::CountDistinct(Box::new(expr))),
+        }
+    }
+
+    fn parse_count_star(&mut self, name: &ObjectName) -> Result<Option<Expr>> {
+        if !is_unqualified_function(name, "count") || !self.consume_if(&TokenKind::Star) {
+            return Ok(None);
+        }
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Some(Expr::CountStar))
+    }
+
+    fn parse_function_arguments(&mut self, name: &ObjectName) -> Result<FunctionArguments> {
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(FunctionArguments::Regular(Vec::new()));
+        }
+        if self.consume_if(&TokenKind::Distinct) {
+            let expr = self.parse_expr()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            if is_unqualified_function(name, "count") {
+                return Ok(FunctionArguments::CountDistinct(expr));
+            }
+            return Err(self.error(format!(
+                "DISTINCT arguments are not supported for function {name}"
+            )));
+        }
+        let args = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(FunctionArguments::Regular(args))
+    }
+
+    fn build_function_call(&mut self, name: ObjectName, args: Vec<Expr>) -> Result<Expr> {
+        if name.schema().is_some() {
+            return Ok(regular_function_call(name, args));
+        }
+        if let Some(constructor) = ranking_window_function(name.object()) {
+            return self.build_ranking_window_call(name.object(), args, constructor);
+        }
+        if let Some((function_name, constructor)) = single_argument_function(name.object()) {
+            return self.build_single_argument_call(function_name, args, constructor);
+        }
+        match name.object() {
+            "coalesce" => self.build_coalesce_call(args),
+            "nullif" => self.build_nullif_call(args),
+            _ => Ok(regular_function_call(name, args)),
+        }
+    }
+
+    fn build_ranking_window_call(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        constructor: fn(Vec<OrderByExpr>) -> Expr,
+    ) -> Result<Expr> {
+        if !args.is_empty() {
+            return Err(self.error(format!("{name}() does not accept arguments")));
+        }
+        let order_by = self.parse_window_order_by(name)?;
+        Ok(constructor(order_by))
+    }
+
+    fn build_single_argument_call(
+        &self,
+        name: &'static str,
+        mut args: Vec<Expr>,
+        constructor: SingleArgumentConstructor,
+    ) -> Result<Expr> {
+        let argument = self.single_function_arg(name, &mut args)?;
+        Ok(constructor(Box::new(argument)))
+    }
+
+    fn build_coalesce_call(&self, args: Vec<Expr>) -> Result<Expr> {
+        if args.is_empty() {
+            return Err(self.error("COALESCE requires at least one expression"));
+        }
+        Ok(Expr::Coalesce(args))
+    }
+
+    fn build_nullif_call(&self, args: Vec<Expr>) -> Result<Expr> {
+        if args.len() != 2 {
+            return Err(self.error("NULLIF requires exactly two expressions"));
+        }
+        let mut args = args.into_iter();
+        let left = args.next().expect("NULLIF argument length checked");
+        let right = args.next().expect("NULLIF argument length checked");
+        Ok(Expr::NullIf {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    fn parse_parenthesized_primary_expr(&mut self) -> Result<Expr> {
+        self.bump();
+        if self.peek_kind() == Some(&TokenKind::Select) {
+            let query = self.parse_query()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            return Ok(Expr::ScalarSubquery {
+                query: SelectSubquery::Parsed(Box::new(query)),
+            });
+        }
+        let expr = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(expr)
+    }
+
+    fn parse_literal_expr(&mut self, kind: TokenKind) -> Result<Expr> {
+        let expr = match kind {
+            TokenKind::Integer(value) => Expr::Integer(value),
+            TokenKind::Float64(value) => Expr::Float64(value),
+            TokenKind::String(value) => Expr::String(value),
+            TokenKind::True => Expr::Bool(true),
+            TokenKind::False => Expr::Bool(false),
+            TokenKind::Null => Expr::Null,
+            unexpected => {
+                return Err(self.error(format!("unexpected expression token {unexpected:?}")));
+            }
+        };
+        self.bump();
+        Ok(expr)
     }
 
     fn parse_exists_subquery_expr(&mut self) -> Result<Expr> {
@@ -2573,6 +2593,38 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             limit: tail.limit,
             offset: tail.offset,
         },
+    }
+}
+
+fn object_name_into_identifier(name: ObjectName) -> Expr {
+    match name.schema() {
+        Some(qualifier) => Expr::QualifiedIdentifier {
+            qualifier: Ident::new(qualifier),
+            name: Ident::new(name.object()),
+        },
+        None => Expr::Identifier(Ident::new(name.object())),
+    }
+}
+
+fn is_unqualified_function(name: &ObjectName, expected: &str) -> bool {
+    name.schema().is_none() && name.object() == expected
+}
+
+fn regular_function_call(name: ObjectName, args: Vec<Expr>) -> Expr {
+    Expr::Call {
+        function_id: None,
+        name,
+        args,
+    }
+}
+
+fn single_argument_function(name: &str) -> Option<NamedSingleArgumentFunction> {
+    match name {
+        "count" => Some(("count", Expr::Count)),
+        "sum" => Some(("sum", Expr::Sum)),
+        "min" => Some(("min", Expr::Min)),
+        "max" => Some(("max", Expr::Max)),
+        _ => None,
     }
 }
 
