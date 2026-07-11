@@ -187,6 +187,35 @@ struct SelectSourceClauses {
     having: Option<Expr>,
 }
 
+#[derive(Clone, Copy)]
+enum SetOperationKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOperationKind {
+    fn combine(self, all: bool, left: Statement, right: Statement) -> Statement {
+        match self {
+            Self::Union => Statement::Union {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            Self::Intersect => Statement::Intersect {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            Self::Except => Statement::Except {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        }
+    }
+}
+
 impl SelectCoreParts {
     fn into_statement(self) -> Statement {
         if !self.grouping_sets.is_empty() {
@@ -1349,51 +1378,61 @@ impl Parser {
     }
 
     fn parse_query(&mut self) -> Result<Statement> {
-        let mut statement = self.parse_select_core()?;
-        let mut set_operation = false;
-        loop {
-            if self.consume_if(&TokenKind::Union) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Union {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else if self.consume_if(&TokenKind::Intersect) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Intersect {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else if self.consume_if(&TokenKind::Except) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Except {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else {
-                break;
-            }
-        }
+        let statement = self.parse_select_core()?;
+        let (statement, set_operation) = self.parse_set_operation_chain(statement)?;
         let tail = self.parse_query_tail()?;
         Ok(apply_query_tail(statement, tail, set_operation))
     }
 
+    fn parse_set_operation_chain(&mut self, mut statement: Statement) -> Result<(Statement, bool)> {
+        let mut set_operation = false;
+        while let Some(kind) = self.consume_set_operation_kind() {
+            let all = self.consume_if(&TokenKind::All);
+            let right = self.parse_select_core()?;
+            statement = kind.combine(all, statement, right);
+            set_operation = true;
+        }
+        Ok((statement, set_operation))
+    }
+
+    fn consume_set_operation_kind(&mut self) -> Option<SetOperationKind> {
+        if self.consume_if(&TokenKind::Union) {
+            return Some(SetOperationKind::Union);
+        }
+        if self.consume_if(&TokenKind::Intersect) {
+            return Some(SetOperationKind::Intersect);
+        }
+        if self.consume_if(&TokenKind::Except) {
+            return Some(SetOperationKind::Except);
+        }
+        None
+    }
+
     fn parse_recursive_cte(&mut self) -> Result<Statement> {
+        let (name, columns) = self.parse_recursive_cte_header()?;
+        let (seed, recursive) = self.parse_recursive_cte_members()?;
+        self.ensure_recursive_cte_columns(&columns)?;
+        let query = self.parse_query()?;
+        Ok(Statement::RecursiveCte {
+            name,
+            columns,
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query: Box::new(query),
+        })
+    }
+
+    fn parse_recursive_cte_header(&mut self) -> Result<(ObjectName, Vec<Ident>)> {
         self.expect_keyword(TokenKind::With)?;
         self.expect_keyword(TokenKind::Recursive)?;
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let columns = self.parse_ident_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((name, columns))
+    }
+
+    fn parse_recursive_cte_members(&mut self) -> Result<(Statement, Statement)> {
         self.expect_keyword(TokenKind::As)?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let seed = self.parse_select_core()?;
@@ -1403,17 +1442,14 @@ impl Parser {
         }
         let recursive = self.parse_select_core()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((seed, recursive))
+    }
+
+    fn ensure_recursive_cte_columns(&self, columns: &[Ident]) -> Result<()> {
         if columns.is_empty() {
             return Err(self.error("recursive CTE requires at least one output column"));
         }
-        let query = self.parse_query()?;
-        Ok(Statement::RecursiveCte {
-            name,
-            columns,
-            seed: Box::new(seed),
-            recursive: Box::new(recursive),
-            query: Box::new(query),
-        })
+        Ok(())
     }
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
@@ -1456,27 +1492,38 @@ impl Parser {
 
     fn parse_grouping_sets(&mut self) -> Result<Vec<Vec<Expr>>> {
         self.expect_keyword(TokenKind::LeftParen)?;
+        let grouping_sets = self.parse_grouping_set_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.ensure_grouping_sets_not_empty(&grouping_sets)?;
+        Ok(grouping_sets)
+    }
+
+    fn parse_grouping_set_list(&mut self) -> Result<Vec<Vec<Expr>>> {
         let mut grouping_sets = Vec::new();
         loop {
-            self.expect_keyword(TokenKind::LeftParen)?;
-            let grouping_set = if self.consume_if(&TokenKind::RightParen) {
-                Vec::new()
-            } else {
-                let expressions = self.parse_expr_list()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                expressions
-            };
-            grouping_sets.push(grouping_set);
-            if self.consume_if(&TokenKind::Comma) {
-                continue;
+            grouping_sets.push(self.parse_grouping_set()?);
+            if !self.consume_if(&TokenKind::Comma) {
+                break;
             }
-            break;
         }
+        Ok(grouping_sets)
+    }
+
+    fn parse_grouping_set(&mut self) -> Result<Vec<Expr>> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(Vec::new());
+        }
+        let expressions = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok(expressions)
+    }
+
+    fn ensure_grouping_sets_not_empty(&self, grouping_sets: &[Vec<Expr>]) -> Result<()> {
         if grouping_sets.is_empty() {
             return Err(self.error("GROUPING SETS requires at least one grouping set"));
         }
-        Ok(grouping_sets)
+        Ok(())
     }
 
     fn parse_parenthesized_expr_list(&mut self) -> Result<Vec<Expr>> {
