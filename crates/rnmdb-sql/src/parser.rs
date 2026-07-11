@@ -92,6 +92,45 @@ impl QueryTail {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExplainOptions {
+    analyze: bool,
+    format: ExplainFormat,
+}
+
+impl Default for ExplainOptions {
+    fn default() -> Self {
+        Self {
+            analyze: false,
+            format: ExplainFormat::Logical,
+        }
+    }
+}
+
+impl ExplainOptions {
+    fn enable_analyze(&mut self) -> std::result::Result<(), &'static str> {
+        if self.analyze {
+            return Err("duplicate EXPLAIN ANALYZE option");
+        }
+        self.analyze = true;
+        Ok(())
+    }
+
+    fn set_format(&mut self, format: ExplainFormat) -> std::result::Result<(), &'static str> {
+        if self.format != ExplainFormat::Logical {
+            return Err("conflicting EXPLAIN format options");
+        }
+        self.format = format;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CreateTableElements {
+    columns: Vec<ColumnDef>,
+    foreign_keys: Vec<(Ident, ColumnReference)>,
+}
+
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -123,40 +162,48 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Explain)?;
-        let mut analyze = false;
-        let mut format = ExplainFormat::Logical;
-        loop {
-            if self.consume_if(&TokenKind::Analyze) {
-                if analyze {
-                    return Err(self.error("duplicate EXPLAIN ANALYZE option"));
-                }
-                analyze = true;
-                continue;
-            }
-            if self.consume_identifier_keyword("costs") {
-                if format != ExplainFormat::Logical {
-                    return Err(self.error("conflicting EXPLAIN format options"));
-                }
-                format = ExplainFormat::Costs;
-                continue;
-            }
-            if self.consume_identifier_keyword("physical") {
-                if format != ExplainFormat::Logical {
-                    return Err(self.error("conflicting EXPLAIN format options"));
-                }
-                format = ExplainFormat::Physical;
-                continue;
-            }
-            break;
+        let options = self.parse_explain_options()?;
+        self.reject_nested_explain()?;
+        Ok(Statement::Explain {
+            analyze: options.analyze,
+            format: options.format,
+            statement: Box::new(self.parse_statement()?),
+        })
+    }
+
+    fn parse_explain_options(&mut self) -> Result<ExplainOptions> {
+        let mut options = ExplainOptions::default();
+        while self.parse_explain_option(&mut options)? {}
+        Ok(options)
+    }
+
+    fn parse_explain_option(&mut self, options: &mut ExplainOptions) -> Result<bool> {
+        if self.consume_if(&TokenKind::Analyze) {
+            return options
+                .enable_analyze()
+                .map(|()| true)
+                .map_err(|message| self.error(message));
         }
+        if self.consume_identifier_keyword("costs") {
+            return options
+                .set_format(ExplainFormat::Costs)
+                .map(|()| true)
+                .map_err(|message| self.error(message));
+        }
+        if self.consume_identifier_keyword("physical") {
+            return options
+                .set_format(ExplainFormat::Physical)
+                .map(|()| true)
+                .map_err(|message| self.error(message));
+        }
+        Ok(false)
+    }
+
+    fn reject_nested_explain(&self) -> Result<()> {
         if matches!(self.peek_kind(), Some(TokenKind::Explain)) {
             return Err(self.error("nested EXPLAIN is not supported"));
         }
-        Ok(Statement::Explain {
-            analyze,
-            format,
-            statement: Box::new(self.parse_statement()?),
-        })
+        Ok(())
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -181,22 +228,27 @@ impl Parser {
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Table)?;
-        let if_not_exists = if self.consume_if(&TokenKind::If) {
-            self.expect_keyword(TokenKind::Not)?;
-            self.expect_keyword(TokenKind::Exists)?;
-            true
-        } else {
-            false
-        };
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        let mut columns = Vec::new();
-        let mut foreign_keys = Vec::new();
+        let mut elements = self.parse_create_table_elements()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.apply_table_foreign_keys(&mut elements.columns, elements.foreign_keys)?;
+
+        Ok(Statement::CreateTable {
+            name,
+            columns: elements.columns,
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_table_elements(&mut self) -> Result<CreateTableElements> {
+        let mut elements = CreateTableElements::default();
         loop {
             if self.next_is_identifier_keyword("foreign") {
-                foreign_keys.push(self.parse_table_foreign_key()?);
+                elements.foreign_keys.push(self.parse_table_foreign_key()?);
             } else {
-                columns.push(self.parse_column_def()?);
+                elements.columns.push(self.parse_column_def()?);
             }
 
             if self.consume_if(&TokenKind::Comma) {
@@ -204,32 +256,13 @@ impl Parser {
             }
             break;
         }
-        self.expect_keyword(TokenKind::RightParen)?;
-        self.apply_table_foreign_keys(&mut columns, foreign_keys)?;
-
-        Ok(Statement::CreateTable {
-            name,
-            columns,
-            if_not_exists,
-        })
+        Ok(elements)
     }
 
     fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Index)?;
-        let if_not_exists = if self.consume_if(&TokenKind::If) {
-            self.expect_keyword(TokenKind::Not)?;
-            self.expect_keyword(TokenKind::Exists)?;
-            true
-        } else {
-            false
-        };
-        let name = self.parse_object_name()?;
-        self.expect_keyword(TokenKind::On)?;
-        let table = self.parse_object_name()?;
-        let method = self.parse_optional_index_method()?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let keys = self.parse_index_keys()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (name, table, method, keys) = self.parse_create_index_definition()?;
 
         Ok(Statement::CreateIndex {
             name,
@@ -241,22 +274,27 @@ impl Parser {
         })
     }
 
+    fn parse_create_index_definition(
+        &mut self,
+    ) -> Result<(ObjectName, ObjectName, IndexMethod, Vec<IndexKeyDef>)> {
+        let name = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        let method = self.parse_optional_index_method()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let keys = self.parse_index_keys()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok((name, table, method, keys))
+    }
+
     fn parse_create_trigger_tail(&mut self, unique: bool) -> Result<Statement> {
         if unique {
             return Err(self.error("CREATE UNIQUE TRIGGER is not supported"));
         }
         self.expect_keyword(TokenKind::Trigger)?;
         let if_not_exists = self.parse_if_not_exists()?;
-        let name = self.parse_ident()?;
-        self.expect_keyword(TokenKind::After)?;
-        let event = self.parse_trigger_event()?;
-        self.expect_keyword(TokenKind::On)?;
-        let table = self.parse_object_name()?;
-        self.expect_keyword(TokenKind::Execute)?;
-        if !self.consume_identifier_keyword("sql") {
-            return Err(self.error("expected SQL after EXECUTE"));
-        }
-        let body = self.parse_string_literal("trigger SQL body")?;
+        let (name, event, table) = self.parse_create_trigger_header()?;
+        let body = self.parse_trigger_sql_body()?;
         Ok(Statement::CreateTrigger {
             name,
             table,
@@ -265,6 +303,23 @@ impl Parser {
             body,
             if_not_exists,
         })
+    }
+
+    fn parse_create_trigger_header(&mut self) -> Result<(Ident, TriggerEvent, ObjectName)> {
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::After)?;
+        let event = self.parse_trigger_event()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        Ok((name, event, table))
+    }
+
+    fn parse_trigger_sql_body(&mut self) -> Result<String> {
+        self.expect_keyword(TokenKind::Execute)?;
+        if !self.consume_identifier_keyword("sql") {
+            return Err(self.error("expected SQL after EXECUTE"));
+        }
+        self.parse_string_literal("trigger SQL body")
     }
 
     fn parse_trigger_event(&mut self) -> Result<TriggerEvent> {
