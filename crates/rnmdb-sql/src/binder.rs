@@ -11,7 +11,7 @@ use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundHashJoinKeys,
     BoundIndexKey, BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery,
     BoundRecursiveCte, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion,
-    BoundUpdate, CaseWhen, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef,
+    BoundUpdate, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef,
     JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, SelectItem, SelectSubquery,
     Statement, TransactionAction, WasmFunctionBody,
 };
@@ -3454,411 +3454,44 @@ impl<'a> Binder<'a> {
         hidden_aggregates: &mut Vec<BoundSelectItem>,
         expr: &Expr,
     ) -> Result<Expr> {
-        if let Some(item) = projection
-            .iter()
-            .chain(hidden_group_keys.iter())
-            .chain(hidden_aggregates.iter())
-            .find(|item| &item.expr == expr)
-        {
-            return Ok(Expr::Identifier(Ident::new(item.column.name.as_str())));
-        }
-        if group_by.iter().any(|group| group == expr) {
-            return self.rewrite_having_group_key_expr(
-                table,
-                projection,
-                hidden_group_keys,
-                hidden_aggregates,
-                expr,
-            );
-        }
-        match expr {
-            Expr::CountStar
-            | Expr::Count(_)
-            | Expr::CountDistinct(_)
-            | Expr::Sum(_)
-            | Expr::Min(_)
-            | Expr::Max(_) => {
-                self.rewrite_having_aggregate_expr(table, projection, hidden_aggregates, expr)
+        rewrite_expr_tree(expr, &mut |candidate| {
+            if let Some(item) = projection
+                .iter()
+                .chain(hidden_group_keys.iter())
+                .chain(hidden_aggregates.iter())
+                .find(|item| &item.expr == candidate)
+            {
+                return Ok(Some(Expr::Identifier(Ident::new(
+                    item.column.name.as_str(),
+                ))));
             }
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
+            if group_by.iter().any(|group| group == candidate) {
+                return self
+                    .rewrite_having_group_key_expr(
+                        table,
+                        projection,
+                        hidden_group_keys,
+                        hidden_aggregates,
+                        candidate,
+                    )
+                    .map(Some);
+            }
+            if is_aggregate_expr(candidate) {
+                return self
+                    .rewrite_having_aggregate_expr(table, projection, hidden_aggregates, candidate)
+                    .map(Some);
+            }
+            if matches!(
+                candidate,
+                Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. }
+            ) {
+                return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "HAVING does not support window expressions",
-                ))
+                ));
             }
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                op: op.clone(),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.rewrite_grouped_having_expr(
-                table,
-                projection,
-                group_by,
-                hidden_group_keys,
-                hidden_aggregates,
-                expr,
-            )?))),
-            Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                negated: *negated,
-            }),
-            Expr::IsTruth {
-                expr,
-                value,
-                negated,
-            } => Ok(Expr::IsTruth {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                value: *value,
-                negated: *negated,
-            }),
-            Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                negated: *negated,
-            }),
-            Expr::IsDistinctFrom {
-                left,
-                right,
-                negated,
-            } => Ok(Expr::IsDistinctFrom {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-                negated: *negated,
-            }),
-            Expr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => Ok(Expr::Between {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                low: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    low,
-                )?),
-                high: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    high,
-                )?),
-                negated: *negated,
-            }),
-            Expr::InList {
-                expr,
-                values,
-                negated,
-            } => Ok(Expr::InList {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                values: values
-                    .iter()
-                    .map(|value| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            value,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                negated: *negated,
-            }),
-            Expr::InSubquery {
-                expr,
-                query,
-                negated,
-            } => Ok(Expr::InSubquery {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                query: query.clone(),
-                negated: *negated,
-            }),
-            Expr::ExistsSubquery { query } => Ok(Expr::ExistsSubquery {
-                query: query.clone(),
-            }),
-            Expr::Like {
-                expr,
-                pattern,
-                negated,
-            } => Ok(Expr::Like {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                pattern: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    pattern,
-                )?),
-                negated: *negated,
-            }),
-            Expr::Coalesce(values) => values
-                .iter()
-                .map(|value| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        value,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Coalesce),
-            Expr::NullIf { left, right } => Ok(Expr::NullIf {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-            }),
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => Ok(Expr::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|operand| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            operand,
-                        )
-                    })
-                    .transpose()?
-                    .map(Box::new),
-                whens: whens
-                    .iter()
-                    .map(|arm| {
-                        Ok(CaseWhen {
-                            condition: self.rewrite_grouped_having_expr(
-                                table,
-                                projection,
-                                group_by,
-                                hidden_group_keys,
-                                hidden_aggregates,
-                                &arm.condition,
-                            )?,
-                            result: self.rewrite_grouped_having_expr(
-                                table,
-                                projection,
-                                group_by,
-                                hidden_group_keys,
-                                hidden_aggregates,
-                                &arm.result,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|else_expr| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            else_expr,
-                        )
-                    })
-                    .transpose()?
-                    .map(Box::new),
-            }),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                data_type: data_type.clone(),
-            }),
-            Expr::Array(values) => values
-                .iter()
-                .map(|value| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        value,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Array),
-            Expr::Range {
-                lower,
-                upper,
-                bounds,
-            } => Ok(Expr::Range {
-                lower: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    lower,
-                )?),
-                upper: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    upper,
-                )?),
-                bounds: *bounds,
-            }),
-            Expr::Call {
-                function_id,
-                name,
-                args,
-            } => args
-                .iter()
-                .map(|arg| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        arg,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|args| Expr::Call {
-                    function_id: *function_id,
-                    name: name.clone(),
-                    args,
-                }),
-            Expr::Identifier(_)
-            | Expr::QualifiedIdentifier { .. }
-            | Expr::Integer(_)
-            | Expr::Float64(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::RuntimeValue(_)
-            | Expr::HStore(_) => Ok(expr.clone()),
-            Expr::ScalarSubquery { query } => Ok(Expr::ScalarSubquery {
-                query: query.clone(),
-            }),
-        }
+            Ok(None)
+        })
     }
 
     fn rewrite_having_group_key_expr(
