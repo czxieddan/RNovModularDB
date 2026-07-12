@@ -8365,22 +8365,8 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
             range_literal_value(lower, upper, bounds.lower_inclusive, bounds.upper_inclusive)?
                 .data_type(),
         ),
-        Expr::Binary { op, .. } if boolean_operator(op) => Ok(SqlType::Bool),
-        Expr::Binary { left, op, right } if arithmetic_operator(op) => {
-            projection_arithmetic_type(columns, left, op, right)
-        }
-        Expr::Binary { op, .. } if text_concat_operator(op) => Ok(SqlType::Text),
-        Expr::Binary { op, .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("memory projection does not support operator {op}"),
-        )),
-        Expr::Unary { op, expr } if unary_arithmetic_operator(op) => {
-            projection_unary_arithmetic_type(columns, op, expr)
-        }
-        Expr::Unary { op, .. } => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("memory projection does not support unary operator {op}"),
-        )),
+        Expr::Binary { left, op, right } => projection_binary_type(columns, left, op, right),
+        Expr::Unary { op, expr } => projection_unary_type(columns, op, expr),
         Expr::Not(_) => Ok(SqlType::Bool),
         Expr::IsNull { .. } => Ok(SqlType::Bool),
         Expr::IsTruth { .. } => Ok(SqlType::Bool),
@@ -8406,6 +8392,37 @@ fn projection_type(columns: &[ColumnSchema], expr: &Expr) -> Result<SqlType> {
         Expr::Cast { data_type, .. } => Ok(data_type.clone()),
         Expr::Call { name, args, .. } => projection_call_type(columns, name.object(), args),
     }
+}
+
+fn projection_binary_type(
+    columns: &[ColumnSchema],
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlType> {
+    if boolean_operator(op) {
+        return Ok(SqlType::Bool);
+    }
+    if arithmetic_operator(op) {
+        return projection_arithmetic_type(columns, left, op, right);
+    }
+    if text_concat_operator(op) {
+        return Ok(SqlType::Text);
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("memory projection does not support operator {op}"),
+    ))
+}
+
+fn projection_unary_type(columns: &[ColumnSchema], op: &str, expr: &Expr) -> Result<SqlType> {
+    if unary_arithmetic_operator(op) {
+        return projection_unary_arithmetic_type(columns, op, expr);
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("memory projection does not support unary operator {op}"),
+    ))
 }
 
 fn projection_type_with_runtime(
@@ -8442,22 +8459,44 @@ fn projection_arithmetic_type(
 ) -> Result<SqlType> {
     let left_type = projection_type(columns, left)?;
     let right_type = projection_type(columns, right)?;
-    if !numeric_or_null_type(&left_type) || !numeric_or_null_type(&right_type) {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("arithmetic operator {op} requires numeric operands"),
-        ));
+    ensure_projection_numeric_operands(op, &left_type, &right_type)?;
+    ensure_projection_modulo_types(op, &left_type, &right_type)?;
+    Ok(projection_numeric_result_type(&left_type, &right_type))
+}
+
+fn ensure_projection_numeric_operands(
+    op: &str,
+    left_type: &SqlType,
+    right_type: &SqlType,
+) -> Result<()> {
+    if numeric_or_null_type(left_type) && numeric_or_null_type(right_type) {
+        return Ok(());
     }
-    if op == "%" && (left_type == SqlType::Float64 || right_type == SqlType::Float64) {
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("arithmetic operator {op} requires numeric operands"),
+    ))
+}
+
+fn ensure_projection_modulo_types(
+    op: &str,
+    left_type: &SqlType,
+    right_type: &SqlType,
+) -> Result<()> {
+    if op == "%" && (left_type == &SqlType::Float64 || right_type == &SqlType::Float64) {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             "modulo operator requires INT64 operands",
         ));
     }
-    if left_type == SqlType::Float64 || right_type == SqlType::Float64 {
-        Ok(SqlType::Float64)
+    Ok(())
+}
+
+fn projection_numeric_result_type(left_type: &SqlType, right_type: &SqlType) -> SqlType {
+    if left_type == &SqlType::Float64 || right_type == &SqlType::Float64 {
+        SqlType::Float64
     } else {
-        Ok(SqlType::Int64)
+        SqlType::Int64
     }
 }
 
@@ -8483,67 +8522,77 @@ fn numeric_or_null_type(data_type: &SqlType) -> bool {
 
 fn projection_call_type(columns: &[ColumnSchema], name: &str, args: &[Expr]) -> Result<SqlType> {
     match name {
-        "text_rank" => {
-            ensure_function_arity(name, args, 2)?;
-            let value_type = projection_type(columns, &args[0])?;
-            if !matches!(
-                value_type,
-                SqlType::Text | SqlType::TextVector | SqlType::Null
-            ) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "text_rank value argument requires TEXT or TEXTVECTOR, got {value_type:?}"
-                    ),
-                ));
-            }
-
-            let query_type = projection_type(columns, &args[1])?;
-            if !matches!(query_type, SqlType::Text | SqlType::Null) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("text_rank query argument requires TEXT, got {query_type:?}"),
-                ));
-            }
-            Ok(SqlType::Int64)
-        }
-        "text_phrase_match" => {
-            ensure_function_arity(name, args, 3)?;
-            let value_type = projection_type(columns, &args[0])?;
-            if !matches!(
-                value_type,
-                SqlType::Text | SqlType::TextVector | SqlType::Null
-            ) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "text_phrase_match value argument requires TEXT or TEXTVECTOR, got {value_type:?}"
-                    ),
-                ));
-            }
-
-            let phrase_type = projection_type(columns, &args[1])?;
-            if !matches!(phrase_type, SqlType::Text | SqlType::Null) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("text_phrase_match phrase argument requires TEXT, got {phrase_type:?}"),
-                ));
-            }
-
-            let gap_type = projection_type(columns, &args[2])?;
-            if !matches!(gap_type, SqlType::Int64 | SqlType::Null) {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("text_phrase_match gap argument requires INT64, got {gap_type:?}"),
-                ));
-            }
-            Ok(SqlType::Bool)
-        }
+        "text_rank" => projection_text_rank_type(columns, name, args),
+        "text_phrase_match" => projection_text_phrase_match_type(columns, name, args),
         other => Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("memory projection does not support function call {other}"),
         )),
     }
+}
+
+fn projection_text_rank_type(
+    columns: &[ColumnSchema],
+    name: &str,
+    args: &[Expr],
+) -> Result<SqlType> {
+    ensure_function_arity(name, args, 2)?;
+    let value_type = projection_type(columns, &args[0])?;
+    if !matches!(
+        value_type,
+        SqlType::Text | SqlType::TextVector | SqlType::Null
+    ) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("text_rank value argument requires TEXT or TEXTVECTOR, got {value_type:?}"),
+        ));
+    }
+
+    let query_type = projection_type(columns, &args[1])?;
+    if !matches!(query_type, SqlType::Text | SqlType::Null) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("text_rank query argument requires TEXT, got {query_type:?}"),
+        ));
+    }
+    Ok(SqlType::Int64)
+}
+
+fn projection_text_phrase_match_type(
+    columns: &[ColumnSchema],
+    name: &str,
+    args: &[Expr],
+) -> Result<SqlType> {
+    ensure_function_arity(name, args, 3)?;
+    let value_type = projection_type(columns, &args[0])?;
+    if !matches!(
+        value_type,
+        SqlType::Text | SqlType::TextVector | SqlType::Null
+    ) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "text_phrase_match value argument requires TEXT or TEXTVECTOR, got {value_type:?}"
+            ),
+        ));
+    }
+
+    let phrase_type = projection_type(columns, &args[1])?;
+    if !matches!(phrase_type, SqlType::Text | SqlType::Null) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("text_phrase_match phrase argument requires TEXT, got {phrase_type:?}"),
+        ));
+    }
+
+    let gap_type = projection_type(columns, &args[2])?;
+    if !matches!(gap_type, SqlType::Int64 | SqlType::Null) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("text_phrase_match gap argument requires INT64, got {gap_type:?}"),
+        ));
+    }
+    Ok(SqlType::Bool)
 }
 
 fn ensure_function_arity(name: &str, args: &[Expr], expected: usize) -> Result<()> {
