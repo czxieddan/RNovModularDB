@@ -1,11 +1,20 @@
 use rnmdb_cli::CommandOutput;
 use rnmdb_storage::{
-    SingleFileBackupReport, SingleFileInspection, SingleFileRestoreDryRun, SingleFileRestoreReport,
-    SingleFileUpgradeReport, SingleFileVerificationReport,
+    SingleFileBackupReport, SingleFileInspection, SingleFilePageRecordInspection,
+    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
+    SingleFileVerificationReport,
 };
 
 pub(super) fn format_inspection(inspection: &SingleFileInspection) -> String {
-    [
+    inspection_summary_lines(inspection)
+        .into_iter()
+        .chain(inspection.page_records().iter().map(format_page_record))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn inspection_summary_lines(inspection: &SingleFileInspection) -> Vec<String> {
+    vec![
         format!("path: {}", inspection.path().display()),
         format!("mode: {:?}", inspection.mode()),
         format!("page_size_bytes: {}", inspection.page_size().bytes()),
@@ -45,23 +54,21 @@ pub(super) fn format_inspection(inspection: &SingleFileInspection) -> String {
             inspection.capabilities().names().join(",")
         ),
     ]
-    .into_iter()
-    .chain(inspection.page_records().iter().map(|record| {
-        format!(
-            "page_record[{}]: page_id={} offset_bytes={} present={} encrypted={} authenticated={} checksum_verified={} counter={} encrypted_payload_bytes={}",
-            record.slot_index(),
-            record.page_id().get(),
-            record.offset_bytes(),
-            record.is_present(),
-            record.encrypted_payload_bytes().is_some(),
-            record.encryption_authenticated(),
-            record.page_checksum_verified(),
-            optional_u32(record.encryption_counter()),
-            optional_u64(record.encrypted_payload_bytes()),
-        )
-    }))
-    .collect::<Vec<_>>()
-    .join("\n")
+}
+
+fn format_page_record(record: &SingleFilePageRecordInspection) -> String {
+    format!(
+        "page_record[{}]: page_id={} offset_bytes={} present={} encrypted={} authenticated={} checksum_verified={} counter={} encrypted_payload_bytes={}",
+        record.slot_index(),
+        record.page_id().get(),
+        record.offset_bytes(),
+        record.is_present(),
+        record.encrypted_payload_bytes().is_some(),
+        record.encryption_authenticated(),
+        record.page_checksum_verified(),
+        optional_u32(record.encryption_counter()),
+        optional_u64(record.encrypted_payload_bytes()),
+    )
 }
 
 fn optional_u32(value: Option<u32>) -> String {
