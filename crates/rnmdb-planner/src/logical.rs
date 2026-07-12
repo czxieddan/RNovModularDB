@@ -1,9 +1,10 @@
-use rnmdb_catalog::IndexMethod;
+use rnmdb_catalog::{IndexMethod, TriggerEvent, TriggerTiming};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundIndexKey, BoundStatement, ColumnDef, ExplainFormat, Expr, Ident, IndexKeyDef, ObjectName,
+    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundStatement, BoundUnion, ColumnDef,
+    CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName,
     OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
@@ -24,6 +25,17 @@ pub enum LogicalPlan {
         predicate: Expr,
         input: Box<LogicalPlan>,
     },
+    InSubqueryFilter {
+        expr: Expr,
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+        input: Box<LogicalPlan>,
+    },
+    ExistsSubqueryFilter {
+        subquery: Box<LogicalPlan>,
+        negated: bool,
+        input: Box<LogicalPlan>,
+    },
     TextSearch {
         relation_id: RelationId,
         table: String,
@@ -37,6 +49,19 @@ pub enum LogicalPlan {
         inner_table: String,
         inner_column: String,
         outer_column: String,
+    },
+    NestedLoopJoin {
+        kind: JoinKind,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        predicate: Expr,
+    },
+    HashJoin {
+        kind: JoinKind,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        left_key: String,
+        right_key: String,
     },
     Project {
         items: Vec<ProjectionItem>,
@@ -99,6 +124,7 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
     },
     Insert {
+        relation_id: RelationId,
         table: String,
         columns: Vec<String>,
         values: Vec<Expr>,
@@ -128,6 +154,15 @@ pub enum LogicalPlan {
         unique: bool,
         if_not_exists: bool,
     },
+    CreateTrigger {
+        name: String,
+        relation_id: RelationId,
+        table: String,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
+        if_not_exists: bool,
+    },
     AlterTableAddColumn {
         relation_id: RelationId,
         table: String,
@@ -147,6 +182,12 @@ pub enum LogicalPlan {
     },
     DropIndex {
         name: String,
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: String,
+        relation_id: RelationId,
+        table: String,
         if_exists: bool,
     },
     DropFunction {
@@ -178,6 +219,7 @@ pub enum LogicalPlan {
         name: String,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {
@@ -347,6 +389,23 @@ impl LogicalPlanner {
                 unique: *unique,
                 if_not_exists: *if_not_exists,
             }),
+            BoundStatement::CreateTrigger {
+                name,
+                relation_id,
+                table,
+                timing,
+                event,
+                body,
+                if_not_exists,
+            } => Ok(LogicalPlan::CreateTrigger {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
+                table: object_name(table),
+                timing: *timing,
+                event: *event,
+                body: body.clone(),
+                if_not_exists: *if_not_exists,
+            }),
             BoundStatement::AlterTableAddColumn {
                 relation_id,
                 table,
@@ -380,6 +439,17 @@ impl LogicalPlanner {
             }),
             BoundStatement::DropIndex { name, if_exists } => Ok(LogicalPlan::DropIndex {
                 name: object_name(name),
+                if_exists: *if_exists,
+            }),
+            BoundStatement::DropTrigger {
+                name,
+                relation_id,
+                table,
+                if_exists,
+            } => Ok(LogicalPlan::DropTrigger {
+                name: name.as_str().to_string(),
+                relation_id: *relation_id,
+                table: object_name(table),
                 if_exists: *if_exists,
             }),
             BoundStatement::DropFunction {
@@ -425,10 +495,12 @@ impl LogicalPlanner {
                 if_exists: *if_exists,
             }),
             BoundStatement::Insert {
+                relation_id,
                 table,
                 columns,
                 values,
             } => Ok(LogicalPlan::Insert {
+                relation_id: *relation_id,
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
                 values: values.clone(),
@@ -455,75 +527,29 @@ impl LogicalPlanner {
                 };
                 self.plan_select_with_input(select, input, true)
             }
-            BoundStatement::Union(union) => Ok(LogicalPlan::Union {
-                all: union.all,
-                left: Box::new(self.plan(&union.left)?),
-                right: Box::new(self.plan(&union.right)?),
-            }),
-            BoundStatement::Intersect(intersect) => Ok(LogicalPlan::Intersect {
-                all: intersect.all,
-                left: Box::new(self.plan(&intersect.left)?),
-                right: Box::new(self.plan(&intersect.right)?),
-            }),
-            BoundStatement::Except(except) => Ok(LogicalPlan::Except {
-                all: except.all,
-                left: Box::new(self.plan(&except.left)?),
-                right: Box::new(self.plan(&except.right)?),
-            }),
-            BoundStatement::RecursiveCte(cte) => {
-                let seed = self.plan(&cte.seed)?;
-                let recursive_input = LogicalPlan::RecursiveScan {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
+            BoundStatement::SelectJoin(join_select) => {
+                let input = LogicalPlan::Scan {
+                    relation_id: join_select.select.relation_id,
+                    table: object_name(&join_select.select.table),
                 };
-                let recursive = self.plan_select_with_input(
-                    bound_select_from_statement(&cte.recursive)?,
-                    recursive_input,
-                    false,
-                )?;
-                let query_input = LogicalPlan::RecursiveScan {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                };
-                let query = self.plan_select_with_input(&cte.query, query_input, false)?;
-                Ok(LogicalPlan::RecursiveCte {
-                    name: object_name(&cte.name),
-                    columns: cte
-                        .columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect(),
-                    seed: Box::new(seed),
-                    recursive: Box::new(recursive),
-                    query: Box::new(query),
-                })
+                self.plan_select_join(&join_select.select, &join_select.join, input)
             }
-            BoundStatement::Query(query) => {
-                let plan = self.plan(&query.input)?;
-                Ok(apply_query_tail(
-                    plan,
-                    &query.order_by,
-                    query.limit,
-                    query.offset,
-                ))
-            }
+            BoundStatement::Union(union) => self.plan_union(union),
+            BoundStatement::Intersect(intersect) => self.plan_intersect(intersect),
+            BoundStatement::Except(except) => self.plan_except(except),
+            BoundStatement::RecursiveCte(cte) => self.plan_recursive_cte(cte),
+            BoundStatement::Query(query) => self.plan_query(query),
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
                 return_type,
+                implementation,
                 if_not_exists,
             } => Ok(LogicalPlan::CreateFunction {
                 name: name.as_str().to_string(),
                 argument_types: argument_types.clone(),
                 return_type: return_type.clone(),
+                implementation: implementation.clone(),
                 if_not_exists: *if_not_exists,
             }),
             BoundStatement::CreateProcedure {
@@ -596,15 +622,113 @@ impl LogicalPlanner {
                 analyze,
                 format,
                 statement,
-            } => Ok(LogicalPlan::Explain {
-                analyze: *analyze,
-                format: *format,
-                input: Box::new(self.plan(statement)?),
-            }),
+            } => self.plan_explain(*analyze, *format, statement),
         }
     }
 
+    fn plan_union(&self, union: &BoundUnion) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Union {
+            all: union.all,
+            left: Box::new(self.plan(&union.left)?),
+            right: Box::new(self.plan(&union.right)?),
+        })
+    }
+
+    fn plan_intersect(&self, intersect: &BoundIntersect) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Intersect {
+            all: intersect.all,
+            left: Box::new(self.plan(&intersect.left)?),
+            right: Box::new(self.plan(&intersect.right)?),
+        })
+    }
+
+    fn plan_except(&self, except: &BoundExcept) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Except {
+            all: except.all,
+            left: Box::new(self.plan(&except.left)?),
+            right: Box::new(self.plan(&except.right)?),
+        })
+    }
+
+    fn plan_recursive_cte(&self, cte: &rnmdb_sql::ast::BoundRecursiveCte) -> Result<LogicalPlan> {
+        let seed = self.plan(&cte.seed)?;
+        let recursive_input = LogicalPlan::RecursiveScan {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+        };
+        let recursive = self.plan_select_with_input(
+            bound_select_from_statement(&cte.recursive)?,
+            recursive_input,
+            false,
+        )?;
+        let query_input = LogicalPlan::RecursiveScan {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+        };
+        let query = self.plan_select_with_input(&cte.query, query_input, false)?;
+        Ok(LogicalPlan::RecursiveCte {
+            name: object_name(&cte.name),
+            columns: cte
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query: Box::new(query),
+        })
+    }
+
+    fn plan_query(&self, query: &rnmdb_sql::ast::BoundQuery) -> Result<LogicalPlan> {
+        let plan = self.plan(&query.input)?;
+        Ok(apply_query_tail(
+            plan,
+            &query.order_by,
+            query.limit,
+            query.offset,
+        ))
+    }
+
+    fn plan_explain(
+        &self,
+        analyze: bool,
+        format: ExplainFormat,
+        statement: &BoundStatement,
+    ) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Explain {
+            analyze,
+            format,
+            input: Box::new(self.plan(statement)?),
+        })
+    }
+
     fn plan_select_with_input(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        mut plan: LogicalPlan,
+        include_table_dependent_rewrites: bool,
+    ) -> Result<LogicalPlan> {
+        plan = self.plan_select_rewrites(select, plan, include_table_dependent_rewrites)?;
+        plan = self.plan_select_selection(select, plan, include_table_dependent_rewrites)?;
+
+        let mut state = SelectPlanningState::new(select);
+        plan = plan_select_pre_output_sort(plan, &state);
+        plan = self.plan_select_output(select, plan, &mut state);
+        plan = plan_select_having(select, plan);
+        plan = plan_select_post_output_sort(plan, &state);
+        plan = plan_select_internal_outputs(select, plan, state.project_internal_outputs);
+        Ok(plan_select_tail(select, plan))
+    }
+
+    fn plan_select_rewrites(
         &self,
         select: &rnmdb_sql::ast::BoundSelect,
         mut plan: LogicalPlan,
@@ -624,139 +748,164 @@ impl LogicalPlanner {
                 };
             }
         }
+        Ok(plan)
+    }
+
+    fn plan_select_selection(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        plan: LogicalPlan,
+        include_table_dependent_rewrites: bool,
+    ) -> Result<LogicalPlan> {
         if let Some(predicate) = &select.selection {
-            plan = if include_table_dependent_rewrites {
-                plan_selection(select.relation_id, &select.table, predicate, plan)?
+            if include_table_dependent_rewrites {
+                self.plan_select_predicate(select.relation_id, &select.table, predicate, plan)
             } else {
-                LogicalPlan::Filter {
-                    predicate: predicate.clone(),
-                    input: Box::new(plan),
-                }
-            };
-        }
-        let grouping_sets = !select.grouping_sets.is_empty();
-        let grouped = !select.group_by.is_empty() || grouping_sets;
-        let aggregate_functions = select_aggregate_functions(select);
-        let mut order_by = select.order_by.clone();
-        let mut project_internal_outputs =
-            !select.hidden_group_keys.is_empty() || !select.hidden_aggregates.is_empty();
-        if !grouped && aggregate_functions.is_none() && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        let mut plan = if grouped {
-            let mut items = select
-                .projection
-                .iter()
-                .chain(select.hidden_group_keys.iter())
-                .chain(select.hidden_aggregates.iter())
-                .map(|item| GroupedAggregateItem {
-                    name: item.column.name.clone(),
-                    kind: grouped_aggregate_item_kind(&item.expr),
-                })
-                .collect::<Vec<_>>();
-            project_internal_outputs |=
-                add_grouped_sort_keys(&mut items, &mut order_by, &select.group_by);
-            if grouping_sets {
-                LogicalPlan::GroupingSetsAggregate {
-                    group_by: select.group_by.clone(),
-                    grouping_sets: select.grouping_sets.clone(),
-                    items,
-                    input: Box::new(plan),
-                }
-            } else {
-                LogicalPlan::GroupedAggregate {
-                    group_by: select.group_by.clone(),
-                    items,
-                    input: Box::new(plan),
-                }
+                self.plan_bound_predicate(predicate, plan)
             }
-        } else if let Some(functions) = select_aggregate_functions(select) {
-            LogicalPlan::Aggregate {
-                items: select
-                    .projection
-                    .iter()
-                    .chain(select.hidden_aggregates.iter())
-                    .zip(functions)
-                    .map(|(item, function)| AggregateItem {
-                        name: item.column.name.clone(),
-                        function,
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            }
-        } else {
-            let window_items = select_window_items(select);
-            if !window_items.is_empty() {
-                plan = LogicalPlan::Window {
-                    items: window_items,
-                    input: Box::new(plan),
-                };
-            }
-            LogicalPlan::Project {
-                items: select
-                    .projection
-                    .iter()
-                    .map(|item| ProjectionItem {
-                        name: item.column.name.clone(),
-                        expr: projection_expr_after_windows(item),
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            }
-        };
-        if let Some(predicate) = &select.having {
-            plan = LogicalPlan::Filter {
-                predicate: predicate.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if !grouped && aggregate_functions.is_some() && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if grouped && !order_by.is_empty() {
-            plan = LogicalPlan::Sort {
-                keys: order_by.clone(),
-                input: Box::new(plan),
-            };
-        }
-        if project_internal_outputs {
-            plan = LogicalPlan::Project {
-                items: select
-                    .projection
-                    .iter()
-                    .map(|item| ProjectionItem {
-                        name: item.column.name.clone(),
-                        expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
-                    })
-                    .collect(),
-                input: Box::new(plan),
-            };
-        }
-        if select.distinct {
-            plan = LogicalPlan::Distinct {
-                input: Box::new(plan),
-            };
-        }
-        if let Some(count) = select.offset {
-            plan = LogicalPlan::Offset {
-                count,
-                input: Box::new(plan),
-            };
-        }
-        if let Some(count) = select.limit {
-            Ok(LogicalPlan::Limit {
-                count,
-                input: Box::new(plan),
-            })
         } else {
             Ok(plan)
         }
+    }
+
+    fn plan_select_output(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        plan: LogicalPlan,
+        state: &mut SelectPlanningState,
+    ) -> LogicalPlan {
+        if state.grouped {
+            return plan_grouped_output(select, plan, state);
+        }
+        if let Some(functions) = &state.aggregate_functions {
+            return plan_scalar_aggregate(select, plan, functions.clone());
+        }
+        plan_window_projection(select, plan)
+    }
+
+    fn plan_select_join(
+        &self,
+        select: &rnmdb_sql::ast::BoundSelect,
+        join: &BoundJoin,
+        mut plan: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        for policy in &select.row_policy_predicates {
+            plan = plan_selection(select.relation_id, &select.table, &policy.predicate, plan)?;
+        }
+        let right = join_right_plan(join)?;
+        plan = match &join.hash_keys {
+            Some(keys) => LogicalPlan::HashJoin {
+                kind: join.kind,
+                left: Box::new(plan),
+                right: Box::new(right),
+                left_key: keys.left_column.clone(),
+                right_key: keys.right_column.clone(),
+            },
+            None => LogicalPlan::NestedLoopJoin {
+                kind: join.kind,
+                left: Box::new(plan),
+                right: Box::new(right),
+                predicate: join.predicate.clone(),
+            },
+        };
+        self.plan_select_with_input(select, plan, false)
+    }
+
+    fn plan_select_predicate(
+        &self,
+        relation_id: RelationId,
+        table: &ObjectName,
+        predicate: &Expr,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        match predicate {
+            Expr::Binary { left, op, right } if op == "AND" => {
+                let input = self.plan_select_predicate(relation_id, table, left, input)?;
+                self.plan_select_predicate(relation_id, table, right, input)
+            }
+            Expr::InSubquery { .. } | Expr::Not(_) => self.plan_bound_predicate(predicate, input),
+            Expr::ExistsSubquery { .. } => self.plan_bound_predicate(predicate, input),
+            _ => plan_selection(relation_id, table, predicate, input),
+        }
+    }
+
+    fn plan_bound_predicate(&self, predicate: &Expr, input: LogicalPlan) -> Result<LogicalPlan> {
+        match predicate {
+            Expr::Binary { left, op, right } if op == "AND" => {
+                let input = self.plan_bound_predicate(left, input)?;
+                self.plan_bound_predicate(right, input)
+            }
+            Expr::Not(expr) => self.plan_negated_bound_predicate(expr, input),
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self.plan_in_subquery_filter(expr, query.bound(), *negated, input),
+            Expr::ExistsSubquery { query } => {
+                self.plan_exists_subquery_filter(query.bound(), false, input)
+            }
+            _ => Ok(LogicalPlan::Filter {
+                predicate: predicate.clone(),
+                input: Box::new(input),
+            }),
+        }
+    }
+
+    fn plan_negated_bound_predicate(&self, expr: &Expr, input: LogicalPlan) -> Result<LogicalPlan> {
+        match expr {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self.plan_in_subquery_filter(expr, query.bound(), !*negated, input),
+            Expr::ExistsSubquery { query } => {
+                self.plan_exists_subquery_filter(query.bound(), true, input)
+            }
+            _ => Ok(LogicalPlan::Filter {
+                predicate: Expr::Not(Box::new(expr.clone())),
+                input: Box::new(input),
+            }),
+        }
+    }
+
+    fn plan_in_subquery_filter(
+        &self,
+        expr: &Expr,
+        query: Option<&BoundStatement>,
+        negated: bool,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let query = query.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "IN subquery was not bound before planning",
+            )
+        })?;
+        Ok(LogicalPlan::InSubqueryFilter {
+            expr: expr.clone(),
+            subquery: Box::new(self.plan(query)?),
+            negated,
+            input: Box::new(input),
+        })
+    }
+
+    fn plan_exists_subquery_filter(
+        &self,
+        query: Option<&BoundStatement>,
+        negated: bool,
+        input: LogicalPlan,
+    ) -> Result<LogicalPlan> {
+        let query = query.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "EXISTS subquery was not bound before planning",
+            )
+        })?;
+        Ok(LogicalPlan::ExistsSubqueryFilter {
+            subquery: Box::new(self.plan(query)?),
+            negated,
+            input: Box::new(input),
+        })
     }
 }
 
@@ -790,6 +939,31 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
             write_plan(input, indent + 1, out);
         }
+        LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery,
+            negated,
+            input,
+        } => {
+            out.push_str(&format!(
+                "{prefix}InSubqueryFilter expr={expr} op={}\n",
+                subquery_operator(*negated, "IN")
+            ));
+            write_plan(input, indent + 1, out);
+            write_plan(subquery, indent + 1, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => {
+            out.push_str(&format!(
+                "{prefix}ExistsSubqueryFilter op={}\n",
+                subquery_operator(*negated, "EXISTS")
+            ));
+            write_plan(input, indent + 1, out);
+            write_plan(subquery, indent + 1, out);
+        }
         LogicalPlan::TextSearch {
             table,
             column,
@@ -811,6 +985,33 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 "{prefix}SidewaysLookup inner={inner_table} inner_column={inner_column} outer_column={outer_column}\n"
             ));
             write_plan(outer, indent + 1, out);
+        }
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => {
+            out.push_str(&format!(
+                "{prefix}NestedLoopJoin kind={} predicate={predicate}\n",
+                join_kind_name(*kind)
+            ));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
+        }
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
+            out.push_str(&format!(
+                "{prefix}HashJoin kind={} left_key={left_key} right_key={right_key}\n",
+                join_kind_name(*kind)
+            ));
+            write_plan(left, indent + 1, out);
+            write_plan(right, indent + 1, out);
         }
         LogicalPlan::Project { items, input } => {
             let columns = items
@@ -857,14 +1058,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             let items = items
                 .iter()
-                .map(|item| match &item.kind {
-                    GroupedAggregateItemKind::GroupKey(expr) => {
-                        format!("{} := {}", item.name, expr)
-                    }
-                    GroupedAggregateItemKind::Aggregate(function) => {
-                        format!("{} := {}", item.name, aggregate_function_name(function))
-                    }
-                })
+                .map(grouped_aggregate_item_name)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
@@ -885,32 +1079,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .join(", ");
             let grouping_sets = grouping_sets
                 .iter()
-                .map(|grouping_set| {
-                    if grouping_set.is_empty() {
-                        "()".to_string()
-                    } else {
-                        format!(
-                            "({})",
-                            grouping_set
-                                .iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    }
-                })
+                .map(|grouping_set| grouping_set_name(grouping_set))
                 .collect::<Vec<_>>()
                 .join(", ");
             let items = items
                 .iter()
-                .map(|item| match &item.kind {
-                    GroupedAggregateItemKind::GroupKey(expr) => {
-                        format!("{} := {}", item.name, expr)
-                    }
-                    GroupedAggregateItemKind::Aggregate(function) => {
-                        format!("{} := {}", item.name, aggregate_function_name(function))
-                    }
-                })
+                .map(grouped_aggregate_item_name)
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
@@ -923,20 +1097,17 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Union { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Union {mode}\n"));
+            out.push_str(&format!("{prefix}Union {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
         LogicalPlan::Intersect { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Intersect {mode}\n"));
+            out.push_str(&format!("{prefix}Intersect {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
         LogicalPlan::Except { all, left, right } => {
-            let mode = if *all { "ALL" } else { "DISTINCT" };
-            out.push_str(&format!("{prefix}Except {mode}\n"));
+            out.push_str(&format!("{prefix}Except {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
@@ -993,31 +1164,24 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .map(|(column, expr)| format!("{column} = {expr}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push_str(&format!("{prefix}Update table={table} set={assignments}"));
-            if let Some(selection) = selection {
-                out.push_str(&format!(" where={selection}"));
-            }
-            out.push('\n');
+            out.push_str(&format!(
+                "{prefix}Update table={table} set={assignments}{}\n",
+                selection_suffix(selection.as_ref())
+            ));
         }
         LogicalPlan::Delete {
             table, selection, ..
         } => {
-            out.push_str(&format!("{prefix}Delete table={table}"));
-            if let Some(selection) = selection {
-                out.push_str(&format!(" where={selection}"));
-            }
-            out.push('\n');
+            out.push_str(&format!(
+                "{prefix}Delete table={table}{}\n",
+                selection_suffix(selection.as_ref())
+            ));
         }
         LogicalPlan::CreateTable {
             table,
             columns,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateTable table={table} columns={}{}\n",
                 columns
@@ -1025,7 +1189,7 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .map(|column| column.name.as_str().to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
-                exists
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::CreateIndex {
@@ -1037,12 +1201,6 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let mode = if *unique { "unique " } else { "" };
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateIndex {mode}name={name} table={table} method={} keys={}{}\n",
                 method.as_str(),
@@ -1050,7 +1208,21 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join(", "),
-                exists
+                if_not_exists_suffix(*if_not_exists),
+                mode = unique_prefix(*unique)
+            ));
+        }
+        LogicalPlan::CreateTrigger {
+            name,
+            table,
+            timing,
+            event,
+            if_not_exists,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{}\n",
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::AlterTableAddColumn {
@@ -1059,14 +1231,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}AlterTableAddColumn table={table} column={}{}\n",
-                column.name, exists
+                column.name,
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::AlterColumnEncryption {
@@ -1089,6 +1257,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         LogicalPlan::DropIndex { name, if_exists } => {
             out.push_str(&format!(
                 "{prefix}DropIndex name={name} if_exists={if_exists}\n"
+            ));
+        }
+        LogicalPlan::DropTrigger {
+            name,
+            table,
+            if_exists,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{prefix}DropTrigger name={name} table={table} if_exists={if_exists}\n"
             ));
         }
         LogicalPlan::DropFunction {
@@ -1139,17 +1317,14 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             argument_types,
             return_type,
+            implementation,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
-                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{}\n",
+                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{} language={}\n",
                 sql_type_list(argument_types),
-                exists
+                if_not_exists_suffix(*if_not_exists),
+                create_function_language(implementation)
             ));
         }
         LogicalPlan::CreateProcedure {
@@ -1158,15 +1333,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             if_not_exists,
             ..
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
                 "{prefix}CreateProcedure name={name} args={}{}\n",
                 sql_type_list(argument_types),
-                exists
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::CreateOperator {
@@ -1202,12 +1372,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             name,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
-            out.push_str(&format!("{prefix}CreateRole name={name}{exists}\n"));
+            out.push_str(&format!(
+                "{prefix}CreateRole name={name}{}\n",
+                if_not_exists_suffix(*if_not_exists)
+            ));
         }
         LogicalPlan::CreatePolicy {
             name,
@@ -1215,13 +1383,9 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             predicate,
             if_not_exists,
         } => {
-            let exists = if *if_not_exists {
-                " if_not_exists=true"
-            } else {
-                ""
-            };
             out.push_str(&format!(
-                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{exists}\n"
+                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{}\n",
+                if_not_exists_suffix(*if_not_exists)
             ));
         }
         LogicalPlan::GrantTablePrivilege {
@@ -1256,12 +1420,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             format,
             input,
         } => {
-            let format = if *format == ExplainFormat::Logical {
-                ""
-            } else {
+            out.push_str(&format!(
+                "{prefix}Explain analyze={analyze}{}\n",
                 explain_format_suffix(*format)
-            };
-            out.push_str(&format!("{prefix}Explain analyze={analyze}{format}\n"));
+            ));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Parallel { hint, input } => {
@@ -1271,6 +1433,57 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             write_plan(input, indent + 1, out);
         }
+    }
+}
+
+fn subquery_operator(negated: bool, operator: &str) -> String {
+    match negated {
+        true => format!("NOT {operator}"),
+        false => operator.to_string(),
+    }
+}
+
+fn grouped_aggregate_item_name(item: &GroupedAggregateItem) -> String {
+    let value = match &item.kind {
+        GroupedAggregateItemKind::GroupKey(expr) => expr.to_string(),
+        GroupedAggregateItemKind::Aggregate(function) => aggregate_function_name(function),
+    };
+    format!("{} := {value}", item.name)
+}
+
+fn grouping_set_name(grouping_set: &[Expr]) -> String {
+    let label = grouping_set
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({label})")
+}
+
+fn set_operation_mode(all: bool) -> &'static str {
+    match all {
+        true => "ALL",
+        false => "DISTINCT",
+    }
+}
+
+fn selection_suffix(selection: Option<&Expr>) -> String {
+    selection
+        .map(|selection| format!(" where={selection}"))
+        .unwrap_or_default()
+}
+
+fn if_not_exists_suffix(if_not_exists: bool) -> &'static str {
+    match if_not_exists {
+        true => " if_not_exists=true",
+        false => "",
+    }
+}
+
+fn unique_prefix(unique: bool) -> &'static str {
+    match unique {
+        true => "unique ",
+        false => "",
     }
 }
 
@@ -1303,11 +1516,27 @@ fn write_plan_with_costs(
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(input, indent + 1, cost_model, out);
         }
+        LogicalPlan::InSubqueryFilter {
+            input, subquery, ..
+        } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(input, indent + 1, cost_model, out);
+            write_plan_with_costs(subquery, indent + 1, cost_model, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => {
+            truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
+            write_plan_with_costs(input, indent + 1, cost_model, out);
+            write_plan_with_costs(subquery, indent + 1, cost_model, out);
+        }
         LogicalPlan::SidewaysLookup { outer, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
             write_plan_with_costs(outer, indent + 1, cost_model, out);
         }
-        LogicalPlan::Union { left, right, .. }
+        LogicalPlan::NestedLoopJoin { left, right, .. }
+        | LogicalPlan::HashJoin { left, right, .. }
+        | LogicalPlan::Union { left, right, .. }
         | LogicalPlan::Intersect { left, right, .. }
         | LogicalPlan::Except { left, right, .. } => {
             truncate_child_lines(out, line_end + format_plan_cost(cost).len() + 1);
@@ -1341,6 +1570,8 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
     match plan {
         LogicalPlan::Project { items, .. } => Some(items),
         LogicalPlan::Filter { input, .. }
+        | LogicalPlan::InSubqueryFilter { input, .. }
+        | LogicalPlan::ExistsSubqueryFilter { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Offset { input, .. }
@@ -1353,6 +1584,7 @@ fn first_project_items(plan: &LogicalPlan) -> Option<&[ProjectionItem]> {
 fn first_filter_predicate(plan: &LogicalPlan) -> Option<&Expr> {
     match plan {
         LogicalPlan::Filter { predicate, .. } => Some(predicate),
+        LogicalPlan::InSubqueryFilter { .. } | LogicalPlan::ExistsSubqueryFilter { .. } => None,
         LogicalPlan::Project { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
@@ -1380,13 +1612,186 @@ fn explain_format_suffix(format: ExplainFormat) -> &'static str {
     }
 }
 
+struct SelectPlanningState {
+    grouped: bool,
+    aggregate_functions: Option<Vec<AggregateFunction>>,
+    order_by: Vec<OrderByExpr>,
+    project_internal_outputs: bool,
+}
+
+impl SelectPlanningState {
+    fn new(select: &rnmdb_sql::ast::BoundSelect) -> Self {
+        Self {
+            grouped: !select.group_by.is_empty() || !select.grouping_sets.is_empty(),
+            aggregate_functions: select_aggregate_functions(select),
+            order_by: select.order_by.clone(),
+            project_internal_outputs: !select.hidden_group_keys.is_empty()
+                || !select.hidden_aggregates.is_empty(),
+        }
+    }
+}
+
+fn plan_select_pre_output_sort(plan: LogicalPlan, state: &SelectPlanningState) -> LogicalPlan {
+    if !state.grouped && state.aggregate_functions.is_none() && !state.order_by.is_empty() {
+        LogicalPlan::Sort {
+            keys: state.order_by.clone(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_grouped_output(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    state: &mut SelectPlanningState,
+) -> LogicalPlan {
+    let mut items = select
+        .projection
+        .iter()
+        .chain(select.hidden_group_keys.iter())
+        .chain(select.hidden_aggregates.iter())
+        .map(|item| GroupedAggregateItem {
+            name: item.column.name.clone(),
+            kind: grouped_aggregate_item_kind(&item.expr),
+        })
+        .collect::<Vec<_>>();
+    state.project_internal_outputs |=
+        add_grouped_sort_keys(&mut items, &mut state.order_by, &select.group_by);
+    if select.grouping_sets.is_empty() {
+        LogicalPlan::GroupedAggregate {
+            group_by: select.group_by.clone(),
+            items,
+            input: Box::new(plan),
+        }
+    } else {
+        LogicalPlan::GroupingSetsAggregate {
+            group_by: select.group_by.clone(),
+            grouping_sets: select.grouping_sets.clone(),
+            items,
+            input: Box::new(plan),
+        }
+    }
+}
+
+fn plan_scalar_aggregate(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    functions: Vec<AggregateFunction>,
+) -> LogicalPlan {
+    LogicalPlan::Aggregate {
+        items: select
+            .projection
+            .iter()
+            .chain(select.hidden_aggregates.iter())
+            .zip(functions)
+            .map(|(item, function)| AggregateItem {
+                name: item.column.name.clone(),
+                function,
+            })
+            .collect(),
+        input: Box::new(plan),
+    }
+}
+
+fn plan_window_projection(
+    select: &rnmdb_sql::ast::BoundSelect,
+    mut plan: LogicalPlan,
+) -> LogicalPlan {
+    let window_items = select_window_items(select);
+    if !window_items.is_empty() {
+        plan = LogicalPlan::Window {
+            items: window_items,
+            input: Box::new(plan),
+        };
+    }
+    LogicalPlan::Project {
+        items: select
+            .projection
+            .iter()
+            .map(|item| ProjectionItem {
+                name: item.column.name.clone(),
+                expr: projection_expr_after_windows(item),
+            })
+            .collect(),
+        input: Box::new(plan),
+    }
+}
+
+fn plan_select_having(select: &rnmdb_sql::ast::BoundSelect, plan: LogicalPlan) -> LogicalPlan {
+    match &select.having {
+        Some(predicate) => LogicalPlan::Filter {
+            predicate: predicate.clone(),
+            input: Box::new(plan),
+        },
+        None => plan,
+    }
+}
+
+fn plan_select_post_output_sort(plan: LogicalPlan, state: &SelectPlanningState) -> LogicalPlan {
+    if (state.grouped || state.aggregate_functions.is_some()) && !state.order_by.is_empty() {
+        LogicalPlan::Sort {
+            keys: state.order_by.clone(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_select_internal_outputs(
+    select: &rnmdb_sql::ast::BoundSelect,
+    plan: LogicalPlan,
+    project_internal_outputs: bool,
+) -> LogicalPlan {
+    if project_internal_outputs {
+        LogicalPlan::Project {
+            items: select
+                .projection
+                .iter()
+                .map(|item| ProjectionItem {
+                    name: item.column.name.clone(),
+                    expr: Expr::Identifier(Ident::new(item.column.name.as_str())),
+                })
+                .collect(),
+            input: Box::new(plan),
+        }
+    } else {
+        plan
+    }
+}
+
+fn plan_select_tail(select: &rnmdb_sql::ast::BoundSelect, mut plan: LogicalPlan) -> LogicalPlan {
+    if select.distinct {
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = select.offset {
+        plan = LogicalPlan::Offset {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    if let Some(count) = select.limit {
+        plan = LogicalPlan::Limit {
+            count,
+            input: Box::new(plan),
+        };
+    }
+    plan
+}
+
 fn plan_selection(
     relation_id: RelationId,
     table: &ObjectName,
     predicate: &Expr,
     fallback_input: LogicalPlan,
 ) -> Result<LogicalPlan> {
-    if let Some((column, query)) = text_search_predicate(predicate) {
+    if base_scan_matches(&fallback_input, relation_id, table)
+        && let Some((column, query)) = text_search_predicate(predicate)
+    {
         let parsed = TextQuery::parse(query)?;
         return Ok(LogicalPlan::TextSearch {
             relation_id,
@@ -1417,6 +1822,40 @@ fn plan_selection(
         predicate: predicate.clone(),
         input: Box::new(fallback_input),
     })
+}
+
+fn base_scan_matches(input: &LogicalPlan, relation_id: RelationId, table: &ObjectName) -> bool {
+    let LogicalPlan::Scan {
+        relation_id: input_relation,
+        table: input_table,
+    } = input
+    else {
+        return false;
+    };
+    *input_relation == relation_id && input_table == &object_name(table)
+}
+
+fn join_right_plan(join: &BoundJoin) -> Result<LogicalPlan> {
+    let mut plan = LogicalPlan::Scan {
+        relation_id: join.right_relation_id,
+        table: object_name(&join.right_table),
+    };
+    for policy in &join.row_policy_predicates {
+        plan = plan_selection(
+            join.right_relation_id,
+            &join.right_table,
+            &policy.predicate,
+            plan,
+        )?;
+    }
+    Ok(plan)
+}
+
+fn join_kind_name(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
+    }
 }
 
 fn text_search_predicate(predicate: &Expr) -> Option<(&str, &str)> {
@@ -1491,6 +1930,13 @@ fn sql_type_list(types: &[SqlType]) -> String {
         .map(|data_type| format!("{data_type:?}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn create_function_language(implementation: &CreateFunctionImplementation) -> &'static str {
+    match implementation {
+        CreateFunctionImplementation::MetadataOnly => "metadata",
+        CreateFunctionImplementation::Wasm(_) => "wasm",
+    }
 }
 
 fn select_aggregate_functions(

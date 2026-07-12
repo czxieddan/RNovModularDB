@@ -2,6 +2,17 @@ use std::time::Duration;
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
 use rnmdb_types::SqlType;
+use sha2::{Digest, Sha256};
+
+mod registry;
+mod wasm_runtime;
+
+pub use registry::UdfRegistry;
+pub use wasm_runtime::WasmScalarRuntime;
+
+/// Maximum accepted module size; accepted modules are lazily compiled and cached by content key.
+pub const MAX_WASM_MODULE_BYTES: usize = 1024 * 1024;
+pub(crate) type WasmModuleCacheKey = [u8; 32];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdfBudget {
@@ -80,6 +91,7 @@ pub enum WasmImportCapability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WasmModuleDefinition {
     module_bytes: Vec<u8>,
+    cache_key: WasmModuleCacheKey,
     initial_memory_bytes: usize,
     imports: Vec<WasmImportCapability>,
 }
@@ -96,15 +108,18 @@ impl WasmModuleDefinition {
                 "wasm module cannot be empty",
             ));
         }
-        if initial_memory_bytes == 0 {
+        if module_bytes.len() > MAX_WASM_MODULE_BYTES {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "wasm module initial memory must be greater than zero",
+                format!(
+                    "wasm module exceeds the {MAX_WASM_MODULE_BYTES}-byte compilation input limit; runtime compilation is cached by exact module bytes"
+                ),
             ));
         }
-
+        let cache_key = wasm_module_cache_key(&module_bytes);
         Ok(Self {
             module_bytes,
+            cache_key,
             initial_memory_bytes,
             imports,
         })
@@ -112,6 +127,10 @@ impl WasmModuleDefinition {
 
     pub fn module_bytes(&self) -> &[u8] {
         &self.module_bytes
+    }
+
+    pub(crate) fn cache_key(&self) -> WasmModuleCacheKey {
+        self.cache_key
     }
 
     pub fn initial_memory_bytes(&self) -> usize {
@@ -159,6 +178,13 @@ impl WasmModuleDefinition {
 
         Ok(())
     }
+}
+
+fn wasm_module_cache_key(module_bytes: &[u8]) -> WasmModuleCacheKey {
+    let digest = Sha256::digest(module_bytes);
+    let mut cache_key = [0; 32];
+    cache_key.copy_from_slice(&digest);
+    cache_key
 }
 
 impl UdfSandboxPolicy {
@@ -462,68 +488,5 @@ impl UdfDefinition {
     fn with_function_id(mut self, function_id: FunctionId) -> Self {
         self.function_id = function_id;
         self
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct UdfRegistry {
-    next_function_id: u64,
-    functions: Vec<UdfDefinition>,
-}
-
-impl UdfRegistry {
-    pub fn new() -> Self {
-        Self {
-            next_function_id: 1,
-            functions: Vec::new(),
-        }
-    }
-
-    pub fn register(&mut self, definition: UdfDefinition) -> Result<FunctionId> {
-        if self.functions.iter().any(|function| {
-            function.name == definition.name && function.argument_types == definition.argument_types
-        }) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("function already exists: {}", definition.name),
-            ));
-        }
-
-        let function_id = FunctionId::new(self.next_function_id);
-        self.next_function_id += 1;
-        self.functions
-            .push(definition.with_function_id(function_id));
-        Ok(function_id)
-    }
-
-    pub fn resolve(&self, name: &str, argument_types: &[SqlType]) -> Option<&UdfDefinition> {
-        self.functions
-            .iter()
-            .find(|function| function.name == name && function.argument_types == argument_types)
-    }
-
-    pub fn resolve_class(
-        &self,
-        name: &str,
-        argument_types: &[SqlType],
-        class: FunctionClass,
-    ) -> Option<&UdfDefinition> {
-        self.functions.iter().find(|function| {
-            function.name == name
-                && function.argument_types == argument_types
-                && function.class() == class
-        })
-    }
-
-    pub fn functions(&self) -> &[UdfDefinition] {
-        &self.functions
-    }
-
-    pub fn len(&self) -> usize {
-        self.functions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.functions.is_empty()
     }
 }

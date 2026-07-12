@@ -7,9 +7,11 @@ use std::{
 use rnmdb_common::error::{ErrorKind, Result, RnovError};
 
 use super::{
-    Page, PageCrypto, PageCryptoKey, PageNonce, SINGLE_FILE_FORMAT_VERSION,
+    Page, PageCrypto, PageCryptoKey, PageNonce, SINGLE_FILE_FORMAT_VERSION, SingleFileInspection,
     SingleFileUpgradeOptions, SingleFileUpgradePageReport, SingleFileUpgradeReport,
-    next_page_counter, write_encrypted_page_record, write_single_file_header_with_roots,
+    inspect_single_file_from_file, inspect_single_file_with_key_locked, next_page_counter,
+    with_new_single_file_exclusive, with_single_file_shared, write_encrypted_page_record,
+    write_single_file_header_with_roots,
 };
 
 mod legacy;
@@ -53,11 +55,12 @@ pub fn upgrade_single_file_with_options(
     let source = source.as_ref();
     let target = target.as_ref();
     validate_upgrade_paths(source, target)?;
-    let mut source_file = open_upgrade_source(source)?;
-    let metadata = read_legacy_v1_metadata(&mut source_file)?;
-    let records = collect_legacy_v1_page_records(&mut source_file, metadata)?;
-    let keys = resolve_upgrade_keys(records.len(), options)?;
-    write_upgrade_target(source, target, metadata, &records, keys)
+    with_single_file_shared(source, |source_file| {
+        let metadata = read_legacy_v1_metadata(source_file)?;
+        let records = collect_legacy_v1_page_records(source_file, metadata)?;
+        let keys = resolve_upgrade_keys(records.len(), options)?;
+        write_upgrade_target(source, target, metadata, &records, keys)
+    })
 }
 
 fn validate_upgrade_paths(source: &Path, target: &Path) -> Result<()> {
@@ -109,15 +112,6 @@ fn comparable_path_from_parent(path: &Path) -> Option<PathBuf> {
     Some(canonical_parent.join(file_name))
 }
 
-fn open_upgrade_source(source: &Path) -> Result<File> {
-    OpenOptions::new().read(true).open(source).map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to open upgrade source: {err}"),
-        )
-    })
-}
-
 fn write_upgrade_target(
     source: &Path,
     target: &Path,
@@ -126,8 +120,9 @@ fn write_upgrade_target(
     keys: Option<UpgradeKeys>,
 ) -> Result<SingleFileUpgradeReport> {
     let mut target_file = create_upgrade_target(target)?;
-    let result =
-        write_upgrade_target_file(&mut target_file, source, target, metadata, records, keys);
+    let result = with_new_single_file_exclusive(&mut target_file, |target_file| {
+        write_upgrade_target_file(target_file, source, target, metadata, records, keys)
+    });
     if result.is_err() {
         drop(target_file);
         let _ = remove_file(target);
@@ -171,21 +166,19 @@ fn write_upgrade_target_file(
             format!("failed to sync upgrade target: {err}"),
         )
     })?;
-    let bytes_written = target_file
-        .metadata()
-        .map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to inspect upgrade target metadata: {err}"),
-            )
-        })?
-        .len();
+    let inspection = validate_upgrade_target(
+        target_file,
+        target,
+        metadata,
+        page_reports.len() as u64,
+        keys,
+    )?;
     Ok(SingleFileUpgradeReport {
         source_path: source.to_path_buf(),
         target_path: target.to_path_buf(),
         source_format_version: metadata.format_version,
         target_format_version: SINGLE_FILE_FORMAT_VERSION,
-        bytes_written,
+        bytes_written: inspection.file_len_bytes(),
         page_size: metadata.page_size,
         superblock_generation: metadata.superblock.generation,
         page_record_slots: metadata.page_record_slots,
@@ -193,6 +186,30 @@ fn write_upgrade_target_file(
         key_rotated: keys.is_some_and(|keys| keys.rotated),
         page_reports,
     })
+}
+
+fn validate_upgrade_target(
+    target_file: &mut File,
+    target: &Path,
+    metadata: LegacySingleFileMetadata,
+    pages_upgraded: u64,
+    keys: Option<UpgradeKeys>,
+) -> Result<SingleFileInspection> {
+    let inspection = match keys {
+        Some(keys) => inspect_single_file_with_key_locked(target, keys.target, target_file)?,
+        None => inspect_single_file_from_file(target, target_file)?,
+    };
+    if inspection.page_size() != metadata.page_size
+        || inspection.superblock_generation() != metadata.superblock.generation
+        || inspection.page_record_slots() != metadata.page_record_slots
+        || inspection.present_page_records() != pages_upgraded
+    {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "upgraded database validation does not match the legacy source",
+        ));
+    }
+    Ok(inspection)
 }
 
 fn resolve_upgrade_keys(

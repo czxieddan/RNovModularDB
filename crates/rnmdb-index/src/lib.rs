@@ -1,10 +1,14 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
 };
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::PageId};
-use rnmdb_types::{HStore, HStoreValue, SqlArray, SqlRange, SqlType, SqlValue, TextVector};
+use rnmdb_types::{
+    HStore, HStoreValue, RangeBound, SqlArray, SqlRange, SqlType, SqlValue, TextVector,
+};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum IndexKey {
@@ -398,11 +402,27 @@ fn hstore_value_token(value: &HStoreValue) -> HStoreValueToken {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryRangeIndex {
     name: String,
     element_type: Option<SqlType>,
-    entries: Vec<(SqlRange, IndexPointer)>,
+    entries: Vec<RangeEntry>,
+    lower_index: BTreeMap<RangeEndpointKey, BTreeSet<usize>>,
+    upper_index: BTreeMap<RangeEndpointKey, BTreeSet<usize>>,
+    last_recheck_count: AtomicUsize,
+}
+
+impl Clone for MemoryRangeIndex {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            element_type: self.element_type.clone(),
+            entries: self.entries.clone(),
+            lower_index: self.lower_index.clone(),
+            upper_index: self.upper_index.clone(),
+            last_recheck_count: AtomicUsize::new(self.last_recheck_count()),
+        }
+    }
 }
 
 impl MemoryRangeIndex {
@@ -411,11 +431,18 @@ impl MemoryRangeIndex {
             name: name.into(),
             element_type: None,
             entries: Vec::new(),
+            lower_index: BTreeMap::new(),
+            upper_index: BTreeMap::new(),
+            last_recheck_count: AtomicUsize::new(0),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn last_recheck_count(&self) -> usize {
+        self.last_recheck_count.load(AtomicOrdering::Relaxed)
     }
 
     pub fn insert_range(&mut self, pointer: IndexPointer, range: &SqlRange) -> Result<()> {
@@ -426,7 +453,12 @@ impl MemoryRangeIndex {
             ));
         }
         self.ensure_range_type(range.element_type())?;
-        self.entries.push((range.clone(), pointer));
+        let entry_id = self.entries.len();
+        self.index_range_entry(entry_id, range)?;
+        self.entries.push(RangeEntry {
+            range: range.clone(),
+            pointer,
+        });
         Ok(())
     }
 
@@ -440,23 +472,72 @@ impl MemoryRangeIndex {
         if let Some(element_type) = other.element_type {
             self.ensure_range_type(&element_type)?;
         }
-        self.entries.extend(other.entries);
+        for entry in other.entries {
+            self.insert_range(entry.pointer, &entry.range)?;
+        }
         Ok(())
     }
 
     pub fn overlap_scan(&self, query: &SqlRange) -> Result<Vec<IndexPointer>> {
+        self.store_last_recheck_count(0);
         if query.is_empty() {
             return Ok(Vec::new());
         }
         self.ensure_query_range_type(query.element_type())?;
 
+        let candidate_ids = self.overlap_candidate_ids(query)?;
+        self.store_last_recheck_count(candidate_ids.len());
         let mut matches = Vec::new();
-        for (range, pointer) in &self.entries {
-            if range.overlaps(query)? {
-                matches.push(*pointer);
+        for entry_id in candidate_ids {
+            let entry = &self.entries[entry_id];
+            if entry.range.overlaps(query)? {
+                matches.push(entry.pointer);
             }
         }
         Ok(matches)
+    }
+
+    fn index_range_entry(&mut self, entry_id: usize, range: &SqlRange) -> Result<()> {
+        let lower_key = lower_index_key(range.lower())?;
+        let upper_key = upper_index_key(range.upper())?;
+        self.lower_index
+            .entry(lower_key)
+            .or_default()
+            .insert(entry_id);
+        self.upper_index
+            .entry(upper_key)
+            .or_default()
+            .insert(entry_id);
+        Ok(())
+    }
+
+    fn overlap_candidate_ids(&self, query: &SqlRange) -> Result<Vec<usize>> {
+        let lower_ids = self.lower_candidate_ids(query.upper())?;
+        let upper_ids = self.upper_candidate_ids(query.lower())?;
+        Ok(intersect_entry_ids(&lower_ids, &upper_ids))
+    }
+
+    fn lower_candidate_ids(&self, query_upper: &RangeBound) -> Result<BTreeSet<usize>> {
+        let upper_key = upper_index_key(query_upper)?;
+        Ok(self
+            .lower_index
+            .range(..=upper_key)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect())
+    }
+
+    fn upper_candidate_ids(&self, query_lower: &RangeBound) -> Result<BTreeSet<usize>> {
+        let lower_key = lower_index_key(query_lower)?;
+        Ok(self
+            .upper_index
+            .range(lower_key..)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect())
+    }
+
+    fn store_last_recheck_count(&self, value: usize) {
+        self.last_recheck_count
+            .store(value, AtomicOrdering::Relaxed);
     }
 
     fn ensure_range_type(&mut self, element_type: &SqlType) -> Result<()> {
@@ -482,6 +563,86 @@ impl MemoryRangeIndex {
             _ => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct RangeEntry {
+    range: SqlRange,
+    pointer: IndexPointer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RangeEndpointKey {
+    NegInfinity,
+    Finite(SqlValue),
+    PosInfinity,
+}
+
+impl Ord for RangeEndpointKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::NegInfinity, Self::NegInfinity) | (Self::PosInfinity, Self::PosInfinity) => {
+                Ordering::Equal
+            }
+            (Self::NegInfinity, _) | (_, Self::PosInfinity) => Ordering::Less,
+            (Self::PosInfinity, _) | (_, Self::NegInfinity) => Ordering::Greater,
+            (Self::Finite(left), Self::Finite(right)) => compare_endpoint_values(left, right),
+        }
+    }
+}
+
+impl PartialOrd for RangeEndpointKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn lower_index_key(bound: &RangeBound) -> Result<RangeEndpointKey> {
+    match bound {
+        RangeBound::Unbounded => Ok(RangeEndpointKey::NegInfinity),
+        RangeBound::Included(value) | RangeBound::Excluded(value) => finite_endpoint_key(value),
+    }
+}
+
+fn upper_index_key(bound: &RangeBound) -> Result<RangeEndpointKey> {
+    match bound {
+        RangeBound::Unbounded => Ok(RangeEndpointKey::PosInfinity),
+        RangeBound::Included(value) | RangeBound::Excluded(value) => finite_endpoint_key(value),
+    }
+}
+
+fn finite_endpoint_key(value: &SqlValue) -> Result<RangeEndpointKey> {
+    if !is_indexable_range_endpoint(value) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range index endpoint must be a comparable scalar value",
+        ));
+    }
+    Ok(RangeEndpointKey::Finite(value.clone()))
+}
+
+fn is_indexable_range_endpoint(value: &SqlValue) -> bool {
+    matches!(
+        value,
+        SqlValue::Bool(_)
+            | SqlValue::Int64(_)
+            | SqlValue::UInt64(_)
+            | SqlValue::Float64(_)
+            | SqlValue::Uuid(_)
+            | SqlValue::Timestamp(_)
+            | SqlValue::Text(_)
+            | SqlValue::Bytes(_)
+    )
+}
+
+fn compare_endpoint_values(left: &SqlValue, right: &SqlValue) -> Ordering {
+    left.sql_cmp(right)
+        .expect("range endpoint comparison is valid")
+        .expect("range endpoint values are non-null")
+}
+
+fn intersect_entry_ids(left: &BTreeSet<usize>, right: &BTreeSet<usize>) -> Vec<usize> {
+    left.intersection(right).copied().collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -552,13 +713,59 @@ impl BoundingBox {
             .zip(other.axes.iter())
             .all(|(left, right)| left.intersects(*right)))
     }
+
+    fn union(&self, other: &Self) -> Self {
+        let axes = self
+            .axes
+            .iter()
+            .copied()
+            .zip(other.axes.iter().copied())
+            .map(|(left, right)| AxisBounds {
+                lower: left.lower().min(right.lower()),
+                upper: left.upper().max(right.upper()),
+            })
+            .collect();
+        Self { axes }
+    }
+
+    fn area(&self) -> f64 {
+        self.axes
+            .iter()
+            .map(|axis| axis.upper().saturating_sub(axis.lower()).saturating_add(1) as f64)
+            .product()
+    }
+
+    fn enlargement_for(&self, other: &Self) -> f64 {
+        self.union(other).area() - self.area()
+    }
+
+    fn center_on_axis(&self, axis_index: usize) -> i64 {
+        let axis = self.axes[axis_index];
+        axis.lower().saturating_add(axis.upper()) / 2
+    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MemoryBoundsIndex {
     name: String,
     rank: Option<usize>,
-    entries: Vec<(BoundingBox, IndexPointer)>,
+    entries: Vec<BoundsEntry>,
+    tree: Option<BoundsRTree>,
+    last_recheck_count: AtomicUsize,
+    last_tree_node_visit_count: AtomicUsize,
+}
+
+impl Clone for MemoryBoundsIndex {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            rank: self.rank,
+            entries: self.entries.clone(),
+            tree: self.tree.clone(),
+            last_recheck_count: AtomicUsize::new(self.last_recheck_count()),
+            last_tree_node_visit_count: AtomicUsize::new(self.last_tree_node_visit_count()),
+        }
+    }
 }
 
 impl MemoryBoundsIndex {
@@ -567,6 +774,9 @@ impl MemoryBoundsIndex {
             name: name.into(),
             rank: None,
             entries: Vec::new(),
+            tree: None,
+            last_recheck_count: AtomicUsize::new(0),
+            last_tree_node_visit_count: AtomicUsize::new(0),
         }
     }
 
@@ -574,9 +784,23 @@ impl MemoryBoundsIndex {
         &self.name
     }
 
+    pub fn last_recheck_count(&self) -> usize {
+        self.last_recheck_count.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn last_tree_node_visit_count(&self) -> usize {
+        self.last_tree_node_visit_count
+            .load(AtomicOrdering::Relaxed)
+    }
+
     pub fn insert_box(&mut self, pointer: IndexPointer, bounds: &BoundingBox) -> Result<()> {
         self.ensure_rank(bounds.rank())?;
-        self.entries.push((bounds.clone(), pointer));
+        let entry_id = self.entries.len();
+        self.insert_tree_entry(entry_id, bounds)?;
+        self.entries.push(BoundsEntry {
+            bounds: bounds.clone(),
+            pointer,
+        });
         Ok(())
     }
 
@@ -590,20 +814,64 @@ impl MemoryBoundsIndex {
         if let Some(rank) = other.rank {
             self.ensure_rank(rank)?;
         }
-        self.entries.extend(other.entries);
+        for entry in other.entries {
+            self.insert_box(entry.pointer, &entry.bounds)?;
+        }
         Ok(())
     }
 
     pub fn intersection_scan(&self, query: &BoundingBox) -> Result<Vec<IndexPointer>> {
+        self.store_last_recheck_count(0);
+        self.store_last_tree_node_visit_count(0);
         self.ensure_query_rank(query.rank())?;
+        if self.rank.is_none() {
+            return Ok(Vec::new());
+        }
 
+        let candidate_ids = self.intersection_candidate_ids(query)?;
+        self.store_last_recheck_count(candidate_ids.len());
         let mut matches = Vec::new();
-        for (bounds, pointer) in &self.entries {
-            if bounds.intersects(query)? {
-                matches.push(*pointer);
+        for entry_id in candidate_ids {
+            let entry = &self.entries[entry_id];
+            if entry.bounds.intersects(query)? {
+                matches.push(entry.pointer);
             }
         }
         Ok(matches)
+    }
+
+    fn insert_tree_entry(&mut self, entry_id: usize, bounds: &BoundingBox) -> Result<()> {
+        let tree = self.tree.as_mut().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "bounds index rank must be initialized before insert",
+            )
+        })?;
+        tree.insert(BoundsLeaf {
+            entry_id,
+            bounds: bounds.clone(),
+        });
+        Ok(())
+    }
+
+    fn intersection_candidate_ids(&self, query: &BoundingBox) -> Result<Vec<usize>> {
+        let Some(tree) = &self.tree else {
+            return Ok(Vec::new());
+        };
+        let mut stats = BoundsTreeSearchStats::default();
+        let ids = tree.intersection_candidate_ids(query, &mut stats)?;
+        self.store_last_tree_node_visit_count(stats.node_visits);
+        Ok(ids)
+    }
+
+    fn store_last_recheck_count(&self, value: usize) {
+        self.last_recheck_count
+            .store(value, AtomicOrdering::Relaxed);
+    }
+
+    fn store_last_tree_node_visit_count(&self, value: usize) {
+        self.last_tree_node_visit_count
+            .store(value, AtomicOrdering::Relaxed);
     }
 
     fn ensure_rank(&mut self, rank: usize) -> Result<()> {
@@ -615,6 +883,7 @@ impl MemoryBoundsIndex {
             Some(_) => Ok(()),
             None => {
                 self.rank = Some(rank);
+                self.tree = Some(BoundsRTree::new(rank));
                 Ok(())
             }
         }
@@ -629,6 +898,268 @@ impl MemoryBoundsIndex {
             _ => Ok(()),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct BoundsEntry {
+    bounds: BoundingBox,
+    pointer: IndexPointer,
+}
+
+const BOUNDS_RTREE_MAX_CHILDREN: usize = 8;
+
+#[derive(Clone, Debug)]
+struct BoundsRTree {
+    rank: usize,
+    root: Option<BoundsTreeNode>,
+}
+
+impl BoundsRTree {
+    fn new(rank: usize) -> Self {
+        Self { rank, root: None }
+    }
+
+    fn insert(&mut self, leaf: BoundsLeaf) {
+        if self.root.is_none() {
+            self.root = Some(BoundsTreeNode::leaf(vec![leaf]));
+            return;
+        }
+        let sibling = self
+            .root
+            .as_mut()
+            .and_then(|root| root.insert_leaf(leaf, self.rank));
+        if let Some(sibling) = sibling {
+            let root = self.root.take().expect("root checked above");
+            self.root = Some(BoundsTreeNode::internal(vec![root, sibling]));
+        }
+    }
+
+    fn intersection_candidate_ids(
+        &self,
+        query: &BoundingBox,
+        stats: &mut BoundsTreeSearchStats,
+    ) -> Result<Vec<usize>> {
+        let mut ids = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_intersections(query, stats, &mut ids)?;
+        }
+        Ok(ids)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoundsTreeNode {
+    bounds: BoundingBox,
+    children: BoundsTreeChildren,
+}
+
+impl BoundsTreeNode {
+    fn leaf(leaves: Vec<BoundsLeaf>) -> Self {
+        let bounds = bounds_for_leaves(&leaves);
+        Self {
+            bounds,
+            children: BoundsTreeChildren::Leaf(leaves),
+        }
+    }
+
+    fn internal(nodes: Vec<Self>) -> Self {
+        let bounds = bounds_for_nodes(&nodes);
+        Self {
+            bounds,
+            children: BoundsTreeChildren::Internal(nodes),
+        }
+    }
+
+    fn insert_leaf(&mut self, leaf: BoundsLeaf, rank: usize) -> Option<Self> {
+        let sibling = match &mut self.children {
+            BoundsTreeChildren::Leaf(leaves) => insert_leaf_child(leaves, leaf, rank),
+            BoundsTreeChildren::Internal(nodes) => insert_internal_child(nodes, leaf, rank),
+        };
+        self.refresh_bounds();
+        sibling
+    }
+
+    fn collect_intersections(
+        &self,
+        query: &BoundingBox,
+        stats: &mut BoundsTreeSearchStats,
+        ids: &mut Vec<usize>,
+    ) -> Result<()> {
+        stats.node_visits += 1;
+        if !self.bounds.intersects(query)? {
+            return Ok(());
+        }
+        match &self.children {
+            BoundsTreeChildren::Leaf(leaves) => collect_leaf_intersections(leaves, query, ids),
+            BoundsTreeChildren::Internal(nodes) => {
+                collect_node_intersections(nodes, query, stats, ids)
+            }
+        }
+    }
+
+    fn refresh_bounds(&mut self) {
+        self.bounds = match &self.children {
+            BoundsTreeChildren::Leaf(leaves) => bounds_for_leaves(leaves),
+            BoundsTreeChildren::Internal(nodes) => bounds_for_nodes(nodes),
+        };
+    }
+}
+
+#[derive(Clone, Debug)]
+enum BoundsTreeChildren {
+    Leaf(Vec<BoundsLeaf>),
+    Internal(Vec<BoundsTreeNode>),
+}
+
+#[derive(Clone, Debug)]
+struct BoundsLeaf {
+    entry_id: usize,
+    bounds: BoundingBox,
+}
+
+#[derive(Default)]
+struct BoundsTreeSearchStats {
+    node_visits: usize,
+}
+
+fn insert_leaf_child(
+    leaves: &mut Vec<BoundsLeaf>,
+    leaf: BoundsLeaf,
+    rank: usize,
+) -> Option<BoundsTreeNode> {
+    leaves.push(leaf);
+    (leaves.len() > BOUNDS_RTREE_MAX_CHILDREN).then(|| split_leaf_node(leaves, rank))
+}
+
+fn insert_internal_child(
+    nodes: &mut Vec<BoundsTreeNode>,
+    leaf: BoundsLeaf,
+    rank: usize,
+) -> Option<BoundsTreeNode> {
+    let child_index = choose_bounds_child(nodes, &leaf.bounds);
+    if let Some(sibling) = nodes[child_index].insert_leaf(leaf, rank) {
+        nodes.push(sibling);
+    }
+    (nodes.len() > BOUNDS_RTREE_MAX_CHILDREN).then(|| split_internal_node(nodes, rank))
+}
+
+fn choose_bounds_child(nodes: &[BoundsTreeNode], bounds: &BoundingBox) -> usize {
+    nodes
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| compare_child_enlargement(left, right, bounds))
+        .map(|(index, _)| index)
+        .expect("internal node has at least one child")
+}
+
+fn compare_child_enlargement(
+    left: &BoundsTreeNode,
+    right: &BoundsTreeNode,
+    bounds: &BoundingBox,
+) -> Ordering {
+    left.bounds
+        .enlargement_for(bounds)
+        .total_cmp(&right.bounds.enlargement_for(bounds))
+        .then_with(|| left.bounds.area().total_cmp(&right.bounds.area()))
+}
+
+fn split_leaf_node(leaves: &mut Vec<BoundsLeaf>, rank: usize) -> BoundsTreeNode {
+    let axis = widest_leaf_axis(leaves, rank);
+    leaves.sort_by(|left, right| compare_leaf_on_axis(left, right, axis));
+    let right = leaves.split_off(leaves.len() / 2);
+    BoundsTreeNode::leaf(right)
+}
+
+fn split_internal_node(nodes: &mut Vec<BoundsTreeNode>, rank: usize) -> BoundsTreeNode {
+    let axis = widest_node_axis(nodes, rank);
+    nodes.sort_by(|left, right| compare_node_on_axis(left, right, axis));
+    let right = nodes.split_off(nodes.len() / 2);
+    BoundsTreeNode::internal(right)
+}
+
+fn widest_leaf_axis(leaves: &[BoundsLeaf], rank: usize) -> usize {
+    (0..rank)
+        .max_by_key(|axis| leaf_axis_spread(leaves, *axis))
+        .unwrap_or(0)
+}
+
+fn widest_node_axis(nodes: &[BoundsTreeNode], rank: usize) -> usize {
+    (0..rank)
+        .max_by_key(|axis| node_axis_spread(nodes, *axis))
+        .unwrap_or(0)
+}
+
+fn leaf_axis_spread(leaves: &[BoundsLeaf], axis: usize) -> i64 {
+    axis_center_spread(leaves.iter().map(|leaf| leaf.bounds.center_on_axis(axis)))
+}
+
+fn node_axis_spread(nodes: &[BoundsTreeNode], axis: usize) -> i64 {
+    axis_center_spread(nodes.iter().map(|node| node.bounds.center_on_axis(axis)))
+}
+
+fn axis_center_spread(centers: impl Iterator<Item = i64>) -> i64 {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for center in centers {
+        min = min.min(center);
+        max = max.max(center);
+    }
+    max.saturating_sub(min)
+}
+
+fn compare_leaf_on_axis(left: &BoundsLeaf, right: &BoundsLeaf, axis: usize) -> Ordering {
+    left.bounds
+        .center_on_axis(axis)
+        .cmp(&right.bounds.center_on_axis(axis))
+        .then_with(|| left.entry_id.cmp(&right.entry_id))
+}
+
+fn compare_node_on_axis(left: &BoundsTreeNode, right: &BoundsTreeNode, axis: usize) -> Ordering {
+    left.bounds
+        .center_on_axis(axis)
+        .cmp(&right.bounds.center_on_axis(axis))
+        .then_with(|| left.bounds.area().total_cmp(&right.bounds.area()))
+}
+
+fn collect_leaf_intersections(
+    leaves: &[BoundsLeaf],
+    query: &BoundingBox,
+    ids: &mut Vec<usize>,
+) -> Result<()> {
+    for leaf in leaves {
+        if leaf.bounds.intersects(query)? {
+            ids.push(leaf.entry_id);
+        }
+    }
+    Ok(())
+}
+
+fn collect_node_intersections(
+    nodes: &[BoundsTreeNode],
+    query: &BoundingBox,
+    stats: &mut BoundsTreeSearchStats,
+    ids: &mut Vec<usize>,
+) -> Result<()> {
+    for node in nodes {
+        node.collect_intersections(query, stats, ids)?;
+    }
+    Ok(())
+}
+
+fn bounds_for_leaves(leaves: &[BoundsLeaf]) -> BoundingBox {
+    union_bounds(leaves.iter().map(|leaf| &leaf.bounds))
+}
+
+fn bounds_for_nodes(nodes: &[BoundsTreeNode]) -> BoundingBox {
+    union_bounds(nodes.iter().map(|node| &node.bounds))
+}
+
+fn union_bounds<'a>(mut bounds: impl Iterator<Item = &'a BoundingBox>) -> BoundingBox {
+    let first = bounds
+        .next()
+        .expect("R-tree nodes are never built from empty children")
+        .clone();
+    bounds.fold(first, |combined, next| combined.union(next))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

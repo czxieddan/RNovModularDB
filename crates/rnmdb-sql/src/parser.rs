@@ -1,12 +1,15 @@
-use rnmdb_catalog::{IndexMethod, Privilege};
+use rnmdb_catalog::{
+    IndexMethod, MAX_WASM_FUNCTION_MODULE_BYTES, Privilege, TriggerEvent, TriggerTiming,
+};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::SqlType;
 
 use crate::{
     ast::{
-        Assignment, CaseWhen, ColumnDef, ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef,
-        LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SortDirection,
-        Statement, TransactionAction,
+        Assignment, CaseWhen, ColumnDef, ColumnReference, CreateFunctionImplementation,
+        ExplainFormat, Expr, GeneratedColumn, Ident, IndexKeyDef, JoinClause, JoinKind,
+        LateralJoin, ObjectName, OrderByExpr, RangeLiteralBounds, SelectItem, SelectSubquery,
+        SortDirection, Statement, TransactionAction, WasmFunctionBody,
     },
     lexer::{Token, TokenKind, lex},
 };
@@ -37,6 +40,53 @@ struct Parser {
     position: usize,
 }
 
+enum FunctionArguments {
+    Regular(Vec<Expr>),
+    CountDistinct(Expr),
+}
+
+type SingleArgumentConstructor = fn(Box<Expr>) -> Expr;
+type NamedSingleArgumentFunction = (&'static str, SingleArgumentConstructor);
+
+#[derive(Default)]
+struct WasmFunctionOptions {
+    max_memory_bytes: Option<u64>,
+    max_instructions: Option<u64>,
+    timeout_millis: Option<u64>,
+}
+
+impl WasmFunctionOptions {
+    fn set(&mut self, name: &str, value: u64) -> Result<()> {
+        let slot = match name {
+            "max_memory_bytes" => &mut self.max_memory_bytes,
+            "max_instructions" => &mut self.max_instructions,
+            "timeout_ms" => &mut self.timeout_millis,
+            unknown => {
+                return Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("unknown wasm function option {unknown}"),
+                ));
+            }
+        };
+        if slot.replace(value).is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("duplicate wasm function option {name}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_body(self, module_bytes: Vec<u8>) -> Result<WasmFunctionBody> {
+        Ok(WasmFunctionBody {
+            module_bytes,
+            max_memory_bytes: required_wasm_option(self.max_memory_bytes, "max_memory_bytes")?,
+            max_instructions: required_wasm_option(self.max_instructions, "max_instructions")?,
+            timeout_millis: required_wasm_option(self.timeout_millis, "timeout_ms")?,
+        })
+    }
+}
+
 #[derive(Default)]
 struct QueryTail {
     order_by: Vec<OrderByExpr>,
@@ -47,6 +97,192 @@ struct QueryTail {
 impl QueryTail {
     fn is_empty(&self) -> bool {
         self.order_by.is_empty() && self.limit.is_none() && self.offset.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExplainOptions {
+    analyze: bool,
+    format: ExplainFormat,
+}
+
+impl Default for ExplainOptions {
+    fn default() -> Self {
+        Self {
+            analyze: false,
+            format: ExplainFormat::Logical,
+        }
+    }
+}
+
+impl ExplainOptions {
+    fn enable_analyze(&mut self) -> std::result::Result<(), &'static str> {
+        if self.analyze {
+            return Err("duplicate EXPLAIN ANALYZE option");
+        }
+        self.analyze = true;
+        Ok(())
+    }
+
+    fn set_format(&mut self, format: ExplainFormat) -> std::result::Result<(), &'static str> {
+        if self.format != ExplainFormat::Logical {
+            return Err("conflicting EXPLAIN format options");
+        }
+        self.format = format;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CreateTableElements {
+    columns: Vec<ColumnDef>,
+    foreign_keys: Vec<(Ident, ColumnReference)>,
+}
+
+struct CreateOperatorSignature {
+    symbol: String,
+    left_type: SqlType,
+    right_type: SqlType,
+    result_type: SqlType,
+    function: Ident,
+}
+
+#[derive(Default)]
+struct CreateOperatorOptions {
+    precedence: Option<u8>,
+    commutator: Option<String>,
+    negator: Option<String>,
+    selectivity: Option<Ident>,
+}
+
+struct ColumnOptions {
+    nullable: bool,
+    encrypted: bool,
+    generated: Option<GeneratedColumn>,
+    references: Option<ColumnReference>,
+}
+
+impl Default for ColumnOptions {
+    fn default() -> Self {
+        Self {
+            nullable: true,
+            encrypted: false,
+            generated: None,
+            references: None,
+        }
+    }
+}
+
+struct SelectCoreParts {
+    distinct: bool,
+    projection: Vec<SelectItem>,
+    from: ObjectName,
+    join: Option<JoinClause>,
+    lateral_join: Option<LateralJoin>,
+    selection: Option<Expr>,
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    having: Option<Expr>,
+}
+
+struct SelectSourceClauses {
+    from: ObjectName,
+    join: Option<JoinClause>,
+    lateral_join: Option<LateralJoin>,
+    selection: Option<Expr>,
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    having: Option<Expr>,
+}
+
+#[derive(Clone, Copy)]
+enum SetOperationKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+impl SetOperationKind {
+    fn combine(self, all: bool, left: Statement, right: Statement) -> Statement {
+        match self {
+            Self::Union => Statement::Union {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            Self::Intersect => Statement::Intersect {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            Self::Except => Statement::Except {
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+        }
+    }
+}
+
+impl SelectCoreParts {
+    fn into_statement(self) -> Statement {
+        if !self.grouping_sets.is_empty() {
+            return self.into_grouping_sets_statement();
+        }
+        if let Some(lateral_join) = self.lateral_join {
+            return Statement::SelectLateral {
+                distinct: self.distinct,
+                projection: self.projection,
+                from: self.from,
+                lateral_join,
+                selection: self.selection,
+                group_by: self.group_by,
+                having: self.having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        if let Some(join) = self.join {
+            return Statement::SelectJoin {
+                distinct: self.distinct,
+                projection: self.projection,
+                from: self.from,
+                join,
+                selection: self.selection,
+                group_by: self.group_by,
+                having: self.having,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+        }
+        Statement::Select {
+            distinct: self.distinct,
+            projection: self.projection,
+            from: self.from,
+            selection: self.selection,
+            group_by: self.group_by,
+            having: self.having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    fn into_grouping_sets_statement(self) -> Statement {
+        Statement::SelectGroupingSets {
+            distinct: self.distinct,
+            projection: self.projection,
+            from: self.from,
+            selection: self.selection,
+            group_by: self.group_by,
+            grouping_sets: self.grouping_sets,
+            having: self.having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
     }
 }
 
@@ -81,40 +317,48 @@ impl Parser {
 
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Explain)?;
-        let mut analyze = false;
-        let mut format = ExplainFormat::Logical;
-        loop {
-            if self.consume_if(&TokenKind::Analyze) {
-                if analyze {
-                    return Err(self.error("duplicate EXPLAIN ANALYZE option"));
-                }
-                analyze = true;
-                continue;
-            }
-            if self.consume_identifier_keyword("costs") {
-                if format != ExplainFormat::Logical {
-                    return Err(self.error("conflicting EXPLAIN format options"));
-                }
-                format = ExplainFormat::Costs;
-                continue;
-            }
-            if self.consume_identifier_keyword("physical") {
-                if format != ExplainFormat::Logical {
-                    return Err(self.error("conflicting EXPLAIN format options"));
-                }
-                format = ExplainFormat::Physical;
-                continue;
-            }
-            break;
+        let options = self.parse_explain_options()?;
+        self.reject_nested_explain()?;
+        Ok(Statement::Explain {
+            analyze: options.analyze,
+            format: options.format,
+            statement: Box::new(self.parse_statement()?),
+        })
+    }
+
+    fn parse_explain_options(&mut self) -> Result<ExplainOptions> {
+        let mut options = ExplainOptions::default();
+        while self.parse_explain_option(&mut options)? {}
+        Ok(options)
+    }
+
+    fn parse_explain_option(&mut self, options: &mut ExplainOptions) -> Result<bool> {
+        if self.consume_if(&TokenKind::Analyze) {
+            return options
+                .enable_analyze()
+                .map(|()| true)
+                .map_err(|message| self.error(message));
         }
+        if self.consume_identifier_keyword("costs") {
+            return options
+                .set_format(ExplainFormat::Costs)
+                .map(|()| true)
+                .map_err(|message| self.error(message));
+        }
+        if self.consume_identifier_keyword("physical") {
+            return options
+                .set_format(ExplainFormat::Physical)
+                .map(|()| true)
+                .map_err(|message| self.error(message));
+        }
+        Ok(false)
+    }
+
+    fn reject_nested_explain(&self) -> Result<()> {
         if matches!(self.peek_kind(), Some(TokenKind::Explain)) {
             return Err(self.error("nested EXPLAIN is not supported"));
         }
-        Ok(Statement::Explain {
-            analyze,
-            format,
-            statement: Box::new(self.parse_statement()?),
-        })
+        Ok(())
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -123,6 +367,7 @@ impl Parser {
         match self.peek_kind() {
             Some(TokenKind::Index) => self.parse_create_index_tail(unique),
             Some(TokenKind::Table) => self.parse_create_table_tail(),
+            Some(TokenKind::Trigger) => self.parse_create_trigger_tail(unique),
             Some(TokenKind::Function) => self.parse_create_function_tail(),
             Some(TokenKind::Procedure) => self.parse_create_procedure_tail(),
             Some(TokenKind::OperatorKeyword) => self.parse_create_operator_tail(),
@@ -138,49 +383,41 @@ impl Parser {
 
     fn parse_create_table_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Table)?;
-        let if_not_exists = if self.consume_if(&TokenKind::If) {
-            self.expect_keyword(TokenKind::Not)?;
-            self.expect_keyword(TokenKind::Exists)?;
-            true
-        } else {
-            false
-        };
+        let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        let mut columns = Vec::new();
+        let mut elements = self.parse_create_table_elements()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.apply_table_foreign_keys(&mut elements.columns, elements.foreign_keys)?;
+
+        Ok(Statement::CreateTable {
+            name,
+            columns: elements.columns,
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_table_elements(&mut self) -> Result<CreateTableElements> {
+        let mut elements = CreateTableElements::default();
         loop {
-            columns.push(self.parse_column_def()?);
+            if self.next_is_identifier_keyword("foreign") {
+                elements.foreign_keys.push(self.parse_table_foreign_key()?);
+            } else {
+                elements.columns.push(self.parse_column_def()?);
+            }
 
             if self.consume_if(&TokenKind::Comma) {
                 continue;
             }
             break;
         }
-        self.expect_keyword(TokenKind::RightParen)?;
-
-        Ok(Statement::CreateTable {
-            name,
-            columns,
-            if_not_exists,
-        })
+        Ok(elements)
     }
 
     fn parse_create_index_tail(&mut self, unique: bool) -> Result<Statement> {
         self.expect_keyword(TokenKind::Index)?;
-        let if_not_exists = if self.consume_if(&TokenKind::If) {
-            self.expect_keyword(TokenKind::Not)?;
-            self.expect_keyword(TokenKind::Exists)?;
-            true
-        } else {
-            false
-        };
-        let name = self.parse_object_name()?;
-        self.expect_keyword(TokenKind::On)?;
-        let table = self.parse_object_name()?;
-        let method = self.parse_optional_index_method()?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let keys = self.parse_index_keys()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (name, table, method, keys) = self.parse_create_index_definition()?;
 
         Ok(Statement::CreateIndex {
             name,
@@ -190,6 +427,76 @@ impl Parser {
             unique,
             if_not_exists,
         })
+    }
+
+    fn parse_create_index_definition(
+        &mut self,
+    ) -> Result<(ObjectName, ObjectName, IndexMethod, Vec<IndexKeyDef>)> {
+        let name = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        let method = self.parse_optional_index_method()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let keys = self.parse_index_keys()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok((name, table, method, keys))
+    }
+
+    fn parse_create_trigger_tail(&mut self, unique: bool) -> Result<Statement> {
+        if unique {
+            return Err(self.error("CREATE UNIQUE TRIGGER is not supported"));
+        }
+        self.expect_keyword(TokenKind::Trigger)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (name, event, table) = self.parse_create_trigger_header()?;
+        let body = self.parse_trigger_sql_body()?;
+        Ok(Statement::CreateTrigger {
+            name,
+            table,
+            timing: TriggerTiming::After,
+            event,
+            body,
+            if_not_exists,
+        })
+    }
+
+    fn parse_create_trigger_header(&mut self) -> Result<(Ident, TriggerEvent, ObjectName)> {
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::After)?;
+        let event = self.parse_trigger_event()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        Ok((name, event, table))
+    }
+
+    fn parse_trigger_sql_body(&mut self) -> Result<String> {
+        self.expect_keyword(TokenKind::Execute)?;
+        if !self.consume_identifier_keyword("sql") {
+            return Err(self.error("expected SQL after EXECUTE"));
+        }
+        let body = self.parse_string_literal("trigger SQL body")?;
+        crate::parser::parse_statement(&body)
+            .map_err(|err| self.error(format!("invalid trigger SQL body: {err}")))?;
+        Ok(body)
+    }
+
+    fn parse_trigger_event(&mut self) -> Result<TriggerEvent> {
+        match self.peek_kind() {
+            Some(TokenKind::Insert) => {
+                self.bump();
+                Ok(TriggerEvent::Insert)
+            }
+            Some(TokenKind::Update) => {
+                self.bump();
+                Ok(TriggerEvent::Update)
+            }
+            Some(TokenKind::Delete) => {
+                self.bump();
+                Ok(TriggerEvent::Delete)
+            }
+            Some(kind) => Err(self.error(format!("unexpected trigger event {kind:?}"))),
+            None => Err(self.error("expected trigger event")),
+        }
     }
 
     fn parse_index_keys(&mut self) -> Result<Vec<IndexKeyDef>> {
@@ -279,6 +586,7 @@ impl Parser {
         self.expect_keyword(TokenKind::Drop)?;
         match self.peek_kind() {
             Some(TokenKind::Index) => self.parse_drop_index_tail(),
+            Some(TokenKind::Trigger) => self.parse_drop_trigger_tail(),
             Some(TokenKind::Table) => self.parse_drop_table_tail(),
             Some(TokenKind::Function) => self.parse_drop_function_tail(),
             Some(TokenKind::Procedure) => self.parse_drop_procedure_tail(),
@@ -294,6 +602,19 @@ impl Parser {
         let if_exists = self.parse_if_exists()?;
         let name = self.parse_object_name()?;
         Ok(Statement::DropIndex { name, if_exists })
+    }
+
+    fn parse_drop_trigger_tail(&mut self) -> Result<Statement> {
+        self.expect_keyword(TokenKind::Trigger)?;
+        let if_exists = self.parse_if_exists()?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::On)?;
+        let table = self.parse_object_name()?;
+        Ok(Statement::DropTrigger {
+            name,
+            table,
+            if_exists,
+        })
     }
 
     fn parse_drop_table_tail(&mut self) -> Result<Statement> {
@@ -344,18 +665,23 @@ impl Parser {
     fn parse_drop_operator_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::OperatorKeyword)?;
         let if_exists = self.parse_if_exists()?;
-        let symbol = self.parse_operator_symbol()?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let left_type = self.parse_type()?;
-        self.expect_keyword(TokenKind::Comma)?;
-        let right_type = self.parse_type()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let (symbol, left_type, right_type) = self.parse_drop_operator_signature()?;
         Ok(Statement::DropOperator {
             symbol,
             left_type,
             right_type,
             if_exists,
         })
+    }
+
+    fn parse_drop_operator_signature(&mut self) -> Result<(String, SqlType, SqlType)> {
+        let symbol = self.parse_operator_symbol()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let left_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::Comma)?;
+        let right_type = self.parse_type()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok((symbol, left_type, right_type))
     }
 
     fn parse_drop_role_tail(&mut self) -> Result<Statement> {
@@ -392,51 +718,149 @@ impl Parser {
     fn parse_column_def(&mut self) -> Result<ColumnDef> {
         let name = self.parse_ident()?;
         let data_type = self.parse_type()?;
-        let mut nullable = true;
-        let mut encrypted = false;
-        let mut generated = None;
-
-        loop {
-            match self.peek_kind() {
-                Some(TokenKind::Not) => {
-                    self.bump();
-                    self.expect_keyword(TokenKind::Null)?;
-                    nullable = false;
-                }
-                Some(TokenKind::Encrypted) => {
-                    self.bump();
-                    encrypted = true;
-                }
-                Some(TokenKind::Generated) => {
-                    if generated.is_some() {
-                        return Err(self.error("column has duplicate generated expression"));
-                    }
-                    self.bump();
-                    self.expect_keyword(TokenKind::Always)?;
-                    self.expect_keyword(TokenKind::As)?;
-                    self.expect_keyword(TokenKind::LeftParen)?;
-                    let expr = self.parse_expr()?;
-                    self.expect_keyword(TokenKind::RightParen)?;
-                    self.expect_keyword(TokenKind::Stored)?;
-                    generated = Some(GeneratedColumn { expr, stored: true });
-                }
-                _ => break,
-            }
-        }
+        let options = self.parse_column_options()?;
 
         Ok(ColumnDef {
             name,
             data_type,
-            nullable,
-            encrypted,
-            generated,
+            nullable: options.nullable,
+            encrypted: options.encrypted,
+            generated: options.generated,
+            references: options.references,
         })
+    }
+
+    fn parse_column_options(&mut self) -> Result<ColumnOptions> {
+        let mut options = ColumnOptions::default();
+        while self.parse_column_option(&mut options)? {}
+        Ok(options)
+    }
+
+    fn parse_column_option(&mut self, options: &mut ColumnOptions) -> Result<bool> {
+        match self.peek_kind() {
+            Some(TokenKind::Not) => {
+                self.bump();
+                self.expect_keyword(TokenKind::Null)?;
+                options.nullable = false;
+            }
+            Some(TokenKind::Encrypted) => {
+                self.bump();
+                options.encrypted = true;
+            }
+            Some(TokenKind::Generated) => self.parse_generated_column_option(options)?,
+            Some(TokenKind::References) => self.parse_column_reference_option(options)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn parse_generated_column_option(&mut self, options: &mut ColumnOptions) -> Result<()> {
+        self.ensure_column_option_absent(
+            options.generated.is_some(),
+            "column has duplicate generated expression",
+        )?;
+        self.bump();
+        options.generated = Some(self.parse_stored_generated_column()?);
+        Ok(())
+    }
+
+    fn parse_stored_generated_column(&mut self) -> Result<GeneratedColumn> {
+        self.expect_keyword(TokenKind::Always)?;
+        self.expect_keyword(TokenKind::As)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let expr = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.expect_keyword(TokenKind::Stored)?;
+        Ok(GeneratedColumn { expr, stored: true })
+    }
+
+    fn parse_column_reference_option(&mut self, options: &mut ColumnOptions) -> Result<()> {
+        self.ensure_column_option_absent(
+            options.references.is_some(),
+            "column has duplicate references clause",
+        )?;
+        options.references = Some(self.parse_column_reference()?);
+        Ok(())
+    }
+
+    fn ensure_column_option_absent(&self, duplicate: bool, message: &str) -> Result<()> {
+        if duplicate {
+            return Err(self.error(message));
+        }
+        Ok(())
+    }
+
+    fn parse_column_reference(&mut self) -> Result<ColumnReference> {
+        self.expect_keyword(TokenKind::References)?;
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let column = self.parse_ident()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(ColumnReference { table, column })
+    }
+
+    fn parse_table_foreign_key(&mut self) -> Result<(Ident, ColumnReference)> {
+        if !self.consume_identifier_keyword("foreign") {
+            return Err(self.error("expected FOREIGN"));
+        }
+        if !self.consume_identifier_keyword("key") {
+            return Err(self.error("expected KEY"));
+        }
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let columns = self.parse_ident_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        let [column] = columns.as_slice() else {
+            return Err(self.error("table-level FOREIGN KEY supports exactly one column"));
+        };
+        let reference = self.parse_column_reference()?;
+        Ok((column.clone(), reference))
+    }
+
+    fn apply_table_foreign_keys(
+        &self,
+        columns: &mut [ColumnDef],
+        foreign_keys: Vec<(Ident, ColumnReference)>,
+    ) -> Result<()> {
+        for (column_name, reference) in foreign_keys {
+            let Some(column) = columns.iter_mut().find(|column| column.name == column_name) else {
+                return Err(self.error(format!(
+                    "table-level FOREIGN KEY references unknown column {column_name}"
+                )));
+            };
+            if column.references.is_some() {
+                return Err(self.error(format!(
+                    "column {} has duplicate references clause",
+                    column.name
+                )));
+            }
+            column.references = Some(reference);
+        }
+        Ok(())
     }
 
     fn parse_create_function_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Function)?;
         let if_not_exists = self.parse_if_not_exists()?;
+        let (name, argument_types, return_type) = self.parse_function_signature()?;
+        let implementation = self.parse_create_function_implementation()?;
+        Ok(Statement::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+            implementation,
+            if_not_exists,
+        })
+    }
+
+    fn parse_function_signature(&mut self) -> Result<(Ident, Vec<SqlType>, SqlType)> {
         let name = self.parse_ident()?;
+        let argument_types = self.parse_function_argument_types()?;
+        self.expect_keyword(TokenKind::Returns)?;
+        let return_type = self.parse_type()?;
+        Ok((name, argument_types, return_type))
+    }
+
+    fn parse_function_argument_types(&mut self) -> Result<Vec<SqlType>> {
         self.expect_keyword(TokenKind::LeftParen)?;
         let argument_types = if self.consume_if(&TokenKind::RightParen) {
             Vec::new()
@@ -445,14 +869,69 @@ impl Parser {
             self.expect_keyword(TokenKind::RightParen)?;
             types
         };
-        self.expect_keyword(TokenKind::Returns)?;
-        let return_type = self.parse_type()?;
-        Ok(Statement::CreateFunction {
-            name,
-            argument_types,
-            return_type,
-            if_not_exists,
-        })
+        Ok(argument_types)
+    }
+
+    fn parse_create_function_implementation(&mut self) -> Result<CreateFunctionImplementation> {
+        if !self.next_is_identifier_keyword("language") {
+            return Ok(CreateFunctionImplementation::MetadataOnly);
+        }
+        self.parse_wasm_function_implementation()
+    }
+
+    fn parse_wasm_function_implementation(&mut self) -> Result<CreateFunctionImplementation> {
+        self.parse_wasm_language()?;
+        let module_bytes = self.parse_wasm_module_bytes()?;
+        self.parse_wasm_options_clause(module_bytes)
+            .map(CreateFunctionImplementation::Wasm)
+    }
+
+    fn parse_wasm_language(&mut self) -> Result<()> {
+        self.expect_option_label("language")?;
+        let language = self.parse_ident()?;
+        if language.as_str() != "wasm" {
+            return Err(self.error(format!(
+                "unsupported function language {}",
+                language.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_wasm_module_bytes(&mut self) -> Result<Vec<u8>> {
+        self.expect_keyword(TokenKind::As)?;
+        let encoded = self.parse_string_literal("wasm module hex")?;
+        decode_wasm_module_hex(&encoded)
+    }
+
+    fn parse_wasm_options_clause(&mut self, module_bytes: Vec<u8>) -> Result<WasmFunctionBody> {
+        self.expect_keyword(TokenKind::With)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let options = self.parse_wasm_function_options()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        options.into_body(module_bytes)
+    }
+
+    fn parse_wasm_function_options(&mut self) -> Result<WasmFunctionOptions> {
+        let mut options = WasmFunctionOptions::default();
+        loop {
+            let name = self.parse_ident()?;
+            self.expect_operator("=")?;
+            let value = self.parse_positive_wasm_option(name.as_str())?;
+            options.set(name.as_str(), value)?;
+            if !self.consume_if(&TokenKind::Comma) {
+                return Ok(options);
+            }
+        }
+    }
+
+    fn parse_positive_wasm_option(&mut self, name: &str) -> Result<u64> {
+        let value = self.parse_row_count("wasm function option")?;
+        if value == 0 {
+            return Err(self.error(format!("wasm function option {name} must be positive")));
+        }
+        u64::try_from(value)
+            .map_err(|_| self.error(format!("wasm function option {name} is too large")))
     }
 
     fn parse_create_procedure_tail(&mut self) -> Result<Statement> {
@@ -460,13 +939,7 @@ impl Parser {
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.parse_ident()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        let argument_types = if self.consume_if(&TokenKind::RightParen) {
-            Vec::new()
-        } else {
-            let types = self.parse_type_list()?;
-            self.expect_keyword(TokenKind::RightParen)?;
-            types
-        };
+        let argument_types = self.parse_optional_type_list_body()?;
         self.expect_keyword(TokenKind::As)?;
         let body = self.parse_string_literal("procedure body")?;
         Ok(Statement::CreateProcedure {
@@ -477,18 +950,62 @@ impl Parser {
         })
     }
 
+    fn parse_optional_type_list_body(&mut self) -> Result<Vec<SqlType>> {
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(Vec::new());
+        }
+        let types = self.parse_type_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(types)
+    }
+
     fn parse_create_operator_tail(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::OperatorKeyword)?;
+        let signature = self.parse_create_operator_signature()?;
+        let options = self.parse_create_operator_options()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Statement::CreateOperator {
+            symbol: signature.symbol,
+            left_type: signature.left_type,
+            right_type: signature.right_type,
+            result_type: signature.result_type,
+            function: signature.function,
+            precedence: options.precedence,
+            commutator: options.commutator,
+            negator: options.negator,
+            selectivity: options.selectivity,
+        })
+    }
+
+    fn parse_create_operator_signature(&mut self) -> Result<CreateOperatorSignature> {
+        let (symbol, left_type, right_type) = self.parse_operator_operand_types()?;
+        let (result_type, function) = self.parse_operator_result_and_function()?;
+        Ok(CreateOperatorSignature {
+            symbol,
+            left_type,
+            right_type,
+            result_type,
+            function,
+        })
+    }
+
+    fn parse_operator_operand_types(&mut self) -> Result<(String, SqlType, SqlType)> {
         let symbol = self.parse_operator_symbol()?;
         self.expect_keyword(TokenKind::LeftParen)?;
-        self.expect_option_label("leftarg")?;
-        self.expect_operator("=")?;
-        let left_type = self.parse_type()?;
+        let left_type = self.parse_labeled_operator_type("leftarg")?;
         self.expect_keyword(TokenKind::Comma)?;
-        self.expect_option_label("rightarg")?;
-        self.expect_operator("=")?;
-        let right_type = self.parse_type()?;
+        let right_type = self.parse_labeled_operator_type("rightarg")?;
         self.expect_keyword(TokenKind::Comma)?;
+        Ok((symbol, left_type, right_type))
+    }
+
+    fn parse_labeled_operator_type(&mut self, label: &str) -> Result<SqlType> {
+        self.expect_option_label(label)?;
+        self.expect_operator("=")?;
+        self.parse_type()
+    }
+
+    fn parse_operator_result_and_function(&mut self) -> Result<(SqlType, Ident)> {
         self.expect_keyword(TokenKind::Returns)?;
         self.expect_operator("=")?;
         let result_type = self.parse_type()?;
@@ -496,40 +1013,34 @@ impl Parser {
         self.expect_keyword(TokenKind::Function)?;
         self.expect_operator("=")?;
         let function = self.parse_ident()?;
-        let mut precedence = None;
-        let mut commutator = None;
-        let mut negator = None;
-        let mut selectivity = None;
+        Ok((result_type, function))
+    }
+
+    fn parse_create_operator_options(&mut self) -> Result<CreateOperatorOptions> {
+        let mut options = CreateOperatorOptions::default();
         while self.consume_if(&TokenKind::Comma) {
-            let option = self.parse_ident()?;
-            self.expect_operator("=")?;
-            match option.as_str() {
-                "precedence" => {
-                    let value = self.parse_row_count("PRECEDENCE")?;
-                    precedence = Some(u8::try_from(value).map_err(|_| {
-                        self.error("operator precedence must fit in an unsigned byte")
-                    })?);
-                }
-                "commutator" => commutator = Some(self.parse_operator_symbol()?),
-                "negator" => negator = Some(self.parse_operator_symbol()?),
-                "selectivity" => selectivity = Some(self.parse_ident()?),
-                unknown => {
-                    return Err(self.error(format!("unknown operator option {unknown}")));
-                }
-            }
+            self.parse_create_operator_option(&mut options)?;
         }
-        self.expect_keyword(TokenKind::RightParen)?;
-        Ok(Statement::CreateOperator {
-            symbol,
-            left_type,
-            right_type,
-            result_type,
-            function,
-            precedence,
-            commutator,
-            negator,
-            selectivity,
-        })
+        Ok(options)
+    }
+
+    fn parse_create_operator_option(&mut self, options: &mut CreateOperatorOptions) -> Result<()> {
+        let option = self.parse_ident()?;
+        self.expect_operator("=")?;
+        match option.as_str() {
+            "precedence" => options.precedence = Some(self.parse_operator_precedence()?),
+            "commutator" => options.commutator = Some(self.parse_operator_symbol()?),
+            "negator" => options.negator = Some(self.parse_operator_symbol()?),
+            "selectivity" => options.selectivity = Some(self.parse_ident()?),
+            unknown => return Err(self.error(format!("unknown operator option {unknown}"))),
+        }
+        Ok(())
+    }
+
+    fn parse_operator_precedence(&mut self) -> Result<u8> {
+        let value = self.parse_row_count("PRECEDENCE")?;
+        u8::try_from(value)
+            .map_err(|_| self.error("operator precedence must fit in an unsigned byte"))
     }
 
     fn parse_create_role_tail(&mut self) -> Result<Statement> {
@@ -548,15 +1059,20 @@ impl Parser {
         self.expect_keyword(TokenKind::On)?;
         let table = self.parse_object_name()?;
         self.expect_keyword(TokenKind::Using)?;
-        self.expect_keyword(TokenKind::LeftParen)?;
-        let predicate = self.parse_expr()?;
-        self.expect_keyword(TokenKind::RightParen)?;
+        let predicate = self.parse_parenthesized_expr()?;
         Ok(Statement::CreatePolicy {
             name,
             table,
             predicate,
             if_not_exists,
         })
+    }
+
+    fn parse_parenthesized_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let predicate = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(predicate)
     }
 
     fn parse_if_not_exists(&mut self) -> Result<bool> {
@@ -573,39 +1089,50 @@ impl Parser {
         self.expect_keyword(TokenKind::Grant)?;
         let privilege = self.parse_privilege()?;
         self.expect_keyword(TokenKind::On)?;
+        self.parse_grant_target(privilege)
+    }
+
+    fn parse_grant_target(&mut self, privilege: Privilege) -> Result<Statement> {
         if self.consume_if(&TokenKind::Table) {
-            let table = self.parse_object_name()?;
-            self.expect_keyword(TokenKind::To)?;
-            let role = self.parse_ident()?;
-            return Ok(Statement::GrantTablePrivilege {
-                privilege,
-                table,
-                role,
-            });
+            return self.parse_grant_table(privilege);
         }
         if self.consume_if(&TokenKind::Procedure) {
-            if privilege != Privilege::Execute {
-                return Err(self.error("expected EXECUTE privilege for procedure grant"));
-            }
-            let name = self.parse_ident()?;
-            self.expect_keyword(TokenKind::LeftParen)?;
-            let argument_types = if self.consume_if(&TokenKind::RightParen) {
-                Vec::new()
-            } else {
-                let types = self.parse_type_list()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                types
-            };
-            self.expect_keyword(TokenKind::To)?;
-            let role = self.parse_ident()?;
-            return Ok(Statement::GrantProcedurePrivilege {
-                privilege,
-                name,
-                argument_types,
-                role,
-            });
+            return self.parse_grant_procedure(privilege);
         }
         Err(self.error("expected TABLE or PROCEDURE after GRANT privilege ON"))
+    }
+
+    fn parse_grant_table(&mut self, privilege: Privilege) -> Result<Statement> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::To)?;
+        let role = self.parse_ident()?;
+        Ok(Statement::GrantTablePrivilege {
+            privilege,
+            table,
+            role,
+        })
+    }
+
+    fn parse_grant_procedure(&mut self, privilege: Privilege) -> Result<Statement> {
+        self.ensure_procedure_grant_privilege(privilege)?;
+        let name = self.parse_ident()?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let argument_types = self.parse_optional_type_list_body()?;
+        self.expect_keyword(TokenKind::To)?;
+        let role = self.parse_ident()?;
+        Ok(Statement::GrantProcedurePrivilege {
+            privilege,
+            name,
+            argument_types,
+            role,
+        })
+    }
+
+    fn ensure_procedure_grant_privilege(&self, privilege: Privilege) -> Result<()> {
+        if privilege != Privilege::Execute {
+            return Err(self.error("expected EXECUTE privilege for procedure grant"));
+        }
+        Ok(())
     }
 
     fn parse_call_procedure(&mut self) -> Result<Statement> {
@@ -623,24 +1150,39 @@ impl Parser {
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
+        let (table, columns) = self.parse_insert_target()?;
+        let values = self.parse_insert_values()?;
+        self.validate_insert_arity(&columns, &values)?;
+        Ok(Statement::Insert {
+            table,
+            columns,
+            values,
+        })
+    }
+
+    fn parse_insert_target(&mut self) -> Result<(ObjectName, Vec<Ident>)> {
         self.expect_keyword(TokenKind::Insert)?;
         self.expect_keyword(TokenKind::Into)?;
         let table = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let columns = self.parse_ident_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((table, columns))
+    }
+
+    fn parse_insert_values(&mut self) -> Result<Vec<Expr>> {
         self.expect_keyword(TokenKind::Values)?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let values = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok(values)
+    }
+
+    fn validate_insert_arity(&self, columns: &[Ident], values: &[Expr]) -> Result<()> {
         if columns.len() != values.len() {
             return Err(self.error("insert column count does not match value count"));
         }
-        Ok(Statement::Insert {
-            table,
-            columns,
-            values,
-        })
+        Ok(())
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -679,163 +1221,233 @@ impl Parser {
 
     fn parse_select_core(&mut self) -> Result<Statement> {
         self.expect_keyword(TokenKind::Select)?;
+        let distinct = self.parse_select_quantifier();
+        let projection = self.parse_select_projection()?;
+        let source = self.parse_select_source_clauses()?;
+        let parts = SelectCoreParts {
+            distinct,
+            projection,
+            from: source.from,
+            join: source.join,
+            lateral_join: source.lateral_join,
+            selection: source.selection,
+            group_by: source.group_by,
+            grouping_sets: source.grouping_sets,
+            having: source.having,
+        };
+        self.validate_select_grouping(&parts)?;
+        Ok(parts.into_statement())
+    }
+
+    fn parse_select_source_clauses(&mut self) -> Result<SelectSourceClauses> {
+        self.expect_keyword(TokenKind::From)?;
+        let from = self.parse_object_name()?;
+        let (join, lateral_join) = self.parse_select_join()?;
+        let selection = self.parse_optional_expr_clause(&TokenKind::Where)?;
+        let (group_by, grouping_sets) = self.parse_group_by_clause()?;
+        let having = self.parse_optional_expr_clause(&TokenKind::Having)?;
+        Ok(SelectSourceClauses {
+            from,
+            join,
+            lateral_join,
+            selection,
+            group_by,
+            grouping_sets,
+            having,
+        })
+    }
+
+    fn parse_select_quantifier(&mut self) -> bool {
         let distinct = self.consume_if(&TokenKind::Distinct);
         if !distinct {
             let _ = self.consume_if(&TokenKind::All);
         }
-        let mut projection = Vec::new();
-        loop {
-            if self.consume_if(&TokenKind::Star) {
-                projection.push(SelectItem::Wildcard);
-            } else {
-                let expr = self.parse_expr()?;
-                let alias = if self.consume_if(&TokenKind::As) {
-                    Some(self.parse_ident()?)
-                } else {
-                    None
-                };
-                projection.push(SelectItem::Expr { expr, alias });
-            }
-            if self.consume_if(&TokenKind::Comma) {
-                continue;
-            }
-            break;
-        }
-        self.expect_keyword(TokenKind::From)?;
-        let from = self.parse_object_name()?;
-        let lateral_join = if self.consume_if(&TokenKind::Join) {
-            self.expect_keyword(TokenKind::Lateral)?;
-            let table = self.parse_object_name()?;
-            self.expect_keyword(TokenKind::On)?;
-            Some(LateralJoin {
-                table,
-                on: self.parse_expr()?,
-            })
-        } else {
-            None
-        };
-        let selection = if self.consume_if(&TokenKind::Where) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-        let (group_by, grouping_sets) = if self.consume_if(&TokenKind::Group) {
-            self.expect_keyword(TokenKind::By)?;
-            if self.consume_if(&TokenKind::Grouping) {
-                self.expect_keyword(TokenKind::Sets)?;
-                let grouping_sets = self.parse_grouping_sets()?;
-                let group_by = grouping_sets_union(&grouping_sets);
-                (group_by, grouping_sets)
-            } else if self.consume_if(&TokenKind::Rollup) {
-                let group_by = self.parse_parenthesized_expr_list()?;
-                let grouping_sets = rollup_grouping_sets(&group_by);
-                (group_by, grouping_sets)
-            } else if self.consume_if(&TokenKind::Cube) {
-                let group_by = self.parse_parenthesized_expr_list()?;
-                let grouping_sets = cube_grouping_sets(&group_by)?;
-                (group_by, grouping_sets)
-            } else {
-                (self.parse_expr_list()?, Vec::new())
-            }
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let having = if self.consume_if(&TokenKind::Having) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-        if lateral_join.is_some() && !grouping_sets.is_empty() {
-            return Err(self.error("JOIN LATERAL does not support GROUPING SETS yet"));
-        }
-        if !grouping_sets.is_empty() {
-            return Ok(Statement::SelectGroupingSets {
-                distinct,
-                projection,
-                from,
-                selection,
-                group_by,
-                grouping_sets,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            });
-        }
-        if let Some(lateral_join) = lateral_join {
-            Ok(Statement::SelectLateral {
-                distinct,
-                projection,
-                from,
-                lateral_join,
-                selection,
-                group_by,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            })
-        } else {
-            Ok(Statement::Select {
-                distinct,
-                projection,
-                from,
-                selection,
-                group_by,
-                having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            })
-        }
+        distinct
     }
 
-    fn parse_query(&mut self) -> Result<Statement> {
-        let mut statement = self.parse_select_core()?;
-        let mut set_operation = false;
+    fn parse_select_projection(&mut self) -> Result<Vec<SelectItem>> {
+        let mut projection = Vec::new();
         loop {
-            if self.consume_if(&TokenKind::Union) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Union {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else if self.consume_if(&TokenKind::Intersect) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Intersect {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else if self.consume_if(&TokenKind::Except) {
-                let all = self.consume_if(&TokenKind::All);
-                let right = self.parse_select_core()?;
-                statement = Statement::Except {
-                    all,
-                    left: Box::new(statement),
-                    right: Box::new(right),
-                };
-                set_operation = true;
-            } else {
+            projection.push(self.parse_select_item()?);
+            if !self.consume_if(&TokenKind::Comma) {
                 break;
             }
         }
+        Ok(projection)
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        if self.consume_if(&TokenKind::Star) {
+            return Ok(SelectItem::Wildcard);
+        }
+        let expr = self.parse_expr()?;
+        let alias = if self.consume_if(&TokenKind::As) {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    fn parse_optional_expr_clause(&mut self, keyword: &TokenKind) -> Result<Option<Expr>> {
+        if self.consume_if(keyword) {
+            return self.parse_expr().map(Some);
+        }
+        Ok(None)
+    }
+
+    fn parse_group_by_clause(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        if !self.consume_if(&TokenKind::Group) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        self.expect_keyword(TokenKind::By)?;
+        self.parse_group_by_body()
+    }
+
+    fn parse_group_by_body(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        if self.consume_if(&TokenKind::Grouping) {
+            return self.parse_explicit_grouping_sets();
+        }
+        if self.consume_if(&TokenKind::Rollup) {
+            return self.parse_rollup_grouping_sets();
+        }
+        if self.consume_if(&TokenKind::Cube) {
+            return self.parse_cube_grouping_sets();
+        }
+        self.parse_expr_list()
+            .map(|group_by| (group_by, Vec::new()))
+    }
+
+    fn parse_explicit_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        self.expect_keyword(TokenKind::Sets)?;
+        let grouping_sets = self.parse_grouping_sets()?;
+        let group_by = grouping_sets_union(&grouping_sets);
+        Ok((group_by, grouping_sets))
+    }
+
+    fn parse_rollup_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.parse_parenthesized_expr_list()?;
+        let grouping_sets = rollup_grouping_sets(&group_by);
+        Ok((group_by, grouping_sets))
+    }
+
+    fn parse_cube_grouping_sets(&mut self) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.parse_parenthesized_expr_list()?;
+        let grouping_sets = cube_grouping_sets(&group_by)?;
+        Ok((group_by, grouping_sets))
+    }
+
+    fn validate_select_grouping(&self, parts: &SelectCoreParts) -> Result<()> {
+        if (parts.join.is_some() || parts.lateral_join.is_some()) && !parts.grouping_sets.is_empty()
+        {
+            return Err(self.error("JOIN does not support GROUPING SETS yet"));
+        }
+        Ok(())
+    }
+
+    fn parse_select_join(&mut self) -> Result<(Option<JoinClause>, Option<LateralJoin>)> {
+        if self.consume_if(&TokenKind::Left) {
+            let _ = self.consume_if(&TokenKind::Outer);
+            return self
+                .parse_join_clause(JoinKind::Left)
+                .map(|join| (Some(join), None));
+        }
+        if self.consume_if(&TokenKind::Inner) {
+            self.expect_keyword(TokenKind::Join)?;
+            return self
+                .parse_join_table(JoinKind::Inner)
+                .map(|join| (Some(join), None));
+        }
+        if !self.consume_if(&TokenKind::Join) {
+            return Ok((None, None));
+        }
+        if self.consume_if(&TokenKind::Lateral) {
+            return self.parse_lateral_join().map(|join| (None, Some(join)));
+        }
+        self.parse_join_table(JoinKind::Inner)
+            .map(|join| (Some(join), None))
+    }
+
+    fn parse_join_clause(&mut self, kind: JoinKind) -> Result<JoinClause> {
+        self.expect_keyword(TokenKind::Join)?;
+        self.parse_join_table(kind)
+    }
+
+    fn parse_join_table(&mut self, kind: JoinKind) -> Result<JoinClause> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        Ok(JoinClause {
+            kind,
+            table,
+            on: self.parse_expr()?,
+        })
+    }
+
+    fn parse_lateral_join(&mut self) -> Result<LateralJoin> {
+        let table = self.parse_object_name()?;
+        self.expect_keyword(TokenKind::On)?;
+        Ok(LateralJoin {
+            table,
+            on: self.parse_expr()?,
+        })
+    }
+
+    fn parse_query(&mut self) -> Result<Statement> {
+        let statement = self.parse_select_core()?;
+        let (statement, set_operation) = self.parse_set_operation_chain(statement)?;
         let tail = self.parse_query_tail()?;
         Ok(apply_query_tail(statement, tail, set_operation))
     }
 
+    fn parse_set_operation_chain(&mut self, mut statement: Statement) -> Result<(Statement, bool)> {
+        let mut set_operation = false;
+        while let Some(kind) = self.consume_set_operation_kind() {
+            let all = self.consume_if(&TokenKind::All);
+            let right = self.parse_select_core()?;
+            statement = kind.combine(all, statement, right);
+            set_operation = true;
+        }
+        Ok((statement, set_operation))
+    }
+
+    fn consume_set_operation_kind(&mut self) -> Option<SetOperationKind> {
+        if self.consume_if(&TokenKind::Union) {
+            return Some(SetOperationKind::Union);
+        }
+        if self.consume_if(&TokenKind::Intersect) {
+            return Some(SetOperationKind::Intersect);
+        }
+        if self.consume_if(&TokenKind::Except) {
+            return Some(SetOperationKind::Except);
+        }
+        None
+    }
+
     fn parse_recursive_cte(&mut self) -> Result<Statement> {
+        let (name, columns) = self.parse_recursive_cte_header()?;
+        let (seed, recursive) = self.parse_recursive_cte_members()?;
+        self.ensure_recursive_cte_columns(&columns)?;
+        let query = self.parse_query()?;
+        Ok(Statement::RecursiveCte {
+            name,
+            columns,
+            seed: Box::new(seed),
+            recursive: Box::new(recursive),
+            query: Box::new(query),
+        })
+    }
+
+    fn parse_recursive_cte_header(&mut self) -> Result<(ObjectName, Vec<Ident>)> {
         self.expect_keyword(TokenKind::With)?;
         self.expect_keyword(TokenKind::Recursive)?;
         let name = self.parse_object_name()?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let columns = self.parse_ident_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((name, columns))
+    }
+
+    fn parse_recursive_cte_members(&mut self) -> Result<(Statement, Statement)> {
         self.expect_keyword(TokenKind::As)?;
         self.expect_keyword(TokenKind::LeftParen)?;
         let seed = self.parse_select_core()?;
@@ -845,17 +1457,14 @@ impl Parser {
         }
         let recursive = self.parse_select_core()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok((seed, recursive))
+    }
+
+    fn ensure_recursive_cte_columns(&self, columns: &[Ident]) -> Result<()> {
         if columns.is_empty() {
             return Err(self.error("recursive CTE requires at least one output column"));
         }
-        let query = self.parse_query()?;
-        Ok(Statement::RecursiveCte {
-            name,
-            columns,
-            seed: Box::new(seed),
-            recursive: Box::new(recursive),
-            query: Box::new(query),
-        })
+        Ok(())
     }
 
     fn parse_object_name(&mut self) -> Result<ObjectName> {
@@ -898,27 +1507,38 @@ impl Parser {
 
     fn parse_grouping_sets(&mut self) -> Result<Vec<Vec<Expr>>> {
         self.expect_keyword(TokenKind::LeftParen)?;
+        let grouping_sets = self.parse_grouping_set_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        self.ensure_grouping_sets_not_empty(&grouping_sets)?;
+        Ok(grouping_sets)
+    }
+
+    fn parse_grouping_set_list(&mut self) -> Result<Vec<Vec<Expr>>> {
         let mut grouping_sets = Vec::new();
         loop {
-            self.expect_keyword(TokenKind::LeftParen)?;
-            let grouping_set = if self.consume_if(&TokenKind::RightParen) {
-                Vec::new()
-            } else {
-                let expressions = self.parse_expr_list()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                expressions
-            };
-            grouping_sets.push(grouping_set);
-            if self.consume_if(&TokenKind::Comma) {
-                continue;
+            grouping_sets.push(self.parse_grouping_set()?);
+            if !self.consume_if(&TokenKind::Comma) {
+                break;
             }
-            break;
         }
+        Ok(grouping_sets)
+    }
+
+    fn parse_grouping_set(&mut self) -> Result<Vec<Expr>> {
+        self.expect_keyword(TokenKind::LeftParen)?;
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(Vec::new());
+        }
+        let expressions = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
+        Ok(expressions)
+    }
+
+    fn ensure_grouping_sets_not_empty(&self, grouping_sets: &[Vec<Expr>]) -> Result<()> {
         if grouping_sets.is_empty() {
             return Err(self.error("GROUPING SETS requires at least one grouping set"));
         }
-        Ok(grouping_sets)
+        Ok(())
     }
 
     fn parse_parenthesized_expr_list(&mut self) -> Result<Vec<Expr>> {
@@ -993,43 +1613,9 @@ impl Parser {
     }
 
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_concat_expr()?;
+        let expr = self.parse_concat_expr()?;
         if self.consume_if(&TokenKind::Is) {
-            let negated = self.consume_if(&TokenKind::Not);
-            if self.consume_if(&TokenKind::Distinct) {
-                self.expect_keyword(TokenKind::From)?;
-                let right = self.parse_additive_expr()?;
-                return Ok(Expr::IsDistinctFrom {
-                    left: Box::new(expr),
-                    right: Box::new(right),
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::True) {
-                return Ok(Expr::IsTruth {
-                    expr: Box::new(expr),
-                    value: true,
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::False) {
-                return Ok(Expr::IsTruth {
-                    expr: Box::new(expr),
-                    value: false,
-                    negated,
-                });
-            }
-            if self.consume_if(&TokenKind::Unknown) {
-                return Ok(Expr::IsUnknown {
-                    expr: Box::new(expr),
-                    negated,
-                });
-            }
-            self.expect_keyword(TokenKind::Null)?;
-            return Ok(Expr::IsNull {
-                expr: Box::new(expr),
-                negated,
-            });
+            return self.parse_is_predicate(expr);
         }
         if self.consume_if(&TokenKind::Between) {
             return self.parse_between_tail(expr, false);
@@ -1041,23 +1627,69 @@ impl Parser {
             return self.parse_like_tail(expr, false);
         }
         if self.consume_if(&TokenKind::Not) {
-            if self.consume_if(&TokenKind::Between) {
-                return self.parse_between_tail(expr, true);
-            }
-            if self.consume_if(&TokenKind::In) {
-                return self.parse_in_list_tail(expr, true);
-            }
-            self.expect_keyword(TokenKind::Like)?;
-            return self.parse_like_tail(expr, true);
+            return self.parse_negated_comparison_tail(expr);
         }
+        self.parse_binary_comparison_tail(expr)
+    }
+
+    fn parse_is_predicate(&mut self, expr: Expr) -> Result<Expr> {
+        let negated = self.consume_if(&TokenKind::Not);
+        if self.consume_if(&TokenKind::Distinct) {
+            self.expect_keyword(TokenKind::From)?;
+            let right = self.parse_additive_expr()?;
+            return Ok(Expr::IsDistinctFrom {
+                left: Box::new(expr),
+                right: Box::new(right),
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::True) {
+            return Ok(Expr::IsTruth {
+                expr: Box::new(expr),
+                value: true,
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::False) {
+            return Ok(Expr::IsTruth {
+                expr: Box::new(expr),
+                value: false,
+                negated,
+            });
+        }
+        if self.consume_if(&TokenKind::Unknown) {
+            return Ok(Expr::IsUnknown {
+                expr: Box::new(expr),
+                negated,
+            });
+        }
+        self.expect_keyword(TokenKind::Null)?;
+        Ok(Expr::IsNull {
+            expr: Box::new(expr),
+            negated,
+        })
+    }
+
+    fn parse_negated_comparison_tail(&mut self, expr: Expr) -> Result<Expr> {
+        if self.consume_if(&TokenKind::Between) {
+            return self.parse_between_tail(expr, true);
+        }
+        if self.consume_if(&TokenKind::In) {
+            return self.parse_in_list_tail(expr, true);
+        }
+        self.expect_keyword(TokenKind::Like)?;
+        self.parse_like_tail(expr, true)
+    }
+
+    fn parse_binary_comparison_tail(&mut self, expr: Expr) -> Result<Expr> {
         if let Some(TokenKind::Operator(op)) = self.peek_kind().cloned() {
             self.bump();
             let right = self.parse_concat_expr()?;
-            expr = Expr::Binary {
+            return Ok(Expr::Binary {
                 left: Box::new(expr),
                 op,
                 right: Box::new(right),
-            };
+            });
         }
         Ok(expr)
     }
@@ -1079,11 +1711,24 @@ impl Parser {
         if self.consume_if(&TokenKind::RightParen) {
             return Err(self.error("IN requires at least one expression"));
         }
+        if self.peek_kind() == Some(&TokenKind::Select) {
+            return self.parse_in_subquery_tail(expr, negated);
+        }
         let values = self.parse_expr_list()?;
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(Expr::InList {
             expr: Box::new(expr),
             values,
+            negated,
+        })
+    }
+
+    fn parse_in_subquery_tail(&mut self, expr: Expr, negated: bool) -> Result<Expr> {
+        let query = self.parse_query()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::InSubquery {
+            expr: Box::new(expr),
+            query: SelectSubquery::Parsed(Box::new(query)),
             negated,
         })
     }
@@ -1166,158 +1811,210 @@ impl Parser {
     fn parse_primary_expr(&mut self) -> Result<Expr> {
         match self.peek_kind().cloned() {
             Some(TokenKind::Case) => self.parse_case_expr(),
-            Some(TokenKind::Identifier(_)) => {
-                let first = self.parse_ident()?;
-                if first.as_str() == "array" && self.consume_if(&TokenKind::LeftBracket) {
-                    let values = if self.consume_if(&TokenKind::RightBracket) {
-                        Vec::new()
-                    } else {
-                        let values = self.parse_expr_list()?;
-                        self.expect_keyword(TokenKind::RightBracket)?;
-                        values
-                    };
-                    return Ok(Expr::Array(values));
-                }
-                if first.as_str() == "hstore" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_hstore_literal_tail();
-                }
-                if first.as_str() == "range" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_range_literal_tail();
-                }
-                if first.as_str() == "cast" && self.consume_if(&TokenKind::LeftParen) {
-                    return self.parse_cast_expr_tail();
-                }
-
-                let name = self.parse_object_name_from_first(first)?;
-                if self.consume_if(&TokenKind::LeftParen) {
-                    if name.schema().is_none()
-                        && name.object() == "count"
-                        && self.consume_if(&TokenKind::Star)
-                    {
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        return Ok(Expr::CountStar);
-                    }
-                    let args = if self.consume_if(&TokenKind::RightParen) {
-                        Vec::new()
-                    } else if self.consume_if(&TokenKind::Distinct) {
-                        let expr = self.parse_expr()?;
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        if name.schema().is_none() && name.object() == "count" {
-                            return Ok(Expr::CountDistinct(Box::new(expr)));
-                        }
-                        return Err(self.error(format!(
-                            "DISTINCT arguments are not supported for function {name}"
-                        )));
-                    } else {
-                        let args = self.parse_expr_list()?;
-                        self.expect_keyword(TokenKind::RightParen)?;
-                        args
-                    };
-                    if name.schema().is_none() && ranking_window_function(name.object()).is_some() {
-                        if !args.is_empty() {
-                            return Err(self
-                                .error(format!("{}() does not accept arguments", name.object())));
-                        }
-                        let order_by = self.parse_window_order_by(name.object())?;
-                        return Ok(ranking_window_function(name.object())
-                            .expect("checked ranking window function")(
-                            order_by
-                        ));
-                    }
-                    if name.schema().is_none() && name.object() == "count" {
-                        let mut args = args;
-                        return Ok(Expr::Count(Box::new(
-                            self.single_function_arg("count", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "sum" {
-                        let mut args = args;
-                        return Ok(Expr::Sum(Box::new(
-                            self.single_function_arg("sum", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "min" {
-                        let mut args = args;
-                        return Ok(Expr::Min(Box::new(
-                            self.single_function_arg("min", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "max" {
-                        let mut args = args;
-                        return Ok(Expr::Max(Box::new(
-                            self.single_function_arg("max", &mut args)?,
-                        )));
-                    }
-                    if name.schema().is_none() && name.object() == "coalesce" {
-                        if args.is_empty() {
-                            return Err(self.error("COALESCE requires at least one expression"));
-                        }
-                        return Ok(Expr::Coalesce(args));
-                    }
-                    if name.schema().is_none() && name.object() == "nullif" {
-                        if args.len() != 2 {
-                            return Err(self.error("NULLIF requires exactly two expressions"));
-                        }
-                        let mut args = args.into_iter();
-                        let left = args.next().expect("NULLIF argument length checked");
-                        let right = args.next().expect("NULLIF argument length checked");
-                        return Ok(Expr::NullIf {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        });
-                    }
-                    Ok(Expr::Call { name, args })
-                } else {
-                    match name.schema() {
-                        Some(qualifier) => Ok(Expr::QualifiedIdentifier {
-                            qualifier: Ident::new(qualifier),
-                            name: Ident::new(name.object()),
-                        }),
-                        None => Ok(Expr::Identifier(Ident::new(name.object()))),
-                    }
-                }
-            }
-            Some(TokenKind::Integer(value)) => {
-                self.bump();
-                Ok(Expr::Integer(value))
-            }
-            Some(TokenKind::String(value)) => {
-                self.bump();
-                Ok(Expr::String(value))
-            }
-            Some(TokenKind::True) => {
-                self.bump();
-                Ok(Expr::Bool(true))
-            }
-            Some(TokenKind::False) => {
-                self.bump();
-                Ok(Expr::Bool(false))
-            }
-            Some(TokenKind::Null) => {
-                self.bump();
-                Ok(Expr::Null)
-            }
-            Some(TokenKind::LeftParen) => {
-                self.bump();
-                let expr = self.parse_expr()?;
-                self.expect_keyword(TokenKind::RightParen)?;
-                Ok(expr)
-            }
-            Some(kind) => Err(self.error(format!("unexpected expression token {kind:?}"))),
+            Some(TokenKind::Exists) => self.parse_exists_subquery_expr(),
+            Some(TokenKind::Identifier(_)) => self.parse_identifier_expr(),
+            Some(TokenKind::LeftParen) => self.parse_parenthesized_primary_expr(),
+            Some(kind) => self.parse_literal_expr(kind),
             None => Err(self.error("expected expression")),
         }
     }
 
+    fn parse_identifier_expr(&mut self) -> Result<Expr> {
+        let first = self.parse_ident()?;
+        if self.consume_named_token(first.as_str(), "array", &TokenKind::LeftBracket) {
+            return self.parse_array_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "hstore", &TokenKind::LeftParen) {
+            return self.parse_hstore_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "range", &TokenKind::LeftParen) {
+            return self.parse_range_literal_tail();
+        }
+        if self.consume_named_token(first.as_str(), "cast", &TokenKind::LeftParen) {
+            return self.parse_cast_expr_tail();
+        }
+
+        let name = self.parse_object_name_from_first(first)?;
+        if self.consume_if(&TokenKind::LeftParen) {
+            return self.parse_function_call(name);
+        }
+        Ok(object_name_into_identifier(name))
+    }
+
+    fn consume_named_token(&mut self, actual: &str, expected: &str, token: &TokenKind) -> bool {
+        actual == expected && self.consume_if(token)
+    }
+
+    fn parse_array_literal_tail(&mut self) -> Result<Expr> {
+        if self.consume_if(&TokenKind::RightBracket) {
+            return Ok(Expr::Array(Vec::new()));
+        }
+        let values = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightBracket)?;
+        Ok(Expr::Array(values))
+    }
+
+    fn parse_function_call(&mut self, name: ObjectName) -> Result<Expr> {
+        if let Some(count_star) = self.parse_count_star(&name)? {
+            return Ok(count_star);
+        }
+        match self.parse_function_arguments(&name)? {
+            FunctionArguments::Regular(args) => self.build_function_call(name, args),
+            FunctionArguments::CountDistinct(expr) => Ok(Expr::CountDistinct(Box::new(expr))),
+        }
+    }
+
+    fn parse_count_star(&mut self, name: &ObjectName) -> Result<Option<Expr>> {
+        if !is_unqualified_function(name, "count") || !self.consume_if(&TokenKind::Star) {
+            return Ok(None);
+        }
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Some(Expr::CountStar))
+    }
+
+    fn parse_function_arguments(&mut self, name: &ObjectName) -> Result<FunctionArguments> {
+        if self.consume_if(&TokenKind::RightParen) {
+            return Ok(FunctionArguments::Regular(Vec::new()));
+        }
+        if self.consume_if(&TokenKind::Distinct) {
+            let expr = self.parse_expr()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            if is_unqualified_function(name, "count") {
+                return Ok(FunctionArguments::CountDistinct(expr));
+            }
+            return Err(self.error(format!(
+                "DISTINCT arguments are not supported for function {name}"
+            )));
+        }
+        let args = self.parse_expr_list()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(FunctionArguments::Regular(args))
+    }
+
+    fn build_function_call(&mut self, name: ObjectName, args: Vec<Expr>) -> Result<Expr> {
+        if name.schema().is_some() {
+            return Ok(regular_function_call(name, args));
+        }
+        if let Some(constructor) = ranking_window_function(name.object()) {
+            return self.build_ranking_window_call(name.object(), args, constructor);
+        }
+        if let Some((function_name, constructor)) = single_argument_function(name.object()) {
+            return self.build_single_argument_call(function_name, args, constructor);
+        }
+        match name.object() {
+            "coalesce" => self.build_coalesce_call(args),
+            "nullif" => self.build_nullif_call(args),
+            _ => Ok(regular_function_call(name, args)),
+        }
+    }
+
+    fn build_ranking_window_call(
+        &mut self,
+        name: &str,
+        args: Vec<Expr>,
+        constructor: fn(Vec<OrderByExpr>) -> Expr,
+    ) -> Result<Expr> {
+        if !args.is_empty() {
+            return Err(self.error(format!("{name}() does not accept arguments")));
+        }
+        let order_by = self.parse_window_order_by(name)?;
+        Ok(constructor(order_by))
+    }
+
+    fn build_single_argument_call(
+        &self,
+        name: &'static str,
+        mut args: Vec<Expr>,
+        constructor: SingleArgumentConstructor,
+    ) -> Result<Expr> {
+        let argument = self.single_function_arg(name, &mut args)?;
+        Ok(constructor(Box::new(argument)))
+    }
+
+    fn build_coalesce_call(&self, args: Vec<Expr>) -> Result<Expr> {
+        if args.is_empty() {
+            return Err(self.error("COALESCE requires at least one expression"));
+        }
+        Ok(Expr::Coalesce(args))
+    }
+
+    fn build_nullif_call(&self, args: Vec<Expr>) -> Result<Expr> {
+        if args.len() != 2 {
+            return Err(self.error("NULLIF requires exactly two expressions"));
+        }
+        let mut args = args.into_iter();
+        let left = args.next().expect("NULLIF argument length checked");
+        let right = args.next().expect("NULLIF argument length checked");
+        Ok(Expr::NullIf {
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    fn parse_parenthesized_primary_expr(&mut self) -> Result<Expr> {
+        self.bump();
+        if self.peek_kind() == Some(&TokenKind::Select) {
+            let query = self.parse_query()?;
+            self.expect_keyword(TokenKind::RightParen)?;
+            return Ok(Expr::ScalarSubquery {
+                query: SelectSubquery::Parsed(Box::new(query)),
+            });
+        }
+        let expr = self.parse_expr()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(expr)
+    }
+
+    fn parse_literal_expr(&mut self, kind: TokenKind) -> Result<Expr> {
+        let expr = match kind {
+            TokenKind::Integer(value) => Expr::Integer(value),
+            TokenKind::Float64(value) => Expr::Float64(value),
+            TokenKind::String(value) => Expr::String(value),
+            TokenKind::True => Expr::Bool(true),
+            TokenKind::False => Expr::Bool(false),
+            TokenKind::Null => Expr::Null,
+            unexpected => {
+                return Err(self.error(format!("unexpected expression token {unexpected:?}")));
+            }
+        };
+        self.bump();
+        Ok(expr)
+    }
+
+    fn parse_exists_subquery_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(TokenKind::Exists)?;
+        self.expect_keyword(TokenKind::LeftParen)?;
+        let query = self.parse_query()?;
+        self.expect_keyword(TokenKind::RightParen)?;
+        Ok(Expr::ExistsSubquery {
+            query: SelectSubquery::Parsed(Box::new(query)),
+        })
+    }
+
     fn parse_case_expr(&mut self) -> Result<Expr> {
         self.expect_keyword(TokenKind::Case)?;
-        let operand = if self.consume_if(&TokenKind::When) {
-            None
-        } else {
-            let operand = self.parse_expr()?;
-            self.expect_keyword(TokenKind::When)?;
-            Some(Box::new(operand))
-        };
+        let operand = self.parse_case_operand()?;
+        let whens = self.parse_case_when_arms()?;
+        let else_expr = self.parse_case_else()?;
+        self.expect_keyword(TokenKind::End)?;
 
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        })
+    }
+
+    fn parse_case_operand(&mut self) -> Result<Option<Box<Expr>>> {
+        if self.consume_if(&TokenKind::When) {
+            return Ok(None);
+        }
+        let operand = self.parse_expr()?;
+        self.expect_keyword(TokenKind::When)?;
+        Ok(Some(Box::new(operand)))
+    }
+
+    fn parse_case_when_arms(&mut self) -> Result<Vec<CaseWhen>> {
         let mut whens = Vec::new();
         loop {
             let condition = self.parse_expr()?;
@@ -1329,19 +2026,14 @@ impl Parser {
                 break;
             }
         }
+        Ok(whens)
+    }
 
-        let else_expr = if self.consume_if(&TokenKind::Else) {
-            Some(Box::new(self.parse_expr()?))
-        } else {
-            None
-        };
-        self.expect_keyword(TokenKind::End)?;
-
-        Ok(Expr::Case {
-            operand,
-            whens,
-            else_expr,
-        })
+    fn parse_case_else(&mut self) -> Result<Option<Box<Expr>>> {
+        if self.consume_if(&TokenKind::Else) {
+            return self.parse_expr().map(Box::new).map(Some);
+        }
+        Ok(None)
     }
 
     fn parse_hstore_literal_tail(&mut self) -> Result<Expr> {
@@ -1375,15 +2067,19 @@ impl Parser {
         self.expect_keyword(TokenKind::Comma)?;
         let upper = self.parse_expr()?;
         self.expect_keyword(TokenKind::Comma)?;
-        let raw_bounds = self.parse_string_literal("range bounds")?;
-        let bounds = RangeLiteralBounds::parse(&raw_bounds)
-            .ok_or_else(|| self.error("range bounds must be one of [], [), (], ()"))?;
+        let bounds = self.parse_range_bounds()?;
         self.expect_keyword(TokenKind::RightParen)?;
         Ok(Expr::Range {
             lower: Box::new(lower),
             upper: Box::new(upper),
             bounds,
         })
+    }
+
+    fn parse_range_bounds(&mut self) -> Result<RangeLiteralBounds> {
+        let raw_bounds = self.parse_string_literal("range bounds")?;
+        RangeLiteralBounds::parse(&raw_bounds)
+            .ok_or_else(|| self.error("range bounds must be one of [], [), (], ()"))
     }
 
     fn parse_cast_expr_tail(&mut self) -> Result<Expr> {
@@ -1399,29 +2095,49 @@ impl Parser {
 
     fn parse_type(&mut self) -> Result<SqlType> {
         let type_name = self.parse_ident()?;
-        let mut data_type = if type_name.as_str() == "range" {
-            self.expect_operator("<")?;
-            let element_type = self.parse_type()?;
-            self.expect_operator(">")?;
-            SqlType::Range(Box::new(element_type))
+        let data_type = if type_name.as_str() == "range" {
+            self.parse_range_type()?
         } else {
-            match type_name.as_str() {
-                "bool" | "boolean" => SqlType::Bool,
-                "int64" | "bigint" | "integer" => SqlType::Int64,
-                "uint64" => SqlType::UInt64,
-                "text" | "string" | "varchar" => SqlType::Text,
-                "bytes" | "bytea" => SqlType::Bytes,
-                "hstore" => SqlType::HStore,
-                "textvector" | "tsvector" => SqlType::TextVector,
-                unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
-            }
+            self.parse_named_type(type_name.as_str())?
         };
+        self.parse_array_type_suffixes(data_type)
+    }
 
+    fn parse_range_type(&mut self) -> Result<SqlType> {
+        self.expect_operator("<")?;
+        let element_type = self.parse_type()?;
+        self.expect_operator(">")?;
+        Ok(SqlType::Range(Box::new(element_type)))
+    }
+
+    fn parse_named_type(&mut self, type_name: &str) -> Result<SqlType> {
+        let data_type = match type_name {
+            "bool" | "boolean" => SqlType::Bool,
+            "int64" | "bigint" | "integer" => SqlType::Int64,
+            "uint64" => SqlType::UInt64,
+            "float" | "float64" => SqlType::Float64,
+            "double" => {
+                let _ = self.consume_identifier_keyword("precision");
+                SqlType::Float64
+            }
+            "doubleprecision" => SqlType::Float64,
+            "uuid" => SqlType::Uuid,
+            "timestamp" | "datetime" => SqlType::Timestamp,
+            "json" | "jsonb" => SqlType::Json,
+            "text" | "string" | "varchar" => SqlType::Text,
+            "bytes" | "bytea" => SqlType::Bytes,
+            "hstore" => SqlType::HStore,
+            "textvector" | "tsvector" => SqlType::TextVector,
+            unknown => return Err(self.error(format!("unknown SQL type {unknown}"))),
+        };
+        Ok(data_type)
+    }
+
+    fn parse_array_type_suffixes(&mut self, mut data_type: SqlType) -> Result<SqlType> {
         while self.consume_if(&TokenKind::LeftBracket) {
             self.expect_keyword(TokenKind::RightBracket)?;
             data_type = SqlType::Array(Box::new(data_type));
         }
-
         Ok(data_type)
     }
 
@@ -1479,31 +2195,49 @@ impl Parser {
     }
 
     fn parse_query_tail(&mut self) -> Result<QueryTail> {
-        let order_by = if self.consume_if(&TokenKind::Order) {
-            self.expect_keyword(TokenKind::By)?;
-            self.parse_order_by_list()?
-        } else {
-            Vec::new()
-        };
-        let limit = if self.consume_if(&TokenKind::Limit) {
-            self.parse_limit_count()?
-        } else {
-            None
-        };
-        let offset = if self.consume_if(&TokenKind::Offset) {
-            Some(self.parse_offset_count()?)
-        } else {
-            None
-        };
+        let order_by = self.parse_optional_order_by()?;
+        let limit = self.parse_optional_limit()?;
+        let offset = self.parse_optional_offset()?;
         let fetch = self.parse_fetch_count()?;
-        if limit.is_some() && fetch.is_some() {
-            return Err(self.error("LIMIT and FETCH cannot be used together"));
-        }
+        self.ensure_limit_fetch_compatible(limit, fetch)?;
         Ok(QueryTail {
             order_by,
             limit: limit.or(fetch),
             offset,
         })
+    }
+
+    fn parse_optional_order_by(&mut self) -> Result<Vec<OrderByExpr>> {
+        if !self.consume_if(&TokenKind::Order) {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword(TokenKind::By)?;
+        self.parse_order_by_list()
+    }
+
+    fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
+        if self.consume_if(&TokenKind::Limit) {
+            return self.parse_limit_count();
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_offset(&mut self) -> Result<Option<usize>> {
+        if self.consume_if(&TokenKind::Offset) {
+            return self.parse_offset_count().map(Some);
+        }
+        Ok(None)
+    }
+
+    fn ensure_limit_fetch_compatible(
+        &self,
+        limit: Option<usize>,
+        fetch: Option<usize>,
+    ) -> Result<()> {
+        if limit.is_some() && fetch.is_some() {
+            return Err(self.error("LIMIT and FETCH cannot be used together"));
+        }
+        Ok(())
     }
 
     fn parse_limit_count(&mut self) -> Result<Option<usize>> {
@@ -1518,19 +2252,32 @@ impl Parser {
         if !self.consume_if(&TokenKind::Fetch) {
             return Ok(None);
         }
+        self.parse_fetch_direction()?;
+        let count = self.parse_fetch_row_count()?;
+        self.parse_fetch_suffix()?;
+        Ok(Some(count))
+    }
+
+    fn parse_fetch_direction(&mut self) -> Result<()> {
         if !self.consume_if(&TokenKind::First) {
             self.expect_keyword(TokenKind::Next)?;
         }
-        let count = if matches!(self.peek_kind(), Some(TokenKind::Row | TokenKind::Rows)) {
-            1
-        } else {
-            self.parse_row_count("FETCH")?
-        };
+        Ok(())
+    }
+
+    fn parse_fetch_row_count(&mut self) -> Result<usize> {
+        if matches!(self.peek_kind(), Some(TokenKind::Row | TokenKind::Rows)) {
+            return Ok(1);
+        }
+        self.parse_row_count("FETCH")
+    }
+
+    fn parse_fetch_suffix(&mut self) -> Result<()> {
         if !self.consume_if(&TokenKind::Row) {
             self.expect_keyword(TokenKind::Rows)?;
         }
         self.expect_keyword(TokenKind::Only)?;
-        Ok(Some(count))
+        Ok(())
     }
 
     fn parse_offset_count(&mut self) -> Result<usize> {
@@ -1679,6 +2426,13 @@ impl Parser {
         }
     }
 
+    fn next_is_identifier_keyword(&self, expected: &str) -> bool {
+        matches!(
+            self.peek_kind(),
+            Some(TokenKind::Identifier(value)) if value == expected
+        )
+    }
+
     fn bump(&mut self) {
         self.position += 1;
     }
@@ -1689,6 +2443,55 @@ impl Parser {
 
     fn error(&self, message: impl Into<String>) -> RnovError {
         RnovError::new(ErrorKind::InvalidInput, message)
+    }
+}
+
+fn required_wasm_option(value: Option<u64>, name: &str) -> Result<u64> {
+    value.ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("missing wasm function option {name}"),
+        )
+    })
+}
+
+fn decode_wasm_module_hex(encoded: &str) -> Result<Vec<u8>> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm module hex must contain an even number of digits",
+        ));
+    }
+    let byte_len = encoded.len() / 2;
+    if byte_len > MAX_WASM_FUNCTION_MODULE_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("wasm module exceeds the {MAX_WASM_FUNCTION_MODULE_BYTES}-byte input limit"),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(index, pair)| decode_hex_pair(pair, index * 2))
+        .collect()
+}
+
+fn decode_hex_pair(pair: &[u8], offset: usize) -> Result<u8> {
+    let high = decode_hex_nibble(pair[0], offset)?;
+    let low = decode_hex_nibble(pair[1], offset + 1)?;
+    Ok((high << 4) | low)
+}
+
+fn decode_hex_nibble(byte: u8, offset: usize) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid wasm module hex digit at offset {offset}"),
+        )),
     }
 }
 
@@ -1721,6 +2524,27 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             distinct,
             projection,
             from,
+            selection,
+            group_by,
+            having,
+            order_by: tail.order_by,
+            limit: tail.limit,
+            offset: tail.offset,
+        },
+        Statement::SelectJoin {
+            distinct,
+            projection,
+            from,
+            join,
+            selection,
+            group_by,
+            having,
+            ..
+        } => Statement::SelectJoin {
+            distinct,
+            projection,
+            from,
+            join,
             selection,
             group_by,
             having,
@@ -1776,6 +2600,38 @@ fn apply_query_tail(statement: Statement, tail: QueryTail, set_operation: bool) 
             limit: tail.limit,
             offset: tail.offset,
         },
+    }
+}
+
+fn object_name_into_identifier(name: ObjectName) -> Expr {
+    match name.schema() {
+        Some(qualifier) => Expr::QualifiedIdentifier {
+            qualifier: Ident::new(qualifier),
+            name: Ident::new(name.object()),
+        },
+        None => Expr::Identifier(Ident::new(name.object())),
+    }
+}
+
+fn is_unqualified_function(name: &ObjectName, expected: &str) -> bool {
+    name.schema().is_none() && name.object() == expected
+}
+
+fn regular_function_call(name: ObjectName, args: Vec<Expr>) -> Expr {
+    Expr::Call {
+        function_id: None,
+        name,
+        args,
+    }
+}
+
+fn single_argument_function(name: &str) -> Option<NamedSingleArgumentFunction> {
+    match name {
+        "count" => Some(("count", Expr::Count)),
+        "sum" => Some(("sum", Expr::Sum)),
+        "min" => Some(("min", Expr::Min)),
+        "max" => Some(("max", Expr::Max)),
+        _ => None,
     }
 }
 

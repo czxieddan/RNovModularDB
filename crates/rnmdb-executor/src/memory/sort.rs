@@ -55,6 +55,62 @@ pub(super) fn sort_rows(
     Ok(rows)
 }
 
+pub(super) fn apply_sort_with_key_values_cancellable(
+    batch: VectorBatch,
+    keys: &[OrderByExpr],
+    key_values: Vec<Vec<SqlValue>>,
+    cancellation: &CancellationToken,
+) -> Result<VectorBatch> {
+    if keys.is_empty() {
+        return Ok(batch);
+    }
+
+    let mut rows = sort_rows_from_key_values(&batch, key_values, keys.len(), cancellation)?;
+    rows.sort_by(|left, right| compare_sort_rows(left, right, keys));
+    cancellation.check()?;
+    VectorBatch::new(
+        batch.columns().to_vec(),
+        rows.into_iter().map(|row| row.row).collect(),
+    )
+}
+
+fn sort_rows_from_key_values(
+    batch: &VectorBatch,
+    key_values: Vec<Vec<SqlValue>>,
+    key_count: usize,
+    cancellation: &CancellationToken,
+) -> Result<Vec<SortRow>> {
+    if key_values.len() != batch.rows().len() {
+        return Err(RnovError::new(
+            ErrorKind::Internal,
+            "resolved ORDER BY key count does not match row count",
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(batch.rows().len());
+    for (original_index, (row, keys)) in batch.rows().iter().zip(key_values).enumerate() {
+        cancellation.check()?;
+        validate_resolved_key_width(keys.len(), key_count)?;
+        rows.push(SortRow {
+            keys,
+            original_index,
+            row: row.clone(),
+        });
+    }
+    validate_sort_key_types(&rows, key_count)?;
+    Ok(rows)
+}
+
+fn validate_resolved_key_width(actual: usize, expected: usize) -> Result<()> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Internal,
+        "resolved ORDER BY key width does not match key count",
+    ))
+}
+
 fn validate_sort_key_types(rows: &[SortRow], key_count: usize) -> Result<()> {
     let mut key_types = vec![None; key_count];
     for row in rows {
@@ -130,6 +186,12 @@ fn compare_sort_values(left: &SqlValue, right: &SqlValue, direction: SortDirecti
         (SqlValue::Bool(left), SqlValue::Bool(right)) => left.cmp(right),
         (SqlValue::Int64(left), SqlValue::Int64(right)) => left.cmp(right),
         (SqlValue::UInt64(left), SqlValue::UInt64(right)) => left.cmp(right),
+        (SqlValue::Float64(left), SqlValue::Float64(right)) => left
+            .get()
+            .partial_cmp(&right.get())
+            .unwrap_or(Ordering::Equal),
+        (SqlValue::Uuid(left), SqlValue::Uuid(right)) => left.cmp(right),
+        (SqlValue::Timestamp(left), SqlValue::Timestamp(right)) => left.cmp(right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
         (SqlValue::Bytes(left), SqlValue::Bytes(right)) => left.cmp(right),
         _ => Ordering::Equal,

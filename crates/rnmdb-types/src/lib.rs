@@ -14,6 +14,10 @@ pub enum SqlType {
     Bool,
     Int64,
     UInt64,
+    Float64,
+    Uuid,
+    Timestamp,
+    Json,
     Text,
     Bytes,
     HStore,
@@ -28,12 +32,425 @@ pub enum SqlValue {
     Bool(bool),
     Int64(i64),
     UInt64(u64),
+    Float64(SqlFloat64),
+    Uuid(SqlUuid),
+    Timestamp(SqlTimestamp),
+    Json(SqlJson),
     Text(String),
     Bytes(Vec<u8>),
     HStore(HStore),
     TextVector(TextVector),
     Array(SqlArray),
     Range(SqlRange),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlUuid([u8; 16]);
+
+impl SqlUuid {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn parse_str(value: &str) -> Result<Self> {
+        validate_uuid_shape(value)?;
+        let mut bytes = [0_u8; 16];
+        let mut byte_index = 0_usize;
+        let mut chars = value
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(|byte| *byte != b'-');
+        while byte_index < bytes.len() {
+            let high = chars.next().expect("uuid shape validated");
+            let low = chars.next().expect("uuid shape validated");
+            bytes[byte_index] = parse_hex_pair(high, low)?;
+            byte_index += 1;
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
+    pub fn to_hyphenated_string(self) -> String {
+        let mut out = String::with_capacity(36);
+        for (index, byte) in self.0.iter().enumerate() {
+            if matches!(index, 4 | 6 | 8 | 10) {
+                out.push('-');
+            }
+            out.push(hex_char(byte >> 4));
+            out.push(hex_char(byte & 0x0f));
+        }
+        out
+    }
+}
+
+fn validate_uuid_shape(value: &str) -> Result<()> {
+    if value.len() != 36 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "uuid text must use hyphenated 36-character form",
+        ));
+    }
+    for (position, byte) in value.as_bytes().iter().enumerate() {
+        let expects_hyphen = matches!(position, 8 | 13 | 18 | 23);
+        if (*byte == b'-') != expects_hyphen {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "uuid text has invalid hyphen positions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_hex_pair(high: u8, low: u8) -> Result<u8> {
+    let high = hex_value(high)?;
+    let low = hex_value(low)?;
+    Ok((high << 4) | low)
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "uuid text contains non-hex character",
+        )),
+    }
+}
+
+fn hex_char(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + value - 10),
+        _ => unreachable!("uuid nybble is in range"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlTimestamp(i64);
+
+impl SqlTimestamp {
+    pub fn from_epoch_micros(epoch_micros: i64) -> Self {
+        Self(epoch_micros)
+    }
+
+    pub fn parse_str(value: &str) -> Result<Self> {
+        let (date, time) = parse_timestamp_text(value)?;
+        let epoch_micros = timestamp_epoch_micros(date, time)?;
+        Ok(Self(epoch_micros))
+    }
+
+    pub fn epoch_micros(self) -> i64 {
+        self.0
+    }
+
+    pub fn to_rfc3339_string(self) -> String {
+        let days = self.0.div_euclid(MICROS_PER_DAY);
+        let day_micros = self.0.rem_euclid(MICROS_PER_DAY);
+        let (year, month, day) = civil_from_days(days);
+        let (hour, minute, second, micros) = split_day_micros(day_micros);
+        let fraction = format_timestamp_fraction(micros);
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{fraction}Z")
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DateParts {
+    year: i32,
+    month: u8,
+    day: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TimeParts {
+    hour: u8,
+    minute: u8,
+    second: u8,
+    micros: u32,
+}
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
+const MICROS_PER_DAY: i64 = SECONDS_PER_DAY * MICROS_PER_SECOND;
+
+fn parse_timestamp_text(value: &str) -> Result<(DateParts, TimeParts)> {
+    let value = value.trim();
+    let value = value.strip_suffix('Z').unwrap_or(value);
+    let (date, time) = split_timestamp_parts(value)?;
+    Ok((parse_date_parts(date)?, parse_time_parts(time)?))
+}
+
+fn split_timestamp_parts(value: &str) -> Result<(&str, &str)> {
+    value
+        .split_once('T')
+        .or_else(|| value.split_once(' '))
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "timestamp text must include date and time",
+            )
+        })
+}
+
+fn parse_date_parts(value: &str) -> Result<DateParts> {
+    let (year, month, day) = split_three(value, '-', "timestamp date")?;
+    let date = DateParts {
+        year: parse_year(year)?,
+        month: parse_two_digit_u8(month, "timestamp month")?,
+        day: parse_two_digit_u8(day, "timestamp day")?,
+    };
+    validate_date_parts(date)?;
+    Ok(date)
+}
+
+fn parse_time_parts(value: &str) -> Result<TimeParts> {
+    let (time, fraction) = split_time_fraction(value)?;
+    let (hour, minute, second) = split_three(time, ':', "timestamp time")?;
+    let time = TimeParts {
+        hour: parse_two_digit_u8(hour, "timestamp hour")?,
+        minute: parse_two_digit_u8(minute, "timestamp minute")?,
+        second: parse_two_digit_u8(second, "timestamp second")?,
+        micros: fraction
+            .map(parse_fraction_micros)
+            .transpose()?
+            .unwrap_or(0),
+    };
+    validate_time_parts(time)?;
+    Ok(time)
+}
+
+fn split_time_fraction(value: &str) -> Result<(&str, Option<&str>)> {
+    let mut parts = value.split('.');
+    let Some(time) = parts.next() else {
+        return Err(invalid_timestamp("timestamp time is missing"));
+    };
+    let fraction = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid_timestamp(
+            "timestamp fraction contains multiple dots",
+        ));
+    }
+    Ok((time, fraction))
+}
+
+fn split_three<'a>(
+    value: &'a str,
+    separator: char,
+    label: &str,
+) -> Result<(&'a str, &'a str, &'a str)> {
+    let mut parts = value.split(separator);
+    let Some(first) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    let Some(second) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    let Some(third) = parts.next() else {
+        return Err(invalid_timestamp(label));
+    };
+    if parts.next().is_some() {
+        return Err(invalid_timestamp(label));
+    }
+    Ok((first, second, third))
+}
+
+fn parse_year(value: &str) -> Result<i32> {
+    if value.len() != 4 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp("timestamp year must use four digits"));
+    }
+    value
+        .parse::<i32>()
+        .map_err(|_| invalid_timestamp("timestamp year is invalid"))
+}
+
+fn parse_two_digit_u8(value: &str, label: &str) -> Result<u8> {
+    if value.len() != 2 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp(label));
+    }
+    value.parse::<u8>().map_err(|_| invalid_timestamp(label))
+}
+
+fn parse_fraction_micros(value: &str) -> Result<u32> {
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_timestamp(
+            "timestamp fraction must use one to six digits",
+        ));
+    }
+    let mut micros = value
+        .parse::<u32>()
+        .map_err(|_| invalid_timestamp("timestamp fraction must use one to six digits"))?;
+    for _ in value.len()..6 {
+        micros *= 10;
+    }
+    Ok(micros)
+}
+
+fn validate_date_parts(date: DateParts) -> Result<()> {
+    if !(1..=9999).contains(&date.year) {
+        return Err(invalid_timestamp("timestamp year is out of range"));
+    }
+    let max_day = days_in_month(date.year, date.month)?;
+    if date.day == 0 || date.day > max_day {
+        return Err(invalid_timestamp("timestamp day is out of range"));
+    }
+    Ok(())
+}
+
+fn validate_time_parts(time: TimeParts) -> Result<()> {
+    if time.hour > 23 || time.minute > 59 || time.second > 59 {
+        return Err(invalid_timestamp("timestamp time is out of range"));
+    }
+    Ok(())
+}
+
+fn days_in_month(year: i32, month: u8) -> Result<u8> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Ok(31),
+        4 | 6 | 9 | 11 => Ok(30),
+        2 if leap_year(year) => Ok(29),
+        2 => Ok(28),
+        _ => Err(invalid_timestamp("timestamp month is out of range")),
+    }
+}
+
+fn leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn timestamp_epoch_micros(date: DateParts, time: TimeParts) -> Result<i64> {
+    let days = days_from_civil(date.year, date.month, date.day);
+    let seconds =
+        i64::from(time.hour) * 3_600 + i64::from(time.minute) * 60 + i64::from(time.second);
+    checked_timestamp_micros(days, seconds, time.micros)
+}
+
+fn checked_timestamp_micros(days: i64, seconds: i64, micros: u32) -> Result<i64> {
+    days.checked_mul(MICROS_PER_DAY)
+        .and_then(|value| value.checked_add(seconds * MICROS_PER_SECOND))
+        .and_then(|value| value.checked_add(i64::from(micros)))
+        .ok_or_else(|| invalid_timestamp("timestamp value is out of range"))
+}
+
+fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
+    let year = i64::from(year) - if month <= 2 { 1 } else { 0 };
+    let era = floor_div(year, 400);
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let days = days + 719_468;
+    let era = floor_div(days, 146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (
+        year + if month <= 2 { 1 } else { 0 },
+        month as u8,
+        day as u8,
+    )
+}
+
+fn floor_div(value: i64, divisor: i64) -> i64 {
+    value.div_euclid(divisor)
+}
+
+fn split_day_micros(day_micros: i64) -> (u8, u8, u8, u32) {
+    let total_seconds = day_micros / MICROS_PER_SECOND;
+    let micros = (day_micros % MICROS_PER_SECOND) as u32;
+    let hour = (total_seconds / 3_600) as u8;
+    let minute = ((total_seconds % 3_600) / 60) as u8;
+    let second = (total_seconds % 60) as u8;
+    (hour, minute, second, micros)
+}
+
+fn format_timestamp_fraction(micros: u32) -> String {
+    if micros == 0 {
+        return String::new();
+    }
+    let digits = micros.to_string();
+    let leading_zeroes = 6usize.saturating_sub(digits.len());
+    let mut fraction = String::from(".");
+    fraction.push_str(&"0".repeat(leading_zeroes));
+    fraction.push_str(digits.trim_end_matches("0"));
+    fraction
+}
+
+fn invalid_timestamp(message: &str) -> RnovError {
+    RnovError::new(ErrorKind::InvalidInput, message)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SqlJson(String);
+
+impl SqlJson {
+    pub fn parse_str(value: &str) -> Result<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(value).map_err(|err| {
+            RnovError::new(ErrorKind::InvalidInput, format!("invalid json text: {err}"))
+        })?;
+        let canonical = serde_json::to_string(&parsed).map_err(|err| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("failed to canonicalize json text: {err}"),
+            )
+        })?;
+        Ok(Self(canonical))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SqlFloat64(u64);
+
+impl SqlFloat64 {
+    pub fn new(value: f64) -> Result<Self> {
+        if !value.is_finite() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "float64 value must be finite",
+            ));
+        }
+
+        Ok(Self(Self::canonical_bits(value)))
+    }
+
+    pub fn from_bits(bits: u64) -> Result<Self> {
+        Self::new(f64::from_bits(bits))
+    }
+
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    pub fn to_bits(self) -> u64 {
+        self.0
+    }
+
+    fn canonical_bits(value: f64) -> u64 {
+        if value == 0.0 {
+            0.0_f64.to_bits()
+        } else {
+            value.to_bits()
+        }
+    }
 }
 
 impl SqlValue {
@@ -49,6 +466,10 @@ impl SqlValue {
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
+    const TAG_FLOAT64: u8 = 10;
+    const TAG_UUID: u8 = 11;
+    const TAG_TIMESTAMP: u8 = 12;
+    const TAG_JSON: u8 = 13;
 
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
@@ -60,6 +481,10 @@ impl SqlValue {
             Self::Bool(_) => SqlType::Bool,
             Self::Int64(_) => SqlType::Int64,
             Self::UInt64(_) => SqlType::UInt64,
+            Self::Float64(_) => SqlType::Float64,
+            Self::Uuid(_) => SqlType::Uuid,
+            Self::Timestamp(_) => SqlType::Timestamp,
+            Self::Json(_) => SqlType::Json,
             Self::Text(_) => SqlType::Text,
             Self::Bytes(_) => SqlType::Bytes,
             Self::HStore(_) => SqlType::HStore,
@@ -74,7 +499,7 @@ impl SqlValue {
             return Truth::Unknown;
         }
 
-        if self == other {
+        if self == other || numeric_values_are_equal(self, other) {
             Truth::True
         } else {
             Truth::False
@@ -97,6 +522,12 @@ impl SqlValue {
             Self::Bool(value) => encoded.push(u8::from(*value)),
             Self::Int64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
             Self::UInt64(value) => encoded.extend_from_slice(&value.to_be_bytes()),
+            Self::Float64(value) => encoded.extend_from_slice(&value.to_bits().to_be_bytes()),
+            Self::Uuid(value) => encoded.extend_from_slice(&value.as_bytes()),
+            Self::Timestamp(value) => {
+                encoded.extend_from_slice(&value.epoch_micros().to_be_bytes())
+            }
+            Self::Json(value) => encode_bytes(value.as_str().as_bytes(), &mut encoded),
             Self::Text(value) => encode_bytes(value.as_bytes(), &mut encoded),
             Self::Bytes(value) => encode_bytes(value, &mut encoded),
             Self::HStore(value) => encode_hstore(value, &mut encoded),
@@ -146,6 +577,22 @@ impl SqlValue {
             Self::TAG_UINT64 => Ok(Self::UInt64(u64::from_be_bytes(read_array::<8>(
                 payload, "uint64",
             )?))),
+            Self::TAG_FLOAT64 => Ok(Self::Float64(SqlFloat64::from_bits(u64::from_be_bytes(
+                read_array::<8>(payload, "float64")?,
+            ))?)),
+            Self::TAG_UUID => Ok(Self::Uuid(SqlUuid::from_bytes(read_array::<16>(
+                payload, "uuid",
+            )?))),
+            Self::TAG_TIMESTAMP => Ok(Self::Timestamp(SqlTimestamp::from_epoch_micros(
+                i64::from_be_bytes(read_array::<8>(payload, "timestamp")?),
+            ))),
+            Self::TAG_JSON => {
+                let bytes = decode_bytes(payload, "json")?;
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    RnovError::new(ErrorKind::InvalidInput, "json is not valid utf-8")
+                })?;
+                SqlJson::parse_str(&text).map(Self::Json)
+            }
             Self::TAG_TEXT => {
                 let bytes = decode_bytes(payload, "text")?;
                 let text = String::from_utf8(bytes).map_err(|_| {
@@ -171,6 +618,10 @@ impl SqlValue {
             Self::Bool(_) => Self::TAG_BOOL,
             Self::Int64(_) => Self::TAG_INT64,
             Self::UInt64(_) => Self::TAG_UINT64,
+            Self::Float64(_) => Self::TAG_FLOAT64,
+            Self::Uuid(_) => Self::TAG_UUID,
+            Self::Timestamp(_) => Self::TAG_TIMESTAMP,
+            Self::Json(_) => Self::TAG_JSON,
             Self::Text(_) => Self::TAG_TEXT,
             Self::Bytes(_) => Self::TAG_BYTES,
             Self::HStore(_) => Self::TAG_HSTORE,
@@ -192,6 +643,10 @@ impl SqlType {
     const TAG_RANGE: u8 = 7;
     const TAG_HSTORE: u8 = 8;
     const TAG_TEXT_VECTOR: u8 = 9;
+    const TAG_FLOAT64: u8 = 10;
+    const TAG_UUID: u8 = 11;
+    const TAG_TIMESTAMP: u8 = 12;
+    const TAG_JSON: u8 = 13;
 
     fn encode_into(&self, encoded: &mut Vec<u8>) {
         match self {
@@ -199,6 +654,10 @@ impl SqlType {
             Self::Bool => encoded.push(Self::TAG_BOOL),
             Self::Int64 => encoded.push(Self::TAG_INT64),
             Self::UInt64 => encoded.push(Self::TAG_UINT64),
+            Self::Float64 => encoded.push(Self::TAG_FLOAT64),
+            Self::Uuid => encoded.push(Self::TAG_UUID),
+            Self::Timestamp => encoded.push(Self::TAG_TIMESTAMP),
+            Self::Json => encoded.push(Self::TAG_JSON),
             Self::Text => encoded.push(Self::TAG_TEXT),
             Self::Bytes => encoded.push(Self::TAG_BYTES),
             Self::HStore => encoded.push(Self::TAG_HSTORE),
@@ -220,6 +679,10 @@ impl SqlType {
             Self::TAG_BOOL => Ok(Self::Bool),
             Self::TAG_INT64 => Ok(Self::Int64),
             Self::TAG_UINT64 => Ok(Self::UInt64),
+            Self::TAG_FLOAT64 => Ok(Self::Float64),
+            Self::TAG_UUID => Ok(Self::Uuid),
+            Self::TAG_TIMESTAMP => Ok(Self::Timestamp),
+            Self::TAG_JSON => Ok(Self::Json),
             Self::TAG_TEXT => Ok(Self::Text),
             Self::TAG_BYTES => Ok(Self::Bytes),
             Self::TAG_HSTORE => Ok(Self::HStore),
@@ -614,22 +1077,8 @@ impl SqlRange {
         if value.is_null() || value.data_type() != self.element_type {
             return Ok(false);
         }
-
-        let above_lower = match self.lower() {
-            RangeBound::Unbounded => true,
-            RangeBound::Included(bound) => compare_scalar_values(value, bound)? != Ordering::Less,
-            RangeBound::Excluded(bound) => {
-                compare_scalar_values(value, bound)? == Ordering::Greater
-            }
-        };
-        let below_upper = match self.upper() {
-            RangeBound::Unbounded => true,
-            RangeBound::Included(bound) => {
-                compare_scalar_values(value, bound)? != Ordering::Greater
-            }
-            RangeBound::Excluded(bound) => compare_scalar_values(value, bound)? == Ordering::Less,
-        };
-
+        let above_lower = value_satisfies_lower_bound(value, self.lower())?;
+        let below_upper = value_satisfies_upper_bound(value, self.upper())?;
         Ok(above_lower && below_upper)
     }
 
@@ -640,12 +1089,13 @@ impl SqlRange {
 
     pub fn adjacent(&self, other: &Self) -> Result<bool> {
         self.ensure_same_element_type(other)?;
-        if self.empty || other.empty || self.overlaps(other)? {
+        if self.empty || other.empty {
             return Ok(false);
         }
-
-        Ok(bounds_touch_without_gap(self.upper(), other.lower())?
-            || bounds_touch_without_gap(other.upper(), self.lower())?)
+        if self.overlaps(other)? {
+            return Ok(false);
+        }
+        ranges_touch_at_boundary(self, other)
     }
 
     pub fn intersection(&self, other: &Self) -> Result<Self> {
@@ -667,16 +1117,20 @@ impl SqlRange {
         if other.empty {
             return Ok(self.clone());
         }
-        if !self.overlaps(other)? && !self.adjacent(other)? {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "ranges are disjoint and cannot be represented as one range",
-            ));
-        }
-
+        self.ensure_unionable(other)?;
         let lower = min_lower_bound(self.lower(), other.lower())?;
         let upper = max_upper_bound(self.upper(), other.upper())?;
         Self::new(self.element_type.clone(), lower, upper)
+    }
+
+    fn ensure_unionable(&self, other: &Self) -> Result<()> {
+        if self.overlaps(other)? || self.adjacent(other)? {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "ranges are disjoint and cannot be represented as one range",
+        ))
     }
 
     fn ensure_same_element_type(&self, other: &Self) -> Result<()> {
@@ -750,96 +1204,110 @@ fn decode_array(payload: &[u8]) -> Result<SqlArray> {
     let mut cursor = Cursor::new(payload);
     let element_type = SqlType::decode_from(&mut cursor)?;
     let dimension_count = cursor.read_u32("array dimension count")? as usize;
-    let mut dimensions = Vec::with_capacity(dimension_count);
+    let dimensions = decode_array_dimensions(&mut cursor, dimension_count)?;
+    let value_count = cursor.read_u32("array value count")? as usize;
+    let values = decode_array_values(&mut cursor, value_count)?;
+    ensure_cursor_complete(&cursor, "array")?;
+    SqlArray::new(element_type, dimensions, values)
+}
 
+fn decode_array_dimensions(
+    cursor: &mut Cursor<'_>,
+    dimension_count: usize,
+) -> Result<Vec<ArrayDimension>> {
+    let mut dimensions = Vec::with_capacity(dimension_count);
     for _ in 0..dimension_count {
         let lower_bound = cursor.read_i64("array lower bound")?;
         let len = cursor.read_u32("array dimension length")? as usize;
         dimensions.push(ArrayDimension::new(lower_bound, len)?);
     }
+    Ok(dimensions)
+}
 
-    let value_count = cursor.read_u32("array value count")? as usize;
+fn decode_array_values(cursor: &mut Cursor<'_>, value_count: usize) -> Result<Vec<SqlValue>> {
     let mut values = Vec::with_capacity(value_count);
     for _ in 0..value_count {
         let len = cursor.read_u32("array value length")? as usize;
         let bytes = cursor.read_exact(len, "array value payload")?;
         values.push(SqlValue::decode(bytes)?);
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "array payload has trailing bytes",
-        ));
-    }
-
-    SqlArray::new(element_type, dimensions, values)
+    Ok(values)
 }
 
 fn decode_hstore(payload: &[u8]) -> Result<HStore> {
     let mut cursor = Cursor::new(payload);
     let entry_count = cursor.read_u32("hstore entry count")? as usize;
     let mut hstore = HStore::new();
-
     for _ in 0..entry_count {
-        let key_bytes = cursor.read_len_prefixed_bytes("hstore key")?;
-        let key = String::from_utf8(key_bytes)
-            .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "hstore key is not utf-8"))?;
-        let value = match cursor.read_u8("hstore value tag")? {
-            0 => HStoreValue::Null,
-            1 => {
-                let value_bytes = cursor.read_len_prefixed_bytes("hstore value")?;
-                HStoreValue::Text(String::from_utf8(value_bytes).map_err(|_| {
-                    RnovError::new(ErrorKind::InvalidInput, "hstore value is not utf-8")
-                })?)
-            }
-            unknown => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("unknown hstore value tag {unknown}"),
-                ));
-            }
-        };
+        let (key, value) = decode_hstore_entry(&mut cursor)?;
         hstore.insert(key, value)?;
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "hstore payload has trailing bytes",
-        ));
-    }
-
+    ensure_cursor_complete(&cursor, "hstore")?;
     Ok(hstore)
+}
+
+fn decode_hstore_entry(cursor: &mut Cursor<'_>) -> Result<(String, HStoreValue)> {
+    let key_bytes = cursor.read_len_prefixed_bytes("hstore key")?;
+    let key = decode_utf8(key_bytes, "hstore key")?;
+    let value = decode_hstore_value(cursor)?;
+    Ok((key, value))
+}
+
+fn decode_hstore_value(cursor: &mut Cursor<'_>) -> Result<HStoreValue> {
+    match cursor.read_u8("hstore value tag")? {
+        0 => Ok(HStoreValue::Null),
+        1 => {
+            let value_bytes = cursor.read_len_prefixed_bytes("hstore value")?;
+            decode_utf8(value_bytes, "hstore value").map(HStoreValue::Text)
+        }
+        unknown => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unknown hstore value tag {unknown}"),
+        )),
+    }
 }
 
 fn decode_text_vector(payload: &[u8]) -> Result<TextVector> {
     let mut cursor = Cursor::new(payload);
     let lexeme_count = cursor.read_u32("text vector lexeme count")? as usize;
     let mut lexemes = Vec::with_capacity(lexeme_count);
-
     for _ in 0..lexeme_count {
-        let term_bytes = cursor.read_len_prefixed_bytes("text vector lexeme term")?;
-        let term = String::from_utf8(term_bytes).map_err(|_| {
-            RnovError::new(ErrorKind::InvalidInput, "text vector term is not utf-8")
-        })?;
-        let weight = LexemeWeight::from_u8(cursor.read_u8("text vector weight")?)?;
-        let position_count = cursor.read_u32("text vector position count")? as usize;
-        let mut positions = Vec::with_capacity(position_count);
-        for _ in 0..position_count {
-            positions.push(cursor.read_u32("text vector position")?);
-        }
-        lexemes.push(TextLexeme::new(term, positions, weight)?);
+        lexemes.push(decode_text_lexeme(&mut cursor)?);
     }
-
-    if !cursor.is_complete() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "text vector payload has trailing bytes",
-        ));
-    }
-
+    ensure_cursor_complete(&cursor, "text vector")?;
     TextVector::from_lexemes(lexemes)
+}
+
+fn decode_text_lexeme(cursor: &mut Cursor<'_>) -> Result<TextLexeme> {
+    let term_bytes = cursor.read_len_prefixed_bytes("text vector lexeme term")?;
+    let term = decode_utf8(term_bytes, "text vector term")?;
+    let weight = LexemeWeight::from_u8(cursor.read_u8("text vector weight")?)?;
+    let position_count = cursor.read_u32("text vector position count")? as usize;
+    let positions = decode_text_positions(cursor, position_count)?;
+    TextLexeme::new(term, positions, weight)
+}
+
+fn decode_text_positions(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<u32>> {
+    let mut positions = Vec::with_capacity(count);
+    for _ in 0..count {
+        positions.push(cursor.read_u32("text vector position")?);
+    }
+    Ok(positions)
+}
+
+fn decode_utf8(bytes: Vec<u8>, name: &str) -> Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, format!("{name} is not utf-8")))
+}
+
+fn ensure_cursor_complete(cursor: &Cursor<'_>, payload_name: &str) -> Result<()> {
+    if cursor.is_complete() {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("{payload_name} payload has trailing bytes"),
+    ))
 }
 
 fn decode_range(payload: &[u8]) -> Result<SqlRange> {
@@ -905,7 +1373,14 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
     match (left, right) {
         (SqlValue::Bool(a), SqlValue::Bool(b)) => Ok(a.cmp(b)),
         (SqlValue::Int64(a), SqlValue::Int64(b)) => Ok(a.cmp(b)),
+        (SqlValue::Int64(a), SqlValue::Float64(b)) => compare_int64_float64(*a, *b),
+        (SqlValue::Float64(a), SqlValue::Int64(b)) => {
+            compare_int64_float64(*b, *a).map(Ordering::reverse)
+        }
         (SqlValue::UInt64(a), SqlValue::UInt64(b)) => Ok(a.cmp(b)),
+        (SqlValue::Float64(a), SqlValue::Float64(b)) => compare_float64_values(*a, *b),
+        (SqlValue::Uuid(a), SqlValue::Uuid(b)) => Ok(a.cmp(b)),
+        (SqlValue::Timestamp(a), SqlValue::Timestamp(b)) => Ok(a.cmp(b)),
         (SqlValue::Text(a), SqlValue::Text(b)) => Ok(a.cmp(b)),
         (SqlValue::Bytes(a), SqlValue::Bytes(b)) => Ok(a.cmp(b)),
         _ => Err(RnovError::new(
@@ -913,6 +1388,57 @@ fn compare_scalar_values(left: &SqlValue, right: &SqlValue) -> Result<Ordering> 
             "range comparison only supports matching scalar types",
         )),
     }
+}
+
+fn numeric_values_are_equal(left: &SqlValue, right: &SqlValue) -> bool {
+    matches!(compare_numeric_values(left, right), Some(Ordering::Equal))
+}
+
+fn compare_numeric_values(left: &SqlValue, right: &SqlValue) -> Option<Ordering> {
+    match (left, right) {
+        (SqlValue::Int64(a), SqlValue::Float64(b)) => compare_int64_float64(*a, *b).ok(),
+        (SqlValue::Float64(a), SqlValue::Int64(b)) => {
+            compare_int64_float64(*b, *a).map(Ordering::reverse).ok()
+        }
+        _ => None,
+    }
+}
+
+fn compare_int64_float64(left: i64, right: SqlFloat64) -> Result<Ordering> {
+    let right = right.get();
+    if right >= 9_223_372_036_854_775_808.0 {
+        return Ok(Ordering::Less);
+    }
+    if right < -9_223_372_036_854_775_808.0 {
+        return Ok(Ordering::Greater);
+    }
+
+    let truncated = right.trunc() as i64;
+    match left.cmp(&truncated) {
+        Ordering::Equal => compare_int64_to_fractional_float(right),
+        other => Ok(other),
+    }
+}
+
+fn compare_int64_to_fractional_float(value: f64) -> Result<Ordering> {
+    match value.partial_cmp(&value.trunc()) {
+        Some(Ordering::Greater) => Ok(Ordering::Less),
+        Some(Ordering::Less) => Ok(Ordering::Greater),
+        Some(Ordering::Equal) => Ok(Ordering::Equal),
+        None => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "float64 comparison requires finite values",
+        )),
+    }
+}
+
+fn compare_float64_values(left: SqlFloat64, right: SqlFloat64) -> Result<Ordering> {
+    left.get().partial_cmp(&right.get()).ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "float64 comparison requires finite values",
+        )
+    })
 }
 
 fn validate_range_bound_type(element_type: &SqlType, bound: &RangeBound) -> Result<()> {
@@ -1000,6 +1526,33 @@ fn compare_upper_bounds(left: &RangeBound, right: &RangeBound) -> Result<Orderin
             other => Ok(other),
         },
     }
+}
+
+fn value_satisfies_lower_bound(value: &SqlValue, bound: &RangeBound) -> Result<bool> {
+    match bound {
+        RangeBound::Unbounded => Ok(true),
+        RangeBound::Included(bound) => Ok(compare_scalar_values(value, bound)? != Ordering::Less),
+        RangeBound::Excluded(bound) => {
+            Ok(compare_scalar_values(value, bound)? == Ordering::Greater)
+        }
+    }
+}
+
+fn value_satisfies_upper_bound(value: &SqlValue, bound: &RangeBound) -> Result<bool> {
+    match bound {
+        RangeBound::Unbounded => Ok(true),
+        RangeBound::Included(bound) => {
+            Ok(compare_scalar_values(value, bound)? != Ordering::Greater)
+        }
+        RangeBound::Excluded(bound) => Ok(compare_scalar_values(value, bound)? == Ordering::Less),
+    }
+}
+
+fn ranges_touch_at_boundary(left: &SqlRange, right: &SqlRange) -> Result<bool> {
+    if bounds_touch_without_gap(left.upper(), right.lower())? {
+        return Ok(true);
+    }
+    bounds_touch_without_gap(right.upper(), left.lower())
 }
 
 fn bounds_touch_without_gap(left_upper: &RangeBound, right_lower: &RangeBound) -> Result<bool> {

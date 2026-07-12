@@ -178,8 +178,7 @@ fn validate_legacy_page_size_bytes(page_size_bytes: u64, context: &str) -> Resul
 }
 
 fn is_supported_legacy_page_size(page_size_bytes: u64) -> bool {
-    page_size_bytes >= LEGACY_PAGE_SIZE_MIN_BYTES
-        && page_size_bytes <= LEGACY_PAGE_SIZE_MAX_BYTES
+    (LEGACY_PAGE_SIZE_MIN_BYTES..=LEGACY_PAGE_SIZE_MAX_BYTES).contains(&page_size_bytes)
         && page_size_bytes.is_power_of_two()
 }
 

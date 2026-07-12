@@ -1,4 +1,6 @@
-use rnmdb_catalog::{Catalog, IndexMethod, OperatorSignature, Privilege, Table};
+use rnmdb_catalog::{
+    Catalog, IndexMethod, OperatorSignature, Privilege, Table, WasmFunctionImplementation,
+};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{RelationId, RoleId},
@@ -6,12 +8,14 @@ use rnmdb_common::{
 use rnmdb_types::SqlType;
 
 use crate::ast::{
-    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundIndexKey,
-    BoundIntersect, BoundLateralJoin, BoundQuery, BoundRecursiveCte, BoundRowPolicy, BoundSelect,
-    BoundSelectItem, BoundStatement, BoundUnion, BoundUpdate, CaseWhen, ColumnDef, Expr, Ident,
-    IndexKeyDef, LateralJoin, ObjectName, OrderByExpr, SelectItem, Statement, TransactionAction,
+    Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundHashJoinKeys,
+    BoundIndexKey, BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery,
+    BoundRecursiveCte, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion,
+    BoundUpdate, CaseWhen, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef,
+    JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, SelectItem, SelectSubquery,
+    Statement, TransactionAction, WasmFunctionBody,
 };
-use crate::expr_mutator::rewrite_qualified_expr;
+use crate::expr_mutator::{rewrite_expr_tree, rewrite_qualified_expr};
 use crate::parser::{parse_expr, parse_statement};
 
 const RLS_DENY_DEFAULT_POLICY: &str = "rnmdb_rls_deny_default";
@@ -36,6 +40,7 @@ struct SelectInput<'a> {
     distinct: bool,
     select_items: &'a [SelectItem],
     from: &'a ObjectName,
+    join: Option<&'a JoinClause>,
     lateral_join: Option<&'a LateralJoin>,
     selection: &'a Option<Expr>,
     group_by: &'a [Expr],
@@ -44,6 +49,53 @@ struct SelectInput<'a> {
     order_by: &'a [OrderByExpr],
     limit: Option<usize>,
     offset: Option<usize>,
+    role_id: RoleId,
+}
+
+struct CteSelectInput<'a> {
+    distinct: bool,
+    projection: &'a [SelectItem],
+    from: &'a ObjectName,
+    selection: &'a Option<Expr>,
+    order_by: &'a [OrderByExpr],
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+struct JoinBindingContext<'a> {
+    right_table: &'a Table,
+    joined_columns: Vec<LateralColumn>,
+    bound_columns: Vec<BoundColumn>,
+}
+
+struct LateralBindingContext<'a> {
+    inner_table: &'a Table,
+    lateral_columns: Vec<LateralColumn>,
+    bound_columns: Vec<BoundColumn>,
+    inner_column: String,
+    outer_column: String,
+}
+
+struct SelectGrouping {
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    grouped: bool,
+    aggregate_count: usize,
+}
+
+#[derive(Default)]
+struct SelectHavingOutputs {
+    having: Option<Expr>,
+    hidden_group_keys: Vec<BoundSelectItem>,
+    hidden_aggregates: Vec<BoundSelectItem>,
+}
+
+struct SelectSortContext<'a> {
+    table: &'a Table,
+    projection: &'a [BoundSelectItem],
+    group_by: &'a [Expr],
+    grouped: bool,
+    aggregate_count: usize,
     role_id: RoleId,
 }
 
@@ -59,25 +111,50 @@ struct OperatorSignatureMetadata<'a> {
     selectivity_function_id: Option<rnmdb_common::ids::FunctionId>,
 }
 
+#[derive(Clone, Copy)]
+enum OuterQueryScope<'a> {
+    Table(&'a Table),
+    Columns(&'a [LateralColumn]),
+}
+
+#[derive(Clone, Copy)]
+enum ExpressionTypeScope<'a> {
+    Table(&'a Table),
+    Policy(&'a Table),
+    Grouped(&'a [BoundSelectItem]),
+}
+
+impl ExpressionTypeScope<'_> {
+    fn is_policy(self) -> bool {
+        matches!(self, Self::Policy(_))
+    }
+
+    fn unknown_type(self, policy_type: SqlType) -> Option<SqlType> {
+        self.is_policy().then_some(policy_type)
+    }
+}
+
 impl<'a> Binder<'a> {
     pub fn new(catalog: &'a Catalog) -> Self {
         Self { catalog }
     }
 
     pub fn bind_for_role(&self, statement: &Statement, role_id: RoleId) -> Result<BoundStatement> {
+        self.bind_for_role_with_outer(statement, role_id, None)
+    }
+
+    fn bind_for_role_with_outer(
+        &self,
+        statement: &Statement,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
         match statement {
             Statement::CreateTable {
                 name,
                 columns,
                 if_not_exists,
-            } => {
-                self.validate_create_columns(columns)?;
-                Ok(BoundStatement::CreateTable {
-                    name: name.clone(),
-                    columns: columns.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_table(name, columns, *if_not_exists),
             Statement::CreateIndex {
                 name,
                 table,
@@ -86,31 +163,19 @@ impl<'a> Binder<'a> {
                 unique,
                 if_not_exists,
             } => self.bind_create_index(name, table, keys, *method, *unique, *if_not_exists),
+            Statement::CreateTrigger {
+                name,
+                table,
+                timing,
+                event,
+                body,
+                if_not_exists,
+            } => self.bind_create_trigger(name, table, *timing, *event, body, *if_not_exists),
             Statement::AlterTableAddColumn {
                 table,
                 column,
                 if_not_exists,
-            } => {
-                let resolved = self.resolve_table(table)?;
-                if resolved
-                    .columns()
-                    .iter()
-                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("column already exists: {}", column.name),
-                    ));
-                }
-                self.validate_column_definition(column)?;
-                Ok(BoundStatement::AlterTableAddColumn {
-                    relation_id: resolved.relation_id(),
-                    table: table.clone(),
-                    column: column.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_alter_table_add_column(table, column, *if_not_exists),
             Statement::AlterColumnEncryption {
                 table,
                 column,
@@ -118,6 +183,11 @@ impl<'a> Binder<'a> {
             } => self.bind_alter_column_encryption(table, column, *encrypted),
             Statement::DropTable { name, if_exists } => self.bind_drop_table(name, *if_exists),
             Statement::DropIndex { name, if_exists } => self.bind_drop_index(name, *if_exists),
+            Statement::DropTrigger {
+                name,
+                table,
+                if_exists,
+            } => self.bind_drop_trigger(name, table, *if_exists),
             Statement::DropFunction {
                 name,
                 argument_types,
@@ -144,50 +214,21 @@ impl<'a> Binder<'a> {
                 name,
                 argument_types,
                 return_type,
+                implementation,
                 if_not_exists,
-            } => {
-                if self.catalog.functions().iter().any(|function| {
-                    function.name() == name.as_str()
-                        && function.argument_types() == argument_types.as_slice()
-                }) && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("function already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateFunction {
-                    name: name.clone(),
-                    argument_types: argument_types.clone(),
-                    return_type: return_type.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_function(
+                name,
+                argument_types,
+                return_type,
+                implementation,
+                *if_not_exists,
+            ),
             Statement::CreateProcedure {
                 name,
                 argument_types,
                 body,
                 if_not_exists,
-            } => {
-                validate_sql_procedure_body(body)?;
-                if self
-                    .catalog
-                    .get_procedure(name.as_str(), argument_types)
-                    .is_some()
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("procedure already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateProcedure {
-                    name: name.clone(),
-                    argument_types: argument_types.clone(),
-                    body: body.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_procedure(name, argument_types, body, *if_not_exists),
             Statement::CreateOperator {
                 symbol,
                 left_type,
@@ -212,95 +253,24 @@ impl<'a> Binder<'a> {
             Statement::CreateRole {
                 name,
                 if_not_exists,
-            } => {
-                if self.catalog.get_role(name.as_str()).is_some() && !if_not_exists {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("role already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateRole {
-                    name: name.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_role(name, *if_not_exists),
             Statement::CreatePolicy {
                 name,
                 table,
                 predicate,
                 if_not_exists,
-            } => {
-                let table = self.resolve_table(table)?;
-                if self
-                    .catalog
-                    .row_policies(table.relation_id())
-                    .iter()
-                    .any(|policy| policy.name() == name.as_str())
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("row policy already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreatePolicy {
-                    name: name.clone(),
-                    relation_id: table.relation_id(),
-                    predicate: predicate.to_string(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_policy(name, table, predicate, *if_not_exists),
             Statement::GrantTablePrivilege {
                 privilege,
                 table,
                 role,
-            } => {
-                let table = self.resolve_table(table)?;
-                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("role does not exist: {}", role.as_str()),
-                    )
-                })?;
-                Ok(BoundStatement::GrantTablePrivilege {
-                    role_id: role.role_id(),
-                    relation_id: table.relation_id(),
-                    privilege: *privilege,
-                })
-            }
+            } => self.bind_grant_table_privilege(*privilege, table, role),
             Statement::GrantProcedurePrivilege {
                 privilege,
                 name,
                 argument_types,
                 role,
-            } => {
-                if *privilege != Privilege::Execute {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "procedure grants only support EXECUTE privilege",
-                    ));
-                }
-                let procedure = self
-                    .catalog
-                    .get_procedure(name.as_str(), argument_types)
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!("procedure does not exist: {}", name.as_str()),
-                        )
-                    })?;
-                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("role does not exist: {}", role.as_str()),
-                    )
-                })?;
-                Ok(BoundStatement::GrantProcedurePrivilege {
-                    role_id: role.role_id(),
-                    procedure_id: procedure.procedure_id(),
-                    privilege: *privilege,
-                })
-            }
+            } => self.bind_grant_procedure_privilege(*privilege, name, argument_types, role),
             Statement::CallProcedure { name, args } => {
                 self.bind_call_procedure(name, args, role_id)
             }
@@ -325,20 +295,53 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
+            Statement::SelectJoin {
+                distinct,
+                projection,
                 from,
-                lateral_join: None,
+                join,
                 selection,
                 group_by,
-                grouping_sets: &[],
                 having,
                 order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+                limit,
+                offset,
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: Some(join),
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::SelectLateral {
                 distinct,
                 projection,
@@ -350,20 +353,24 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                lateral_join: Some(lateral_join),
-                selection,
-                group_by,
-                grouping_sets: &[],
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: Some(lateral_join),
+                    selection,
+                    group_by,
+                    grouping_sets: &[],
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
             Statement::SelectGroupingSets {
                 distinct,
                 projection,
@@ -375,25 +382,33 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_select(SelectInput {
-                distinct: *distinct,
-                select_items: projection,
-                from,
-                lateral_join: None,
-                selection,
-                group_by,
-                grouping_sets,
-                having,
-                order_by,
-                limit: *limit,
-                offset: *offset,
-                role_id,
-            }),
-            Statement::Union { all, left, right } => self.bind_union(*all, left, right, role_id),
-            Statement::Intersect { all, left, right } => {
-                self.bind_intersect(*all, left, right, role_id)
+            } => self.bind_select(
+                SelectInput {
+                    distinct: *distinct,
+                    select_items: projection,
+                    from,
+                    join: None,
+                    lateral_join: None,
+                    selection,
+                    group_by,
+                    grouping_sets,
+                    having,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                    role_id,
+                },
+                outer_scope,
+            ),
+            Statement::Union { all, left, right } => {
+                self.bind_union(*all, left, right, role_id, outer_scope)
             }
-            Statement::Except { all, left, right } => self.bind_except(*all, left, right, role_id),
+            Statement::Intersect { all, left, right } => {
+                self.bind_intersect(*all, left, right, role_id, outer_scope)
+            }
+            Statement::Except { all, left, right } => {
+                self.bind_except(*all, left, right, role_id, outer_scope)
+            }
             Statement::RecursiveCte {
                 name,
                 columns,
@@ -406,7 +421,7 @@ impl<'a> Binder<'a> {
                 order_by,
                 limit,
                 offset,
-            } => self.bind_query(input, order_by, *limit, *offset, role_id),
+            } => self.bind_query(input, order_by, *limit, *offset, role_id, outer_scope),
             Statement::Transaction { action } => {
                 Ok(BoundStatement::Transaction { action: *action })
             }
@@ -414,12 +429,201 @@ impl<'a> Binder<'a> {
                 analyze,
                 format,
                 statement,
-            } => Ok(BoundStatement::Explain {
-                analyze: *analyze,
-                format: *format,
-                statement: Box::new(self.bind_for_role(statement, role_id)?),
-            }),
+            } => self.bind_explain(*analyze, *format, statement, role_id),
         }
+    }
+
+    fn bind_create_table(
+        &self,
+        name: &ObjectName,
+        columns: &[ColumnDef],
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        self.validate_create_columns(columns)?;
+        Ok(BoundStatement::CreateTable {
+            name: name.clone(),
+            columns: columns.to_vec(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_alter_table_add_column(
+        &self,
+        table: &ObjectName,
+        column: &ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        if resolved
+            .columns()
+            .iter()
+            .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("column already exists: {}", column.name),
+            ));
+        }
+        self.validate_column_definition(column)?;
+        Ok(BoundStatement::AlterTableAddColumn {
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            column: column.clone(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_drop_trigger(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        Ok(BoundStatement::DropTrigger {
+            name: name.clone(),
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            if_exists,
+        })
+    }
+
+    fn bind_create_procedure(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        validate_sql_procedure_body(body)?;
+        if self
+            .catalog
+            .get_procedure(name.as_str(), argument_types)
+            .is_some()
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("procedure already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreateProcedure {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            body: body.to_string(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_create_role(&self, name: &Ident, if_not_exists: bool) -> Result<BoundStatement> {
+        if self.catalog.get_role(name.as_str()).is_some() && !if_not_exists {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("role already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreateRole {
+            name: name.clone(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_create_policy(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        predicate: &Expr,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table)?;
+        if self
+            .catalog
+            .row_policies(table.relation_id())
+            .iter()
+            .any(|policy| policy.name() == name.as_str())
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("row policy already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreatePolicy {
+            name: name.clone(),
+            relation_id: table.relation_id(),
+            predicate: predicate.to_string(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_grant_table_privilege(
+        &self,
+        privilege: Privilege,
+        table: &ObjectName,
+        role: &Ident,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table)?;
+        let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("role does not exist: {}", role.as_str()),
+            )
+        })?;
+        Ok(BoundStatement::GrantTablePrivilege {
+            role_id: role.role_id(),
+            relation_id: table.relation_id(),
+            privilege,
+        })
+    }
+
+    fn bind_grant_procedure_privilege(
+        &self,
+        privilege: Privilege,
+        name: &Ident,
+        argument_types: &[SqlType],
+        role: &Ident,
+    ) -> Result<BoundStatement> {
+        if privilege != Privilege::Execute {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "procedure grants only support EXECUTE privilege",
+            ));
+        }
+        let procedure = self
+            .catalog
+            .get_procedure(name.as_str(), argument_types)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("procedure does not exist: {}", name.as_str()),
+                )
+            })?;
+        let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("role does not exist: {}", role.as_str()),
+            )
+        })?;
+        Ok(BoundStatement::GrantProcedurePrivilege {
+            role_id: role.role_id(),
+            procedure_id: procedure.procedure_id(),
+            privilege,
+        })
+    }
+
+    fn bind_explain(
+        &self,
+        analyze: bool,
+        format: crate::ast::ExplainFormat,
+        statement: &Statement,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        Ok(BoundStatement::Explain {
+            analyze,
+            format,
+            statement: Box::new(self.bind_for_role(statement, role_id)?),
+        })
     }
 
     fn bind_drop_table(&self, name: &ObjectName, if_exists: bool) -> Result<BoundStatement> {
@@ -433,6 +637,35 @@ impl<'a> Binder<'a> {
             relation_id,
             name: name.clone(),
             if_exists,
+        })
+    }
+
+    fn bind_create_function(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        return_type: &SqlType,
+        implementation: &CreateFunctionImplementation,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        if self
+            .catalog
+            .get_function(name.as_str(), argument_types)
+            .is_some()
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("function already exists: {}", name.as_str()),
+            ));
+        }
+        validate_create_function_implementation(argument_types, return_type, implementation)?;
+        Ok(BoundStatement::CreateFunction {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            return_type: return_type.clone(),
+            implementation: implementation.clone(),
+            if_not_exists,
         })
     }
 
@@ -597,67 +830,13 @@ impl<'a> Binder<'a> {
         unique: bool,
         if_not_exists: bool,
     ) -> Result<BoundStatement> {
-        let table_schema = table.schema().unwrap_or("public");
-        let index_schema = name.schema().unwrap_or(table_schema);
-        if self
-            .catalog
-            .get_index(index_schema, name.object())
-            .is_some()
-            && !if_not_exists
-        {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("index already exists: {index_schema}.{}", name.object()),
-            ));
-        }
+        let index_name = qualified_index_name(name, table);
+        self.ensure_index_available(&index_name, if_not_exists)?;
         let resolved = self.resolve_table(table)?;
         let available_columns = bound_columns_for_table(resolved)?;
-        let mut bound_keys = Vec::with_capacity(keys.len());
-        for key in keys {
-            match key {
-                IndexKeyDef::Column(column) => {
-                    bound_keys.push(BoundIndexKey::Column(
-                        self.resolve_column(resolved, column.as_str())?,
-                    ));
-                }
-                IndexKeyDef::Expression(expr) => {
-                    if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "expression indexes support only btree and hash methods",
-                        ));
-                    }
-                    if keys.len() != 1 {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "expression indexes support exactly one expression",
-                        ));
-                    }
-                    let data_type = self
-                        .infer_expr_type_from_columns(&available_columns, expr)?
-                        .ok_or_else(|| {
-                            RnovError::new(
-                                ErrorKind::InvalidInput,
-                                format!("cannot infer expression index type: {expr}"),
-                            )
-                        })?;
-                    if !matches!(data_type, SqlType::Int64 | SqlType::Text) {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "expression index requires INT64 or TEXT expression, got {data_type:?}"
-                            ),
-                        ));
-                    }
-                    bound_keys.push(BoundIndexKey::Expression {
-                        expr: expr.clone(),
-                        data_type,
-                    });
-                }
-            }
-        }
+        let bound_keys = self.bind_index_keys(resolved, &available_columns, keys, method)?;
         Ok(BoundStatement::CreateIndex {
-            name: ObjectName::qualified(index_schema, name.object()),
+            name: index_name,
             relation_id: resolved.relation_id(),
             table: table.clone(),
             keys: bound_keys,
@@ -667,6 +846,91 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn ensure_index_available(&self, name: &ObjectName, if_not_exists: bool) -> Result<()> {
+        let schema = name.schema().expect("qualified index name");
+        if self.catalog.get_index(schema, name.object()).is_some() && !if_not_exists {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("index already exists: {schema}.{}", name.object()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn bind_index_keys(
+        &self,
+        table: &Table,
+        available_columns: &[BoundColumn],
+        keys: &[IndexKeyDef],
+        method: IndexMethod,
+    ) -> Result<Vec<BoundIndexKey>> {
+        keys.iter()
+            .map(|key| self.bind_index_key(table, available_columns, keys.len(), method, key))
+            .collect()
+    }
+
+    fn bind_index_key(
+        &self,
+        table: &Table,
+        available_columns: &[BoundColumn],
+        key_count: usize,
+        method: IndexMethod,
+        key: &IndexKeyDef,
+    ) -> Result<BoundIndexKey> {
+        match key {
+            IndexKeyDef::Column(column) => Ok(BoundIndexKey::Column(
+                self.resolve_column(table, column.as_str())?,
+            )),
+            IndexKeyDef::Expression(expr) => {
+                self.bind_expression_index_key(available_columns, key_count, method, expr)
+            }
+        }
+    }
+
+    fn bind_expression_index_key(
+        &self,
+        available_columns: &[BoundColumn],
+        key_count: usize,
+        method: IndexMethod,
+        expr: &Expr,
+    ) -> Result<BoundIndexKey> {
+        self.validate_expression_index_shape(method, key_count)?;
+        let data_type = self
+            .infer_expr_type_from_columns(available_columns, expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer expression index type: {expr}"),
+                )
+            })?;
+        if !matches!(data_type, SqlType::Int64 | SqlType::Text) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("expression index requires INT64 or TEXT expression, got {data_type:?}"),
+            ));
+        }
+        Ok(BoundIndexKey::Expression {
+            expr: expr.clone(),
+            data_type,
+        })
+    }
+
+    fn validate_expression_index_shape(&self, method: IndexMethod, key_count: usize) -> Result<()> {
+        if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "expression indexes support only btree and hash methods",
+            ));
+        }
+        if key_count != 1 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "expression indexes support exactly one expression",
+            ));
+        }
+        Ok(())
+    }
+
     fn bind_query(
         &self,
         input: &Statement,
@@ -674,8 +938,9 @@ impl<'a> Binder<'a> {
         limit: Option<usize>,
         offset: Option<usize>,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let input = self.bind_for_role(input, role_id)?;
+        let input = self.bind_for_role_with_outer(input, role_id, outer_scope)?;
         let columns = query_output_columns(&input)?.to_vec();
         let order_by = self.bind_query_output_order_by(&columns, order_by)?;
         Ok(BoundStatement::Query(BoundQuery {
@@ -700,44 +965,10 @@ impl<'a> Binder<'a> {
             selectivity,
         } = input;
         let argument_types = [left_type.clone(), right_type.clone()];
-        let function = self
-            .catalog
-            .functions()
-            .iter()
-            .find(|function| {
-                function.name() == function_name
-                    && function.argument_types() == argument_types
-                    && function.return_type() == result_type
-            })
-            .ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::NotFound,
-                    format!("function does not exist for operator {symbol}: {function_name}"),
-                )
-            })?;
-        let selectivity_function_id = if let Some(selectivity) = selectivity {
-            Some(
-                self.catalog
-                    .functions()
-                    .iter()
-                    .find(|function| {
-                        function.name() == selectivity
-                            && function.argument_types() == argument_types
-                            && function.return_type() == &SqlType::Int64
-                    })
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!(
-                                "selectivity function does not exist for operator {symbol}: {selectivity}"
-                            ),
-                        )
-                    })?
-                    .function_id(),
-            )
-        } else {
-            None
-        };
+        let function_id =
+            self.resolve_operator_function_id(symbol, function_name, &argument_types, result_type)?;
+        let selectivity_function_id =
+            self.resolve_operator_selectivity_function_id(symbol, selectivity, &argument_types)?;
 
         Ok(BoundStatement::CreateOperator {
             signature: operator_signature_with_metadata(
@@ -745,7 +976,7 @@ impl<'a> Binder<'a> {
                 left_type.clone(),
                 right_type.clone(),
                 result_type.clone(),
-                function.function_id(),
+                function_id,
                 OperatorSignatureMetadata {
                     precedence,
                     commutator,
@@ -754,6 +985,56 @@ impl<'a> Binder<'a> {
                 },
             ),
         })
+    }
+
+    fn resolve_operator_function_id(
+        &self,
+        symbol: &str,
+        name: &str,
+        argument_types: &[SqlType; 2],
+        result_type: &SqlType,
+    ) -> Result<rnmdb_common::ids::FunctionId> {
+        self.catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name
+                    && function.argument_types() == *argument_types
+                    && function.return_type() == result_type
+            })
+            .map(|function| function.function_id())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("function does not exist for operator {symbol}: {name}"),
+                )
+            })
+    }
+
+    fn resolve_operator_selectivity_function_id(
+        &self,
+        symbol: &str,
+        selectivity: Option<&str>,
+        argument_types: &[SqlType; 2],
+    ) -> Result<Option<rnmdb_common::ids::FunctionId>> {
+        let Some(name) = selectivity else {
+            return Ok(None);
+        };
+        self.catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name
+                    && function.argument_types() == *argument_types
+                    && function.return_type() == &SqlType::Int64
+            })
+            .map(|function| Some(function.function_id()))
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("selectivity function does not exist for operator {symbol}: {name}"),
+                )
+            })
     }
 
     fn bind_call_procedure(
@@ -834,6 +1115,28 @@ impl<'a> Binder<'a> {
         Ok(())
     }
 
+    fn bind_create_trigger(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        timing: rnmdb_catalog::TriggerTiming,
+        event: rnmdb_catalog::TriggerEvent,
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        validate_trigger_sql_body(body)?;
+        Ok(BoundStatement::CreateTrigger {
+            name: name.clone(),
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            timing,
+            event,
+            body: body.to_string(),
+            if_not_exists,
+        })
+    }
+
     fn bind_insert(
         &self,
         table_name: &ObjectName,
@@ -844,6 +1147,7 @@ impl<'a> Binder<'a> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Insert)?;
         let mut bound_columns = Vec::with_capacity(columns.len());
+        let mut bound_values = Vec::with_capacity(values.len());
         for (ident, value) in columns.iter().zip(values) {
             let column = self.resolve_column(table, ident.as_str())?;
             if column.generated.is_some() {
@@ -855,13 +1159,17 @@ impl<'a> Binder<'a> {
                     ),
                 ));
             }
-            self.ensure_expr_assignable(table, &column, value)?;
+            let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+            let value = self.bind_function_calls(value, &mut infer)?;
+            self.ensure_expr_assignable(table, &column, &value)?;
             bound_columns.push(column);
+            bound_values.push(value);
         }
         Ok(BoundStatement::Insert {
+            relation_id: table.relation_id(),
             table: table_name.clone(),
             columns: bound_columns,
-            values: values.to_vec(),
+            values: bound_values,
         })
     }
 
@@ -874,34 +1182,49 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Update)?;
-
-        let mut bound_assignments = Vec::with_capacity(assignments.len());
-        for assignment in assignments {
-            let column = self.resolve_column(table, assignment.column.as_str())?;
-            if column.generated.is_some() {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!("cannot update generated column {}", column.name),
-                ));
-            }
-            self.ensure_expr_assignable(table, &column, &assignment.value)?;
-            bound_assignments.push(BoundAssignment {
-                column,
-                value: assignment.value.clone(),
-            });
-        }
-        if let Some(selection) = selection {
-            self.validate_predicate(table, selection)?;
-        }
-
+        let bound_assignments = assignments
+            .iter()
+            .map(|assignment| self.bind_update_assignment(table, assignment))
+            .collect::<Result<Vec<_>>>()?;
+        let selection = self.bind_table_selection(table, selection)?;
         Ok(BoundStatement::Update(BoundUpdate {
             relation_id: table.relation_id(),
             table: table_name.clone(),
             assignments: bound_assignments,
-            selection: selection.clone(),
+            selection,
             applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
             row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
+    }
+
+    fn bind_update_assignment(
+        &self,
+        table: &Table,
+        assignment: &Assignment,
+    ) -> Result<BoundAssignment> {
+        let column = self.resolve_column(table, assignment.column.as_str())?;
+        if column.generated.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot update generated column {}", column.name),
+            ));
+        }
+        let value = self.rewrite_table_qualified_expr(table, &assignment.value)?;
+        self.ensure_expr_assignable(table, &column, &value)?;
+        Ok(BoundAssignment { column, value })
+    }
+
+    fn bind_table_selection(
+        &self,
+        table: &Table,
+        selection: &Option<Expr>,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.rewrite_table_qualified_expr(table, selection)?;
+        self.validate_predicate(table, &selection)?;
+        Ok(Some(selection))
     }
 
     fn bind_except(
@@ -910,9 +1233,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("EXCEPT", &left, &right)?;
         Ok(BoundStatement::Except(BoundExcept {
             all,
@@ -930,14 +1254,12 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Delete)?;
-        if let Some(selection) = selection {
-            self.validate_predicate(table, selection)?;
-        }
+        let selection = self.bind_table_selection(table, selection)?;
 
         Ok(BoundStatement::Delete(BoundDelete {
             relation_id: table.relation_id(),
             table: table_name.clone(),
-            selection: selection.clone(),
+            selection,
             applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
             row_policy_predicates: self.bind_row_policies(role_id, table)?,
         }))
@@ -949,9 +1271,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("UNION", &left, &right)?;
         Ok(BoundStatement::Union(BoundUnion {
             all,
@@ -970,35 +1293,8 @@ impl<'a> Binder<'a> {
         query: &Statement,
         role_id: RoleId,
     ) -> Result<BoundStatement> {
-        if name.schema().is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE name must be unqualified",
-            ));
-        }
-        let seed = self.bind_for_role(seed, role_id)?;
-        let seed_columns = query_output_columns(&seed)?;
-        if seed_columns.len() != column_names.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "recursive CTE column count mismatch: declared {}, seed returns {}",
-                    column_names.len(),
-                    seed_columns.len()
-                ),
-            ));
-        }
-        let cte_columns = seed_columns
-            .iter()
-            .zip(column_names.iter())
-            .map(|(column, name)| BoundColumn {
-                name: name.as_str().to_string(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                encrypted: false,
-                generated: None,
-            })
-            .collect::<Vec<_>>();
+        validate_recursive_cte_name(name)?;
+        let (seed, cte_columns) = self.bind_recursive_cte_seed(seed, column_names, role_id)?;
         let recursive = self.bind_recursive_cte_step(name, &cte_columns, recursive)?;
         let recursive_columns = query_output_columns(&recursive)?;
         validate_recursive_cte_columns(&cte_columns, recursive_columns)?;
@@ -1011,6 +1307,18 @@ impl<'a> Binder<'a> {
             recursive: Box::new(recursive),
             query,
         }))
+    }
+
+    fn bind_recursive_cte_seed(
+        &self,
+        statement: &Statement,
+        column_names: &[Ident],
+        role_id: RoleId,
+    ) -> Result<(BoundStatement, Vec<BoundColumn>)> {
+        let seed = self.bind_for_role(statement, role_id)?;
+        let seed_columns = query_output_columns(&seed)?;
+        let cte_columns = recursive_cte_columns(seed_columns, column_names)?;
+        Ok((seed, cte_columns))
     }
 
     fn bind_recursive_cte_step(
@@ -1039,9 +1347,10 @@ impl<'a> Binder<'a> {
         left: &Statement,
         right: &Statement,
         role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
     ) -> Result<BoundStatement> {
-        let left = self.bind_for_role(left, role_id)?;
-        let right = self.bind_for_role(right, role_id)?;
+        let left = self.bind_for_role_with_outer(left, role_id, outer_scope)?;
+        let right = self.bind_for_role_with_outer(right, role_id, outer_scope)?;
         let columns = validate_set_operation_columns("INTERSECT", &left, &right)?;
         Ok(BoundStatement::Intersect(BoundIntersect {
             all,
@@ -1051,345 +1360,440 @@ impl<'a> Binder<'a> {
         }))
     }
 
-    fn bind_select(&self, input: SelectInput<'_>) -> Result<BoundStatement> {
+    fn bind_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
         let table = self.resolve_table(input.from)?;
         self.require_table_privilege(input.role_id, table.relation_id(), Privilege::Select)?;
         if let Some(lateral_join) = input.lateral_join {
             return self.bind_lateral_select(&input, table, lateral_join);
         }
+        if let Some(join) = input.join {
+            return self.bind_join_select(&input, table, join);
+        }
 
+        self.bind_table_select(input, outer_scope, table)
+    }
+
+    fn bind_table_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        table: &Table,
+    ) -> Result<BoundStatement> {
+        let (projection, columns) =
+            self.bind_select_projection(table, input.select_items, input.role_id)?;
+        self.finish_table_select(input, outer_scope, table, projection, columns)
+    }
+
+    fn bind_select_projection(
+        &self,
+        table: &Table,
+        select_items: &[SelectItem],
+        role_id: RoleId,
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
         let mut columns = Vec::new();
         let mut projection = Vec::new();
-        for item in input.select_items {
-            match item {
-                SelectItem::Wildcard => {
-                    for column in table.columns() {
-                        let bound_column = BoundColumn {
-                            name: column.name().to_string(),
-                            data_type: column.data_type().clone(),
-                            nullable: column.nullable(),
-                            encrypted: column.is_encrypted(),
-                            generated: column
-                                .generated_expr()
-                                .map(|expr| {
-                                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
-                                        expr,
-                                        stored: column.generated_stored(),
-                                    })
-                                })
-                                .transpose()?,
-                        };
-                        projection.push(BoundSelectItem {
-                            column: bound_column.clone(),
-                            expr: Expr::Identifier(Ident::new(column.name())),
-                        });
-                        columns.push(bound_column);
-                    }
-                }
-                SelectItem::Expr {
-                    expr: Expr::Identifier(identifier),
-                    alias,
-                } => {
-                    let column = self.resolve_column(table, identifier.as_str())?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(identifier.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::QualifiedIdentifier { qualifier, name },
-                    alias,
-                } => {
-                    self.ensure_table_qualifier(table, qualifier)?;
-                    let column = self.resolve_column(table, name.as_str())?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(name.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::CountStar,
-                    alias,
-                } => {
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::CountStar,
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Count(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer COUNT expression type: {expr}"),
-                        )
-                    })?;
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Count(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::CountDistinct(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer COUNT DISTINCT expression type: {expr}"),
-                        )
-                    })?;
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::CountDistinct(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Sum(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer SUM expression type: {expr}"),
-                        )
-                    })?;
-                    if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("SUM expression must be INT64, got {expr_type:?}"),
-                        ));
-                    }
-                    let column = aggregate_bound_column(&columns, "sum", SqlType::Int64, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Sum(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Min(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer MIN expression type: {expr}"),
-                        )
-                    })?;
-                    self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
-                    let column = aggregate_bound_column(&columns, "min", expr_type, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Min(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Max(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer MAX expression type: {expr}"),
-                        )
-                    })?;
-                    self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
-                    let column = aggregate_bound_column(&columns, "max", expr_type, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Max(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::RowNumberOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "row_number",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::RowNumberOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr {
-                    expr: Expr::RankOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "rank",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::RankOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr {
-                    expr: Expr::DenseRankOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "dense_rank",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::DenseRankOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr { expr, alias } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer select expression type: {expr}"),
-                        )
-                    })?;
-                    let column = BoundColumn {
-                        name: format!("expr{}", columns.len() + 1),
-                        data_type,
-                        nullable: true,
-                        encrypted: false,
-                        generated: None,
-                    };
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
+        for item in select_items {
+            self.bind_select_projection_item(
+                table,
+                item,
+                role_id,
+                ProjectionOutputs {
+                    projection: &mut projection,
+                    columns: &mut columns,
+                },
+            )?;
+        }
+        Ok((projection, columns))
+    }
+
+    fn bind_select_projection_item(
+        &self,
+        table: &Table,
+        item: &SelectItem,
+        role_id: RoleId,
+        outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let ProjectionOutputs {
+            projection,
+            columns,
+        } = outputs;
+        match item {
+            SelectItem::Wildcard => self.bind_table_wildcard_projection(
+                table,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Identifier(identifier),
+                alias,
+            } => self.bind_table_identifier_projection(
+                table,
+                identifier,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::QualifiedIdentifier { qualifier, name },
+                alias,
+            } => self.bind_table_qualified_projection(
+                table,
+                qualifier,
+                name,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::CountStar,
+                alias,
+            } => bind_count_star_projection(
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Count(expr),
+                alias,
+            } => self.bind_count_projection(
+                table,
+                expr,
+                alias,
+                false,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::CountDistinct(expr),
+                alias,
+            } => self.bind_count_projection(
+                table,
+                expr,
+                alias,
+                true,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Sum(expr),
+                alias,
+            } => self.bind_sum_projection(
+                table,
+                expr,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Min(expr),
+                alias,
+            } => self.bind_ordered_aggregate_projection(
+                table,
+                expr,
+                alias,
+                "MIN",
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Max(expr),
+                alias,
+            } => self.bind_ordered_aggregate_projection(
+                table,
+                expr,
+                alias,
+                "MAX",
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::RowNumberOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "row_number",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::RowNumberOver { order_by },
+            ),
+            SelectItem::Expr {
+                expr: Expr::RankOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "rank",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::RankOver { order_by },
+            ),
+            SelectItem::Expr {
+                expr: Expr::DenseRankOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "dense_rank",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::DenseRankOver { order_by },
+            ),
+            SelectItem::Expr { expr, alias } => self.bind_general_select_projection(
+                table,
+                expr,
+                alias,
+                role_id,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+        }
+    }
+
+    fn bind_table_wildcard_projection(
+        &self,
+        table: &Table,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        for column in table.columns() {
+            let generated = column
+                .generated_expr()
+                .map(|expr| {
+                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
                         expr,
-                    });
-                    columns.push(column);
-                }
-            }
-        }
-        let aggregate_count = projection
-            .iter()
-            .filter(|item| is_aggregate_expr(&item.expr))
-            .count();
-        let bound_group_by = self.bind_group_by_exprs(&projection, input.group_by)?;
-        let bound_grouping_sets = self.bind_grouping_sets(&projection, input.grouping_sets)?;
-        if !bound_group_by.is_empty() {
-            self.validate_group_by_exprs(table, &bound_group_by)?;
-        }
-        for grouping_set in &bound_grouping_sets {
-            self.validate_group_by_exprs(table, grouping_set)?;
-        }
-        if !bound_grouping_sets.is_empty() {
-            mark_grouping_set_projection_columns_nullable(
-                &mut projection,
-                &mut columns,
-                &bound_group_by,
+                        stored: column.generated_stored(),
+                    })
+                })
+                .transpose()?;
+            let bound_column = BoundColumn {
+                name: column.name().to_string(),
+                data_type: column.data_type().clone(),
+                nullable: column.nullable(),
+                encrypted: column.is_encrypted(),
+                generated,
+            };
+            push_select_projection(
+                &mut outputs,
+                bound_column,
+                Expr::Identifier(Ident::new(column.name())),
             );
         }
-        let grouped = !bound_group_by.is_empty() || !bound_grouping_sets.is_empty();
-        if aggregate_count > 0 && aggregate_count != projection.len() {
-            self.validate_grouped_projection(&projection, &bound_group_by)?;
-        }
-        if aggregate_count == 0 && grouped {
-            self.validate_grouped_projection(&projection, &bound_group_by)?;
-        }
-        let mut hidden_group_keys = Vec::new();
-        let mut hidden_aggregates = Vec::new();
-        let having = if let Some(having) = input.having {
-            if !grouped && aggregate_count == 0 {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "HAVING requires GROUP BY or aggregate projection in this SQL slice",
-                ));
-            }
-            let having = self.rewrite_grouped_having_expr(
-                table,
-                &projection,
-                &bound_group_by,
-                &mut hidden_group_keys,
-                &mut hidden_aggregates,
-                having,
-            )?;
-            let mut grouped_outputs = projection.clone();
-            grouped_outputs.extend(hidden_group_keys.iter().cloned());
-            grouped_outputs.extend(hidden_aggregates.iter().cloned());
-            self.validate_grouped_having_expr(&grouped_outputs, &having)?;
-            Some(having)
+        Ok(())
+    }
+
+    fn bind_table_identifier_projection(
+        &self,
+        table: &Table,
+        identifier: &Ident,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let column = self.resolve_column(table, identifier.as_str())?;
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Identifier(identifier.clone()));
+        Ok(())
+    }
+
+    fn bind_table_qualified_projection(
+        &self,
+        table: &Table,
+        qualifier: &Ident,
+        name: &Ident,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        self.ensure_table_qualifier(table, qualifier)?;
+        let column = self.resolve_column(table, name.as_str())?;
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Identifier(name.clone()));
+        Ok(())
+    }
+
+    fn bind_count_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        distinct: bool,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let aggregate_name = if distinct { "COUNT DISTINCT" } else { "COUNT" };
+        let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        let column = aggregate_bound_column(outputs.columns, "count", SqlType::Int64, false);
+        let column = aliased_bound_column(column, alias);
+        let expr = if distinct {
+            Expr::CountDistinct(Box::new(expr))
         } else {
-            None
+            Expr::Count(Box::new(expr))
         };
-        if let Some(selection) = input.selection {
-            let selection = self.rewrite_table_qualified_expr(table, selection)?;
-            self.validate_predicate(table, &selection)?;
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn bind_sum_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer SUM expression type: {expr}"),
+            )
+        })?;
+        if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("SUM expression must be INT64, got {expr_type:?}"),
+            ));
         }
-        let selection = input
-            .selection
-            .as_ref()
-            .map(|selection| self.rewrite_table_qualified_expr(table, selection))
-            .transpose()?;
-        let mut bound_order_by = Vec::with_capacity(input.order_by.len());
-        for order_by in input.order_by {
-            let order_by = OrderByExpr {
-                expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
-                direction: order_by.direction,
-            };
-            if !grouped {
-                if aggregate_count > 0 {
-                    bound_order_by.push(self.bind_grouped_sort_expr(
-                        table,
-                        &projection,
-                        &mut hidden_aggregates,
-                        &bound_group_by,
-                        &order_by,
-                    )?);
-                } else {
-                    bound_order_by.push(self.bind_plain_sort_expr(
-                        table,
-                        &projection,
-                        &order_by,
-                    )?);
-                }
-            } else {
-                bound_order_by.push(self.bind_grouped_sort_expr(
-                    table,
-                    &projection,
-                    &mut hidden_aggregates,
-                    &bound_group_by,
-                    &order_by,
-                )?);
-            }
-        }
+        let column = aggregate_bound_column(outputs.columns, "sum", SqlType::Int64, true);
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Sum(Box::new(expr)));
+        Ok(())
+    }
+
+    fn bind_ordered_aggregate_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        aggregate_name: &'static str,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        self.ensure_ordered_aggregate_type(aggregate_name, &expr_type)?;
+        let (column_name, expr) = match aggregate_name {
+            "MIN" => ("min", Expr::Min(Box::new(expr))),
+            "MAX" => ("max", Expr::Max(Box::new(expr))),
+            _ => unreachable!("ordered aggregate binding supports MIN and MAX"),
+        };
+        let column = aggregate_bound_column(outputs.columns, column_name, expr_type, true);
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn bind_general_select_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        role_id: RoleId,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        let expr = self.bind_predicate_subqueries(
+            &expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Table(table)),
+        )?;
+        let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer select expression type: {expr}"),
+            )
+        })?;
+        let column = BoundColumn {
+            name: format!("expr{}", outputs.columns.len() + 1),
+            data_type,
+            nullable: true,
+            encrypted: false,
+            generated: None,
+        };
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn finish_table_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        table: &Table,
+        mut projection: Vec<BoundSelectItem>,
+        mut columns: Vec<BoundColumn>,
+    ) -> Result<BoundStatement> {
+        let grouping = self.bind_select_grouping(
+            table,
+            input.group_by,
+            input.grouping_sets,
+            ProjectionOutputs {
+                projection: &mut projection,
+                columns: &mut columns,
+            },
+        )?;
+        let mut having_outputs = self.bind_select_having(
+            table,
+            &projection,
+            &grouping,
+            input.having.as_ref(),
+            input.role_id,
+        )?;
+        let selection =
+            self.bind_select_selection(table, input.selection, input.role_id, outer_scope)?;
+        let bound_order_by = self.bind_select_order_by(
+            input.order_by,
+            SelectSortContext {
+                table,
+                projection: &projection,
+                group_by: &grouping.group_by,
+                grouped: grouping.grouped,
+                aggregate_count: grouping.aggregate_count,
+                role_id: input.role_id,
+            },
+            &mut having_outputs.hidden_aggregates,
+        )?;
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
@@ -1397,13 +1801,13 @@ impl<'a> Binder<'a> {
             lateral_join: None,
             distinct: input.distinct,
             projection,
-            hidden_group_keys,
-            hidden_aggregates,
+            hidden_group_keys: having_outputs.hidden_group_keys,
+            hidden_aggregates: having_outputs.hidden_aggregates,
             columns,
             selection,
-            group_by: bound_group_by,
-            grouping_sets: bound_grouping_sets,
-            having,
+            group_by: grouping.group_by,
+            grouping_sets: grouping.grouping_sets,
+            having: having_outputs.having,
             order_by: bound_order_by,
             limit: input.limit,
             offset: input.offset,
@@ -1412,67 +1816,175 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn bind_select_grouping(
+        &self,
+        table: &Table,
+        group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+        outputs: ProjectionOutputs<'_>,
+    ) -> Result<SelectGrouping> {
+        let aggregate_count = outputs
+            .projection
+            .iter()
+            .filter(|item| is_aggregate_expr(&item.expr))
+            .count();
+        let (group_by, grouping_sets) =
+            self.bind_grouping_expressions(table, outputs.projection, group_by, grouping_sets)?;
+        if !grouping_sets.is_empty() {
+            mark_grouping_set_projection_columns_nullable(
+                outputs.projection,
+                outputs.columns,
+                &group_by,
+            );
+        }
+        let grouped = !group_by.is_empty() || !grouping_sets.is_empty();
+        self.validate_select_grouping_projection(
+            outputs.projection,
+            &group_by,
+            grouped,
+            aggregate_count,
+        )?;
+        Ok(SelectGrouping {
+            group_by,
+            grouping_sets,
+            grouped,
+            aggregate_count,
+        })
+    }
+
+    fn bind_grouping_expressions(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+    ) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.bind_group_by_exprs(table, projection, group_by)?;
+        let grouping_sets = self.bind_grouping_sets(table, projection, grouping_sets)?;
+        if !group_by.is_empty() {
+            self.validate_group_by_exprs(table, &group_by)?;
+        }
+        for grouping_set in &grouping_sets {
+            self.validate_group_by_exprs(table, grouping_set)?;
+        }
+        Ok((group_by, grouping_sets))
+    }
+
+    fn validate_select_grouping_projection(
+        &self,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+        grouped: bool,
+        aggregate_count: usize,
+    ) -> Result<()> {
+        if aggregate_count > 0 && aggregate_count != projection.len() {
+            self.validate_grouped_projection(projection, group_by)?;
+        }
+        if aggregate_count == 0 && grouped {
+            self.validate_grouped_projection(projection, group_by)?;
+        }
+        Ok(())
+    }
+
+    fn bind_select_having(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        grouping: &SelectGrouping,
+        having: Option<&Expr>,
+        role_id: RoleId,
+    ) -> Result<SelectHavingOutputs> {
+        let Some(having) = having else {
+            return Ok(SelectHavingOutputs::default());
+        };
+        if !grouping.grouped && grouping.aggregate_count == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING requires GROUP BY or aggregate projection in this SQL slice",
+            ));
+        }
+        let mut outputs = SelectHavingOutputs::default();
+        let having = self.rewrite_grouped_having_expr(
+            table,
+            projection,
+            &grouping.group_by,
+            &mut outputs.hidden_group_keys,
+            &mut outputs.hidden_aggregates,
+            having,
+        )?;
+        let mut grouped_outputs = projection.to_vec();
+        grouped_outputs.extend(outputs.hidden_group_keys.iter().cloned());
+        grouped_outputs.extend(outputs.hidden_aggregates.iter().cloned());
+        let mut infer =
+            |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
+        let having = self.bind_predicate_subqueries(&having, role_id, &mut infer, None)?;
+        self.validate_grouped_having_expr(&grouped_outputs, &having)?;
+        outputs.having = Some(having);
+        Ok(outputs)
+    }
+
+    fn bind_select_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        context: SelectSortContext<'_>,
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
+    ) -> Result<Vec<OrderByExpr>> {
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
+        for order_by in order_by {
+            bound_order_by.push(self.bind_select_order_item(
+                order_by,
+                &context,
+                hidden_aggregates,
+            )?);
+        }
+        Ok(bound_order_by)
+    }
+
+    fn bind_select_order_item(
+        &self,
+        order_by: &OrderByExpr,
+        context: &SelectSortContext<'_>,
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
+    ) -> Result<OrderByExpr> {
+        let order_by = OrderByExpr {
+            expr: self.rewrite_table_qualified_expr(context.table, &order_by.expr)?,
+            direction: order_by.direction,
+        };
+        if context.grouped || context.aggregate_count > 0 {
+            return self.bind_grouped_sort_expr(
+                context.table,
+                context.projection,
+                hidden_aggregates,
+                context.group_by,
+                &order_by,
+                context.role_id,
+            );
+        }
+        self.bind_plain_sort_expr(
+            context.table,
+            context.projection,
+            &order_by,
+            context.role_id,
+        )
+    }
+
     fn bind_select_from_columns(
         &self,
         statement: &Statement,
         source: &ObjectName,
         available_columns: &[BoundColumn],
     ) -> Result<BoundSelect> {
-        let Statement::Select {
-            distinct,
-            projection,
-            from,
-            selection,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-        } = statement
-        else {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE clauses currently support SELECT queries only",
-            ));
-        };
-        if !object_names_equal(from, source) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("recursive CTE SELECT must read from {source}, got {from}"),
-            ));
-        }
-        if !group_by.is_empty() || having.is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE SELECT does not support GROUP BY or HAVING yet",
-            ));
-        }
-
-        let (projection, columns) = self.bind_cte_projection(projection, available_columns)?;
-        let selection = selection
-            .as_ref()
-            .map(|selection| self.rewrite_cte_expr(available_columns, selection))
-            .transpose()?;
-        if let Some(selection) = &selection {
-            self.validate_predicate_from_columns(available_columns, selection)?;
-        }
-        let order_by = order_by
-            .iter()
-            .map(|order_by| {
-                let expr = self.rewrite_cte_expr(available_columns, &order_by.expr)?;
-                self.validate_sort_expr_from_columns(available_columns, &expr)?;
-                Ok(OrderByExpr {
-                    expr,
-                    direction: order_by.direction,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let input = recursive_cte_select_input(statement, source)?;
+        let (projection, columns) =
+            self.bind_cte_projection(input.projection, available_columns)?;
+        let selection = self.bind_cte_selection(input.selection, available_columns)?;
+        let order_by = self.bind_cte_order_by(input.order_by, available_columns)?;
 
         Ok(BoundSelect {
             relation_id: recursive_cte_relation_id(source),
-            table: from.clone(),
+            table: input.from.clone(),
             lateral_join: None,
-            distinct: *distinct,
+            distinct: input.distinct,
             projection,
             hidden_group_keys: Vec::new(),
             hidden_aggregates: Vec::new(),
@@ -1482,11 +1994,42 @@ impl<'a> Binder<'a> {
             grouping_sets: Vec::new(),
             having: None,
             order_by,
-            limit: *limit,
-            offset: *offset,
+            limit: input.limit,
+            offset: input.offset,
             applied_row_policies: Vec::new(),
             row_policy_predicates: Vec::new(),
         })
+    }
+
+    fn bind_cte_selection(
+        &self,
+        selection: &Option<Expr>,
+        available_columns: &[BoundColumn],
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.rewrite_cte_expr(available_columns, selection)?;
+        self.validate_predicate_from_columns(available_columns, &selection)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_cte_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        available_columns: &[BoundColumn],
+    ) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| {
+                let expr = self.rewrite_cte_expr(available_columns, &order_by.expr)?;
+                self.validate_sort_expr_from_columns(available_columns, &expr)?;
+                Ok(OrderByExpr {
+                    expr,
+                    direction: order_by.direction,
+                })
+            })
+            .collect()
     }
 
     fn bind_cte_projection(
@@ -1497,74 +2040,112 @@ impl<'a> Binder<'a> {
         let mut projection = Vec::new();
         let mut columns = Vec::new();
         for item in select_items {
-            match item {
-                SelectItem::Wildcard => {
-                    for column in available_columns {
-                        projection.push(BoundSelectItem {
-                            column: column.clone(),
-                            expr: Expr::Identifier(Ident::new(column.name.as_str())),
-                        });
-                        columns.push(column.clone());
-                    }
-                }
-                SelectItem::Expr {
-                    expr: Expr::Identifier(identifier),
-                    alias,
-                } => {
-                    let column = self.resolve_column_from_bound(available_columns, identifier)?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(identifier.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: qualified @ Expr::QualifiedIdentifier { .. },
-                    alias,
-                } => {
-                    let expr = self.rewrite_cte_expr(available_columns, qualified)?;
-                    let Expr::Identifier(name) = expr else {
-                        return Err(RnovError::new(
-                            ErrorKind::Internal,
-                            "qualified recursive CTE column did not rewrite to identifier",
-                        ));
-                    };
-                    let column = self.resolve_column_from_bound(available_columns, &name)?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(name),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr { expr, alias } => {
-                    let expr = self.rewrite_cte_expr(available_columns, expr)?;
-                    let data_type = self
-                        .infer_expr_type_from_columns(available_columns, &expr)?
-                        .ok_or_else(|| {
-                            RnovError::new(
-                                ErrorKind::InvalidInput,
-                                format!("cannot infer recursive CTE expression type: {expr}"),
-                            )
-                        })?;
-                    let column = BoundColumn {
-                        name: format!("expr{}", columns.len() + 1),
-                        data_type,
-                        nullable: true,
-                        encrypted: false,
-                        generated: None,
-                    };
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr,
-                    });
-                    columns.push(column);
-                }
-            }
+            self.bind_cte_projection_item(item, available_columns, &mut projection, &mut columns)?;
         }
         Ok((projection, columns))
+    }
+
+    fn bind_cte_projection_item(
+        &self,
+        item: &SelectItem,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => {
+                bind_cte_wildcard(available_columns, projection, columns);
+                Ok(())
+            }
+            SelectItem::Expr {
+                expr: Expr::Identifier(identifier),
+                alias,
+            } => {
+                self.bind_cte_identifier(identifier, alias, available_columns, projection, columns)
+            }
+            SelectItem::Expr {
+                expr: qualified @ Expr::QualifiedIdentifier { .. },
+                alias,
+            } => self.bind_cte_qualified_identifier(
+                qualified,
+                alias,
+                available_columns,
+                projection,
+                columns,
+            ),
+            SelectItem::Expr { expr, alias } => {
+                self.bind_cte_expression(expr, alias, available_columns, projection, columns)
+            }
+        }
+    }
+
+    fn bind_cte_identifier(
+        &self,
+        identifier: &Ident,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let column = self.resolve_column_from_bound(available_columns, identifier)?;
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(
+            projection,
+            columns,
+            column,
+            Expr::Identifier(identifier.clone()),
+        );
+        Ok(())
+    }
+
+    fn bind_cte_qualified_identifier(
+        &self,
+        qualified: &Expr,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let expr = self.rewrite_cte_expr(available_columns, qualified)?;
+        let Expr::Identifier(name) = expr else {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "qualified recursive CTE column did not rewrite to identifier",
+            ));
+        };
+        let column = self.resolve_column_from_bound(available_columns, &name)?;
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(projection, columns, column, Expr::Identifier(name));
+        Ok(())
+    }
+
+    fn bind_cte_expression(
+        &self,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let expr = self.rewrite_cte_expr(available_columns, expr)?;
+        let data_type = self
+            .infer_expr_type_from_columns(available_columns, &expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer recursive CTE expression type: {expr}"),
+                )
+            })?;
+        let column = BoundColumn {
+            name: format!("expr{}", columns.len() + 1),
+            data_type,
+            nullable: true,
+            encrypted: false,
+            generated: None,
+        };
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(projection, columns, column, expr);
+        Ok(())
     }
 
     fn bind_lateral_select(
@@ -1573,119 +2154,34 @@ impl<'a> Binder<'a> {
         outer_table: &Table,
         lateral_join: &LateralJoin,
     ) -> Result<BoundStatement> {
-        if !input.group_by.is_empty() || input.having.is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "JOIN LATERAL does not support GROUP BY or HAVING in this SQL slice",
-            ));
-        }
-
-        let inner_table = self.resolve_table(&lateral_join.table)?;
-        self.require_table_privilege(input.role_id, inner_table.relation_id(), Privilege::Select)?;
-        if !self
-            .bind_row_policies(input.role_id, inner_table)?
-            .is_empty()
-        {
-            return Err(RnovError::new(
-                ErrorKind::Security,
-                "JOIN LATERAL does not support row policies on the inner table",
-            ));
-        }
-        let lateral_columns = lateral_join_columns(outer_table, inner_table)?;
-        let lateral_bound_columns = lateral_columns_to_bound(&lateral_columns);
-        let (inner_column, outer_column) = self.bind_lateral_equality(
-            outer_table,
-            input.from,
-            inner_table,
-            &lateral_join.table,
-            &lateral_join.on,
+        let context = self.bind_lateral_context(input, outer_table, lateral_join)?;
+        let (projection, columns) = self.bind_lateral_projection(
+            input.select_items,
+            &context.lateral_columns,
+            &context.bound_columns,
         )?;
-
-        let mut projection = Vec::new();
-        let mut columns = Vec::new();
-        for item in input.select_items {
-            match item {
-                SelectItem::Wildcard => {
-                    for lateral_column in &lateral_columns {
-                        projection.push(BoundSelectItem {
-                            column: lateral_column.column.clone(),
-                            expr: Expr::Identifier(Ident::new(lateral_column.output_name.as_str())),
-                        });
-                        columns.push(lateral_column.column.clone());
-                    }
-                }
-                SelectItem::Expr { expr, alias } => {
-                    let expr = self.rewrite_lateral_expr(&lateral_columns, expr)?;
-                    let data_type = self
-                        .infer_expr_type_from_columns(&lateral_bound_columns, &expr)?
-                        .ok_or_else(|| {
-                            RnovError::new(
-                                ErrorKind::InvalidInput,
-                                format!("cannot infer select expression type: {expr}"),
-                            )
-                        })?;
-                    let column = match &expr {
-                        Expr::Identifier(identifier) => lateral_columns
-                            .iter()
-                            .find(|column| {
-                                column.output_name.eq_ignore_ascii_case(identifier.as_str())
-                            })
-                            .map(|column| column.column.clone())
-                            .unwrap_or_else(|| BoundColumn {
-                                name: format!("expr{}", columns.len() + 1),
-                                data_type: data_type.clone(),
-                                nullable: true,
-                                encrypted: false,
-                                generated: None,
-                            }),
-                        _ => BoundColumn {
-                            name: format!("expr{}", columns.len() + 1),
-                            data_type,
-                            nullable: true,
-                            encrypted: false,
-                            generated: None,
-                        },
-                    };
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr,
-                    });
-                    columns.push(column);
-                }
-            }
-        }
-
-        let selection = input
-            .selection
-            .as_ref()
-            .map(|selection| self.rewrite_lateral_expr(&lateral_columns, selection))
-            .transpose()?;
-        if let Some(selection) = &selection {
-            self.validate_predicate_from_columns(&lateral_bound_columns, selection)?;
-        }
-
-        let mut bound_order_by = Vec::with_capacity(input.order_by.len());
-        for order_by in input.order_by {
-            let order_by = OrderByExpr {
-                expr: self.rewrite_lateral_expr(&lateral_columns, &order_by.expr)?,
-                direction: order_by.direction,
-            };
-            bound_order_by.push(self.bind_plain_output_sort_expr(
-                &lateral_bound_columns,
-                &projection,
-                &order_by,
-            )?);
-        }
+        let selection = self.bind_lateral_selection(
+            input.selection,
+            &context.lateral_columns,
+            &context.bound_columns,
+            input.role_id,
+        )?;
+        let bound_order_by = self.bind_lateral_order_by(
+            input.order_by,
+            &context.lateral_columns,
+            &context.bound_columns,
+            &projection,
+            input.role_id,
+        )?;
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: outer_table.relation_id(),
             table: input.from.clone(),
             lateral_join: Some(BoundLateralJoin {
-                inner_relation_id: inner_table.relation_id(),
+                inner_relation_id: context.inner_table.relation_id(),
                 inner_table: lateral_join.table.clone(),
-                inner_column,
-                outer_column,
+                inner_column: context.inner_column,
+                outer_column: context.outer_column,
             }),
             distinct: input.distinct,
             projection,
@@ -1705,6 +2201,426 @@ impl<'a> Binder<'a> {
         }))
     }
 
+    fn bind_lateral_context<'b>(
+        &'b self,
+        input: &SelectInput<'_>,
+        outer_table: &Table,
+        lateral_join: &LateralJoin,
+    ) -> Result<LateralBindingContext<'b>> {
+        self.validate_lateral_select_shape(input)?;
+        let inner_table = self.resolve_lateral_inner_table(input.role_id, lateral_join)?;
+        let lateral_columns = lateral_join_columns(outer_table, inner_table)?;
+        let bound_columns = lateral_columns_to_bound(&lateral_columns);
+        let (inner_column, outer_column) = self.bind_lateral_equality(
+            outer_table,
+            input.from,
+            inner_table,
+            &lateral_join.table,
+            &lateral_join.on,
+        )?;
+        Ok(LateralBindingContext {
+            inner_table,
+            lateral_columns,
+            bound_columns,
+            inner_column,
+            outer_column,
+        })
+    }
+
+    fn validate_lateral_select_shape(&self, input: &SelectInput<'_>) -> Result<()> {
+        if !input.group_by.is_empty() || input.having.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "JOIN LATERAL does not support GROUP BY or HAVING in this SQL slice",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve_lateral_inner_table<'b>(
+        &'b self,
+        role_id: RoleId,
+        lateral_join: &LateralJoin,
+    ) -> Result<&'b Table> {
+        let inner_table = self.resolve_table(&lateral_join.table)?;
+        self.require_table_privilege(role_id, inner_table.relation_id(), Privilege::Select)?;
+        if !self.bind_row_policies(role_id, inner_table)?.is_empty() {
+            return Err(RnovError::new(
+                ErrorKind::Security,
+                "JOIN LATERAL does not support row policies on the inner table",
+            ));
+        }
+        Ok(inner_table)
+    }
+
+    fn bind_lateral_projection(
+        &self,
+        select_items: &[SelectItem],
+        lateral_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
+        let mut projection = Vec::new();
+        let mut columns = Vec::new();
+        for item in select_items {
+            self.bind_lateral_projection_item(
+                item,
+                lateral_columns,
+                bound_columns,
+                &mut projection,
+                &mut columns,
+            )?;
+        }
+        Ok((projection, columns))
+    }
+
+    fn bind_lateral_projection_item(
+        &self,
+        item: &SelectItem,
+        lateral_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => {
+                push_lateral_wildcard(lateral_columns, projection, columns);
+                Ok(())
+            }
+            SelectItem::Expr { expr, alias } => self.bind_lateral_projection_expr(
+                expr,
+                alias,
+                lateral_columns,
+                bound_columns,
+                projection,
+                columns,
+            ),
+        }
+    }
+
+    fn bind_lateral_projection_expr(
+        &self,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        lateral_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let expr = self.rewrite_lateral_expr(lateral_columns, expr)?;
+        let data_type = self
+            .infer_expr_type_from_columns(bound_columns, &expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer select expression type: {expr}"),
+                )
+            })?;
+        let column = lateral_projection_column(lateral_columns, columns.len(), &expr, data_type);
+        let column = aliased_bound_column(column, alias);
+        projection.push(BoundSelectItem {
+            column: column.clone(),
+            expr,
+        });
+        columns.push(column);
+        Ok(())
+    }
+
+    fn bind_lateral_selection(
+        &self,
+        selection: &Option<Expr>,
+        lateral_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<Option<Expr>> {
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_lateral_expr(lateral_columns, selection))
+            .transpose()?;
+        self.bind_columns_selection(selection.as_ref(), bound_columns, role_id)
+    }
+
+    fn bind_lateral_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        lateral_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &[BoundSelectItem],
+        role_id: RoleId,
+    ) -> Result<Vec<OrderByExpr>> {
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
+        for order_by in order_by {
+            let order_by = OrderByExpr {
+                expr: self.rewrite_lateral_expr(lateral_columns, &order_by.expr)?,
+                direction: order_by.direction,
+            };
+            bound_order_by.push(self.bind_plain_output_sort_expr(
+                bound_columns,
+                projection,
+                &order_by,
+                role_id,
+            )?);
+        }
+        Ok(bound_order_by)
+    }
+
+    fn bind_join_select(
+        &self,
+        input: &SelectInput<'_>,
+        left_table: &Table,
+        join: &JoinClause,
+    ) -> Result<BoundStatement> {
+        let context = self.bind_join_context(input, left_table, join)?;
+        let (predicate, hash_keys) = self.bind_join_on_predicate(
+            join,
+            &context.joined_columns,
+            &context.bound_columns,
+            input.role_id,
+        )?;
+        let (projection, columns) = self.bind_join_projection(
+            input.select_items,
+            &context.joined_columns,
+            &context.bound_columns,
+            input.role_id,
+        )?;
+        let selection = self.bind_join_selection(
+            input.selection,
+            &context.joined_columns,
+            &context.bound_columns,
+            input.role_id,
+        )?;
+        let order_by = self.bind_join_order_by(
+            input.order_by,
+            &context.joined_columns,
+            &context.bound_columns,
+            &projection,
+            input.role_id,
+        )?;
+
+        let select = BoundSelect {
+            relation_id: left_table.relation_id(),
+            table: input.from.clone(),
+            lateral_join: None,
+            distinct: input.distinct,
+            projection,
+            hidden_group_keys: Vec::new(),
+            hidden_aggregates: Vec::new(),
+            columns,
+            selection,
+            group_by: Vec::new(),
+            grouping_sets: Vec::new(),
+            having: None,
+            order_by,
+            limit: input.limit,
+            offset: input.offset,
+            applied_row_policies: self
+                .applied_row_policy_names(input.role_id, left_table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(input.role_id, left_table)?,
+        };
+        Ok(BoundStatement::SelectJoin(BoundJoinSelect {
+            select,
+            join: BoundJoin {
+                kind: join.kind,
+                right_relation_id: context.right_table.relation_id(),
+                right_table: join.table.clone(),
+                predicate,
+                hash_keys,
+                applied_row_policies: self
+                    .applied_row_policy_names(input.role_id, context.right_table.relation_id()),
+                row_policy_predicates: self
+                    .bind_row_policies(input.role_id, context.right_table)?,
+            },
+        }))
+    }
+
+    fn bind_join_context<'b>(
+        &'b self,
+        input: &SelectInput<'_>,
+        left_table: &Table,
+        join: &JoinClause,
+    ) -> Result<JoinBindingContext<'b>> {
+        self.validate_join_select_shape(input)?;
+        let right_table = self.resolve_table(&join.table)?;
+        self.require_table_privilege(input.role_id, right_table.relation_id(), Privilege::Select)?;
+        let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
+        let bound_columns = lateral_columns_to_bound(&joined_columns);
+        Ok(JoinBindingContext {
+            right_table,
+            joined_columns,
+            bound_columns,
+        })
+    }
+
+    fn bind_join_on_predicate(
+        &self,
+        join: &JoinClause,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<(Expr, Option<BoundHashJoinKeys>)> {
+        let hash_keys = hash_join_keys(joined_columns, &join.on);
+        let predicate = self.rewrite_lateral_expr(joined_columns, &join.on)?;
+        let predicate = self.bind_join_predicate_subqueries(
+            joined_columns,
+            bound_columns,
+            &predicate,
+            role_id,
+        )?;
+        self.validate_predicate_from_columns(bound_columns, &predicate)?;
+        Ok((predicate, hash_keys))
+    }
+
+    fn validate_join_select_shape(&self, input: &SelectInput<'_>) -> Result<()> {
+        if input.group_by.is_empty() && input.grouping_sets.is_empty() && input.having.is_none() {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "JOIN does not support GROUP BY, GROUPING SETS, or HAVING in this SQL slice",
+        ))
+    }
+
+    fn bind_join_projection(
+        &self,
+        select_items: &[SelectItem],
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
+        let mut projection = Vec::new();
+        let mut columns = Vec::new();
+        for item in select_items {
+            self.push_join_projection_item(
+                item,
+                joined_columns,
+                bound_columns,
+                role_id,
+                &mut projection,
+                &mut columns,
+            )?;
+        }
+        Ok((projection, columns))
+    }
+
+    fn push_join_projection_item(
+        &self,
+        item: &SelectItem,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => self.push_join_wildcard(joined_columns, projection, columns),
+            SelectItem::Expr { expr, alias } => {
+                let expr = self.rewrite_lateral_expr(joined_columns, expr)?;
+                let mut infer =
+                    |candidate: &Expr| self.infer_expr_type_from_columns(bound_columns, candidate);
+                let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
+                let column = self.join_projection_column(
+                    joined_columns,
+                    bound_columns,
+                    columns,
+                    &expr,
+                    alias,
+                )?;
+                projection.push(BoundSelectItem {
+                    column: column.clone(),
+                    expr,
+                });
+                columns.push(column);
+                Ok(())
+            }
+        }
+    }
+
+    fn push_join_wildcard(
+        &self,
+        joined_columns: &[LateralColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        for joined_column in joined_columns {
+            projection.push(BoundSelectItem {
+                column: joined_column.column.clone(),
+                expr: Expr::Identifier(Ident::new(joined_column.output_name.as_str())),
+            });
+            columns.push(joined_column.column.clone());
+        }
+        Ok(())
+    }
+
+    fn join_projection_column(
+        &self,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        columns: &[BoundColumn],
+        expr: &Expr,
+        alias: &Option<Ident>,
+    ) -> Result<BoundColumn> {
+        let data_type = self
+            .infer_expr_type_from_columns(bound_columns, expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer select expression type: {expr}"),
+                )
+            })?;
+        let column = join_expr_column(joined_columns, columns, expr, data_type);
+        Ok(aliased_bound_column(column, alias))
+    }
+
+    fn bind_join_selection(
+        &self,
+        selection: &Option<Expr>,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<Option<Expr>> {
+        let selection = selection
+            .as_ref()
+            .map(|selection| self.rewrite_lateral_expr(joined_columns, selection))
+            .transpose()?;
+        self.bind_columns_selection(selection.as_ref(), bound_columns, role_id)
+    }
+
+    fn bind_join_predicate_subqueries(
+        &self,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        expr: &Expr,
+        role_id: RoleId,
+    ) -> Result<Expr> {
+        let mut infer =
+            |candidate: &Expr| self.infer_expr_type_from_columns(bound_columns, candidate);
+        self.bind_predicate_subqueries(
+            expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Columns(joined_columns)),
+        )
+    }
+
+    fn bind_join_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        projection: &[BoundSelectItem],
+        role_id: RoleId,
+    ) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| {
+                let order_by = OrderByExpr {
+                    expr: self.rewrite_lateral_expr(joined_columns, &order_by.expr)?,
+                    direction: order_by.direction,
+                };
+                self.bind_plain_output_sort_expr(bound_columns, projection, &order_by, role_id)
+            })
+            .collect()
+    }
+
     fn validate_predicate(&self, table: &Table, expr: &Expr) -> Result<()> {
         match self.infer_expr_type(table, expr)? {
             Some(SqlType::Bool | SqlType::Null) => Ok(()),
@@ -1716,6 +2632,16 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn validate_predicate_with_outer(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<()> {
+        let expr = self.replace_outer_refs_for_type_validation(expr, outer_scope)?;
+        self.validate_predicate(table, &expr)
+    }
+
     fn validate_predicate_from_columns(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
         match self.infer_expr_type_from_columns(columns, expr)? {
             Some(SqlType::Bool | SqlType::Null) => Ok(()),
@@ -1725,6 +2651,231 @@ impl<'a> Binder<'a> {
             )),
             None => Ok(()),
         }
+    }
+
+    fn bind_select_selection(
+        &self,
+        table: &Table,
+        selection: &Option<Expr>,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection =
+            self.rewrite_table_qualified_expr_with_outer(table, selection, outer_scope)?;
+        let selection = self.bind_table_subqueries(table, &selection, role_id)?;
+        self.validate_predicate_with_outer(table, &selection, outer_scope)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_columns_selection(
+        &self,
+        selection: Option<&Expr>,
+        columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.bind_column_subqueries(columns, selection, role_id)?;
+        self.validate_predicate_from_columns(columns, &selection)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_table_subqueries(&self, table: &Table, expr: &Expr, role_id: RoleId) -> Result<Expr> {
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        self.bind_predicate_subqueries(
+            expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Table(table)),
+        )
+    }
+
+    fn bind_column_subqueries(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+        role_id: RoleId,
+    ) -> Result<Expr> {
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        self.bind_predicate_subqueries(expr, role_id, &mut infer, None)
+    }
+
+    fn bind_predicate_subqueries<F>(
+        &self,
+        expr: &Expr,
+        role_id: RoleId,
+        infer: &mut F,
+        subquery_outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        crate::rewrite_expr_tree(expr, &mut |candidate| match candidate {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => self
+                .bind_in_subquery_expr(expr, query, *negated, role_id, infer, subquery_outer_scope)
+                .map(Some),
+            Expr::ExistsSubquery { query } => self
+                .bind_exists_subquery_expr(query, role_id, subquery_outer_scope)
+                .map(Some),
+            Expr::ScalarSubquery { query } => self
+                .bind_scalar_subquery_expr(query, role_id, subquery_outer_scope)
+                .map(Some),
+            _ => Ok(None),
+        })
+    }
+
+    fn bind_in_subquery_expr<F>(
+        &self,
+        expr: &Expr,
+        query: &SelectSubquery,
+        negated: bool,
+        role_id: RoleId,
+        infer: &mut F,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let expr = self.bind_predicate_subqueries(expr, role_id, infer, None)?;
+        let bound = self.bind_in_subquery(query, role_id, outer_scope)?;
+        self.validate_in_subquery_types(&expr, &bound, infer)?;
+        Ok(Expr::InSubquery {
+            expr: Box::new(expr),
+            query: SelectSubquery::Bound(Box::new(bound)),
+            negated,
+        })
+    }
+
+    fn validate_in_subquery_types<F>(
+        &self,
+        expr: &Expr,
+        bound: &BoundStatement,
+        infer: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let expr_type = infer(expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer IN subquery expression type: {expr}"),
+            )
+        })?;
+        let subquery_type = single_query_output_type(bound)?;
+        self.infer_in_list_result_type(&expr_type, std::slice::from_ref(&subquery_type))?;
+        Ok(())
+    }
+
+    fn bind_in_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
+                let _ = single_query_output_type(&bound)?;
+                Ok(bound)
+            }
+            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+        }
+    }
+
+    fn bind_exists_subquery_expr(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let bound = self.bind_exists_subquery(query, role_id, outer_scope)?;
+        Ok(Expr::ExistsSubquery {
+            query: SelectSubquery::Bound(Box::new(bound)),
+        })
+    }
+
+    fn bind_exists_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<BoundStatement> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
+                let _ = query_output_columns(&bound)?;
+                Ok(bound)
+            }
+            SelectSubquery::Bound(statement) => Ok((**statement).clone()),
+        }
+    }
+
+    fn bind_scalar_subquery_expr(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let (bound, data_type) = self.bind_scalar_subquery(query, role_id, outer_scope)?;
+        Ok(Expr::Cast {
+            expr: Box::new(Expr::ScalarSubquery {
+                query: SelectSubquery::Bound(Box::new(bound)),
+            }),
+            data_type,
+        })
+    }
+
+    fn bind_scalar_subquery(
+        &self,
+        query: &SelectSubquery,
+        role_id: RoleId,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<(BoundStatement, SqlType)> {
+        match query {
+            SelectSubquery::Parsed(statement) => {
+                let bound = self.bind_for_role_with_outer(statement, role_id, outer_scope)?;
+                let data_type = single_query_output_type_for(&bound, "scalar subquery")?;
+                Ok((bound, data_type))
+            }
+            SelectSubquery::Bound(statement) => {
+                let statement = (**statement).clone();
+                let data_type = single_query_output_type_for(&statement, "scalar subquery")?;
+                Ok((statement, data_type))
+            }
+        }
+    }
+
+    fn infer_bound_predicate_subquery_type(
+        &self,
+        query: &SelectSubquery,
+        context: &str,
+    ) -> Result<Option<SqlType>> {
+        if query.bound().is_some() {
+            Ok(Some(SqlType::Bool))
+        } else {
+            Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("{context} is only supported after binding"),
+            ))
+        }
+    }
+
+    fn infer_bound_scalar_subquery_type(&self, query: &SelectSubquery) -> Result<Option<SqlType>> {
+        let Some(bound) = query.bound() else {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "scalar subquery is only supported after binding",
+            ));
+        };
+        single_query_output_type_for(bound, "scalar subquery").map(Some)
     }
 
     fn bind_ranking_window_projection(
@@ -1784,6 +2935,9 @@ impl<'a> Binder<'a> {
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
+                | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -1802,6 +2956,9 @@ impl<'a> Binder<'a> {
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
+                | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             ) => Ok(()),
@@ -1818,6 +2975,7 @@ impl<'a> Binder<'a> {
         columns: &[BoundColumn],
         projection: &[BoundSelectItem],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => self
@@ -1831,12 +2989,17 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
         match self.infer_expr_type_from_columns(columns, &expr)? {
             Some(
                 SqlType::Null
                 | SqlType::Bool
                 | SqlType::Int64
                 | SqlType::UInt64
+                | SqlType::Float64
+                | SqlType::Uuid
+                | SqlType::Timestamp
                 | SqlType::Text
                 | SqlType::Bytes,
             )
@@ -1856,6 +3019,7 @@ impl<'a> Binder<'a> {
         table: &Table,
         projection: &[BoundSelectItem],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => self
@@ -1869,6 +3033,13 @@ impl<'a> Binder<'a> {
                 .unwrap_or_else(|| order_by.expr.clone()),
             _ => order_by.expr.clone(),
         };
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        let expr = self.bind_predicate_subqueries(
+            &expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Table(table)),
+        )?;
         self.validate_sort_expr(table, &expr)?;
         Ok(OrderByExpr {
             expr,
@@ -1951,6 +3122,7 @@ impl<'a> Binder<'a> {
         hidden_aggregates: &mut Vec<BoundSelectItem>,
         group_by: &[Expr],
         order_by: &OrderByExpr,
+        role_id: RoleId,
     ) -> Result<OrderByExpr> {
         let expr = match &order_by.expr {
             Expr::Integer(value) => Expr::Identifier(Ident::new(
@@ -1980,6 +3152,9 @@ impl<'a> Binder<'a> {
         };
         let mut grouped_outputs = projection.to_vec();
         grouped_outputs.extend(hidden_aggregates.iter().cloned());
+        let mut infer =
+            |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
+        let expr = self.bind_predicate_subqueries(&expr, role_id, &mut infer, None)?;
         self.validate_grouped_sort_expr(table, &grouped_outputs, group_by, &expr)?;
         Ok(OrderByExpr {
             expr,
@@ -2013,34 +3188,46 @@ impl<'a> Binder<'a> {
 
     fn bind_group_by_exprs(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
         group_by: &[Expr],
     ) -> Result<Vec<Expr>> {
         group_by
             .iter()
-            .map(|expr| match expr {
-                Expr::Integer(value) => Ok(self
-                    .projection_ordinal_item(projection, *value, "GROUP BY")?
-                    .expr
-                    .clone()),
-                Expr::Identifier(identifier) => Ok(projection
-                    .iter()
-                    .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
-                    .map(|item| item.expr.clone())
-                    .unwrap_or_else(|| expr.clone())),
-                _ => Ok(expr.clone()),
-            })
+            .map(|expr| self.bind_group_by_expr(table, projection, expr))
             .collect()
+    }
+
+    fn bind_group_by_expr(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        expr: &Expr,
+    ) -> Result<Expr> {
+        let expr = match expr {
+            Expr::Integer(value) => self
+                .projection_ordinal_item(projection, *value, "GROUP BY")?
+                .expr
+                .clone(),
+            Expr::Identifier(identifier) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| item.expr.clone())
+                .unwrap_or_else(|| expr.clone()),
+            _ => expr.clone(),
+        };
+        self.rewrite_table_qualified_expr(table, &expr)
     }
 
     fn bind_grouping_sets(
         &self,
+        table: &Table,
         projection: &[BoundSelectItem],
         grouping_sets: &[Vec<Expr>],
     ) -> Result<Vec<Vec<Expr>>> {
         grouping_sets
             .iter()
-            .map(|grouping_set| self.bind_group_by_exprs(projection, grouping_set))
+            .map(|grouping_set| self.bind_group_by_exprs(table, projection, grouping_set))
             .collect()
     }
 
@@ -2053,6 +3240,9 @@ impl<'a> Binder<'a> {
                     | SqlType::Bool
                     | SqlType::Int64
                     | SqlType::UInt64
+                    | SqlType::Float64
+                    | SqlType::Uuid
+                    | SqlType::Timestamp
                     | SqlType::Text
                     | SqlType::Bytes,
                 ) => {}
@@ -2073,103 +3263,44 @@ impl<'a> Binder<'a> {
             Expr::Identifier(_)
             | Expr::QualifiedIdentifier { .. }
             | Expr::Integer(_)
+            | Expr::Float64(_)
             | Expr::String(_)
             | Expr::Bool(_)
             | Expr::Null
+            | Expr::RuntimeValue(_)
             | Expr::HStore(_) => Ok(()),
-            Expr::Array(values) => values
-                .iter()
-                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
-            Expr::Range { lower, upper, .. } => {
-                self.validate_group_by_expr_shape(lower)?;
-                self.validate_group_by_expr_shape(upper)
+            Expr::Array(values) | Expr::Coalesce(values) | Expr::Call { args: values, .. } => {
+                self.validate_group_by_expr_list(values)
             }
-            Expr::Binary { left, op, right } => {
-                if !matches!(
-                    op.as_str(),
-                    "=" | "<>"
-                        | "!="
-                        | "<"
-                        | "<="
-                        | ">"
-                        | ">="
-                        | "@@"
-                        | "AND"
-                        | "OR"
-                        | "||"
-                        | "+"
-                        | "-"
-                        | "*"
-                        | "/"
-                        | "%"
-                ) {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("GROUP BY does not support operator {op} yet"),
-                    ));
-                }
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
+            Expr::Range { lower, upper, .. } => self.validate_group_by_pair(lower, upper),
+            Expr::Binary { left, op, right } => self.validate_group_by_binary(left, op, right),
+            Expr::Unary { op, expr } => self.validate_group_by_unary(op, expr),
+            Expr::Not(expr)
+            | Expr::IsNull { expr, .. }
+            | Expr::IsTruth { expr, .. }
+            | Expr::IsUnknown { expr, .. }
+            | Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::IsDistinctFrom { left, right, .. }
+            | Expr::Like {
+                expr: left,
+                pattern: right,
+                ..
             }
-            Expr::Unary { op, expr } => {
-                if !matches!(op.as_str(), "+" | "-") {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("GROUP BY does not support unary operator {op} yet"),
-                    ));
-                }
-                self.validate_group_by_expr_shape(expr)
-            }
-            Expr::Not(expr) => self.validate_group_by_expr_shape(expr),
-            Expr::IsNull { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsTruth { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsUnknown { expr, .. } => self.validate_group_by_expr_shape(expr),
-            Expr::IsDistinctFrom { left, right, .. } => {
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
-            }
+            | Expr::NullIf { left, right } => self.validate_group_by_pair(left, right),
             Expr::Between {
                 expr, low, high, ..
-            } => {
-                self.validate_group_by_expr_shape(expr)?;
-                self.validate_group_by_expr_shape(low)?;
-                self.validate_group_by_expr_shape(high)
-            }
+            } => self.validate_group_by_triple(expr, low, high),
             Expr::InList { expr, values, .. } => {
                 self.validate_group_by_expr_shape(expr)?;
-                values
-                    .iter()
-                    .try_for_each(|value| self.validate_group_by_expr_shape(value))
+                self.validate_group_by_expr_list(values)
             }
-            Expr::Like { expr, pattern, .. } => {
-                self.validate_group_by_expr_shape(expr)?;
-                self.validate_group_by_expr_shape(pattern)
+            Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::ScalarSubquery { .. } => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "GROUP BY does not support subqueries",
+                ))
             }
-            Expr::Coalesce(values) => values
-                .iter()
-                .try_for_each(|value| self.validate_group_by_expr_shape(value)),
-            Expr::NullIf { left, right } => {
-                self.validate_group_by_expr_shape(left)?;
-                self.validate_group_by_expr_shape(right)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                if let Some(operand) = operand {
-                    self.validate_group_by_expr_shape(operand)?;
-                }
-                for arm in whens {
-                    self.validate_group_by_expr_shape(&arm.condition)?;
-                    self.validate_group_by_expr_shape(&arm.result)?;
-                }
-                if let Some(else_expr) = else_expr {
-                    self.validate_group_by_expr_shape(else_expr)?;
-                }
-                Ok(())
-            }
-            Expr::Cast { expr, .. } => self.validate_group_by_expr_shape(expr),
+            Expr::Case { .. } => self.validate_group_by_case(expr),
             Expr::CountStar
             | Expr::Count(_)
             | Expr::CountDistinct(_)
@@ -2185,11 +3316,85 @@ impl<'a> Binder<'a> {
                     "GROUP BY does not support window expressions",
                 ))
             }
-            Expr::Call { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "GROUP BY does not support function calls yet",
-            )),
         }
+    }
+
+    fn validate_group_by_expr_list(&self, values: &[Expr]) -> Result<()> {
+        values
+            .iter()
+            .try_for_each(|value| self.validate_group_by_expr_shape(value))
+    }
+
+    fn validate_group_by_pair(&self, left: &Expr, right: &Expr) -> Result<()> {
+        self.validate_group_by_expr_shape(left)?;
+        self.validate_group_by_expr_shape(right)
+    }
+
+    fn validate_group_by_triple(&self, first: &Expr, second: &Expr, third: &Expr) -> Result<()> {
+        self.validate_group_by_expr_shape(first)?;
+        self.validate_group_by_expr_shape(second)?;
+        self.validate_group_by_expr_shape(third)
+    }
+
+    fn validate_group_by_binary(&self, left: &Expr, op: &str, right: &Expr) -> Result<()> {
+        if !matches!(
+            op,
+            "=" | "<>"
+                | "!="
+                | "<"
+                | "<="
+                | ">"
+                | ">="
+                | "@@"
+                | "AND"
+                | "OR"
+                | "||"
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+        ) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("GROUP BY does not support operator {op} yet"),
+            ));
+        }
+        self.validate_group_by_pair(left, right)
+    }
+
+    fn validate_group_by_unary(&self, op: &str, expr: &Expr) -> Result<()> {
+        if !matches!(op, "+" | "-") {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("GROUP BY does not support unary operator {op} yet"),
+            ));
+        }
+        self.validate_group_by_expr_shape(expr)
+    }
+
+    fn validate_group_by_case(&self, expr: &Expr) -> Result<()> {
+        let Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } = expr
+        else {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "GROUP BY case validator received a non-CASE expression",
+            ));
+        };
+        if let Some(operand) = operand {
+            self.validate_group_by_expr_shape(operand)?;
+        }
+        for arm in whens {
+            self.validate_group_by_pair(&arm.condition, &arm.result)?;
+        }
+        if let Some(else_expr) = else_expr {
+            self.validate_group_by_expr_shape(else_expr)?;
+        }
+        Ok(())
     }
 
     fn validate_grouped_sort_expr(
@@ -2207,21 +3412,21 @@ impl<'a> Binder<'a> {
             return self.ensure_sortable_type(&column.column.data_type);
         }
         if group_by.iter().any(|group| group == expr) {
-            return match self.infer_expr_type(table, expr)? {
-                Some(data_type) => self.ensure_sortable_type(&data_type),
-                None => Ok(()),
-            };
+            let data_type = self.infer_expr_type(table, expr)?;
+            return self.ensure_optional_sortable_type(data_type);
         }
-        Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            match expr {
-                Expr::Identifier(identifier) => format!(
-                    "ORDER BY for grouped queries must reference a projected column or GROUP BY expression: {}",
-                    identifier.as_str()
-                ),
-                _ => "ORDER BY for grouped queries must reference a projected column or GROUP BY expression".to_string(),
-            },
-        ))
+        if grouped_sort_expr_references_outputs(projection, expr) {
+            let data_type = self.infer_grouped_output_expr_type(projection, expr)?;
+            return self.ensure_optional_sortable_type(data_type);
+        }
+        Err(grouped_sort_reference_error(expr))
+    }
+
+    fn ensure_optional_sortable_type(&self, data_type: Option<SqlType>) -> Result<()> {
+        match data_type {
+            Some(data_type) => self.ensure_sortable_type(&data_type),
+            None => Ok(()),
+        }
     }
 
     fn ensure_sortable_type(&self, data_type: &SqlType) -> Result<()> {
@@ -2230,6 +3435,9 @@ impl<'a> Binder<'a> {
             | SqlType::Bool
             | SqlType::Int64
             | SqlType::UInt64
+            | SqlType::Float64
+            | SqlType::Uuid
+            | SqlType::Timestamp
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -2263,382 +3471,44 @@ impl<'a> Binder<'a> {
         hidden_aggregates: &mut Vec<BoundSelectItem>,
         expr: &Expr,
     ) -> Result<Expr> {
-        if let Some(item) = projection
-            .iter()
-            .chain(hidden_group_keys.iter())
-            .chain(hidden_aggregates.iter())
-            .find(|item| &item.expr == expr)
-        {
-            return Ok(Expr::Identifier(Ident::new(item.column.name.as_str())));
-        }
-        if group_by.iter().any(|group| group == expr) {
-            return self.rewrite_having_group_key_expr(
-                table,
-                projection,
-                hidden_group_keys,
-                hidden_aggregates,
-                expr,
-            );
-        }
-        match expr {
-            Expr::CountStar
-            | Expr::Count(_)
-            | Expr::CountDistinct(_)
-            | Expr::Sum(_)
-            | Expr::Min(_)
-            | Expr::Max(_) => {
-                self.rewrite_having_aggregate_expr(table, projection, hidden_aggregates, expr)
+        rewrite_expr_tree(expr, &mut |candidate| {
+            if let Some(item) = projection
+                .iter()
+                .chain(hidden_group_keys.iter())
+                .chain(hidden_aggregates.iter())
+                .find(|item| &item.expr == candidate)
+            {
+                return Ok(Some(Expr::Identifier(Ident::new(
+                    item.column.name.as_str(),
+                ))));
             }
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
+            if group_by.iter().any(|group| group == candidate) {
+                return self
+                    .rewrite_having_group_key_expr(
+                        table,
+                        projection,
+                        hidden_group_keys,
+                        hidden_aggregates,
+                        candidate,
+                    )
+                    .map(Some);
+            }
+            if is_aggregate_expr(candidate) {
+                return self
+                    .rewrite_having_aggregate_expr(table, projection, hidden_aggregates, candidate)
+                    .map(Some);
+            }
+            if matches!(
+                candidate,
+                Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. }
+            ) {
+                return Err(RnovError::new(
                     ErrorKind::InvalidInput,
                     "HAVING does not support window expressions",
-                ))
+                ));
             }
-            Expr::Binary { left, op, right } => Ok(Expr::Binary {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                op: op.clone(),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-            }),
-            Expr::Unary { op, expr } => Ok(Expr::Unary {
-                op: op.clone(),
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-            }),
-            Expr::Not(expr) => Ok(Expr::Not(Box::new(self.rewrite_grouped_having_expr(
-                table,
-                projection,
-                group_by,
-                hidden_group_keys,
-                hidden_aggregates,
-                expr,
-            )?))),
-            Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                negated: *negated,
-            }),
-            Expr::IsTruth {
-                expr,
-                value,
-                negated,
-            } => Ok(Expr::IsTruth {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                value: *value,
-                negated: *negated,
-            }),
-            Expr::IsUnknown { expr, negated } => Ok(Expr::IsUnknown {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                negated: *negated,
-            }),
-            Expr::IsDistinctFrom {
-                left,
-                right,
-                negated,
-            } => Ok(Expr::IsDistinctFrom {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-                negated: *negated,
-            }),
-            Expr::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => Ok(Expr::Between {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                low: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    low,
-                )?),
-                high: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    high,
-                )?),
-                negated: *negated,
-            }),
-            Expr::InList {
-                expr,
-                values,
-                negated,
-            } => Ok(Expr::InList {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                values: values
-                    .iter()
-                    .map(|value| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            value,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                negated: *negated,
-            }),
-            Expr::Like {
-                expr,
-                pattern,
-                negated,
-            } => Ok(Expr::Like {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                pattern: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    pattern,
-                )?),
-                negated: *negated,
-            }),
-            Expr::Coalesce(values) => values
-                .iter()
-                .map(|value| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        value,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Coalesce),
-            Expr::NullIf { left, right } => Ok(Expr::NullIf {
-                left: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    left,
-                )?),
-                right: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    right,
-                )?),
-            }),
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => Ok(Expr::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|operand| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            operand,
-                        )
-                    })
-                    .transpose()?
-                    .map(Box::new),
-                whens: whens
-                    .iter()
-                    .map(|arm| {
-                        Ok(CaseWhen {
-                            condition: self.rewrite_grouped_having_expr(
-                                table,
-                                projection,
-                                group_by,
-                                hidden_group_keys,
-                                hidden_aggregates,
-                                &arm.condition,
-                            )?,
-                            result: self.rewrite_grouped_having_expr(
-                                table,
-                                projection,
-                                group_by,
-                                hidden_group_keys,
-                                hidden_aggregates,
-                                &arm.result,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|else_expr| {
-                        self.rewrite_grouped_having_expr(
-                            table,
-                            projection,
-                            group_by,
-                            hidden_group_keys,
-                            hidden_aggregates,
-                            else_expr,
-                        )
-                    })
-                    .transpose()?
-                    .map(Box::new),
-            }),
-            Expr::Cast { expr, data_type } => Ok(Expr::Cast {
-                expr: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    expr,
-                )?),
-                data_type: data_type.clone(),
-            }),
-            Expr::Array(values) => values
-                .iter()
-                .map(|value| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        value,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(Expr::Array),
-            Expr::Range {
-                lower,
-                upper,
-                bounds,
-            } => Ok(Expr::Range {
-                lower: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    lower,
-                )?),
-                upper: Box::new(self.rewrite_grouped_having_expr(
-                    table,
-                    projection,
-                    group_by,
-                    hidden_group_keys,
-                    hidden_aggregates,
-                    upper,
-                )?),
-                bounds: *bounds,
-            }),
-            Expr::Call { name, args } => args
-                .iter()
-                .map(|arg| {
-                    self.rewrite_grouped_having_expr(
-                        table,
-                        projection,
-                        group_by,
-                        hidden_group_keys,
-                        hidden_aggregates,
-                        arg,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()
-                .map(|args| Expr::Call {
-                    name: name.clone(),
-                    args,
-                }),
-            Expr::Identifier(_)
-            | Expr::QualifiedIdentifier { .. }
-            | Expr::Integer(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::HStore(_) => Ok(expr.clone()),
-        }
+            Ok(None)
+        })
     }
 
     fn rewrite_having_group_key_expr(
@@ -2722,60 +3592,23 @@ impl<'a> Binder<'a> {
             .map(|item| item.column.clone())
             .collect::<Vec<_>>();
         let column = match expr {
-            Expr::CountStar => {
-                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
-            }
+            Expr::CountStar => Ok(aggregate_bound_column(
+                &existing_columns,
+                "count",
+                SqlType::Int64,
+                false,
+            )),
             Expr::Count(expr) | Expr::CountDistinct(expr) => {
-                let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer COUNT expression type: {expr}"),
-                    )
-                })?;
-                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
+                self.hidden_count_column(table, &existing_columns, expr)
             }
-            Expr::Sum(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer SUM expression type: {expr}"),
-                    )
-                })?;
-                if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("SUM expression must be INT64, got {expr_type:?}"),
-                    ));
-                }
-                aggregate_bound_column(&existing_columns, "sum", SqlType::Int64, true)
-            }
-            Expr::Min(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer MIN expression type: {expr}"),
-                    )
-                })?;
-                self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
-                aggregate_bound_column(&existing_columns, "min", expr_type, true)
-            }
-            Expr::Max(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer MAX expression type: {expr}"),
-                    )
-                })?;
-                self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
-                aggregate_bound_column(&existing_columns, "max", expr_type, true)
-            }
-            _ => {
-                return Err(RnovError::new(
-                    ErrorKind::Internal,
-                    "hidden HAVING aggregate requires aggregate expression",
-                ));
-            }
-        };
+            Expr::Sum(expr) => self.hidden_sum_column(table, &existing_columns, expr),
+            Expr::Min(expr) => self.hidden_ordered_column(table, &existing_columns, expr, "MIN"),
+            Expr::Max(expr) => self.hidden_ordered_column(table, &existing_columns, expr, "MAX"),
+            _ => Err(RnovError::new(
+                ErrorKind::Internal,
+                "hidden HAVING aggregate requires aggregate expression",
+            )),
+        }?;
 
         Ok(BoundSelectItem {
             column,
@@ -2783,225 +3616,82 @@ impl<'a> Binder<'a> {
         })
     }
 
+    fn hidden_count_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<BoundColumn> {
+        let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer COUNT expression type: {expr}"),
+            )
+        })?;
+        Ok(aggregate_bound_column(
+            existing_columns,
+            "count",
+            SqlType::Int64,
+            false,
+        ))
+    }
+
+    fn hidden_sum_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<BoundColumn> {
+        let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer SUM expression type: {expr}"),
+            )
+        })?;
+        if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("SUM expression must be INT64, got {expr_type:?}"),
+            ));
+        }
+        Ok(aggregate_bound_column(
+            existing_columns,
+            "sum",
+            SqlType::Int64,
+            true,
+        ))
+    }
+
+    fn hidden_ordered_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+        aggregate_name: &'static str,
+    ) -> Result<BoundColumn> {
+        let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        self.ensure_ordered_aggregate_type(aggregate_name, &expr_type)?;
+        let column_name = aggregate_name.to_ascii_lowercase();
+        Ok(aggregate_bound_column(
+            existing_columns,
+            &column_name,
+            expr_type,
+            true,
+        ))
+    }
+
     fn infer_grouped_output_expr_type(
         &self,
         projection: &[BoundSelectItem],
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
-        match expr {
-            Expr::Identifier(identifier) => projection
-                .iter()
-                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
-                .map(|item| Some(item.column.data_type.clone()))
-                .ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "HAVING must reference a projected column: {}",
-                            identifier.as_str()
-                        ),
-                    )
-                }),
-            Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING does not support qualified column references after binding",
-            )),
-            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
-            Expr::String(_) => Ok(Some(SqlType::Text)),
-            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
-            Expr::Null => Ok(Some(SqlType::Null)),
-            Expr::CountStar
-            | Expr::Count(_)
-            | Expr::CountDistinct(_)
-            | Expr::Sum(_)
-            | Expr::Min(_)
-            | Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING only supports projected aggregate output columns yet",
-            )),
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "HAVING does not support window expressions",
-                ))
-            }
-            Expr::Array(values) => self.infer_array_expr_type(values, |value| {
-                self.infer_grouped_output_expr_type(projection, value)
-            }),
-            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
-            Expr::Range { lower, upper, .. } => {
-                self.infer_range_expr_type(lower, upper, true, |expr| {
-                    self.infer_grouped_output_expr_type(projection, expr)
-                })
-            }
-            Expr::Binary { left, right, .. } => {
-                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
-                else {
-                    return Ok(None);
-                };
-                self.infer_operator_result_type(expr, &left_type, &right_type)
-            }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Not(expr) => {
-                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_not_result_type(&data_type)
-            }
-            Expr::IsNull { expr, .. } => {
-                let _ = self.infer_grouped_output_expr_type(projection, expr)?;
-                Ok(Some(SqlType::Bool))
-            }
-            Expr::IsTruth { expr, value, .. } => {
-                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
-            }
-            Expr::IsUnknown { expr, .. } => {
-                let Some(data_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
-            }
-            Expr::IsDistinctFrom { left, right, .. } => {
-                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
-                else {
-                    return Ok(None);
-                };
-                self.infer_null_safe_comparison_result_type(
-                    "IS DISTINCT FROM",
-                    &left_type,
-                    &right_type,
-                )
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                let Some(low_type) = self.infer_grouped_output_expr_type(projection, low)? else {
-                    return Ok(None);
-                };
-                let Some(high_type) = self.infer_grouped_output_expr_type(projection, high)? else {
-                    return Ok(None);
-                };
-                self.infer_between_result_type(&expr_type, &low_type, &high_type)
-            }
-            Expr::InList { expr, values, .. } => {
-                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) =
-                        self.infer_grouped_output_expr_type(projection, value)?
-                    else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
-                self.infer_in_list_result_type(&expr_type, &value_types)
-            }
-            Expr::Like { expr, pattern, .. } => {
-                let Some(expr_type) = self.infer_grouped_output_expr_type(projection, expr)? else {
-                    return Ok(None);
-                };
-                let Some(pattern_type) =
-                    self.infer_grouped_output_expr_type(projection, pattern)?
-                else {
-                    return Ok(None);
-                };
-                self.infer_like_result_type(&expr_type, &pattern_type)
-            }
-            Expr::Coalesce(values) => {
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) =
-                        self.infer_grouped_output_expr_type(projection, value)?
-                    else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_grouped_output_expr_type(projection, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_grouped_output_expr_type(projection, right)?
-                else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                let operand_type = match operand {
-                    Some(operand) => {
-                        match self.infer_grouped_output_expr_type(projection, operand)? {
-                            Some(data_type) => Some(data_type),
-                            None => return Ok(None),
-                        }
-                    }
-                    None => None,
-                };
-                let mut result_types = Vec::with_capacity(whens.len());
-                for arm in whens {
-                    let Some(condition_type) =
-                        self.infer_grouped_output_expr_type(projection, &arm.condition)?
-                    else {
-                        return Ok(None);
-                    };
-                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
-                    let Some(result_type) =
-                        self.infer_grouped_output_expr_type(projection, &arm.result)?
-                    else {
-                        return Ok(None);
-                    };
-                    result_types.push(result_type);
-                }
-                let else_type = match else_expr {
-                    Some(else_expr) => {
-                        self.infer_grouped_output_expr_type(projection, else_expr)?
-                    }
-                    None => Some(SqlType::Null),
-                };
-                let Some(else_type) = else_type else {
-                    return Ok(None);
-                };
-                self.infer_case_result_type(&result_types, &else_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_grouped_output_expr_type(projection, expr)?
-                else {
-                    return Ok(None);
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Call { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "HAVING does not support function calls yet",
-            )),
-        }
+        self.infer_scoped_expr_type(ExpressionTypeScope::Grouped(projection), expr)
     }
-
     fn validate_grouped_projection(
         &self,
         projection: &[BoundSelectItem],
@@ -3033,6 +3723,9 @@ impl<'a> Binder<'a> {
             | SqlType::Bool
             | SqlType::Int64
             | SqlType::UInt64
+            | SqlType::Float64
+            | SqlType::Uuid
+            | SqlType::Timestamp
             | SqlType::Text
             | SqlType::Bytes => Ok(()),
             other => Err(RnovError::new(
@@ -3112,9 +3805,7 @@ impl<'a> Binder<'a> {
     }
 
     fn ensure_table_qualifier(&self, table: &Table, qualifier: &Ident) -> Result<()> {
-        if qualifier.as_str().eq_ignore_ascii_case(table.name())
-            || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
-        {
+        if self.table_qualifier_matches(table, qualifier) {
             Ok(())
         } else {
             Err(RnovError::new(
@@ -3128,16 +3819,164 @@ impl<'a> Binder<'a> {
         }
     }
 
+    fn table_qualifier_matches(&self, table: &Table, qualifier: &Ident) -> bool {
+        qualifier.as_str().eq_ignore_ascii_case(table.name())
+            || qualifier.as_str().eq_ignore_ascii_case(table.schema_name())
+    }
+
     fn rewrite_table_qualified_expr(&self, table: &Table, expr: &Expr) -> Result<Expr> {
-        rewrite_qualified_expr(expr, &mut |qualifier, name| {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             self.ensure_table_qualifier(table, qualifier)?;
             let _ = self.resolve_column(table, name.as_str())?;
             Ok(Expr::Identifier(name.clone()))
+        })?;
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
+    }
+
+    fn bind_function_calls<F>(&self, expr: &Expr, infer: &mut F) -> Result<Expr>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        rewrite_expr_tree(expr, &mut |candidate| {
+            let Expr::Call { name, args, .. } = candidate else {
+                return Ok(None);
+            };
+            let mut bound_args = Vec::with_capacity(args.len());
+            for arg in args {
+                bound_args.push(self.bind_function_calls(arg, infer)?);
+            }
+            let Some(argument_types) = self.infer_expr_type_list(&bound_args, |arg| infer(arg))?
+            else {
+                return Ok(None);
+            };
+            let function = self
+                .catalog
+                .get_function(name.object(), &argument_types)
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::NotFound,
+                        format!("function does not exist: {name}"),
+                    )
+                })?;
+            Ok(Some(Expr::Call {
+                function_id: Some(function.function_id()),
+                name: name.clone(),
+                args: bound_args,
+            }))
         })
     }
 
-    fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
+    fn rewrite_table_qualified_expr_with_outer(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            self.rewrite_table_qualified_identifier(table, outer_scope, qualifier, name)
+        })?;
+        let mut infer = |candidate: &Expr| {
+            let typed = self.replace_outer_refs_for_type_validation(candidate, outer_scope)?;
+            self.infer_expr_type(table, &typed)
+        };
+        self.bind_function_calls(&rewritten, &mut infer)
+    }
+
+    fn rewrite_table_qualified_identifier(
+        &self,
+        table: &Table,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Expr> {
+        if self.table_qualifier_matches(table, qualifier) {
+            let _ = self.resolve_column(table, name.as_str())?;
+            return Ok(Expr::Identifier(name.clone()));
+        }
+        if let Some(outer_scope) = outer_scope
+            && let Some(expr) =
+                self.rewrite_outer_qualified_identifier(outer_scope, qualifier, name)?
+        {
+            return Ok(expr);
+        }
+        self.ensure_table_qualifier(table, qualifier)?;
+        unreachable!("ensure_table_qualifier returned Ok for a non-matching qualifier")
+    }
+
+    fn rewrite_outer_qualified_identifier(
+        &self,
+        outer_scope: OuterQueryScope<'_>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Option<Expr>> {
+        match outer_scope {
+            OuterQueryScope::Table(table) => {
+                if !self.table_qualifier_matches(table, qualifier) {
+                    return Ok(None);
+                }
+                let _ = self.resolve_column(table, name.as_str())?;
+                Ok(Some(Expr::QualifiedIdentifier {
+                    qualifier: qualifier.clone(),
+                    name: name.clone(),
+                }))
+            }
+            OuterQueryScope::Columns(columns) => {
+                let Some(column) = outer_lateral_column(columns, qualifier, name)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Expr::QualifiedIdentifier {
+                    qualifier: qualifier.clone(),
+                    name: Ident::new(column.output_name.as_str()),
+                }))
+            }
+        }
+    }
+
+    fn replace_outer_refs_for_type_validation(
+        &self,
+        expr: &Expr,
+        outer_scope: Option<OuterQueryScope<'_>>,
+    ) -> Result<Expr> {
+        let Some(outer_scope) = outer_scope else {
+            return Ok(expr.clone());
+        };
         rewrite_qualified_expr(expr, &mut |qualifier, name| {
+            if let Some(expr) = self.typed_null_for_outer_ref(outer_scope, qualifier, name)? {
+                return Ok(expr);
+            }
+            Ok(Expr::QualifiedIdentifier {
+                qualifier: qualifier.clone(),
+                name: name.clone(),
+            })
+        })
+    }
+
+    fn typed_null_for_outer_ref(
+        &self,
+        outer_scope: OuterQueryScope<'_>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Option<Expr>> {
+        match outer_scope {
+            OuterQueryScope::Table(table) => {
+                if !self.table_qualifier_matches(table, qualifier) {
+                    return Ok(None);
+                }
+                let column = self.resolve_column(table, name.as_str())?;
+                Ok(Some(typed_null_expr(column.data_type)))
+            }
+            OuterQueryScope::Columns(columns) => {
+                let Some(column) = outer_lateral_column(columns, qualifier, name)? else {
+                    return Ok(None);
+                };
+                Ok(Some(typed_null_expr(column.column.data_type.clone())))
+            }
+        }
+    }
+
+    fn rewrite_lateral_expr(&self, columns: &[LateralColumn], expr: &Expr) -> Result<Expr> {
+        let rewritten = rewrite_qualified_expr(expr, &mut |qualifier, name| {
             let matches = columns
                 .iter()
                 .filter(|column| {
@@ -3156,7 +3995,11 @@ impl<'a> Binder<'a> {
                     format!("ambiguous qualified column reference: {qualifier}.{name}"),
                 )),
             }
-        })
+        })?;
+        let bound_columns = lateral_columns_to_bound(columns);
+        let mut infer =
+            |candidate: &Expr| self.infer_expr_type_from_columns(&bound_columns, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
     }
 
     fn rewrite_cte_expr(&self, columns: &[BoundColumn], expr: &Expr) -> Result<Expr> {
@@ -3172,104 +4015,29 @@ impl<'a> Binder<'a> {
             }
         })?;
         self.validate_cte_identifiers(columns, &rewritten)?;
-        Ok(rewritten)
+        let mut infer = |candidate: &Expr| self.infer_expr_type_from_columns(columns, candidate);
+        self.bind_function_calls(&rewritten, &mut infer)
     }
 
     fn validate_cte_identifiers(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
-        match expr {
+        rewrite_expr_tree(expr, &mut |candidate| match candidate {
             Expr::Identifier(identifier) => {
                 let _ = self.resolve_column_from_bound(columns, identifier)?;
-                Ok(())
+                Ok(Some(candidate.clone()))
             }
             Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "bound recursive CTE expression must not contain qualified column references",
             )),
-            Expr::Binary { left, right, .. } => {
-                self.validate_cte_identifiers(columns, left)?;
-                self.validate_cte_identifiers(columns, right)
+            Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::ScalarSubquery { .. } => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "recursive CTE expressions do not support subqueries",
+                ))
             }
-            Expr::Unary { expr, .. }
-            | Expr::Not(expr)
-            | Expr::Count(expr)
-            | Expr::CountDistinct(expr)
-            | Expr::Sum(expr)
-            | Expr::Min(expr)
-            | Expr::Max(expr)
-            | Expr::Cast { expr, .. } => self.validate_cte_identifiers(columns, expr),
-            Expr::IsNull { expr, .. }
-            | Expr::IsTruth { expr, .. }
-            | Expr::IsUnknown { expr, .. } => self.validate_cte_identifiers(columns, expr),
-            Expr::IsDistinctFrom { left, right, .. } | Expr::NullIf { left, right } => {
-                self.validate_cte_identifiers(columns, left)?;
-                self.validate_cte_identifiers(columns, right)
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                self.validate_cte_identifiers(columns, low)?;
-                self.validate_cte_identifiers(columns, high)
-            }
-            Expr::InList { expr, values, .. } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                for value in values {
-                    self.validate_cte_identifiers(columns, value)?;
-                }
-                Ok(())
-            }
-            Expr::Like { expr, pattern, .. } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                self.validate_cte_identifiers(columns, pattern)
-            }
-            Expr::Coalesce(values) | Expr::Array(values) => {
-                for value in values {
-                    self.validate_cte_identifiers(columns, value)?;
-                }
-                Ok(())
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                if let Some(operand) = operand {
-                    self.validate_cte_identifiers(columns, operand)?;
-                }
-                for arm in whens {
-                    self.validate_cte_identifiers(columns, &arm.condition)?;
-                    self.validate_cte_identifiers(columns, &arm.result)?;
-                }
-                if let Some(else_expr) = else_expr {
-                    self.validate_cte_identifiers(columns, else_expr)?;
-                }
-                Ok(())
-            }
-            Expr::Call { args, .. } => {
-                for arg in args {
-                    self.validate_cte_identifiers(columns, arg)?;
-                }
-                Ok(())
-            }
-            Expr::RowNumberOver { order_by }
-            | Expr::RankOver { order_by }
-            | Expr::DenseRankOver { order_by } => {
-                for order_by in order_by {
-                    self.validate_cte_identifiers(columns, &order_by.expr)?;
-                }
-                Ok(())
-            }
-            Expr::Range { lower, upper, .. } => {
-                self.validate_cte_identifiers(columns, lower)?;
-                self.validate_cte_identifiers(columns, upper)
-            }
-            Expr::Integer(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::CountStar
-            | Expr::HStore(_) => Ok(()),
-        }
+            _ => Ok(None),
+        })
+        .map(|_| ())
     }
 
     fn bind_lateral_equality(
@@ -3480,216 +4248,7 @@ impl<'a> Binder<'a> {
     }
 
     fn infer_policy_expr_type(&self, table: &Table, expr: &Expr) -> Result<Option<SqlType>> {
-        match expr {
-            Expr::Identifier(identifier) => {
-                let column = self.resolve_column(table, identifier.as_str())?;
-                Ok(Some(column.data_type))
-            }
-            Expr::QualifiedIdentifier { qualifier, name } => {
-                self.ensure_table_qualifier(table, qualifier)?;
-                let column = self.resolve_column(table, name.as_str())?;
-                Ok(Some(column.data_type))
-            }
-            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
-            Expr::String(_) => Ok(Some(SqlType::Text)),
-            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
-            Expr::Null => Ok(Some(SqlType::Null)),
-            Expr::CountStar => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "COUNT(*) is only supported as a SELECT projection",
-            )),
-            Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "COUNT(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Sum(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "SUM(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Min(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "MIN(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "MAX(expr) is only supported as a SELECT projection",
-            )),
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "window expressions are only supported as SELECT projections",
-                ))
-            }
-            Expr::Array(values) => self
-                .infer_array_expr_type(values, |value| self.infer_policy_expr_type(table, value)),
-            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
-            Expr::Range { lower, upper, .. } => {
-                self.infer_range_expr_type(lower, upper, false, |expr| {
-                    self.infer_policy_expr_type(table, expr)
-                })
-            }
-            Expr::Binary { left, right, .. } => {
-                let left_type = self.infer_policy_expr_type(table, left)?;
-                let right_type = self.infer_policy_expr_type(table, right)?;
-                match (left_type, right_type) {
-                    (Some(left_type), Some(right_type)) => {
-                        self.infer_operator_result_type(expr, &left_type, &right_type)
-                    }
-                    _ => Ok(policy_unknown_side_operator_type(expr)),
-                }
-            }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Int64));
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Not(expr) => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_not_result_type(&data_type)
-            }
-            Expr::IsNull { expr, .. } => {
-                let _ = self.infer_policy_expr_type(table, expr)?;
-                Ok(Some(SqlType::Bool))
-            }
-            Expr::IsTruth { expr, value, .. } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
-            }
-            Expr::IsUnknown { expr, .. } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
-            }
-            Expr::IsDistinctFrom { left, right, .. } => {
-                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_null_safe_comparison_result_type(
-                    "IS DISTINCT FROM",
-                    &left_type,
-                    &right_type,
-                )
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(low_type) = self.infer_policy_expr_type(table, low)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(high_type) = self.infer_policy_expr_type(table, high)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_between_result_type(&expr_type, &low_type, &high_type)
-            }
-            Expr::InList { expr, values, .. } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(value_types) = self.infer_expr_type_list(values, |value| {
-                    self.infer_policy_expr_type(table, value)
-                })?
-                else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_in_list_result_type(&expr_type, &value_types)
-            }
-            Expr::Like { expr, pattern, .. } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(pattern_type) = self.infer_policy_expr_type(table, pattern)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_like_result_type(&expr_type, &pattern_type)
-            }
-            Expr::Coalesce(values) => {
-                let Some(value_types) = self.infer_expr_type_list(values, |value| {
-                    self.infer_policy_expr_type(table, value)
-                })?
-                else {
-                    return Ok(None);
-                };
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                let operand_type = match operand {
-                    Some(operand) => match self.infer_policy_expr_type(table, operand)? {
-                        Some(data_type) => Some(data_type),
-                        None => return Ok(None),
-                    },
-                    None => None,
-                };
-                let mut result_types = Vec::with_capacity(whens.len());
-                for arm in whens {
-                    let Some(condition_type) =
-                        self.infer_policy_expr_type(table, &arm.condition)?
-                    else {
-                        return Ok(None);
-                    };
-                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
-                    let Some(result_type) = self.infer_policy_expr_type(table, &arm.result)? else {
-                        return Ok(None);
-                    };
-                    result_types.push(result_type);
-                }
-                let else_type = match else_expr {
-                    Some(else_expr) => self.infer_policy_expr_type(table, else_expr)?,
-                    None => Some(SqlType::Null),
-                };
-                let Some(else_type) = else_type else {
-                    return Ok(None);
-                };
-                self.infer_case_result_type(&result_types, &else_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(data_type.clone()));
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Call { name, args } => {
-                let Some(argument_types) =
-                    self.infer_expr_type_list(args, |arg| self.infer_policy_expr_type(table, arg))?
-                else {
-                    return Ok(None);
-                };
-
-                Ok(self
-                    .catalog
-                    .functions()
-                    .iter()
-                    .find(|function| {
-                        function.name() == name.object()
-                            && function.argument_types() == argument_types
-                    })
-                    .map(|function| function.return_type().clone()))
-            }
-        }
+        self.infer_scoped_expr_type(ExpressionTypeScope::Policy(table), expr)
     }
 
     fn ensure_expr_assignable(
@@ -3729,218 +4288,560 @@ impl<'a> Binder<'a> {
     }
 
     fn infer_expr_type(&self, table: &Table, expr: &Expr) -> Result<Option<SqlType>> {
+        self.infer_scoped_expr_type(ExpressionTypeScope::Table(table), expr)
+    }
+
+    fn infer_scoped_expr_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
         match expr {
-            Expr::Identifier(identifier) => {
+            Expr::Identifier(_) | Expr::QualifiedIdentifier { .. } => {
+                self.infer_scoped_reference_type(scope, expr)
+            }
+            Expr::Integer(_)
+            | Expr::Float64(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::RuntimeValue(_) => Self::infer_bound_literal_type(expr),
+            Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => {
+                self.infer_scoped_subquery_type(scope, expr)
+            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_)
+            | Expr::RowNumberOver { .. }
+            | Expr::RankOver { .. }
+            | Expr::DenseRankOver { .. } => Self::reject_scoped_special_expression(scope, expr),
+            Expr::Array(_) | Expr::HStore(_) | Expr::Range { .. } => {
+                self.infer_scoped_collection_type(scope, expr)
+            }
+            Expr::Binary { .. }
+            | Expr::Unary { .. }
+            | Expr::Not(_)
+            | Expr::IsNull { .. }
+            | Expr::IsTruth { .. }
+            | Expr::IsUnknown { .. } => self.infer_scoped_operator_type(scope, expr),
+            Expr::IsDistinctFrom { .. }
+            | Expr::Between { .. }
+            | Expr::InList { .. }
+            | Expr::Like { .. } => self.infer_scoped_predicate_type(scope, expr),
+            Expr::Coalesce(_)
+            | Expr::NullIf { .. }
+            | Expr::Case { .. }
+            | Expr::Cast { .. }
+            | Expr::Call { .. } => self.infer_scoped_value_type(scope, expr),
+        }
+    }
+
+    fn infer_scoped_reference_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Identifier(identifier) => self.infer_scoped_identifier_type(scope, identifier),
+            Expr::QualifiedIdentifier { qualifier, name } => {
+                self.infer_scoped_qualified_identifier_type(scope, qualifier, name)
+            }
+            _ => Err(expression_type_inference_error("column reference")),
+        }
+    }
+
+    fn infer_scoped_identifier_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        identifier: &Ident,
+    ) -> Result<Option<SqlType>> {
+        match scope {
+            ExpressionTypeScope::Table(table) | ExpressionTypeScope::Policy(table) => {
                 let column = self.resolve_column(table, identifier.as_str())?;
                 Ok(Some(column.data_type))
             }
-            Expr::QualifiedIdentifier { qualifier, name } => {
+            ExpressionTypeScope::Grouped(projection) => projection
+                .iter()
+                .find(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()))
+                .map(|item| Some(item.column.data_type.clone()))
+                .ok_or_else(|| {
+                    RnovError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "HAVING must reference a projected column: {}",
+                            identifier.as_str()
+                        ),
+                    )
+                }),
+        }
+    }
+
+    fn infer_scoped_qualified_identifier_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        qualifier: &Ident,
+        name: &Ident,
+    ) -> Result<Option<SqlType>> {
+        match scope {
+            ExpressionTypeScope::Table(table) | ExpressionTypeScope::Policy(table) => {
                 self.ensure_table_qualifier(table, qualifier)?;
                 let column = self.resolve_column(table, name.as_str())?;
                 Ok(Some(column.data_type))
             }
-            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
-            Expr::String(_) => Ok(Some(SqlType::Text)),
-            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
-            Expr::Null => Ok(Some(SqlType::Null)),
-            Expr::CountStar => Err(RnovError::new(
+            ExpressionTypeScope::Grouped(_) => Err(RnovError::new(
                 ErrorKind::InvalidInput,
+                "HAVING does not support qualified column references after binding",
+            )),
+        }
+    }
+
+    fn infer_scoped_subquery_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
+            Expr::InSubquery { query, .. } => {
+                self.infer_scoped_predicate_subquery_type(scope, query, "IN subquery")
+            }
+            Expr::ExistsSubquery { query } => {
+                self.infer_scoped_predicate_subquery_type(scope, query, "EXISTS subquery")
+            }
+            _ => Err(expression_type_inference_error("subquery")),
+        }
+    }
+
+    fn infer_scoped_predicate_subquery_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        query: &SelectSubquery,
+        context: &str,
+    ) -> Result<Option<SqlType>> {
+        if scope.is_policy() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "row policy predicates do not support subqueries",
+            ));
+        }
+        self.infer_bound_predicate_subquery_type(query, context)
+    }
+
+    fn reject_scoped_special_expression(
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::CountStar => Self::reject_scoped_projection_expression(
+                scope,
                 "COUNT(*) is only supported as a SELECT projection",
-            )),
-            Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
+                "HAVING only supports projected aggregate output columns yet",
+            ),
+            Expr::Count(_) | Expr::CountDistinct(_) => Self::reject_scoped_projection_expression(
+                scope,
                 "COUNT(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Sum(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
+                "HAVING only supports projected aggregate output columns yet",
+            ),
+            Expr::Sum(_) => Self::reject_scoped_projection_expression(
+                scope,
                 "SUM(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Min(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
+                "HAVING only supports projected aggregate output columns yet",
+            ),
+            Expr::Min(_) => Self::reject_scoped_projection_expression(
+                scope,
                 "MIN(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
+                "HAVING only supports projected aggregate output columns yet",
+            ),
+            Expr::Max(_) => Self::reject_scoped_projection_expression(
+                scope,
                 "MAX(expr) is only supported as a SELECT projection",
-            )),
+                "HAVING only supports projected aggregate output columns yet",
+            ),
             Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
+                Self::reject_scoped_projection_expression(
+                    scope,
                     "window expressions are only supported as SELECT projections",
-                ))
+                    "HAVING does not support window expressions",
+                )
             }
-            Expr::Array(values) => {
-                self.infer_array_expr_type(values, |value| self.infer_expr_type(table, value))
-            }
+            _ => Err(expression_type_inference_error(
+                "aggregate or window expression",
+            )),
+        }
+    }
+
+    fn reject_scoped_projection_expression(
+        scope: ExpressionTypeScope<'_>,
+        table_message: &'static str,
+        grouped_message: &'static str,
+    ) -> Result<Option<SqlType>> {
+        let message = match scope {
+            ExpressionTypeScope::Table(_) | ExpressionTypeScope::Policy(_) => table_message,
+            ExpressionTypeScope::Grouped(_) => grouped_message,
+        };
+        Err(RnovError::new(ErrorKind::InvalidInput, message))
+    }
+
+    fn infer_scoped_collection_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Array(values) => self
+                .infer_array_expr_type(values, |value| self.infer_scoped_expr_type(scope, value)),
             Expr::HStore(_) => Ok(Some(SqlType::HStore)),
             Expr::Range { lower, upper, .. } => {
-                self.infer_range_expr_type(lower, upper, true, |expr| {
-                    self.infer_expr_type(table, expr)
+                self.infer_range_expr_type(lower, upper, !scope.is_policy(), |value| {
+                    self.infer_scoped_expr_type(scope, value)
                 })
             }
+            _ => Err(expression_type_inference_error("collection")),
+        }
+    }
+
+    fn infer_scoped_operator_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Binary { left, right, .. } => {
-                let Some(left_type) = self.infer_expr_type(table, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type(table, right)? else {
-                    return Ok(None);
-                };
-                self.infer_operator_result_type(expr, &left_type, &right_type)
+                self.infer_scoped_binary_type(scope, expr, left, right)
             }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Not(expr) => {
-                let Some(data_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_not_result_type(&data_type)
-            }
-            Expr::IsNull { expr, .. } => {
-                let _ = self.infer_expr_type(table, expr)?;
-                Ok(Some(SqlType::Bool))
-            }
+            Expr::Unary { op, expr } => self.infer_scoped_unary_type(scope, op, expr),
+            Expr::Not(expr) => self.infer_scoped_not_type(scope, expr),
+            Expr::IsNull { expr, .. } => self.infer_scoped_is_null_type(scope, expr),
             Expr::IsTruth { expr, value, .. } => {
-                let Some(data_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
+                self.infer_scoped_truth_test_type(scope, truth_test_name(*value), expr)
             }
             Expr::IsUnknown { expr, .. } => {
-                let Some(data_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
+                self.infer_scoped_truth_test_type(scope, "IS UNKNOWN", expr)
             }
+            _ => Err(expression_type_inference_error("operator")),
+        }
+    }
+
+    fn infer_scoped_binary_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        binary: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        if scope.is_policy() {
+            return self.infer_policy_binary_type(scope, binary, left, right);
+        }
+        let Some(left_type) = self.infer_scoped_expr_type(scope, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_scoped_expr_type(scope, right)? else {
+            return Ok(None);
+        };
+        self.infer_operator_result_type(binary, &left_type, &right_type)
+    }
+
+    fn infer_policy_binary_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        binary: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let left_type = self.infer_scoped_expr_type(scope, left)?;
+        let right_type = self.infer_scoped_expr_type(scope, right)?;
+        match (left_type, right_type) {
+            (Some(left_type), Some(right_type)) => {
+                self.infer_operator_result_type(binary, &left_type, &right_type)
+            }
+            _ => Ok(policy_unknown_side_operator_type(binary)),
+        }
+    }
+
+    fn infer_scoped_unary_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        op: &str,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Int64));
+        };
+        self.infer_unary_arithmetic_result_type(op, &data_type)
+    }
+
+    fn infer_scoped_not_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_not_result_type(&data_type)
+    }
+
+    fn infer_scoped_is_null_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let _ = self.infer_scoped_expr_type(scope, expr)?;
+        Ok(Some(SqlType::Bool))
+    }
+
+    fn infer_scoped_truth_test_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        name: &str,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_truth_test_result_type(name, &data_type)
+    }
+
+    fn infer_scoped_predicate_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
             Expr::IsDistinctFrom { left, right, .. } => {
-                let Some(left_type) = self.infer_expr_type(table, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type(table, right)? else {
-                    return Ok(None);
-                };
-                self.infer_null_safe_comparison_result_type(
-                    "IS DISTINCT FROM",
-                    &left_type,
-                    &right_type,
-                )
+                self.infer_scoped_distinct_type(scope, left, right)
             }
             Expr::Between {
                 expr, low, high, ..
-            } => {
-                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                let Some(low_type) = self.infer_expr_type(table, low)? else {
-                    return Ok(None);
-                };
-                let Some(high_type) = self.infer_expr_type(table, high)? else {
-                    return Ok(None);
-                };
-                self.infer_between_result_type(&expr_type, &low_type, &high_type)
-            }
+            } => self.infer_scoped_between_type(scope, expr, low, high),
             Expr::InList { expr, values, .. } => {
-                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                let Some(value_types) =
-                    self.infer_expr_type_list(values, |value| self.infer_expr_type(table, value))?
-                else {
-                    return Ok(None);
-                };
-                self.infer_in_list_result_type(&expr_type, &value_types)
+                self.infer_scoped_in_list_type(scope, expr, values)
             }
-            Expr::Like { expr, pattern, .. } => {
-                let Some(expr_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                let Some(pattern_type) = self.infer_expr_type(table, pattern)? else {
-                    return Ok(None);
-                };
-                self.infer_like_result_type(&expr_type, &pattern_type)
-            }
-            Expr::Coalesce(values) => {
-                let Some(value_types) =
-                    self.infer_expr_type_list(values, |value| self.infer_expr_type(table, value))?
-                else {
-                    return Ok(None);
-                };
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_expr_type(table, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type(table, right)? else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                let operand_type = match operand {
-                    Some(operand) => match self.infer_expr_type(table, operand)? {
-                        Some(data_type) => Some(data_type),
-                        None => return Ok(None),
-                    },
-                    None => None,
-                };
-                let mut result_types = Vec::with_capacity(whens.len());
-                for arm in whens {
-                    let Some(condition_type) = self.infer_expr_type(table, &arm.condition)? else {
-                        return Ok(None);
-                    };
-                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
-                    let Some(result_type) = self.infer_expr_type(table, &arm.result)? else {
-                        return Ok(None);
-                    };
-                    result_types.push(result_type);
-                }
-                let else_type = match else_expr {
-                    Some(else_expr) => self.infer_expr_type(table, else_expr)?,
-                    None => Some(SqlType::Null),
-                };
-                let Some(else_type) = else_type else {
-                    return Ok(None);
-                };
-                self.infer_case_result_type(&result_types, &else_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_expr_type(table, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Call { name, args } => {
-                let Some(argument_types) =
-                    self.infer_expr_type_list(args, |arg| self.infer_expr_type(table, arg))?
-                else {
-                    return Ok(None);
-                };
-
-                let function = self
-                    .catalog
-                    .functions()
-                    .iter()
-                    .find(|function| {
-                        function.name() == name.object()
-                            && function.argument_types() == argument_types
-                    })
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!("function does not exist: {name}"),
-                        )
-                    })?;
-                Ok(Some(function.return_type().clone()))
-            }
+            Expr::Like { expr, pattern, .. } => self.infer_scoped_like_type(scope, expr, pattern),
+            _ => Err(expression_type_inference_error("predicate")),
         }
+    }
+
+    fn infer_scoped_distinct_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_scoped_expr_type(scope, left)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        let Some(right_type) = self.infer_scoped_expr_type(scope, right)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_null_safe_comparison_result_type("IS DISTINCT FROM", &left_type, &right_type)
+    }
+
+    fn infer_scoped_between_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+        low: &Expr,
+        high: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        let Some(low_type) = self.infer_scoped_expr_type(scope, low)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        let Some(high_type) = self.infer_scoped_expr_type(scope, high)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_between_result_type(&expr_type, &low_type, &high_type)
+    }
+
+    fn infer_scoped_in_list_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+        values: &[Expr],
+    ) -> Result<Option<SqlType>> {
+        let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        let Some(value_types) =
+            self.infer_expr_type_list(values, |value| self.infer_scoped_expr_type(scope, value))?
+        else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_in_list_result_type(&expr_type, &value_types)
+    }
+
+    fn infer_scoped_like_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+        pattern: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        let Some(pattern_type) = self.infer_scoped_expr_type(scope, pattern)? else {
+            return Ok(scope.unknown_type(SqlType::Bool));
+        };
+        self.infer_like_result_type(&expr_type, &pattern_type)
+    }
+
+    fn infer_scoped_value_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Coalesce(values) => self.infer_scoped_coalesce_type(scope, values),
+            Expr::NullIf { left, right } => self.infer_scoped_nullif_type(scope, left, right),
+            Expr::Case { .. } => self.infer_scoped_case_type(scope, expr),
+            Expr::Cast { expr, data_type } => self.infer_scoped_cast_type(scope, expr, data_type),
+            Expr::Call { .. } => self.infer_scoped_call_type(scope, expr),
+            _ => Err(expression_type_inference_error("value expression")),
+        }
+    }
+
+    fn infer_scoped_coalesce_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        values: &[Expr],
+    ) -> Result<Option<SqlType>> {
+        let Some(value_types) =
+            self.infer_expr_type_list(values, |value| self.infer_scoped_expr_type(scope, value))?
+        else {
+            return Ok(None);
+        };
+        self.infer_coalesce_result_type(&value_types)
+    }
+
+    fn infer_scoped_nullif_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_scoped_expr_type(scope, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_scoped_expr_type(scope, right)? else {
+            return Ok(None);
+        };
+        self.infer_nullif_result_type(&left_type, &right_type)
+    }
+
+    fn infer_scoped_case_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } = expr
+        else {
+            return Err(expression_type_inference_error("CASE"));
+        };
+        let Some(operand_type) = self.infer_scoped_case_operand_type(scope, operand.as_deref())?
+        else {
+            return Ok(None);
+        };
+        let Some(result_types) =
+            self.infer_scoped_case_arm_types(scope, operand_type.as_ref(), whens)?
+        else {
+            return Ok(None);
+        };
+        let else_type = match else_expr.as_deref() {
+            Some(else_expr) => self.infer_scoped_expr_type(scope, else_expr)?,
+            None => Some(SqlType::Null),
+        };
+        let Some(else_type) = else_type else {
+            return Ok(None);
+        };
+        self.infer_case_result_type(&result_types, &else_type)
+    }
+
+    fn infer_scoped_case_operand_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        operand: Option<&Expr>,
+    ) -> Result<Option<Option<SqlType>>> {
+        match operand {
+            Some(operand) => Ok(self.infer_scoped_expr_type(scope, operand)?.map(Some)),
+            None => Ok(Some(None)),
+        }
+    }
+
+    fn infer_scoped_case_arm_types(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        operand_type: Option<&SqlType>,
+        whens: &[CaseWhen],
+    ) -> Result<Option<Vec<SqlType>>> {
+        let mut result_types = Vec::with_capacity(whens.len());
+        for arm in whens {
+            let Some(condition_type) = self.infer_scoped_expr_type(scope, &arm.condition)? else {
+                return Ok(None);
+            };
+            self.infer_case_condition_type(operand_type, &condition_type)?;
+            let Some(result_type) = self.infer_scoped_expr_type(scope, &arm.result)? else {
+                return Ok(None);
+            };
+            result_types.push(result_type);
+        }
+        Ok(Some(result_types))
+    }
+
+    fn infer_scoped_cast_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+        data_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        let Some(source_type) = self.infer_scoped_expr_type(scope, expr)? else {
+            return Ok(scope.unknown_type(data_type.clone()));
+        };
+        self.infer_cast_result_type(&source_type, data_type)
+    }
+
+    fn infer_scoped_call_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Expr::Call { name, args, .. } = expr else {
+            return Err(expression_type_inference_error("function call"));
+        };
+        if matches!(scope, ExpressionTypeScope::Grouped(_)) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING does not support function calls yet",
+            ));
+        }
+        let Some(argument_types) =
+            self.infer_expr_type_list(args, |arg| self.infer_scoped_expr_type(scope, arg))?
+        else {
+            return Ok(None);
+        };
+        let return_type = self
+            .catalog
+            .get_function(name.object(), &argument_types)
+            .map(|function| function.return_type().clone());
+        if scope.is_policy() {
+            return Ok(return_type);
+        }
+        let return_type = return_type.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("function does not exist: {name}"),
+            )
+        })?;
+        Ok(Some(return_type))
     }
 
     fn infer_array_expr_type<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<SqlType>>
@@ -3981,29 +4882,32 @@ impl<'a> Binder<'a> {
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
-        let lower_type = match infer(lower)? {
-            Some(data_type) => data_type,
-            None if unknown_as_null => SqlType::Null,
-            None => return Ok(None),
+        let Some(lower_type) = self.infer_range_bound_type(lower, unknown_as_null, &mut infer)?
+        else {
+            return Ok(None);
         };
-        let upper_type = match infer(upper)? {
-            Some(data_type) => data_type,
-            None if unknown_as_null => SqlType::Null,
-            None => return Ok(None),
+        let Some(upper_type) = self.infer_range_bound_type(upper, unknown_as_null, &mut infer)?
+        else {
+            return Ok(None);
         };
-        let element_type = match (lower_type, upper_type) {
-            (SqlType::Null, SqlType::Null) => SqlType::Null,
-            (SqlType::Null, upper_type) => upper_type,
-            (lower_type, SqlType::Null) => lower_type,
-            (lower_type, upper_type) if lower_type == upper_type => lower_type,
-            _ => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "range literal bounds have different types",
-                ));
-            }
-        };
+        let element_type = merge_range_bound_types(lower_type, upper_type)?;
         Ok(Some(SqlType::Range(Box::new(element_type))))
+    }
+
+    fn infer_range_bound_type<F>(
+        &self,
+        bound: &Expr,
+        unknown_as_null: bool,
+        infer: &mut F,
+    ) -> Result<Option<SqlType>>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        match infer(bound)? {
+            Some(data_type) => Ok(Some(data_type)),
+            None if unknown_as_null => Ok(Some(SqlType::Null)),
+            None => Ok(None),
+        }
     }
 
     fn infer_expr_type_list<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<Vec<SqlType>>>
@@ -4026,6 +4930,47 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
         match expr {
+            Expr::Identifier(_) | Expr::QualifiedIdentifier { .. } => {
+                self.infer_column_reference_type(columns, expr)
+            }
+            Expr::Integer(_)
+            | Expr::Float64(_)
+            | Expr::String(_)
+            | Expr::Bool(_)
+            | Expr::Null
+            | Expr::RuntimeValue(_) => Self::infer_bound_literal_type(expr),
+            Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => {
+                self.infer_column_subquery_type(expr)
+            }
+            Expr::CountStar
+            | Expr::Count(_)
+            | Expr::CountDistinct(_)
+            | Expr::Sum(_)
+            | Expr::Min(_)
+            | Expr::Max(_)
+            | Expr::RowNumberOver { .. }
+            | Expr::RankOver { .. }
+            | Expr::DenseRankOver { .. } => Self::reject_column_special_expression(expr),
+            Expr::Binary { .. } | Expr::Unary { .. } | Expr::Cast { .. } => {
+                self.infer_column_operator_type(columns, expr)
+            }
+            Expr::Coalesce(_) | Expr::NullIf { .. } => {
+                self.infer_column_null_function_type(columns, expr)
+            }
+            Expr::Call { .. } => self.infer_column_call_type(columns, expr),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("unsupported generated column expression: {other}"),
+            )),
+        }
+    }
+
+    fn infer_column_reference_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Identifier(identifier) => columns
                 .iter()
                 .find(|column| column.name.eq_ignore_ascii_case(identifier.as_str()))
@@ -4040,71 +4985,178 @@ impl<'a> Binder<'a> {
                 ErrorKind::InvalidInput,
                 "bound expressions must not contain qualified column references",
             )),
+            _ => Err(column_type_inference_error("column reference")),
+        }
+    }
+
+    fn infer_bound_literal_type(expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Integer(_) => Ok(Some(SqlType::Int64)),
+            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
             Expr::String(_) => Ok(Some(SqlType::Text)),
             Expr::Bool(_) => Ok(Some(SqlType::Bool)),
             Expr::Null => Ok(Some(SqlType::Null)),
+            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
+            _ => Err(column_type_inference_error("literal")),
+        }
+    }
+
+    fn infer_column_subquery_type(&self, expr: &Expr) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
+            Expr::InSubquery { query, .. } => {
+                self.infer_bound_predicate_subquery_type(query, "IN subquery")
+            }
+            Expr::ExistsSubquery { query } => {
+                self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
+            }
+            _ => Err(column_type_inference_error("subquery")),
+        }
+    }
+
+    fn reject_column_special_expression(expr: &Expr) -> Result<Option<SqlType>> {
+        let message = match expr {
             Expr::CountStar
             | Expr::Count(_)
             | Expr::CountDistinct(_)
             | Expr::Sum(_)
             | Expr::Min(_)
-            | Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "aggregate expressions are only supported as SELECT projections",
-            )),
+            | Expr::Max(_) => "aggregate expressions are only supported as SELECT projections",
             Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "window expressions are only supported as SELECT projections",
-                ))
+                "window expressions are only supported as SELECT projections"
             }
+            _ => {
+                return Err(column_type_inference_error(
+                    "aggregate or window expression",
+                ));
+            }
+        };
+        Err(RnovError::new(ErrorKind::InvalidInput, message))
+    }
+
+    fn infer_column_operator_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
             Expr::Binary { left, right, .. } => {
-                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
-                    return Ok(None);
-                };
-                self.infer_operator_result_type(expr, &left_type, &right_type)
+                self.infer_column_binary_type(columns, expr, left, right)
             }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_expr_type_from_columns(columns, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_expr_type_from_columns(columns, expr)? else {
-                    return Ok(None);
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Coalesce(values) => {
-                let mut value_types = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value_type) = self.infer_expr_type_from_columns(columns, value)?
-                    else {
-                        return Ok(None);
-                    };
-                    value_types.push(value_type);
-                }
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
-            other => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("unsupported generated column expression: {other}"),
-            )),
+            Expr::Unary { op, expr } => self.infer_column_unary_type(columns, op, expr),
+            Expr::Cast { expr, data_type } => self.infer_column_cast_type(columns, expr, data_type),
+            _ => Err(column_type_inference_error("operator")),
         }
+    }
+
+    fn infer_column_binary_type(
+        &self,
+        columns: &[BoundColumn],
+        binary: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+            return Ok(None);
+        };
+        self.infer_operator_result_type(binary, &left_type, &right_type)
+    }
+
+    fn infer_column_unary_type(
+        &self,
+        columns: &[BoundColumn],
+        op: &str,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(data_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+            return Ok(None);
+        };
+        self.infer_unary_arithmetic_result_type(op, &data_type)
+    }
+
+    fn infer_column_cast_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+        data_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        let Some(source_type) = self.infer_expr_type_from_columns(columns, expr)? else {
+            return Ok(None);
+        };
+        self.infer_cast_result_type(&source_type, data_type)
+    }
+
+    fn infer_column_null_function_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        match expr {
+            Expr::Coalesce(values) => self.infer_column_coalesce_type(columns, values),
+            Expr::NullIf { left, right } => self.infer_column_nullif_type(columns, left, right),
+            _ => Err(column_type_inference_error("null-handling function")),
+        }
+    }
+
+    fn infer_column_coalesce_type(
+        &self,
+        columns: &[BoundColumn],
+        values: &[Expr],
+    ) -> Result<Option<SqlType>> {
+        let Some(value_types) = self.infer_expr_type_list(values, |value| {
+            self.infer_expr_type_from_columns(columns, value)
+        })?
+        else {
+            return Ok(None);
+        };
+        self.infer_coalesce_result_type(&value_types)
+    }
+
+    fn infer_column_nullif_type(
+        &self,
+        columns: &[BoundColumn],
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Some(left_type) = self.infer_expr_type_from_columns(columns, left)? else {
+            return Ok(None);
+        };
+        let Some(right_type) = self.infer_expr_type_from_columns(columns, right)? else {
+            return Ok(None);
+        };
+        self.infer_nullif_result_type(&left_type, &right_type)
+    }
+
+    fn infer_column_call_type(
+        &self,
+        columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let Expr::Call { name, args, .. } = expr else {
+            return Err(column_type_inference_error("function call"));
+        };
+        let Some(argument_types) =
+            self.infer_expr_type_list(args, |arg| self.infer_expr_type_from_columns(columns, arg))?
+        else {
+            return Ok(None);
+        };
+        let function = self
+            .catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name.object() && function.argument_types() == argument_types
+            })
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("function does not exist: {name}"),
+                )
+            })?;
+        Ok(Some(function.return_type().clone()))
     }
 
     fn infer_operator_result_type(
@@ -4119,54 +5171,72 @@ impl<'a> Binder<'a> {
                 "operator inference requires binary expression",
             ));
         };
+        if let Some(result) = self.infer_builtin_operator_result_type(op, left_type, right_type) {
+            return result;
+        }
+        self.infer_catalog_operator_result_type(op, left_type, right_type)
+    }
 
-        if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-            return Ok(Some(SqlType::Bool));
+    fn infer_builtin_operator_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Option<Result<Option<SqlType>>> {
+        if is_comparison_operator(op) {
+            return Some(Ok(Some(SqlType::Bool)));
         }
         if is_arithmetic_operator(op) {
-            return self.infer_arithmetic_result_type(op, left_type, right_type);
+            return Some(self.infer_arithmetic_result_type(op, left_type, right_type));
         }
         if is_text_concat_operator(op) {
-            return self.infer_text_concat_result_type(op, left_type, right_type);
+            return Some(self.infer_text_concat_result_type(op, left_type, right_type));
         }
         if op == "&&" {
-            return self.infer_range_overlap_result_type(left_type, right_type);
+            return Some(self.infer_range_overlap_result_type(left_type, right_type));
         }
         if op == "@>" {
-            return self.infer_contains_result_type(left_type, right_type);
+            return Some(self.infer_contains_result_type(left_type, right_type));
         }
         if op == "?" {
-            return self.infer_hstore_key_result_type(left_type, right_type);
+            return Some(self.infer_hstore_key_result_type(left_type, right_type));
         }
-        if is_boolean_connector(op) {
-            if matches!(left_type, SqlType::Bool | SqlType::Null)
-                && matches!(right_type, SqlType::Bool | SqlType::Null)
-            {
-                return Ok(Some(SqlType::Bool));
-            }
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("boolean operator {op} requires BOOL operands"),
-            ));
-        }
+        is_boolean_connector(op)
+            .then(|| self.infer_boolean_connector_result_type(op, left_type, right_type))
+    }
 
+    fn infer_boolean_connector_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Bool | SqlType::Null)
+            && matches!(right_type, SqlType::Bool | SqlType::Null)
+        {
+            return Ok(Some(SqlType::Bool));
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("boolean operator {op} requires BOOL operands"),
+        ))
+    }
+
+    fn infer_catalog_operator_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
         let operator = self
             .catalog
-            .operators()
-            .iter()
-            .find(|operator| {
-                let signature = operator.signature();
-                signature.symbol() == op
-                    && signature.left_type() == left_type
-                    && signature.right_type() == right_type
-            })
+            .get_operator(op, left_type, right_type)
             .ok_or_else(|| {
                 RnovError::new(
                     ErrorKind::NotFound,
                     format!("operator does not exist: {left_type:?} {op} {right_type:?}"),
                 )
             })?;
-
         Ok(Some(operator.signature().result_type().clone()))
     }
 
@@ -4202,15 +5272,22 @@ impl<'a> Binder<'a> {
         left_type: &SqlType,
         right_type: &SqlType,
     ) -> Result<Option<SqlType>> {
-        if matches!(left_type, SqlType::Int64 | SqlType::Null)
-            && matches!(right_type, SqlType::Int64 | SqlType::Null)
-        {
-            Ok(Some(SqlType::Int64))
-        } else {
-            Err(RnovError::new(
+        if !is_numeric_or_null(left_type) || !is_numeric_or_null(right_type) {
+            return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                format!("arithmetic operator {op} requires INT64 operands"),
-            ))
+                format!("arithmetic operator {op} requires numeric operands"),
+            ));
+        }
+        if op == "%" && (left_type == &SqlType::Float64 || right_type == &SqlType::Float64) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "modulo operator requires INT64 operands",
+            ));
+        }
+        if left_type == &SqlType::Float64 || right_type == &SqlType::Float64 {
+            Ok(Some(SqlType::Float64))
+        } else {
+            Ok(Some(SqlType::Int64))
         }
     }
 
@@ -4316,10 +5393,12 @@ impl<'a> Binder<'a> {
         }
         if matches!(data_type, SqlType::Int64 | SqlType::Null) {
             Ok(Some(SqlType::Int64))
+        } else if matches!(data_type, SqlType::Float64) {
+            Ok(Some(SqlType::Float64))
         } else {
             Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                format!("unary operator {op} requires INT64 operand"),
+                format!("unary operator {op} requires numeric operand"),
             ))
         }
     }
@@ -4531,7 +5610,16 @@ impl<'a> Binder<'a> {
             || matches!(
                 (source_type, target_type),
                 (SqlType::Int64, SqlType::Text)
+                    | (SqlType::Int64, SqlType::Float64)
                     | (SqlType::Text, SqlType::Int64)
+                    | (SqlType::Float64, SqlType::Text)
+                    | (SqlType::Text, SqlType::Float64)
+                    | (SqlType::Uuid, SqlType::Text)
+                    | (SqlType::Text, SqlType::Uuid)
+                    | (SqlType::Timestamp, SqlType::Text)
+                    | (SqlType::Text, SqlType::Timestamp)
+                    | (SqlType::Json, SqlType::Text)
+                    | (SqlType::Text, SqlType::Json)
                     | (SqlType::Bool, SqlType::Text)
                     | (SqlType::Text, SqlType::Bool)
             )
@@ -4569,6 +5657,20 @@ fn deny_default_row_policy_predicate() -> Expr {
     Expr::Bool(false)
 }
 
+fn column_type_inference_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("column type inference received a non-{category} expression"),
+    )
+}
+
+fn expression_type_inference_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("expression type inference received a non-{category} expression"),
+    )
+}
+
 fn operator_signature_with_metadata(
     symbol: &str,
     left_type: SqlType,
@@ -4598,8 +5700,29 @@ fn is_boolean_connector(op: &str) -> bool {
     matches!(op, "AND" | "OR")
 }
 
+fn is_comparison_operator(op: &str) -> bool {
+    matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+}
+
 fn is_arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%")
+}
+
+fn merge_range_bound_types(lower_type: SqlType, upper_type: SqlType) -> Result<SqlType> {
+    match (lower_type, upper_type) {
+        (SqlType::Null, SqlType::Null) => Ok(SqlType::Null),
+        (SqlType::Null, upper_type) => Ok(upper_type),
+        (lower_type, SqlType::Null) => Ok(lower_type),
+        (lower_type, upper_type) if lower_type == upper_type => Ok(lower_type),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range literal bounds have different types",
+        )),
+    }
+}
+
+fn is_numeric_or_null(data_type: &SqlType) -> bool {
+    matches!(data_type, SqlType::Int64 | SqlType::Float64 | SqlType::Null)
 }
 
 fn is_text_concat_operator(op: &str) -> bool {
@@ -4608,6 +5731,37 @@ fn is_text_concat_operator(op: &str) -> bool {
 
 fn truth_test_name(value: bool) -> &'static str {
     if value { "IS TRUE" } else { "IS FALSE" }
+}
+
+fn grouped_sort_expr_references_outputs(projection: &[BoundSelectItem], expr: &Expr) -> bool {
+    let mut valid = true;
+    let rewritten = rewrite_expr_tree(expr, &mut |candidate| {
+        match candidate {
+            Expr::Identifier(identifier) => {
+                valid &= projection
+                    .iter()
+                    .any(|item| item.column.name.eq_ignore_ascii_case(identifier.as_str()));
+            }
+            Expr::QualifiedIdentifier { .. } => valid = false,
+            _ => {}
+        }
+        Ok(None)
+    });
+    rewritten.is_ok() && valid
+}
+
+fn grouped_sort_reference_error(expr: &Expr) -> RnovError {
+    let message = match expr {
+        Expr::Identifier(identifier) => format!(
+            "ORDER BY for grouped queries must reference a projected column or GROUP BY expression: {}",
+            identifier.as_str()
+        ),
+        _ => {
+            "ORDER BY for grouped queries must reference a projected column or GROUP BY expression"
+                .to_string()
+        }
+    };
+    RnovError::new(ErrorKind::InvalidInput, message)
 }
 
 fn is_aggregate_expr(expr: &Expr) -> bool {
@@ -4630,8 +5784,9 @@ fn hidden_group_key_nullable(table: &Table, expr: &Expr) -> bool {
             .find(|column| column.name().eq_ignore_ascii_case(identifier.as_str()))
             .map(|column| column.nullable())
             .unwrap_or(true),
-        Expr::Integer(_) | Expr::String(_) | Expr::Bool(_) => false,
+        Expr::Integer(_) | Expr::Float64(_) | Expr::String(_) | Expr::Bool(_) => false,
         Expr::Null => true,
+        Expr::RuntimeValue(value) => value.is_null(),
         _ => true,
     }
 }
@@ -4649,9 +5804,58 @@ fn mark_grouping_set_projection_columns_nullable(
     }
 }
 
+fn validate_create_function_implementation(
+    argument_types: &[SqlType],
+    return_type: &SqlType,
+    implementation: &CreateFunctionImplementation,
+) -> Result<()> {
+    let CreateFunctionImplementation::Wasm(body) = implementation else {
+        return Ok(());
+    };
+    validate_wasm_function_signature(argument_types, return_type)?;
+    validate_wasm_function_body(body)
+}
+
+fn validate_wasm_function_signature(
+    argument_types: &[SqlType],
+    return_type: &SqlType,
+) -> Result<()> {
+    if argument_types == [SqlType::Int64] && return_type == &SqlType::Int64 {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "wasm scalar functions currently require an INT64 argument and INT64 return type",
+    ))
+}
+
+fn validate_wasm_function_body(body: &WasmFunctionBody) -> Result<()> {
+    if body.max_memory_bytes == 0 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function memory budget must be greater than zero",
+        ));
+    }
+    let _ = usize::try_from(body.max_memory_bytes).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm function memory budget does not fit this platform",
+        )
+    })?;
+    let _ = WasmFunctionImplementation::new(
+        body.module_bytes.clone(),
+        0,
+        body.max_memory_bytes,
+        body.max_instructions,
+        body.timeout_millis,
+    )?;
+    Ok(())
+}
+
 fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
     match statement {
         BoundStatement::Select(select) => Ok(&select.columns),
+        BoundStatement::SelectJoin(join_select) => Ok(&join_select.select.columns),
         BoundStatement::Union(union) => Ok(&union.columns),
         BoundStatement::Intersect(intersect) => Ok(&intersect.columns),
         BoundStatement::Except(except) => Ok(&except.columns),
@@ -4662,6 +5866,133 @@ fn query_output_columns(statement: &BoundStatement) -> Result<&[BoundColumn]> {
             "set operation operands must be SELECT queries",
         )),
     }
+}
+
+fn single_query_output_type(statement: &BoundStatement) -> Result<SqlType> {
+    single_query_output_type_for(statement, "IN subquery")
+}
+
+fn single_query_output_type_for(statement: &BoundStatement, context: &str) -> Result<SqlType> {
+    let columns = query_output_columns(statement)?;
+    match columns {
+        [column] => Ok(column.data_type.clone()),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{context} must return exactly one column, got {}",
+                columns.len()
+            ),
+        )),
+    }
+}
+
+fn recursive_cte_select_input<'a>(
+    statement: &'a Statement,
+    source: &ObjectName,
+) -> Result<CteSelectInput<'a>> {
+    let Statement::Select {
+        distinct,
+        projection,
+        from,
+        selection,
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
+    } = statement
+    else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE clauses currently support SELECT queries only",
+        ));
+    };
+    if !object_names_equal(from, source) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("recursive CTE SELECT must read from {source}, got {from}"),
+        ));
+    }
+    if !group_by.is_empty() || having.is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE SELECT does not support GROUP BY or HAVING yet",
+        ));
+    }
+    Ok(CteSelectInput {
+        distinct: *distinct,
+        projection,
+        from,
+        selection,
+        order_by,
+        limit: *limit,
+        offset: *offset,
+    })
+}
+
+fn bind_cte_wildcard(
+    available_columns: &[BoundColumn],
+    projection: &mut Vec<BoundSelectItem>,
+    columns: &mut Vec<BoundColumn>,
+) {
+    for column in available_columns {
+        push_cte_projection(
+            projection,
+            columns,
+            column.clone(),
+            Expr::Identifier(Ident::new(column.name.as_str())),
+        );
+    }
+}
+
+fn push_cte_projection(
+    projection: &mut Vec<BoundSelectItem>,
+    columns: &mut Vec<BoundColumn>,
+    column: BoundColumn,
+    expr: Expr,
+) {
+    projection.push(BoundSelectItem {
+        column: column.clone(),
+        expr,
+    });
+    columns.push(column);
+}
+
+fn validate_recursive_cte_name(name: &ObjectName) -> Result<()> {
+    if name.schema().is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE name must be unqualified",
+        ));
+    }
+    Ok(())
+}
+
+fn recursive_cte_columns(
+    seed_columns: &[BoundColumn],
+    column_names: &[Ident],
+) -> Result<Vec<BoundColumn>> {
+    if seed_columns.len() != column_names.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "recursive CTE column count mismatch: declared {}, seed returns {}",
+                column_names.len(),
+                seed_columns.len()
+            ),
+        ));
+    }
+    Ok(seed_columns
+        .iter()
+        .zip(column_names.iter())
+        .map(|(column, name)| BoundColumn {
+            name: name.as_str().to_string(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            encrypted: false,
+            generated: None,
+        })
+        .collect())
 }
 
 fn validate_recursive_cte_columns(expected: &[BoundColumn], actual: &[BoundColumn]) -> Result<()> {
@@ -4720,6 +6051,12 @@ fn object_names_equal(left: &ObjectName, right: &ObjectName) -> bool {
         && left.object().eq_ignore_ascii_case(right.object())
 }
 
+fn qualified_index_name(name: &ObjectName, table: &ObjectName) -> ObjectName {
+    let table_schema = table.schema().unwrap_or("public");
+    let index_schema = name.schema().unwrap_or(table_schema);
+    ObjectName::qualified(index_schema, name.object())
+}
+
 fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
     table
         .columns()
@@ -4747,6 +6084,7 @@ fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LateralColumn {
+    side: LateralSide,
     table_name: String,
     source_name: String,
     output_name: String,
@@ -4766,9 +6104,14 @@ enum LateralSide {
 }
 
 fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColumn>> {
+    join_clause_columns(outer, inner, JoinKind::Inner)
+}
+
+fn join_clause_columns(outer: &Table, inner: &Table, kind: JoinKind) -> Result<Vec<LateralColumn>> {
     let mut columns = Vec::new();
     for column in bound_columns_for_table(outer)? {
         columns.push(LateralColumn {
+            side: LateralSide::Outer,
             table_name: outer.name().to_string(),
             source_name: column.name.clone(),
             output_name: column.name.clone(),
@@ -4784,8 +6127,12 @@ fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColum
         {
             output_name = format!("inner_{output_name}");
         }
+        if kind == JoinKind::Left {
+            column.nullable = true;
+        }
         column.name = output_name.clone();
         columns.push(LateralColumn {
+            side: LateralSide::Inner,
             table_name: inner.name().to_string(),
             source_name,
             output_name,
@@ -4795,8 +6142,147 @@ fn lateral_join_columns(outer: &Table, inner: &Table) -> Result<Vec<LateralColum
     Ok(columns)
 }
 
+fn hash_join_keys(columns: &[LateralColumn], expr: &Expr) -> Option<BoundHashJoinKeys> {
+    let Expr::Binary { left, op, right } = expr else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+    let left = hash_join_column(columns, left)?;
+    let right = hash_join_column(columns, right)?;
+    if left.column.data_type != right.column.data_type {
+        return None;
+    }
+    match (left.side, right.side) {
+        (LateralSide::Outer, LateralSide::Inner) => Some(oriented_hash_join_keys(left, right)),
+        (LateralSide::Inner, LateralSide::Outer) => Some(oriented_hash_join_keys(right, left)),
+        _ => None,
+    }
+}
+
+fn hash_join_column<'a>(columns: &'a [LateralColumn], expr: &Expr) -> Option<&'a LateralColumn> {
+    let matches = columns
+        .iter()
+        .filter(|column| hash_join_column_matches(column, expr))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Some(*column),
+        _ => None,
+    }
+}
+
+fn hash_join_column_matches(column: &LateralColumn, expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(name) => column.output_name.eq_ignore_ascii_case(name.as_str()),
+        Expr::QualifiedIdentifier { qualifier, name } => {
+            column.table_name.eq_ignore_ascii_case(qualifier.as_str())
+                && column.source_name.eq_ignore_ascii_case(name.as_str())
+        }
+        _ => false,
+    }
+}
+
+fn oriented_hash_join_keys(left: &LateralColumn, right: &LateralColumn) -> BoundHashJoinKeys {
+    BoundHashJoinKeys {
+        left_column: left.source_name.clone(),
+        right_column: right.source_name.clone(),
+    }
+}
+
+fn push_lateral_wildcard(
+    lateral_columns: &[LateralColumn],
+    projection: &mut Vec<BoundSelectItem>,
+    columns: &mut Vec<BoundColumn>,
+) {
+    for lateral_column in lateral_columns {
+        projection.push(BoundSelectItem {
+            column: lateral_column.column.clone(),
+            expr: Expr::Identifier(Ident::new(lateral_column.output_name.as_str())),
+        });
+        columns.push(lateral_column.column.clone());
+    }
+}
+
+fn lateral_projection_column(
+    lateral_columns: &[LateralColumn],
+    output_count: usize,
+    expr: &Expr,
+    data_type: SqlType,
+) -> BoundColumn {
+    match expr {
+        Expr::Identifier(identifier) => lateral_columns
+            .iter()
+            .find(|column| column.output_name.eq_ignore_ascii_case(identifier.as_str()))
+            .map(|column| column.column.clone())
+            .unwrap_or_else(|| expression_output_column(output_count, data_type)),
+        _ => expression_output_column(output_count, data_type),
+    }
+}
+
+fn expression_output_column(output_count: usize, data_type: SqlType) -> BoundColumn {
+    BoundColumn {
+        name: format!("expr{}", output_count + 1),
+        data_type,
+        nullable: true,
+        encrypted: false,
+        generated: None,
+    }
+}
+
 fn lateral_columns_to_bound(columns: &[LateralColumn]) -> Vec<BoundColumn> {
     columns.iter().map(|column| column.column.clone()).collect()
+}
+
+fn outer_lateral_column<'a>(
+    columns: &'a [LateralColumn],
+    qualifier: &Ident,
+    name: &Ident,
+) -> Result<Option<&'a LateralColumn>> {
+    let matches = columns
+        .iter()
+        .filter(|column| {
+            column.table_name.eq_ignore_ascii_case(qualifier.as_str())
+                && column.source_name.eq_ignore_ascii_case(name.as_str())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [column] => Ok(Some(*column)),
+        [] => Ok(None),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("ambiguous outer column reference: {qualifier}.{name}"),
+        )),
+    }
+}
+
+fn typed_null_expr(data_type: SqlType) -> Expr {
+    Expr::Cast {
+        expr: Box::new(Expr::Null),
+        data_type,
+    }
+}
+
+fn join_expr_column(
+    joined_columns: &[LateralColumn],
+    existing_columns: &[BoundColumn],
+    expr: &Expr,
+    data_type: SqlType,
+) -> BoundColumn {
+    if let Expr::Identifier(identifier) = expr
+        && let Some(column) = joined_columns
+            .iter()
+            .find(|column| column.output_name.eq_ignore_ascii_case(identifier.as_str()))
+    {
+        return column.column.clone();
+    }
+    BoundColumn {
+        name: format!("expr{}", existing_columns.len() + 1),
+        data_type,
+        nullable: true,
+        encrypted: false,
+        generated: None,
+    }
 }
 
 fn validate_set_operation_columns(
@@ -4830,6 +6316,24 @@ fn validate_set_operation_columns(
         }
     }
     Ok(left_columns.to_vec())
+}
+
+fn bind_count_star_projection(
+    alias: &Option<Ident>,
+    mut outputs: ProjectionOutputs<'_>,
+) -> Result<()> {
+    let column = aggregate_bound_column(outputs.columns, "count", SqlType::Int64, false);
+    let column = aliased_bound_column(column, alias);
+    push_select_projection(&mut outputs, column, Expr::CountStar);
+    Ok(())
+}
+
+fn push_select_projection(outputs: &mut ProjectionOutputs<'_>, column: BoundColumn, expr: Expr) {
+    outputs.projection.push(BoundSelectItem {
+        column: column.clone(),
+        expr,
+    });
+    outputs.columns.push(column);
 }
 
 fn aggregate_bound_column(
@@ -4891,9 +6395,24 @@ fn validate_sql_procedure_body(body: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_trigger_sql_body(body: &str) -> Result<()> {
+    let statement = parse_statement(body)?;
+    if matches!(
+        statement,
+        Statement::Insert { .. } | Statement::Update { .. } | Statement::Delete { .. }
+    ) {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "trigger SQL body must be INSERT, UPDATE, or DELETE",
+    ))
+}
+
 fn procedure_argument_type(expr: &Expr) -> Result<SqlType> {
     match expr {
         Expr::Integer(_) => Ok(SqlType::Int64),
+        Expr::Float64(_) => Ok(SqlType::Float64),
         Expr::String(_) => Ok(SqlType::Text),
         Expr::Bool(_) => Ok(SqlType::Bool),
         Expr::Null => Ok(SqlType::Null),
@@ -4936,6 +6455,10 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::Bool => "BOOL".to_string(),
         SqlType::Int64 => "INT64".to_string(),
         SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Float64 => "FLOAT64".to_string(),
+        SqlType::Uuid => "UUID".to_string(),
+        SqlType::Timestamp => "TIMESTAMP".to_string(),
+        SqlType::Json => "JSON".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),

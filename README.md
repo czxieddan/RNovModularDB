@@ -1,176 +1,238 @@
 # RNovModularDB
 
-RNovModularDB is an implementation-preview Rust database engine focused on modular internals, secure storage primitives, embedded in-memory execution, and explicit memory/disk synchronization state.
+RNovModularDB is a modular Rust database engine for secure embedded and edge
+workloads. It combines a SQL execution engine with encrypted single-file
+storage, explicit memory/disk synchronization, transaction primitives,
+authorization, row policies, column encryption, audit chains, full-text
+search, and sandboxed WebAssembly scalar functions.
 
-The project is organized as a Cargo workspace with focused crates for common primitives, SQL types, parsing and binding, catalog metadata, storage, transactions, indexes, planning, execution, full-text search, UDF metadata, security, instance isolation, embedded runtime support, and CLI tooling.
+The workspace separates common types, SQL parsing and binding, catalogs,
+storage, transactions, indexes, planning, execution, full-text search, UDFs,
+security, instance isolation, embedded runtimes, server support, and CLI
+tooling into focused crates.
 
 ## Status
 
-RNovModularDB is not ready for production workloads. The current tree is useful for local experimentation, API evaluation, and engine development, but it does not yet provide a stable release contract, a network server protocol, or automatic on-disk format migration.
+RNovModularDB is pre-1.0 software. Durable embedded SQL sessions and the
+versioned single-file format are implemented, but public APIs and compatibility
+guarantees may still evolve before a stable release. It is not a drop-in
+replacement for SQLite or PostgreSQL.
 
-Implemented areas include:
+Implemented product surfaces include:
 
-- Embedded in-memory SQL sessions through `rnmdb_cli::LocalSession`.
-- A command-line binary, `rnmdb`, that executes semicolon-separated SQL from standard input.
-- SQL parsing, binding, planning, and execution for a deliberate subset of DDL, DML, expressions, aggregates, windows, set operations, recursive CTEs, and explain output.
-- Fixed-size page storage with a memory backend, encrypted single-file page backend, and hybrid memory/disk synchronization state.
-- Single-file diagnostics, structure verification, backup, restore dry-run, and restore commands.
-- Catalog metadata for schemas, tables, indexes, functions, procedures, operators, roles, grants, row policies, and column encryption metadata.
-- Security primitives for local credentials, RBAC-style authorization metadata, row policy metadata, column key wrapping metadata, and tamper-evident audit chains.
-- Instance isolation and resource limit scaffolding for temporary embedded memory runtimes.
-
-Important current limits:
-
-- CLI SQL sessions are in-memory only. The storage CLI commands inspect, verify, back up, and restore single-file page stores; they do not yet persist full SQL table state from the SQL stdin session.
-- SQL support is intentionally incomplete. Unsupported syntax returns an error instead of attempting partial compatibility.
-- The single-file storage format is versioned, but there is no migration tool or cross-version upgrade promise yet.
-- Transaction, security, UDF, and instance crates expose core primitives, but a production multi-session durable SQL server is not a supported product surface yet.
+- In-memory and encrypted durable `LocalSession` SQL engines.
+- Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` handling with atomic state rollback.
+- General `INNER JOIN` and `LEFT JOIN` execution using hash or nested-loop plans.
+- `IN`, `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar subqueries, including
+  supported correlated forms.
+- Single-column foreign keys and `AFTER INSERT`, `AFTER UPDATE`, and
+  `AFTER DELETE` SQL triggers.
+- `FLOAT64`, `TIMESTAMP`, `UUID`, and validated `JSON` values in addition to
+  integer, text, bytes, array, range, hstore, and text-vector types.
+- B-tree, hash, inverted, range/GiST, summary/BRIN, and multidimensional bounds
+  indexing, with full-text operators integrated into planning and execution.
+- Wasmtime-backed scalar UDF execution with import denial, fuel, epoch, memory,
+  result-size, and module-cache limits.
+- Encrypted single-file inspection, verification, backup, restore, explicit
+  version 1 to version 2 upgrade, and cross-process file coordination.
+- A bounded TCP line protocol for embedded deployments.
 
 ## Build And Test
 
-RNovModularDB uses Rust 1.95 or newer.
+RNovModularDB requires Rust 1.95 or newer.
 
 ```bash
 cargo check --workspace
 cargo test --workspace
 cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Run the CLI binary from the workspace without arguments to read SQL from standard input:
+Run the `rnmdb` binary without arguments to execute semicolon-separated SQL
+from standard input in a temporary in-memory session:
 
 ```bash
-cargo run -p rnmdb-cli --bin rnmdb
+printf "CREATE TABLE items (id INT64, name TEXT); SELECT id FROM items;" \
+  | cargo run -q -p rnmdb-cli --bin rnmdb
 ```
 
-The current CLI reports unsupported command names as errors.
+## Storage CLI
 
-## CLI Usage
-
-Run an in-memory SQL session:
-
-```bash
-printf "CREATE TABLE items (id INT64 NOT NULL, name TEXT); INSERT INTO items (id, name) VALUES (1, 'alpha'); SELECT id, name FROM items ORDER BY id;" | cargo run -q -p rnmdb-cli --bin rnmdb
-```
-
-Inspect a single-file store:
+Inspect or structurally verify a single-file database:
 
 ```bash
 cargo run -q -p rnmdb-cli --bin rnmdb -- inspect path/to/database.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- inspect --page-key-hex <64-hex-chars> path/to/database.rnmdb
-```
-
-Verify, back up, and restore a single-file store:
-
-```bash
 cargo run -q -p rnmdb-cli --bin rnmdb -- verify path/to/database.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- verify --page-key-hex <64-hex-chars> path/to/database.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- backup path/to/database.rnmdb path/to/database.backup.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- restore --dry-run path/to/database.backup.rnmdb path/to/restored.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- restore path/to/database.backup.rnmdb path/to/restored.rnmdb
 ```
 
-Upgrade an older single-file store to the current format:
+Authenticated inspection and verification require a page key. Keys are never
+accepted as command-line values. Read a 64-character hexadecimal key, with an
+optional `0x` prefix and one optional LF or CRLF terminator, from a protected
+file or standard input:
 
 ```bash
-cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
-cargo run -q -p rnmdb-cli --bin rnmdb -- upgrade --page-key-hex <64-hex-chars> path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  verify --page-key-file /secure/page-key.hex path/to/database.rnmdb
+
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  inspect --page-key-stdin path/to/database.rnmdb < /secure/page-key.hex
 ```
 
-`inspect` reports file layout, page size, single-file format version, superblock generation, page record counts, free space, encryption state, and page record details. Supplying `--page-key-hex` also authenticates encrypted page records and verifies decoded page checksums.
+`--page-key-env` reads the fixed `RNMDB_PAGE_KEY_HEX` environment variable.
+Standard input or a permission-restricted file is preferable where environment
+variables may be exposed to process inspection or inherited by child processes.
+The legacy `--page-key-hex` option is rejected.
 
-`verify` without a key validates the file structure. `verify --page-key-hex` also authenticates present encrypted pages. `restore` refuses to overwrite an existing target.
+Back up and restore a database:
+
+```bash
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  backup path/to/database.rnmdb path/to/database.backup.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  restore --dry-run path/to/database.backup.rnmdb path/to/restored.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  restore path/to/database.backup.rnmdb path/to/restored.rnmdb
+```
+
+Upgrade a version 1 single-file database into a new version 2 target:
+
+```bash
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  upgrade path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  upgrade --page-key-file /secure/page-key.hex \
+  path/to/legacy-v1.rnmdb path/to/upgraded-v2.rnmdb
+```
+
+The upgrade never modifies the source and refuses an existing target. The
+library-level `SingleFileUpgradeOptions` API can use separate source and target
+keys for key rotation.
 
 ## Embedded API
 
-Use `LocalSession` for a temporary in-memory SQL engine:
+Use `LocalSession::memory` for temporary execution:
 
 ```rust
 use rnmdb_cli::{CommandOutput, LocalSession};
 
-fn main() -> rnmdb_common::Result<()> {
+fn run() -> rnmdb_common::Result<()> {
     let mut session = LocalSession::memory()?;
-    session.execute("CREATE TABLE items (id INT64 NOT NULL, name TEXT);")?;
+    session.execute("CREATE TABLE items (id INT64, name TEXT);")?;
     session.execute("INSERT INTO items (id, name) VALUES (1, 'alpha');")?;
 
-    if let CommandOutput::Rows(rows) = session.execute("SELECT id, name FROM items ORDER BY id;")? {
+    if let CommandOutput::Rows(rows) = session.execute("SELECT id, name FROM items;")? {
         println!("{:?}", rows.rows());
     }
-
     Ok(())
 }
 ```
 
-Use `LocalSession::memory_parallel(worker_threads)` or `LocalSession::memory_with_execution(...)` to configure local parallel execution. The optional `tokio-runtime` feature adds Tokio-backed wrappers for local sessions and embedded runtimes without making the storage core depend on Tokio.
-
-Temporary embedded runtimes are available through `rnmdb_server::EmbeddedRuntime`:
+Use `LocalSession::single_file_with_key` for durable SQL state. Call
+`checkpoint` after autocommit changes; a successful explicit transaction
+`COMMIT` checkpoints a durable session automatically.
 
 ```rust
-use rnmdb_common::ids::{DatabaseId, InstanceId};
-use rnmdb_server::EmbeddedRuntime;
+use std::path::Path;
 
-fn main() -> rnmdb_common::Result<()> {
-    let runtime = EmbeddedRuntime::temporary_memory(InstanceId::new(1), DatabaseId::new(1));
-    let mut session = runtime.open_session()?;
-    session.execute("CREATE TABLE events (id INT64 NOT NULL);")?;
+use rnmdb_cli::LocalSession;
+use rnmdb_storage::PageCryptoKey;
+
+fn write_event(path: &Path, page_key: PageCryptoKey) -> rnmdb_common::Result<()> {
+    let mut session = LocalSession::single_file_with_key(path, page_key)?;
+    session.execute("CREATE TABLE events (id INT64, payload TEXT);")?;
+    session.execute("INSERT INTO events VALUES (1, 'created');")?;
+    session.checkpoint()?;
     Ok(())
 }
 ```
 
-Temporary memory runtimes do not allow disk writes.
+Column encryption requires the embedder to provide column key material through
+`LocalSession::configure_column_encryption`. Column keys are not persisted with
+the database and must be reinjected after reopening a session.
+
+`LocalSession::memory_parallel` and `LocalSession::memory_with_execution`
+configure local parallel execution. The optional `tokio-runtime` feature adds
+Tokio wrappers without coupling the storage core to a specific async executor.
+
+## TCP Server
+
+`rnmdb_server::SqlTcpServer` exposes an embedded, newline-delimited protocol.
+It supports optional local credential authentication and applies the
+authenticated catalog role to authorization and column decryption. The server
+limits active clients, command size, and socket I/O time, and isolates client
+errors from the accept loop.
+
+This protocol is not PostgreSQL, MySQL, or SQLite wire compatible. It is a
+small operational interface for controlled embedded deployments, not a general
+database proxy protocol.
 
 ## SQL Support
 
-Supported SQL data types are `BOOL`, `INT64`/`BIGINT`/`INTEGER`, `UINT64`, `TEXT`/`VARCHAR`, `BYTES`/`BYTEA`, `HSTORE`, `TEXTVECTOR`/`TSVECTOR`, arrays with `[]`, and `RANGE<type>`.
-
 Supported statement families include:
 
-- `CREATE TABLE`, `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN ... SET ENCRYPTED`, and `ALTER TABLE ALTER COLUMN ... DROP ENCRYPTED`.
-- `CREATE INDEX` and `CREATE UNIQUE INDEX` with `USING btree`, `hash`, `gin`/`inverted`, `gist`, or `brin`/`summary`; expression indexes are supported for B-tree and hash metadata.
-- `DROP TABLE`, `DROP INDEX`, `DROP FUNCTION`, `DROP PROCEDURE`, `DROP OPERATOR`, `DROP ROLE`, and `DROP POLICY`.
-- `CREATE FUNCTION`, `CREATE PROCEDURE ... AS '<sql>'`, `CALL`, `CREATE OPERATOR`, `CREATE ROLE`, `CREATE POLICY ... USING (...)`, and `GRANT SELECT|INSERT|UPDATE|DELETE ON table TO role`.
-- `INSERT ... VALUES`, `UPDATE ... SET ... WHERE ...`, and `DELETE FROM ... WHERE ...`.
-- `SELECT` from one table with projection aliases, `DISTINCT`, `WHERE`, `GROUP BY`, `GROUPING SETS`, `ROLLUP`, `CUBE`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH FIRST`.
-- A restricted single `JOIN LATERAL ... ON ...` form for sideways lookup planning.
-- `UNION`, `INTERSECT`, and `EXCEPT`, including `ALL`.
-- Restricted recursive CTEs, `EXPLAIN`, `EXPLAIN ANALYZE`, `EXPLAIN COSTS`, and `EXPLAIN PHYSICAL`.
+- `CREATE TABLE`, `ALTER TABLE ADD COLUMN`, column encryption changes,
+  `DROP TABLE`, single-column `REFERENCES`, and table-level single-column
+  `FOREIGN KEY` declarations.
+- `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`, `CREATE TRIGGER`, and
+  `DROP TRIGGER`.
+- `CREATE FUNCTION`, `CREATE PROCEDURE`, `CALL`, `CREATE OPERATOR`, roles,
+  grants, row policies, and their corresponding drop statements.
+- `INSERT`, `UPDATE`, `DELETE`, and `SELECT` with filtering, grouping,
+  grouping sets, `ROLLUP`, `CUBE`, ordering, limits, windows, and set operations.
+- `INNER JOIN`, `LEFT JOIN`, restricted `JOIN LATERAL`, recursive CTEs,
+  expression subqueries, and explain output.
 
-Supported expressions include arithmetic, comparison, boolean logic, `IS NULL`, `IS DISTINCT FROM`, `BETWEEN`, `IN`, `LIKE`, `COALESCE`, `NULLIF`, `CASE`, `CAST`, array literals, hstore literals, range literals, `count`, `count(DISTINCT ...)`, `sum`, `min`, `max`, `row_number`, `rank`, `dense_rank`, and full-text helper functions/operators such as `@@`, `text_rank`, and `text_phrase_match`.
+Supported scalar types are `BOOL`, `INT64`/`BIGINT`/`INTEGER`, `UINT64`,
+`FLOAT64`/`DOUBLE PRECISION`, `TEXT`/`VARCHAR`, `BYTES`/`BYTEA`, `TIMESTAMP`,
+`UUID`, `JSON`/`JSONB`, `HSTORE`, `TEXTVECTOR`/`TSVECTOR`, arrays, and ranges.
 
-Notable unsupported areas include decimal, timestamp, UUID, and JSON document types; arbitrary joins; general subqueries; triggers; foreign keys; virtual generated columns; procedural languages beyond SQL procedure expansion; and wire-protocol server access.
+Important SQL limits include no `DECIMAL`/`NUMERIC`, `RIGHT JOIN`, `FULL JOIN`,
+generated columns, or PostgreSQL-compatible procedural language. JSON values
+are validated and persistable, but a complete JSON operator and path-query
+surface is not provided.
 
 ## Storage Compatibility
 
-The encrypted single-file storage format currently uses `SINGLE_FILE_FORMAT_VERSION = 2`. File headers include this version, and open, inspect, verify, backup, and restore paths reject unsupported format versions rather than attempting best-effort decoding.
+The encrypted single-file format uses `SINGLE_FILE_FORMAT_VERSION = 2`.
+Opening, inspection, verification, backup, restore, and upgrade reject unknown
+versions rather than attempting partial decoding.
 
-Compatibility rules for the current preview:
-
-- Version 2 files are intended to be read and written by this implementation only.
-- Version 1 files can be detected with compatibility diagnostics and upgraded explicitly to version 2 with `upgrade`.
-- Upgrade writes a new target file and leaves the source file untouched. The target path must not already exist.
-- Upgrading encrypted page records requires the page key. Empty version 1 files can be upgraded without a page key.
-- Future or otherwise unsupported versions are rejected explicitly. Downgrade is not supported.
-- Backups are byte copies that are validated against source layout metadata after copying.
+- Version 1 files can be detected and explicitly upgraded to version 2.
+- Upgrade and restore create new targets and never overwrite existing files.
+- Backup sources are held under a shared OS file lock for inspection and copy.
+- Writes, sync, checkpoints, restore targets, and upgrade targets use exclusive
+  file locks and process-local cursor serialization.
+- Backend operations remain attached to the originally opened file handle if a
+  pathname is renamed or replaced.
+- Page records use authenticated encryption and checksums; keyed verification
+  authenticates and decodes every present page.
 - Memory-to-disk checkpoint export requires an explicit page encryption key.
 
-Storage mode switching reports whether an operation is metadata-only, pre-synchronized, or full data movement. Millisecond-level active-target switching is only a valid expectation for metadata-only or pre-synchronized states.
+Storage mode reports distinguish metadata-only switching, pre-synchronized
+switching, and full data movement. Millisecond switching is only claimed for
+metadata-only or already synchronized state changes.
 
 ## Security Model
 
-RNovModularDB uses reviewed Rust cryptography crates for security-sensitive primitives:
+Security-sensitive primitives use reviewed Rust crates:
 
-- Argon2 password hashing for local credentials.
-- ChaCha20-Poly1305 authenticated encryption for storage pages and column key wrapping.
-- HMAC-SHA256 for wrapped-key authentication metadata and SHA-256 based audit hash chains.
-- OS randomness for generated credential salts.
+- Argon2 for local credential password hashing.
+- ChaCha20-Poly1305 for page encryption, column values, and wrapped keys.
+- HMAC-SHA256 for wrapped-key authentication metadata.
+- SHA-256 hash chains for tamper-evident audit records.
+- Operating-system randomness for salts and generated secret material.
 
-Current boundaries:
+RBAC grants, active roles, row policies, foreign keys, triggers, and configured
+column encryption are enforced in the local execution path. Audit verification
+detects insertion, deletion, reordering, sequence gaps, instance mismatch, and
+digest tampering within an inspected chain.
 
-- Page encryption keys are caller-supplied. The CLI accepts page keys as 64-character hex strings for inspection and verification, but it does not manage key storage.
-- Encrypted page reads authenticate metadata and payload before returning decoded pages.
-- Column encryption metadata records wrapped data-encryption keys, key versions, rotation metadata, and decrypt authorization checks, but application-level key custody remains the embedder's responsibility.
-- RBAC, row policy, and grants are represented in catalog/security metadata and are enforced where the current binder/executor path uses them. This is not yet a complete hardened multi-user server boundary.
-- Audit chains detect insertion, deletion, reordering, sequence gaps, instance mismatch, and digest tampering within the inspected chain.
+Page keys, column keys, credential lifecycle, backups, and deployment access
+remain the embedder's responsibility. RNovModularDB does not include a KMS,
+certificate authority, replication layer, or high-availability coordinator.
 
 ## License
 
-RNovModularDB is licensed under AGPL-3.0-only.
+RNovModularDB is offered under a commercial license and under the GNU Affero
+General Public License. For AGPL licensing, see [LICENSE](LICENSE). For custom
+commercial licensing, contact [licensing@aperip.com](mailto:licensing@aperip.com).

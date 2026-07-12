@@ -11,7 +11,9 @@ rnmdb-common.workspace = true
 rnmdb-fts.workspace = true
 rnmdb-index.workspace = true
 rnmdb-planner.workspace = true
+rnmdb-security.workspace = true
 rnmdb-sql.workspace = true
+rnmdb-storage.workspace = true
 rnmdb-types.workspace = true
 crc = "3"
 

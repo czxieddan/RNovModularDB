@@ -202,7 +202,9 @@ pub(crate) fn validate_row_against_columns(columns: &[ColumnSchema], row: &Row) 
                 format!("null value for not-null column {}", column.name()),
             ));
         }
-        if value.data_type() != *column.data_type() {
+        if value.data_type() != *column.data_type()
+            && !encrypted_storage_value_matches(column, value)
+        {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -215,4 +217,8 @@ pub(crate) fn validate_row_against_columns(columns: &[ColumnSchema], row: &Row) 
         }
     }
     Ok(())
+}
+
+fn encrypted_storage_value_matches(column: &ColumnSchema, value: &SqlValue) -> bool {
+    column.is_encrypted() && matches!(value, SqlValue::Bytes(_))
 }

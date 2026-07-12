@@ -268,11 +268,58 @@ impl CostModel {
                     outer.io + probes * inner.io,
                 )
             }
+            LogicalPlan::NestedLoopJoin { left, right, .. } => {
+                let left = self.estimate(left);
+                let right = self.estimate(right);
+                let comparisons = left.rows.max(1.0) * right.rows.max(1.0);
+                PlanCost::new(
+                    (comparisons * DEFAULT_FILTER_SELECTIVITY).max(1.0),
+                    left.row_width_bytes + right.row_width_bytes,
+                    left.cpu + right.cpu + comparisons * self.parameters.cpu_operator_cost,
+                    left.io + right.io,
+                )
+            }
+            LogicalPlan::HashJoin { left, right, .. } => {
+                let left = self.estimate(left);
+                let right = self.estimate(right);
+                PlanCost::new(
+                    (left.rows * right.rows * DEFAULT_FILTER_SELECTIVITY).max(1.0),
+                    left.row_width_bytes + right.row_width_bytes,
+                    left.cpu
+                        + right.cpu
+                        + (left.rows + right.rows) * self.parameters.cpu_operator_cost,
+                    left.io + right.io,
+                )
+            }
             LogicalPlan::Filter { input, .. } => {
                 let input = self.estimate(input);
                 input
                     .with_rows(input.rows * DEFAULT_FILTER_SELECTIVITY)
                     .add_cpu(input.rows * self.parameters.cpu_operator_cost)
+            }
+            LogicalPlan::InSubqueryFilter {
+                input, subquery, ..
+            } => {
+                let input = self.estimate(input);
+                let subquery = self.estimate(subquery);
+                PlanCost::new(
+                    input.rows * DEFAULT_FILTER_SELECTIVITY,
+                    input.row_width_bytes,
+                    input.cpu + subquery.cpu + input.rows * self.parameters.cpu_operator_cost,
+                    input.io + subquery.io,
+                )
+            }
+            LogicalPlan::ExistsSubqueryFilter {
+                input, subquery, ..
+            } => {
+                let input = self.estimate(input);
+                let subquery = self.estimate(subquery);
+                PlanCost::new(
+                    input.rows * DEFAULT_FILTER_SELECTIVITY,
+                    input.row_width_bytes,
+                    input.cpu + subquery.cpu + input.rows * self.parameters.cpu_operator_cost,
+                    input.io + subquery.io,
+                )
             }
             LogicalPlan::Project { items, input } => {
                 let input = self.estimate(input);

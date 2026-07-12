@@ -9,7 +9,7 @@ use chacha20poly1305::{
     aead::{Aead, Payload},
 };
 use hmac::{Hmac, Mac};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{InstanceId, RelationId, RoleId},
@@ -17,6 +17,9 @@ use rnmdb_common::{
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
+const COLUMN_VALUE_MAGIC: [u8; 8] = *b"RNOVCV01";
+const COLUMN_VALUE_VERSION: u8 = 1;
+const COLUMN_VALUE_HEADER_LEN: usize = 8 + 1 + 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditEventKind {
@@ -352,6 +355,12 @@ impl ColumnKeyMaterial {
         Self(bytes)
     }
 
+    pub fn generate() -> Self {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        Self(bytes)
+    }
+
     const fn as_bytes(self) -> [u8; 32] {
         self.0
     }
@@ -359,6 +368,61 @@ impl ColumnKeyMaterial {
     fn to_key(self) -> Key {
         Key::try_from(&self.0[..]).expect("ColumnKeyMaterial is always 32 bytes")
     }
+}
+
+pub fn encrypt_column_value(
+    key: &ColumnKeyMaterial,
+    relation_id: RelationId,
+    column_name: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    encrypt_column_value_with_nonce(key, relation_id, column_name, plaintext, nonce)
+}
+
+pub fn decrypt_column_value(
+    key: &ColumnKeyMaterial,
+    relation_id: RelationId,
+    column_name: &str,
+    encrypted: &[u8],
+) -> Result<Vec<u8>> {
+    let envelope = ColumnValueEnvelope::decode(encrypted)?;
+    let cipher = ChaCha20Poly1305::new(&key.to_key());
+    cipher
+        .decrypt(
+            &Nonce::from(envelope.nonce),
+            Payload {
+                msg: envelope.ciphertext,
+                aad: &column_value_associated_data(relation_id, column_name),
+            },
+        )
+        .map_err(|_| {
+            RnovError::new(
+                ErrorKind::Security,
+                "column value authentication failed during decryption",
+            )
+        })
+}
+
+fn encrypt_column_value_with_nonce(
+    key: &ColumnKeyMaterial,
+    relation_id: RelationId,
+    column_name: &str,
+    plaintext: &[u8],
+    nonce: [u8; 12],
+) -> Result<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(&key.to_key());
+    let ciphertext = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad: &column_value_associated_data(relation_id, column_name),
+            },
+        )
+        .map_err(|_| RnovError::new(ErrorKind::Security, "column value encryption failed"))?;
+    Ok(encode_column_value_envelope(nonce, &ciphertext))
 }
 
 impl std::fmt::Debug for ColumnKeyMaterial {
@@ -1462,6 +1526,72 @@ fn column_key_associated_data(
     aad.extend_from_slice(&relation_id.get().to_be_bytes());
     aad.extend_from_slice(&version.to_be_bytes());
     aad.extend_from_slice(&key_id.get().to_be_bytes());
+    aad.extend_from_slice(&(column_name.len() as u64).to_be_bytes());
+    aad.extend_from_slice(column_name.as_bytes());
+    aad
+}
+
+fn encode_column_value_envelope(nonce: [u8; 12], ciphertext: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(COLUMN_VALUE_HEADER_LEN + ciphertext.len());
+    encoded.extend_from_slice(&COLUMN_VALUE_MAGIC);
+    encoded.push(COLUMN_VALUE_VERSION);
+    encoded.extend_from_slice(&nonce);
+    encoded.extend_from_slice(ciphertext);
+    encoded
+}
+
+struct ColumnValueEnvelope<'a> {
+    nonce: [u8; 12],
+    ciphertext: &'a [u8],
+}
+
+impl<'a> ColumnValueEnvelope<'a> {
+    fn decode(encrypted: &'a [u8]) -> Result<Self> {
+        ensure_column_value_header(encrypted)?;
+        let mut nonce = [0_u8; 12];
+        nonce.copy_from_slice(&encrypted[9..COLUMN_VALUE_HEADER_LEN]);
+        Ok(Self {
+            nonce,
+            ciphertext: &encrypted[COLUMN_VALUE_HEADER_LEN..],
+        })
+    }
+}
+
+fn ensure_column_value_header(encrypted: &[u8]) -> Result<()> {
+    if encrypted.len() < COLUMN_VALUE_HEADER_LEN {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "truncated column value envelope",
+        ));
+    }
+    ensure_column_value_magic(encrypted)?;
+    ensure_column_value_version(encrypted[8])
+}
+
+fn ensure_column_value_magic(encrypted: &[u8]) -> Result<()> {
+    if encrypted[..8] == COLUMN_VALUE_MAGIC {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Corruption,
+        "invalid column value envelope magic",
+    ))
+}
+
+fn ensure_column_value_version(version: u8) -> Result<()> {
+    if version == COLUMN_VALUE_VERSION {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Corruption,
+        format!("unsupported column value envelope version {version}"),
+    ))
+}
+
+fn column_value_associated_data(relation_id: RelationId, column_name: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(40 + column_name.len());
+    aad.extend_from_slice(b"RNOVDB-COLUMN-VALUE-V1");
+    aad.extend_from_slice(&relation_id.get().to_be_bytes());
     aad.extend_from_slice(&(column_name.len() as u64).to_be_bytes());
     aad.extend_from_slice(column_name.as_bytes());
     aad

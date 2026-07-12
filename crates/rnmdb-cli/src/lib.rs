@@ -1,12 +1,29 @@
-use std::time::Instant;
+use std::{
+    collections::HashSet,
+    fmt,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use rnmdb_catalog::{Catalog, IndexKey, OperatorSignature, Privilege, RowPolicy};
+use rnmdb_catalog::{
+    Catalog, CatalogCodec, ForeignKeyReference, Function as CatalogFunction,
+    FunctionImplementation as CatalogFunctionImplementation, IndexKey, OperatorSignature,
+    Privilege, RowPolicy, Table as CatalogTable, Trigger, TriggerEvent, TriggerTiming,
+    WasmFunctionImplementation,
+};
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
-    ids::{DatabaseId, RelationId, RoleId},
+    ids::{DatabaseId, FunctionId, RelationId, RoleId},
 };
 use rnmdb_executor::{
-    memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig},
+    durable::{
+        DurableExecutorImage, read_image_from_single_file_backend,
+        write_image_to_single_file_backend,
+    },
+    memory::{
+        ExecutionResult, MemoryExecutor, MutationDelta, ParallelQueryConfig, ScalarFunctionRuntime,
+    },
     vector::VectorBatch,
 };
 use rnmdb_planner::{
@@ -15,20 +32,26 @@ use rnmdb_planner::{
     optimizer::RuleOptimizer,
     physical::{IndexAccessPath, IndexCatalog, PhysicalPlanner},
 };
+pub use rnmdb_security::ColumnKeyMaterial;
 use rnmdb_sql::{
-    ast::{BoundStatement, ColumnDef, ExplainFormat, ObjectName},
+    ast::{
+        BoundStatement, ColumnDef, CreateFunctionImplementation, ExplainFormat, Ident, ObjectName,
+        TransactionAction, WasmFunctionBody,
+    },
     binder::Binder,
     parser::parse_statement,
 };
 use rnmdb_storage::{
-    PageCryptoKey, SingleFileBackupReport, SingleFileFormatCompatibility, SingleFileInspection,
-    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
-    SingleFileVerificationReport, backup_single_file, check_single_file_format_compatibility,
-    inspect_single_file, inspect_single_file_with_key, restore_single_file,
-    restore_single_file_dry_run, upgrade_single_file, upgrade_single_file_with_key,
-    verify_single_file, verify_single_file_with_key,
+    PageCryptoKey, SingleFileBackend, SingleFileBackupReport, SingleFileFormatCompatibility,
+    SingleFileInspection, SingleFileOptions, SingleFileRestoreDryRun, SingleFileRestoreReport,
+    SingleFileUpgradeReport, SingleFileVerificationReport, backup_single_file,
+    check_single_file_format_compatibility, inspect_single_file, inspect_single_file_with_key,
+    restore_single_file, restore_single_file_dry_run, upgrade_single_file,
+    upgrade_single_file_with_key, verify_single_file, verify_single_file_with_key,
 };
-use rnmdb_types::SqlType;
+use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
+use rnmdb_types::{SqlType, SqlValue};
+use rnmdb_udf::{UdfBudget, UdfDefinition, UdfRegistry, UdfSandboxPolicy, WasmScalarRuntime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
@@ -42,10 +65,73 @@ pub struct LocalSession {
     catalog: Catalog,
     role_id: RoleId,
     executor: MemoryExecutor,
+    udf_registry: UdfRegistry,
+    wasm_runtime: WasmScalarRuntime,
     planner: LogicalPlanner,
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
     procedure_call_stack: Vec<String>,
+    trigger_stack: Vec<String>,
+    durable: Option<LocalDurableStore>,
+    transaction_manager: TransactionManager,
+    transaction: Option<LocalTransactionState>,
+}
+
+struct LocalDurableStore {
+    backend: SingleFileBackend,
+}
+
+struct LocalTransactionState {
+    transaction: Transaction,
+    catalog_snapshot: Catalog,
+    executor_snapshot: MemoryExecutor,
+    udf_registry_snapshot: UdfRegistry,
+}
+
+struct SessionWasmRuntime {
+    registry: UdfRegistry,
+    runtime: WasmScalarRuntime,
+}
+
+impl fmt::Debug for SessionWasmRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionWasmRuntime")
+            .field("registered_functions", &self.registry.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ScalarFunctionRuntime for SessionWasmRuntime {
+    fn return_type(&self, function_id: FunctionId) -> Option<SqlType> {
+        self.registry
+            .resolve_by_id(function_id)
+            .and_then(UdfDefinition::return_type)
+            .cloned()
+    }
+
+    fn execute(&self, function_id: FunctionId, arguments: &[SqlValue]) -> Result<Option<SqlValue>> {
+        let Some(definition) = self.registry.resolve_by_id(function_id) else {
+            return Ok(None);
+        };
+        self.runtime.execute_scalar(definition, arguments).map(Some)
+    }
+}
+
+impl LocalTransactionState {
+    fn capture(
+        transaction: Transaction,
+        catalog: &Catalog,
+        executor: &MemoryExecutor,
+        udf_registry: &UdfRegistry,
+    ) -> Result<Self> {
+        Ok(Self {
+            transaction,
+            catalog_snapshot: catalog.clone(),
+            executor_snapshot: executor.snapshot()?,
+            udf_registry_snapshot: udf_registry.clone(),
+        })
+    }
 }
 
 impl LocalSession {
@@ -58,236 +144,842 @@ impl LocalSession {
     }
 
     pub fn memory_with_execution(execution: LocalExecutionConfig) -> Result<Self> {
-        let mut catalog = Catalog::new(DatabaseId::new(1));
-        catalog.create_schema("public")?;
-        register_builtin_functions(&mut catalog)?;
-        let role = catalog.create_role("local")?;
-        Ok(Self {
-            catalog,
-            role_id: role.role_id(),
-            executor: MemoryExecutor::new(),
-            planner: LogicalPlanner::new(),
-            optimizer: RuleOptimizer::new(),
-            execution,
-            procedure_call_stack: Vec::new(),
-        })
+        let (catalog, role_id) = default_catalog()?;
+        Self::from_parts(catalog, role_id, MemoryExecutor::new(), execution, None)
+    }
+
+    pub fn single_file_with_key(path: impl AsRef<Path>, key: PageCryptoKey) -> Result<Self> {
+        let backend = open_or_create_single_file(path.as_ref(), key)?;
+        let mut session = load_session_from_backend(&backend, LocalExecutionConfig::default())?;
+        session.durable = Some(LocalDurableStore { backend });
+        Ok(session)
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        if self.in_transaction() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot checkpoint while a transaction is active",
+            ));
+        }
+        self.checkpoint_current_state()
+    }
+
+    fn checkpoint_current_state(&mut self) -> Result<()> {
+        let image = self.encode_durable_image()?;
+        let durable = self.durable.as_mut().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "local session has no durable storage backend",
+            )
+        })?;
+        let page_size = durable.backend.page_size();
+        write_image_to_single_file_backend(&mut durable.backend, page_size, &image)
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.transaction.is_some()
+    }
+
+    pub fn set_active_role(&mut self, role_id: RoleId) -> Result<()> {
+        if self.catalog.get_role_by_id(role_id).is_none() {
+            return Err(RnovError::new(ErrorKind::NotFound, "role does not exist"));
+        }
+        self.role_id = role_id;
+        self.executor.set_active_role(role_id);
+        Ok(())
+    }
+
+    pub fn configure_column_encryption(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        key: ColumnKeyMaterial,
+    ) -> Result<()> {
+        let schema_name = Ident::new(schema_name);
+        let table_name = Ident::new(table_name);
+        let column_name = Ident::new(column_name);
+        let table = self
+            .catalog
+            .get_table(schema_name.as_str(), table_name.as_str())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table does not exist: {schema_name}.{table_name}"),
+                )
+            })?;
+        let column = table
+            .columns()
+            .iter()
+            .find(|column| column.name() == column_name.as_str())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {schema_name}.{table_name}.{column_name}"),
+                )
+            })?;
+        if !column.is_encrypted() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("column is not marked encrypted: {schema_name}.{table_name}.{column_name}"),
+            ));
+        }
+        self.executor.configure_column_encryption(
+            table.relation_id(),
+            column.name(),
+            key,
+            [self.role_id],
+        )
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
         let statement = parse_statement(sql)?;
         let bound = Binder::new(&self.catalog).bind_for_role(&statement, self.role_id)?;
+        self.execute_bound_statement(&bound)
+    }
 
-        match &bound {
+    fn execute_bound_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::Transaction { action } => self.execute_transaction(*action),
+            BoundStatement::CreateTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateTrigger { .. }
+            | BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterColumnEncryption { .. }
+            | BoundStatement::DropTable { .. }
+            | BoundStatement::DropIndex { .. }
+            | BoundStatement::DropTrigger { .. } => self.execute_schema_statement(bound),
+            BoundStatement::CreateFunction { .. }
+            | BoundStatement::CreateProcedure { .. }
+            | BoundStatement::CreateOperator { .. }
+            | BoundStatement::CreateRole { .. }
+            | BoundStatement::CreatePolicy { .. }
+            | BoundStatement::DropFunction { .. }
+            | BoundStatement::DropProcedure { .. }
+            | BoundStatement::DropOperator { .. }
+            | BoundStatement::DropRole { .. }
+            | BoundStatement::DropPolicy { .. } => self.execute_catalog_statement(bound),
+            BoundStatement::GrantTablePrivilege { .. }
+            | BoundStatement::GrantProcedurePrivilege { .. } => self.execute_grant_statement(bound),
+            BoundStatement::CallProcedure { name, body, args } => {
+                self.execute_procedure_call(name.as_str(), body, args)
+            }
+            BoundStatement::Select(_)
+            | BoundStatement::SelectJoin(_)
+            | BoundStatement::Union(_)
+            | BoundStatement::Intersect(_)
+            | BoundStatement::Except(_)
+            | BoundStatement::RecursiveCte(_)
+            | BoundStatement::Query(_) => self.execute_read_statement(bound),
+            BoundStatement::Explain {
+                analyze,
+                format,
+                statement,
+            } => self.execute_explain_statement(*analyze, *format, statement),
+            BoundStatement::Insert { .. }
+            | BoundStatement::Update(_)
+            | BoundStatement::Delete(_) => self.execute_mutation_with_constraints(bound),
+        }
+    }
+
+    fn execute_schema_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::CreateTable { .. }
+            | BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterColumnEncryption { .. }
+            | BoundStatement::DropTable { .. } => self.execute_table_schema_statement(bound),
+            BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateTrigger { .. }
+            | BoundStatement::DropIndex { .. }
+            | BoundStatement::DropTrigger { .. } => {
+                self.execute_index_trigger_schema_statement(bound)
+            }
+            _ => Err(command_dispatch_error("schema")),
+        }
+    }
+
+    fn execute_table_schema_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
             BoundStatement::CreateTable {
                 name,
                 columns,
                 if_not_exists,
-            } => {
-                self.apply_catalog_create_table(name, columns, *if_not_exists)?;
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
-            BoundStatement::CreateIndex {
-                name,
-                relation_id,
-                keys,
-                method,
-                unique,
-                if_not_exists,
-                ..
-            } => {
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan)?;
-                self.apply_catalog_create_index(
-                    name,
-                    *relation_id,
-                    keys,
-                    *method,
-                    *unique,
-                    *if_not_exists,
-                )?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropIndex { name, if_exists } => {
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan)?;
-                self.apply_catalog_drop_index(name, *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropFunction {
-                name,
-                argument_types,
-                if_exists,
-            } => {
-                self.apply_catalog_drop_function(name.as_str(), argument_types, *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropProcedure {
-                name,
-                argument_types,
-                if_exists,
-            } => {
-                self.apply_catalog_drop_procedure(name.as_str(), argument_types, *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropOperator {
-                symbol,
-                left_type,
-                right_type,
-                if_exists,
-            } => {
-                self.apply_catalog_drop_operator(symbol, left_type, right_type, *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropRole { name, if_exists } => {
-                self.apply_catalog_drop_role(name.as_str(), *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::DropPolicy {
-                name,
-                relation_id,
-                if_exists,
-            } => {
-                self.apply_catalog_drop_policy(name.as_str(), *relation_id, *if_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
+            } => self.execute_create_table_statement(bound, name, columns, *if_not_exists),
             BoundStatement::AlterTableAddColumn {
                 table,
                 column,
                 if_not_exists,
                 ..
-            } => {
-                self.apply_catalog_add_column(table, column, *if_not_exists)?;
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
+            } => self.execute_add_column_statement(bound, table, column, *if_not_exists),
             BoundStatement::AlterColumnEncryption {
                 table,
                 column,
                 encrypted,
                 ..
-            } => {
-                self.apply_catalog_set_column_encrypted(table, column.as_str(), *encrypted)?;
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
+            } => self.execute_alter_column_encryption(bound, table, column.as_str(), *encrypted),
             BoundStatement::DropTable {
                 name, if_exists, ..
-            } => {
-                self.apply_catalog_drop_table(name, *if_exists)?;
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
+            } => self.execute_drop_table_statement(bound, name, *if_exists),
+            _ => Err(command_dispatch_error("table schema")),
+        }
+    }
+
+    fn execute_create_table_statement(
+        &mut self,
+        bound: &BoundStatement,
+        name: &ObjectName,
+        columns: &[ColumnDef],
+        if_not_exists: bool,
+    ) -> Result<CommandOutput> {
+        self.apply_catalog_create_table(name, columns, if_not_exists)?;
+        let plan = self.planner.plan(bound)?;
+        self.executor.execute_mut(&plan).map(CommandOutput::from)
+    }
+
+    fn execute_add_column_statement(
+        &mut self,
+        bound: &BoundStatement,
+        table: &ObjectName,
+        column: &ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(bound)?;
+        let catalog_snapshot = self.catalog.clone();
+        self.apply_catalog_add_column(table, column, if_not_exists)?;
+        match self.executor.execute_mut(&plan) {
+            Ok(output) => Ok(CommandOutput::from(output)),
+            Err(error) => {
+                self.catalog = catalog_snapshot;
+                Err(error)
             }
-            BoundStatement::CreateFunction {
+        }
+    }
+
+    fn execute_drop_table_statement(
+        &mut self,
+        bound: &BoundStatement,
+        name: &ObjectName,
+        if_exists: bool,
+    ) -> Result<CommandOutput> {
+        self.apply_catalog_drop_table(name, if_exists)?;
+        let plan = self.planner.plan(bound)?;
+        self.executor.execute_mut(&plan).map(CommandOutput::from)
+    }
+
+    fn execute_index_trigger_schema_statement(
+        &mut self,
+        bound: &BoundStatement,
+    ) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::CreateIndex { .. } => self.execute_create_index_statement(bound),
+            BoundStatement::CreateTrigger {
                 name,
-                argument_types,
-                return_type,
+                relation_id,
+                timing,
+                event,
+                body,
                 if_not_exists,
-            } => {
-                self.apply_catalog_create_function(
+                ..
+            } => self
+                .apply_catalog_create_trigger(
                     name.as_str(),
-                    argument_types,
-                    return_type,
+                    *relation_id,
+                    *timing,
+                    *event,
+                    body,
                     *if_not_exists,
-                )?;
-                Ok(CommandOutput::SchemaChanged)
+                )
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::DropIndex { name, if_exists } => {
+                self.execute_drop_index_statement(bound, name, *if_exists)
             }
+            BoundStatement::DropTrigger {
+                name,
+                relation_id,
+                if_exists,
+                ..
+            } => {
+                self.execute_drop_trigger_statement(bound, name.as_str(), *relation_id, *if_exists)
+            }
+            _ => Err(command_dispatch_error("index or trigger schema")),
+        }
+    }
+
+    fn execute_create_index_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        let BoundStatement::CreateIndex {
+            name,
+            relation_id,
+            keys,
+            method,
+            unique,
+            if_not_exists,
+            ..
+        } = bound
+        else {
+            return Err(command_dispatch_error("index creation"));
+        };
+        let plan = self.planner.plan(bound)?;
+        self.executor.execute_mut(&plan)?;
+        self.apply_catalog_create_index(
+            name,
+            *relation_id,
+            keys,
+            *method,
+            *unique,
+            *if_not_exists,
+        )?;
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn execute_drop_index_statement(
+        &mut self,
+        bound: &BoundStatement,
+        name: &ObjectName,
+        if_exists: bool,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(bound)?;
+        self.executor.execute_mut(&plan)?;
+        self.apply_catalog_drop_index(name, if_exists)?;
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn execute_drop_trigger_statement(
+        &mut self,
+        bound: &BoundStatement,
+        name: &str,
+        relation_id: RelationId,
+        if_exists: bool,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(bound)?;
+        self.executor.execute_mut(&plan)?;
+        self.apply_catalog_drop_trigger(name, relation_id, if_exists)?;
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn execute_catalog_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::CreateFunction { .. }
+            | BoundStatement::CreateProcedure { .. }
+            | BoundStatement::CreateOperator { .. }
+            | BoundStatement::CreateRole { .. }
+            | BoundStatement::CreatePolicy { .. } => self.execute_create_catalog_statement(bound),
+            BoundStatement::DropFunction { .. }
+            | BoundStatement::DropProcedure { .. }
+            | BoundStatement::DropOperator { .. }
+            | BoundStatement::DropRole { .. }
+            | BoundStatement::DropPolicy { .. } => self.execute_drop_catalog_statement(bound),
+            _ => Err(command_dispatch_error("catalog")),
+        }
+    }
+
+    fn execute_create_catalog_statement(
+        &mut self,
+        bound: &BoundStatement,
+    ) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::CreateFunction { .. } => self.execute_create_function_catalog(bound),
             BoundStatement::CreateProcedure {
                 name,
                 argument_types,
                 body,
                 if_not_exists,
-            } => {
-                self.apply_catalog_create_procedure(
-                    name.as_str(),
-                    argument_types,
-                    body,
-                    *if_not_exists,
-                )?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            BoundStatement::CallProcedure { name, body, args } => {
-                self.execute_procedure_call(name.as_str(), body, args)
-            }
-            BoundStatement::CreateOperator { signature } => {
-                self.catalog.register_operator(signature.clone())?;
-                Ok(CommandOutput::SchemaChanged)
-            }
+            } => self
+                .apply_catalog_create_procedure(name.as_str(), argument_types, body, *if_not_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::CreateOperator { signature } => self
+                .catalog
+                .register_operator(signature.clone())
+                .map(|_| CommandOutput::SchemaChanged),
             BoundStatement::CreateRole {
                 name,
                 if_not_exists,
-            } => {
-                self.apply_catalog_create_role(name.as_str(), *if_not_exists)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
+            } => self
+                .apply_catalog_create_role(name.as_str(), *if_not_exists)
+                .map(|()| CommandOutput::SchemaChanged),
             BoundStatement::CreatePolicy {
                 name,
                 relation_id,
                 predicate,
                 if_not_exists,
-            } => {
-                self.apply_catalog_create_policy(
-                    name.as_str(),
-                    *relation_id,
-                    predicate.as_str(),
-                    *if_not_exists,
-                )?;
-                Ok(CommandOutput::SchemaChanged)
-            }
+            } => self.execute_create_policy_catalog(
+                name.as_str(),
+                *relation_id,
+                predicate.as_str(),
+                *if_not_exists,
+            ),
+            _ => Err(command_dispatch_error("catalog creation")),
+        }
+    }
+
+    fn execute_create_function_catalog(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        let BoundStatement::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+            implementation,
+            if_not_exists,
+        } = bound
+        else {
+            return Err(command_dispatch_error("function creation"));
+        };
+        self.apply_catalog_create_function(
+            name.as_str(),
+            argument_types,
+            return_type,
+            implementation,
+            *if_not_exists,
+        )
+        .map(|()| CommandOutput::SchemaChanged)
+    }
+
+    fn execute_create_policy_catalog(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        predicate: &str,
+        if_not_exists: bool,
+    ) -> Result<CommandOutput> {
+        self.apply_catalog_create_policy(name, relation_id, predicate, if_not_exists)
+            .map(|()| CommandOutput::SchemaChanged)
+    }
+
+    fn execute_drop_catalog_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
+            BoundStatement::DropFunction {
+                name,
+                argument_types,
+                if_exists,
+            } => self
+                .apply_catalog_drop_function(name.as_str(), argument_types, *if_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::DropProcedure {
+                name,
+                argument_types,
+                if_exists,
+            } => self
+                .apply_catalog_drop_procedure(name.as_str(), argument_types, *if_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::DropOperator {
+                symbol,
+                left_type,
+                right_type,
+                if_exists,
+            } => self
+                .apply_catalog_drop_operator(symbol, left_type, right_type, *if_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::DropRole { name, if_exists } => self
+                .apply_catalog_drop_role(name.as_str(), *if_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::DropPolicy {
+                name,
+                relation_id,
+                if_exists,
+            } => self
+                .apply_catalog_drop_policy(name.as_str(), *relation_id, *if_exists)
+                .map(|()| CommandOutput::SchemaChanged),
+            _ => Err(command_dispatch_error("catalog drop")),
+        }
+    }
+
+    fn execute_grant_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        match bound {
             BoundStatement::GrantTablePrivilege {
                 role_id,
                 relation_id,
                 privilege,
-            } => {
-                self.catalog
-                    .grant_table_privilege(*role_id, *relation_id, *privilege)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
+            } => self
+                .catalog
+                .grant_table_privilege(*role_id, *relation_id, *privilege)
+                .map(|()| CommandOutput::SchemaChanged),
             BoundStatement::GrantProcedurePrivilege {
                 role_id,
                 procedure_id,
                 privilege,
-            } => {
-                self.catalog
-                    .grant_procedure_privilege(*role_id, *procedure_id, *privilege)?;
-                Ok(CommandOutput::SchemaChanged)
-            }
-            statement if is_read_query(statement) => {
-                let plan = self.optimize_read_plan(self.planner.plan(&bound)?);
-                self.executor
-                    .execute_parallel(&plan, self.execution.parallel_query())
-                    .map(CommandOutput::Rows)
-            }
-            BoundStatement::Explain {
-                analyze,
-                format,
-                statement,
-            } => {
-                let plan = self.optimize_read_plan(self.planner.plan(statement)?);
-                let mut text = self.explain_plan(&plan, *format);
-                if *analyze {
-                    let started = Instant::now();
-                    let batch = self
-                        .executor
-                        .execute_parallel(&plan, self.execution.parallel_query())?;
-                    let elapsed = started.elapsed();
-                    text.push_str(&format!(
-                        "Analyze rows={} elapsed_us={}\n",
-                        batch.rows().len(),
-                        elapsed.as_micros()
-                    ));
-                }
-                Ok(CommandOutput::Text(text))
-            }
-            _ => {
-                let plan = self.planner.plan(&bound)?;
-                self.executor.execute_mut(&plan).map(CommandOutput::from)
-            }
+            } => self
+                .catalog
+                .grant_procedure_privilege(*role_id, *procedure_id, *privilege)
+                .map(|()| CommandOutput::SchemaChanged),
+            _ => Err(command_dispatch_error("grant")),
         }
+    }
+
+    fn execute_read_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        let plan = self.optimize_read_plan(self.planner.plan(bound)?);
+        self.executor
+            .execute_parallel(&plan, self.execution.parallel_query())
+            .map(CommandOutput::Rows)
+    }
+
+    fn execute_explain_statement(
+        &mut self,
+        analyze: bool,
+        format: ExplainFormat,
+        statement: &BoundStatement,
+    ) -> Result<CommandOutput> {
+        let plan = self.optimize_read_plan(self.planner.plan(statement)?);
+        let mut text = self.explain_plan(&plan, format);
+        if analyze {
+            let started = Instant::now();
+            let batch = self
+                .executor
+                .execute_parallel(&plan, self.execution.parallel_query())?;
+            let elapsed = started.elapsed();
+            text.push_str(&format!(
+                "Analyze rows={} elapsed_us={}\n",
+                batch.rows().len(),
+                elapsed.as_micros()
+            ));
+        }
+        Ok(CommandOutput::Text(text))
     }
 
     pub async fn execute_async(&mut self, sql: &str) -> Result<CommandOutput> {
         self.execute(sql)
+    }
+
+    fn from_parts(
+        catalog: Catalog,
+        role_id: RoleId,
+        mut executor: MemoryExecutor,
+        execution: LocalExecutionConfig,
+        durable: Option<LocalDurableStore>,
+    ) -> Result<Self> {
+        executor.set_active_role(role_id);
+        let wasm_runtime = WasmScalarRuntime::new()?;
+        let udf_registry = rebuild_udf_registry(&catalog, &wasm_runtime)?;
+        let mut session = Self {
+            catalog,
+            role_id,
+            executor,
+            udf_registry,
+            wasm_runtime,
+            planner: LogicalPlanner::new(),
+            optimizer: RuleOptimizer::new(),
+            execution,
+            procedure_call_stack: Vec::new(),
+            trigger_stack: Vec::new(),
+            durable,
+            transaction_manager: TransactionManager::new(),
+            transaction: None,
+        };
+        session.refresh_scalar_function_runtime();
+        Ok(session)
+    }
+
+    fn refresh_scalar_function_runtime(&mut self) {
+        self.executor
+            .set_scalar_function_runtime(Some(Arc::new(SessionWasmRuntime {
+                registry: self.udf_registry.clone(),
+                runtime: self.wasm_runtime.clone(),
+            })));
+    }
+
+    fn encode_durable_image(&self) -> Result<Vec<u8>> {
+        DurableExecutorImage::new(
+            CatalogCodec::encode(&self.catalog)?,
+            self.executor.snapshot_tables()?,
+        )
+        .encode()
+    }
+
+    fn execute_mutation_with_constraints(
+        &mut self,
+        statement: &BoundStatement,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(statement)?;
+        let snapshot = self.executor.snapshot()?;
+        let (output, delta) = match self.executor.execute_row_mutation(&plan) {
+            Ok(execution) => execution,
+            Err(err) => {
+                self.executor = snapshot;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.finish_mutation_statement(statement, &output, &delta) {
+            self.executor = snapshot;
+            return Err(err);
+        }
+        Ok(CommandOutput::from(output))
+    }
+
+    fn finish_mutation_statement(
+        &mut self,
+        statement: &BoundStatement,
+        output: &ExecutionResult,
+        delta: &MutationDelta,
+    ) -> Result<()> {
+        self.validate_foreign_keys_after_mutation(statement, delta)?;
+        self.execute_after_triggers(statement, output)
+    }
+
+    fn validate_foreign_keys_after_mutation(
+        &self,
+        statement: &BoundStatement,
+        delta: &MutationDelta,
+    ) -> Result<()> {
+        let table = self.mutation_catalog_table(statement, delta)?;
+        self.validate_changed_child_values(table, delta.after())?;
+        self.validate_removed_parent_values(table, delta.before())
+    }
+
+    fn mutation_catalog_table<'a>(
+        &'a self,
+        statement: &BoundStatement,
+        delta: &MutationDelta,
+    ) -> Result<&'a CatalogTable> {
+        let name = mutation_table_name(statement)?;
+        let table = self.catalog_table_for_name(name)?;
+        if table.relation_id() != delta.relation_id() {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "mutation delta relation does not match the bound statement",
+            ));
+        }
+        Ok(table)
+    }
+
+    fn validate_changed_child_values(
+        &self,
+        table: &CatalogTable,
+        changed: &VectorBatch,
+    ) -> Result<()> {
+        for column in table.columns() {
+            if let Some(reference) = column.foreign_key() {
+                self.validate_changed_child_column(changed, table, column.name(), reference)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_changed_child_column(
+        &self,
+        changed: &VectorBatch,
+        child_table: &CatalogTable,
+        child_column: &str,
+        reference: &ForeignKeyReference,
+    ) -> Result<()> {
+        let child_index = batch_column_index(changed, child_column)?;
+        let parent_table = self.foreign_key_parent(reference)?;
+        for value in collect_non_null_values(changed, child_index) {
+            if !self.executor.catalog_table_contains_value(
+                parent_table,
+                reference.column_name(),
+                &value,
+            )? {
+                return Err(foreign_key_violation(
+                    child_table,
+                    child_column,
+                    reference,
+                    &value,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_removed_parent_values(
+        &self,
+        parent_table: &CatalogTable,
+        removed: &VectorBatch,
+    ) -> Result<()> {
+        for child_table in self.catalog.tables() {
+            for child_column in child_table.columns() {
+                let Some(reference) = child_column.foreign_key() else {
+                    continue;
+                };
+                if foreign_key_targets_table(reference, parent_table) {
+                    self.validate_removed_parent_column(
+                        removed,
+                        parent_table,
+                        child_table,
+                        child_column.name(),
+                        reference,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_removed_parent_column(
+        &self,
+        removed: &VectorBatch,
+        parent_table: &CatalogTable,
+        child_table: &CatalogTable,
+        child_column: &str,
+        reference: &ForeignKeyReference,
+    ) -> Result<()> {
+        let parent_index = batch_column_index(removed, reference.column_name())?;
+        for value in collect_non_null_values(removed, parent_index) {
+            let parent_exists = self.executor.catalog_table_contains_value(
+                parent_table,
+                reference.column_name(),
+                &value,
+            )?;
+            if !parent_exists
+                && self
+                    .executor
+                    .catalog_table_contains_value(child_table, child_column, &value)?
+            {
+                return Err(foreign_key_violation(
+                    child_table,
+                    child_column,
+                    reference,
+                    &value,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn catalog_table_for_name(&self, name: &ObjectName) -> Result<&CatalogTable> {
+        let schema = name.schema().unwrap_or("public");
+        self.catalog
+            .get_table(schema, name.object())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table does not exist: {schema}.{}", name.object()),
+                )
+            })
+    }
+
+    fn foreign_key_parent(&self, reference: &ForeignKeyReference) -> Result<&CatalogTable> {
+        self.catalog
+            .get_table(reference.schema_name(), reference.table_name())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "foreign key parent table does not exist: {}.{}",
+                        reference.schema_name(),
+                        reference.table_name()
+                    ),
+                )
+            })
+    }
+
+    fn execute_after_triggers(
+        &mut self,
+        statement: &BoundStatement,
+        output: &ExecutionResult,
+    ) -> Result<()> {
+        if mutation_rows_affected(output) == 0 {
+            return Ok(());
+        }
+        let Some((relation_id, event)) = self.trigger_target(statement)? else {
+            return Ok(());
+        };
+        let triggers = self
+            .catalog
+            .triggers_for(relation_id, TriggerTiming::After, event)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for trigger in triggers {
+            self.execute_trigger(&trigger)?;
+        }
+        Ok(())
+    }
+
+    fn trigger_target(
+        &self,
+        statement: &BoundStatement,
+    ) -> Result<Option<(RelationId, TriggerEvent)>> {
+        match statement {
+            BoundStatement::Insert { table, .. } => {
+                let table = self.catalog_table_for_name(table)?;
+                Ok(Some((table.relation_id(), TriggerEvent::Insert)))
+            }
+            BoundStatement::Update(update) => Ok(Some((update.relation_id, TriggerEvent::Update))),
+            BoundStatement::Delete(delete) => Ok(Some((delete.relation_id, TriggerEvent::Delete))),
+            _ => Ok(None),
+        }
+    }
+
+    fn execute_trigger(&mut self, trigger: &Trigger) -> Result<()> {
+        let key = trigger_stack_key(trigger);
+        if self.trigger_stack.iter().any(|active| active == &key) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "recursive trigger execution is not allowed: {}",
+                    trigger.name()
+                ),
+            ));
+        }
+        self.trigger_stack.push(key);
+        let result = self.execute(trigger.body()).map(|_| ());
+        self.trigger_stack
+            .pop()
+            .expect("trigger stack must contain active trigger");
+        result
+    }
+
+    fn execute_transaction(&mut self, action: TransactionAction) -> Result<CommandOutput> {
+        match action {
+            TransactionAction::Begin => self.begin_transaction(),
+            TransactionAction::Commit => self.commit_transaction(),
+            TransactionAction::Rollback => self.rollback_transaction(),
+        }
+    }
+
+    fn begin_transaction(&mut self) -> Result<CommandOutput> {
+        if self.transaction.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "nested local transactions are not supported",
+            ));
+        }
+        let transaction = self
+            .transaction_manager
+            .begin(IsolationLevel::ReadCommitted)?;
+        self.transaction = Some(LocalTransactionState::capture(
+            transaction,
+            &self.catalog,
+            &self.executor,
+            &self.udf_registry,
+        )?);
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn commit_transaction(&mut self) -> Result<CommandOutput> {
+        let transaction = self.active_transaction("commit")?;
+        if self.durable.is_some() {
+            self.checkpoint_current_state()?;
+        }
+        self.transaction_manager.commit(transaction.id())?;
+        self.transaction = None;
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn rollback_transaction(&mut self) -> Result<CommandOutput> {
+        let active = self.active_transaction("rollback")?;
+        self.transaction_manager.abort(active.id())?;
+        let transaction = self.transaction.take().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "active local transaction disappeared during rollback",
+            )
+        })?;
+        self.catalog = transaction.catalog_snapshot;
+        self.executor = transaction.executor_snapshot;
+        self.udf_registry = transaction.udf_registry_snapshot;
+        self.refresh_scalar_function_runtime();
+        Ok(CommandOutput::SchemaChanged)
+    }
+
+    fn active_transaction(&self, action: &str) -> Result<Transaction> {
+        self.transaction
+            .as_ref()
+            .map(|state| state.transaction)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot {action} without an active local transaction"),
+                )
+            })
     }
 
     fn apply_catalog_create_table(
@@ -302,7 +994,7 @@ impl LocalSession {
         }
         let columns = columns
             .iter()
-            .map(ColumnDef::to_catalog_column)
+            .map(|column| column.to_catalog_column_with_default_schema(schema))
             .collect::<Vec<_>>();
         let relation_id = self
             .catalog
@@ -375,6 +1067,29 @@ impl LocalSession {
         Ok(())
     }
 
+    fn apply_catalog_create_trigger(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self
+            .catalog
+            .triggers_for(relation_id, timing, event)
+            .iter()
+            .any(|trigger| trigger.name() == name)
+            && if_not_exists
+        {
+            return Ok(());
+        }
+        self.catalog
+            .create_trigger(name, relation_id, timing, event, body)?;
+        Ok(())
+    }
+
     fn apply_catalog_drop_index(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {
         let schema = name.schema().unwrap_or("public");
         match self.catalog.drop_index(schema, name.object())? {
@@ -387,20 +1102,63 @@ impl LocalSession {
         }
     }
 
+    fn apply_catalog_drop_trigger(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        if_exists: bool,
+    ) -> Result<()> {
+        match self.catalog.drop_trigger(relation_id, name)? {
+            Some(_) => Ok(()),
+            None if if_exists => Ok(()),
+            None => Err(RnovError::new(
+                ErrorKind::NotFound,
+                format!("trigger does not exist: {name}"),
+            )),
+        }
+    }
+
     fn apply_catalog_drop_function(
         &mut self,
         name: &str,
         argument_types: &[SqlType],
         if_exists: bool,
     ) -> Result<()> {
+        let catalog_snapshot = self.catalog.clone();
         match self.catalog.drop_function(name, argument_types)? {
-            Some(_) => Ok(()),
+            Some(function) => self.finish_drop_function(function, catalog_snapshot),
             None if if_exists => Ok(()),
             None => Err(rnmdb_common::RnovError::new(
                 rnmdb_common::ErrorKind::NotFound,
                 format!("function does not exist: {name}"),
             )),
         }
+    }
+
+    fn finish_drop_function(
+        &mut self,
+        function: CatalogFunction,
+        catalog_snapshot: Catalog,
+    ) -> Result<()> {
+        if !matches!(
+            function.implementation(),
+            CatalogFunctionImplementation::Wasm(_)
+        ) {
+            return Ok(());
+        }
+        if self
+            .udf_registry
+            .unregister(function.function_id())
+            .is_some()
+        {
+            self.refresh_scalar_function_runtime();
+            return Ok(());
+        }
+        self.catalog = catalog_snapshot;
+        Err(RnovError::new(
+            ErrorKind::Corruption,
+            "wasm function is missing from the session registry",
+        ))
     }
 
     fn apply_catalog_drop_procedure(
@@ -493,8 +1251,11 @@ impl LocalSession {
         {
             return Ok(());
         }
-        self.catalog
-            .add_column(schema, table.object(), column.to_catalog_column())?;
+        self.catalog.add_column(
+            schema,
+            table.object(),
+            column.to_catalog_column_with_default_schema(schema),
+        )?;
         Ok(())
     }
 
@@ -508,6 +1269,25 @@ impl LocalSession {
         self.catalog
             .set_column_encrypted(schema, table.object(), column, encrypted)?;
         Ok(())
+    }
+
+    fn execute_alter_column_encryption(
+        &mut self,
+        statement: &BoundStatement,
+        table: &ObjectName,
+        column: &str,
+        encrypted: bool,
+    ) -> Result<CommandOutput> {
+        let plan = self.planner.plan(statement)?;
+        let catalog_snapshot = self.catalog.clone();
+        self.apply_catalog_set_column_encrypted(table, column, encrypted)?;
+        match self.executor.execute_mut(&plan) {
+            Ok(output) => Ok(CommandOutput::from(output)),
+            Err(error) => {
+                self.catalog = catalog_snapshot;
+                Err(error)
+            }
+        }
     }
 
     fn apply_catalog_drop_table(&mut self, name: &ObjectName, if_exists: bool) -> Result<()> {
@@ -527,13 +1307,87 @@ impl LocalSession {
         name: &str,
         argument_types: &[SqlType],
         return_type: &SqlType,
+        implementation: &CreateFunctionImplementation,
         if_not_exists: bool,
     ) -> Result<()> {
         if self.catalog.get_function(name, argument_types).is_some() && if_not_exists {
             return Ok(());
         }
-        self.catalog
-            .register_function(name, argument_types.to_vec(), return_type.clone())?;
+        match implementation {
+            CreateFunctionImplementation::MetadataOnly => {
+                self.catalog.register_function(
+                    name,
+                    argument_types.to_vec(),
+                    return_type.clone(),
+                )?;
+                Ok(())
+            }
+            CreateFunctionImplementation::Wasm(body) => {
+                self.apply_catalog_create_wasm_function(name, body)
+            }
+        }
+    }
+
+    fn apply_catalog_create_wasm_function(
+        &mut self,
+        name: &str,
+        body: &WasmFunctionBody,
+    ) -> Result<()> {
+        let definition = self.prepare_wasm_definition(name, body)?;
+        let implementation = catalog_wasm_implementation(&definition, body)?;
+        let catalog_snapshot = self.catalog.clone();
+        let registry_snapshot = self.udf_registry.clone();
+        let result = self.register_wasm_definition(definition, implementation);
+        if result.is_err() {
+            self.catalog = catalog_snapshot;
+            self.udf_registry = registry_snapshot;
+        }
+        result
+    }
+
+    fn prepare_wasm_definition(
+        &self,
+        name: &str,
+        body: &WasmFunctionBody,
+    ) -> Result<UdfDefinition> {
+        let max_memory_bytes = usize::try_from(body.max_memory_bytes).map_err(|_| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "wasm function memory budget does not fit this platform",
+            )
+        })?;
+        let budget = UdfBudget::new(
+            max_memory_bytes,
+            body.max_instructions,
+            Duration::from_millis(body.timeout_millis),
+        )?;
+        self.wasm_runtime.prepare_i64_unary(
+            name,
+            body.module_bytes.clone(),
+            UdfSandboxPolicy::locked_down(budget),
+        )
+    }
+
+    fn register_wasm_definition(
+        &mut self,
+        definition: UdfDefinition,
+        implementation: WasmFunctionImplementation,
+    ) -> Result<()> {
+        let return_type = definition.return_type().cloned().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Internal,
+                "wasm scalar definition has no return type",
+            )
+        })?;
+        let function = self.catalog.register_function_with_implementation(
+            definition.name(),
+            definition.argument_types().to_vec(),
+            return_type,
+            CatalogFunctionImplementation::Wasm(implementation),
+        )?;
+        self.udf_registry
+            .register_with_id(function.function_id(), definition)?;
+        self.refresh_scalar_function_runtime();
         Ok(())
     }
 
@@ -700,6 +1554,99 @@ impl LocalSession {
     }
 }
 
+fn catalog_wasm_implementation(
+    definition: &UdfDefinition,
+    body: &WasmFunctionBody,
+) -> Result<WasmFunctionImplementation> {
+    let module = definition.wasm_module().ok_or_else(|| {
+        RnovError::new(ErrorKind::Internal, "wasm scalar definition has no module")
+    })?;
+    let initial_memory_bytes = u64::try_from(module.initial_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::InvalidInput,
+            "wasm initial memory does not fit the durable catalog format",
+        )
+    })?;
+    WasmFunctionImplementation::new(
+        module.module_bytes().to_vec(),
+        initial_memory_bytes,
+        body.max_memory_bytes,
+        body.max_instructions,
+        body.timeout_millis,
+    )
+}
+
+fn rebuild_udf_registry(
+    catalog: &Catalog,
+    wasm_runtime: &WasmScalarRuntime,
+) -> Result<UdfRegistry> {
+    let mut registry = UdfRegistry::new();
+    for function in catalog.functions() {
+        let CatalogFunctionImplementation::Wasm(implementation) = function.implementation() else {
+            continue;
+        };
+        let definition = prepare_persisted_wasm_definition(wasm_runtime, function, implementation)?;
+        registry.register_with_id(function.function_id(), definition)?;
+    }
+    Ok(registry)
+}
+
+fn prepare_persisted_wasm_definition(
+    wasm_runtime: &WasmScalarRuntime,
+    function: &CatalogFunction,
+    implementation: &WasmFunctionImplementation,
+) -> Result<UdfDefinition> {
+    if function.argument_types() != [SqlType::Int64] || function.return_type() != &SqlType::Int64 {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm scalar signature must be INT64 -> INT64",
+        ));
+    }
+    let max_memory_bytes = usize::try_from(implementation.max_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm memory budget does not fit this platform",
+        )
+    })?;
+    let budget = UdfBudget::new(
+        max_memory_bytes,
+        implementation.max_instructions(),
+        Duration::from_millis(implementation.timeout_millis()),
+    )?;
+    let definition = wasm_runtime.prepare_i64_unary(
+        function.name(),
+        implementation.module_bytes().to_vec(),
+        UdfSandboxPolicy::locked_down(budget),
+    )?;
+    validate_persisted_wasm_memory(&definition, implementation)?;
+    Ok(definition)
+}
+
+fn validate_persisted_wasm_memory(
+    definition: &UdfDefinition,
+    implementation: &WasmFunctionImplementation,
+) -> Result<()> {
+    let module = definition.wasm_module().ok_or_else(|| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm definition has no validated module",
+        )
+    })?;
+    let initial_memory_bytes = u64::try_from(module.initial_memory_bytes()).map_err(|_| {
+        RnovError::new(
+            ErrorKind::Corruption,
+            "validated wasm initial memory does not fit the durable catalog format",
+        )
+    })?;
+    if initial_memory_bytes != implementation.initial_memory_bytes() {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "persisted wasm initial memory does not match the module",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "tokio-runtime")]
 pub struct TokioLocalSession {
     runtime: tokio::runtime::Runtime,
@@ -750,15 +1697,10 @@ fn build_tokio_runtime() -> Result<tokio::runtime::Runtime> {
         })
 }
 
-fn is_read_query(statement: &BoundStatement) -> bool {
-    matches!(
-        statement,
-        BoundStatement::Select(_)
-            | BoundStatement::Union(_)
-            | BoundStatement::Intersect(_)
-            | BoundStatement::Except(_)
-            | BoundStatement::RecursiveCte(_)
-            | BoundStatement::Query(_)
+fn command_dispatch_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("local session received an unexpected {category} statement"),
     )
 }
 
@@ -806,6 +1748,123 @@ impl Default for LocalExecutionConfig {
             min_parallel_rows: 1024,
         }
     }
+}
+
+fn open_or_create_single_file(path: &Path, key: PageCryptoKey) -> Result<SingleFileBackend> {
+    if path.exists() {
+        return SingleFileBackend::open_with_key(path, key);
+    }
+    SingleFileBackend::create(path, SingleFileOptions::default().with_page_key(key))
+}
+
+fn load_session_from_backend(
+    backend: &SingleFileBackend,
+    execution: LocalExecutionConfig,
+) -> Result<LocalSession> {
+    match read_image_from_single_file_backend(backend)? {
+        Some(image) => decode_session_image(&image, execution),
+        None => LocalSession::memory_with_execution(execution),
+    }
+}
+
+fn decode_session_image(image: &[u8], execution: LocalExecutionConfig) -> Result<LocalSession> {
+    let image = DurableExecutorImage::decode(image)?;
+    let catalog = CatalogCodec::decode(image.catalog())?;
+    let role_id = local_role_id(&catalog)?;
+    let mut executor = MemoryExecutor::new();
+    executor.restore_tables(&catalog, image.tables())?;
+    LocalSession::from_parts(catalog, role_id, executor, execution, None)
+}
+
+fn default_catalog() -> Result<(Catalog, RoleId)> {
+    let mut catalog = Catalog::new(DatabaseId::new(1));
+    catalog.create_schema("public")?;
+    register_builtin_functions(&mut catalog)?;
+    let role_id = catalog.create_role("local")?.role_id();
+    Ok((catalog, role_id))
+}
+
+fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
+    catalog
+        .get_role("local")
+        .map(|role| role.role_id())
+        .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
+}
+
+fn mutation_rows_affected(output: &ExecutionResult) -> u64 {
+    match output {
+        ExecutionResult::RowsAffected(rows) => *rows,
+        _ => 0,
+    }
+}
+
+fn trigger_stack_key(trigger: &Trigger) -> String {
+    format!("{}:{}", trigger.relation_id().get(), trigger.name())
+}
+
+fn batch_column_index(batch: &VectorBatch, column: &str) -> Result<usize> {
+    batch
+        .columns()
+        .iter()
+        .position(|existing| existing.name() == column)
+        .ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("column does not exist in batch: {column}"),
+            )
+        })
+}
+
+fn collect_non_null_values(batch: &VectorBatch, column_index: usize) -> HashSet<SqlValue> {
+    batch
+        .rows()
+        .iter()
+        .filter_map(|row| non_null_value(row.values()[column_index].clone()))
+        .collect()
+}
+
+fn non_null_value(value: SqlValue) -> Option<SqlValue> {
+    if value == SqlValue::Null {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn mutation_table_name(statement: &BoundStatement) -> Result<&ObjectName> {
+    match statement {
+        BoundStatement::Insert { table, .. } => Ok(table),
+        BoundStatement::Update(update) => Ok(&update.table),
+        BoundStatement::Delete(delete) => Ok(&delete.table),
+        _ => Err(RnovError::new(
+            ErrorKind::Internal,
+            "foreign key validation requires a row mutation",
+        )),
+    }
+}
+
+fn foreign_key_targets_table(reference: &ForeignKeyReference, table: &CatalogTable) -> bool {
+    reference.schema_name() == table.schema_name() && reference.table_name() == table.name()
+}
+
+fn foreign_key_violation(
+    child_table: &CatalogTable,
+    child_column: &str,
+    reference: &ForeignKeyReference,
+    value: &SqlValue,
+) -> RnovError {
+    RnovError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "foreign key violation on {}.{}: value {:?} has no parent {}.{}.{}",
+            child_table.name(),
+            child_column,
+            value,
+            reference.schema_name(),
+            reference.table_name(),
+            reference.column_name()
+        ),
+    )
 }
 
 fn expand_procedure_body(body: &str, args: &[rnmdb_sql::ast::Expr]) -> Result<String> {
@@ -895,6 +1954,13 @@ fn procedure_argument_sql_literal(expr: &rnmdb_sql::ast::Expr) -> Result<String>
 }
 
 fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
+    register_text_contains_functions(catalog)?;
+    register_text_rank_functions(catalog)?;
+    register_text_phrase_functions(catalog)?;
+    Ok(())
+}
+
+fn register_text_contains_functions(catalog: &mut Catalog) -> Result<()> {
     let text_contains_text = catalog.register_function(
         "text_contains",
         vec![SqlType::Text, SqlType::Text],
@@ -919,6 +1985,10 @@ fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
         SqlType::Bool,
         text_contains_vector.function_id(),
     ))?;
+    Ok(())
+}
+
+fn register_text_rank_functions(catalog: &mut Catalog) -> Result<()> {
     catalog.register_function(
         "text_rank",
         vec![SqlType::Text, SqlType::Text],
@@ -929,6 +1999,10 @@ fn register_builtin_functions(catalog: &mut Catalog) -> Result<()> {
         vec![SqlType::TextVector, SqlType::Text],
         SqlType::Int64,
     )?;
+    Ok(())
+}
+
+fn register_text_phrase_functions(catalog: &mut Catalog) -> Result<()> {
     catalog.register_function(
         "text_phrase_match",
         vec![SqlType::Text, SqlType::Text, SqlType::Int64],

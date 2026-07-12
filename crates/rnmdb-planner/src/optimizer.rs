@@ -41,6 +41,26 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
                 },
             }
         }
+        LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery: Box::new(optimize_plan(*subquery)),
+            negated,
+            input: Box::new(optimize_plan(*input)),
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            subquery: Box::new(optimize_plan(*subquery)),
+            negated,
+            input: Box::new(optimize_plan(*input)),
+        },
         LogicalPlan::Project { items, input } => LogicalPlan::Project {
             items,
             input: Box::new(optimize_plan(*input)),
@@ -133,6 +153,30 @@ fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
             inner_column,
             outer_column,
         },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+            predicate,
+        },
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => LogicalPlan::HashJoin {
+            kind,
+            left: Box::new(optimize_plan(*left)),
+            right: Box::new(optimize_plan(*right)),
+            left_key,
+            right_key,
+        },
         other => other,
     }
 }
@@ -146,6 +190,26 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
         },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::InSubqueryFilter {
+            expr,
+            subquery: Box::new(annotate_parallel(*subquery, workers)),
+            negated,
+            input: Box::new(annotate_parallel(*input, workers)),
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            subquery,
+            negated,
+            input,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            subquery: Box::new(annotate_parallel(*subquery, workers)),
+            negated,
             input: Box::new(annotate_parallel(*input, workers)),
         },
         LogicalPlan::Project { items, input } => LogicalPlan::Project {
@@ -248,6 +312,30 @@ fn annotate_parallel(plan: LogicalPlan, workers: usize) -> LogicalPlan {
             inner_table,
             inner_column,
             outer_column,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            predicate,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
+            predicate,
+        },
+        LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } => LogicalPlan::HashJoin {
+            kind,
+            left: Box::new(annotate_parallel(*left, workers)),
+            right: Box::new(annotate_parallel(*right, workers)),
+            left_key,
+            right_key,
         },
         other => other,
     }

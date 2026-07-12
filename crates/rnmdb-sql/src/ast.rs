@@ -1,8 +1,11 @@
 use std::fmt;
 
-use rnmdb_catalog::{Column, IndexMethod, OperatorSignature, Privilege};
+use rnmdb_catalog::{
+    Column, ForeignKeyReference, IndexMethod, OperatorSignature, Privilege, TriggerEvent,
+    TriggerTiming,
+};
 use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
-use rnmdb_types::SqlType;
+use rnmdb_types::{SqlFloat64, SqlType, SqlValue};
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Ident(String);
@@ -70,6 +73,7 @@ pub struct ColumnDef {
     pub nullable: bool,
     pub encrypted: bool,
     pub generated: Option<GeneratedColumn>,
+    pub references: Option<ColumnReference>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,8 +82,18 @@ pub struct GeneratedColumn {
     pub stored: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnReference {
+    pub table: ObjectName,
+    pub column: Ident,
+}
+
 impl ColumnDef {
     pub fn to_catalog_column(&self) -> Column {
+        self.to_catalog_column_with_default_schema("public")
+    }
+
+    pub fn to_catalog_column_with_default_schema(&self, default_schema: &str) -> Column {
         let mut column = Column::new(self.name.as_str(), self.data_type.clone());
         if !self.nullable {
             column = column.not_null();
@@ -90,7 +104,33 @@ impl ColumnDef {
         if let Some(generated) = &self.generated {
             column = column.generated(generated.expr.to_string(), generated.stored);
         }
+        if let Some(reference) = &self.references {
+            column = column.references(catalog_reference(reference, default_schema));
+        }
         column
+    }
+}
+
+fn catalog_reference(reference: &ColumnReference, default_schema: &str) -> ForeignKeyReference {
+    ForeignKeyReference::new(
+        reference.table.schema().unwrap_or(default_schema),
+        reference.table.object(),
+        reference.column.as_str(),
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectSubquery {
+    Parsed(Box<Statement>),
+    Bound(Box<BoundStatement>),
+}
+
+impl SelectSubquery {
+    pub fn bound(&self) -> Option<&BoundStatement> {
+        match self {
+            Self::Bound(statement) => Some(statement),
+            Self::Parsed(_) => None,
+        }
     }
 }
 
@@ -102,9 +142,11 @@ pub enum Expr {
         name: Ident,
     },
     Integer(i64),
+    Float64(SqlFloat64),
     String(String),
     Bool(bool),
     Null,
+    RuntimeValue(SqlValue),
     CountStar,
     Count(Box<Expr>),
     CountDistinct(Box<Expr>),
@@ -166,6 +208,17 @@ pub enum Expr {
         values: Vec<Expr>,
         negated: bool,
     },
+    InSubquery {
+        expr: Box<Expr>,
+        query: SelectSubquery,
+        negated: bool,
+    },
+    ExistsSubquery {
+        query: SelectSubquery,
+    },
+    ScalarSubquery {
+        query: SelectSubquery,
+    },
     Like {
         expr: Box<Expr>,
         pattern: Box<Expr>,
@@ -186,6 +239,7 @@ pub enum Expr {
         data_type: SqlType,
     },
     Call {
+        function_id: Option<FunctionId>,
         name: ObjectName,
         args: Vec<Expr>,
     },
@@ -240,176 +294,247 @@ impl RangeLiteralBounds {
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Identifier(ident) => write!(f, "{ident}"),
-            Self::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
-            Self::Integer(value) => write!(f, "{value}"),
-            Self::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
-            Self::Bool(true) => f.write_str("TRUE"),
-            Self::Bool(false) => f.write_str("FALSE"),
-            Self::Null => f.write_str("NULL"),
-            Self::CountStar => f.write_str("count(*)"),
-            Self::Count(expr) => write!(f, "count({expr})"),
-            Self::CountDistinct(expr) => write!(f, "count(DISTINCT {expr})"),
-            Self::Sum(expr) => write!(f, "sum({expr})"),
-            Self::Min(expr) => write!(f, "min({expr})"),
-            Self::Max(expr) => write!(f, "max({expr})"),
-            Self::RowNumberOver { order_by } => write_window_function(f, "row_number", order_by),
-            Self::RankOver { order_by } => write_window_function(f, "rank", order_by),
-            Self::DenseRankOver { order_by } => write_window_function(f, "dense_rank", order_by),
-            Self::Array(values) => {
-                f.write_str("ARRAY[")?;
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{value}")?;
-                }
-                f.write_str("]")
+            Self::Identifier(_)
+            | Self::QualifiedIdentifier { .. }
+            | Self::Integer(_)
+            | Self::Float64(_)
+            | Self::String(_)
+            | Self::Bool(_)
+            | Self::Null
+            | Self::RuntimeValue(_) => write_atom_expr(self, f),
+            Self::CountStar
+            | Self::Count(_)
+            | Self::CountDistinct(_)
+            | Self::Sum(_)
+            | Self::Min(_)
+            | Self::Max(_) => write_aggregate_expr(self, f),
+            Self::RowNumberOver { .. } | Self::RankOver { .. } | Self::DenseRankOver { .. } => {
+                write_window_expr(self, f)
             }
-            Self::HStore(entries) => {
-                f.write_str("HSTORE(")?;
-                for (index, (key, value)) in entries.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "'{}' => ", key.replace('\'', "''"))?;
-                    if let Some(value) = value {
-                        write!(f, "'{}'", value.replace('\'', "''"))?;
-                    } else {
-                        f.write_str("NULL")?;
-                    }
-                }
-                f.write_str(")")
-            }
-            Self::Range {
-                lower,
-                upper,
-                bounds,
-            } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
-            Self::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
-            Self::Unary { op, expr } => write!(f, "{op}{expr}"),
-            Self::Not(expr) => write!(f, "NOT {expr}"),
-            Self::IsNull { expr, negated } => {
-                if *negated {
-                    write!(f, "{expr} IS NOT NULL")
-                } else {
-                    write!(f, "{expr} IS NULL")
-                }
-            }
-            Self::IsTruth {
-                expr,
-                value,
-                negated,
-            } => {
-                let value = if *value { "TRUE" } else { "FALSE" };
-                if *negated {
-                    write!(f, "{expr} IS NOT {value}")
-                } else {
-                    write!(f, "{expr} IS {value}")
-                }
-            }
-            Self::IsUnknown { expr, negated } => {
-                if *negated {
-                    write!(f, "{expr} IS NOT UNKNOWN")
-                } else {
-                    write!(f, "{expr} IS UNKNOWN")
-                }
-            }
-            Self::IsDistinctFrom {
-                left,
-                right,
-                negated,
-            } => {
-                if *negated {
-                    write!(f, "{left} IS NOT DISTINCT FROM {right}")
-                } else {
-                    write!(f, "{left} IS DISTINCT FROM {right}")
-                }
-            }
-            Self::Between {
-                expr,
-                low,
-                high,
-                negated,
-            } => {
-                if *negated {
-                    write!(f, "{expr} NOT BETWEEN {low} AND {high}")
-                } else {
-                    write!(f, "{expr} BETWEEN {low} AND {high}")
-                }
-            }
-            Self::InList {
-                expr,
-                values,
-                negated,
-            } => {
-                if *negated {
-                    write!(f, "{expr} NOT IN (")?;
-                } else {
-                    write!(f, "{expr} IN (")?;
-                }
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{value}")?;
-                }
-                f.write_str(")")
-            }
-            Self::Like {
-                expr,
-                pattern,
-                negated,
-            } => {
-                if *negated {
-                    write!(f, "{expr} NOT LIKE {pattern}")
-                } else {
-                    write!(f, "{expr} LIKE {pattern}")
-                }
-            }
-            Self::Coalesce(values) => {
-                f.write_str("coalesce(")?;
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{value}")?;
-                }
-                f.write_str(")")
-            }
-            Self::NullIf { left, right } => write!(f, "nullif({left}, {right})"),
-            Self::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                f.write_str("CASE")?;
-                if let Some(operand) = operand {
-                    write!(f, " {operand}")?;
-                }
-                for arm in whens {
-                    write!(f, " WHEN {} THEN {}", arm.condition, arm.result)?;
-                }
-                if let Some(else_expr) = else_expr {
-                    write!(f, " ELSE {else_expr}")?;
-                }
-                f.write_str(" END")
-            }
-            Self::Cast { expr, data_type } => {
-                write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
-            }
-            Self::Call { name, args } => {
-                write!(f, "{name}(")?;
-                for (index, arg) in args.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{arg}")?;
-                }
-                f.write_str(")")
-            }
+            Self::Array(_) | Self::HStore(_) | Self::Range { .. } => write_collection_expr(self, f),
+            Self::Binary { .. } | Self::Unary { .. } | Self::Not(_) => write_operator_expr(self, f),
+            Self::IsNull { .. }
+            | Self::IsTruth { .. }
+            | Self::IsUnknown { .. }
+            | Self::IsDistinctFrom { .. }
+            | Self::Between { .. }
+            | Self::Like { .. } => write_predicate_expr(self, f),
+            Self::InList { .. }
+            | Self::InSubquery { .. }
+            | Self::ExistsSubquery { .. }
+            | Self::ScalarSubquery { .. } => write_subquery_expr(self, f),
+            Self::Coalesce(_)
+            | Self::NullIf { .. }
+            | Self::Case { .. }
+            | Self::Cast { .. }
+            | Self::Call { .. } => write_function_expr(self, f),
         }
     }
+}
+
+fn write_atom_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::Identifier(ident) => write!(f, "{ident}"),
+        Expr::QualifiedIdentifier { qualifier, name } => write!(f, "{qualifier}.{name}"),
+        Expr::Integer(value) => write!(f, "{value}"),
+        Expr::Float64(value) => write!(f, "{}", value.get()),
+        Expr::String(value) => write!(f, "'{}'", value.replace('\'', "''")),
+        Expr::Bool(true) => f.write_str("TRUE"),
+        Expr::Bool(false) => f.write_str("FALSE"),
+        Expr::Null => f.write_str("NULL"),
+        Expr::RuntimeValue(value) => write!(f, "{value:?}"),
+        _ => unreachable!("non-atom expression"),
+    }
+}
+
+fn write_aggregate_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::CountStar => f.write_str("count(*)"),
+        Expr::Count(expr) => write!(f, "count({expr})"),
+        Expr::CountDistinct(expr) => write!(f, "count(DISTINCT {expr})"),
+        Expr::Sum(expr) => write!(f, "sum({expr})"),
+        Expr::Min(expr) => write!(f, "min({expr})"),
+        Expr::Max(expr) => write!(f, "max({expr})"),
+        _ => unreachable!("non-aggregate expression"),
+    }
+}
+
+fn write_window_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::RowNumberOver { order_by } => write_window_function(f, "row_number", order_by),
+        Expr::RankOver { order_by } => write_window_function(f, "rank", order_by),
+        Expr::DenseRankOver { order_by } => write_window_function(f, "dense_rank", order_by),
+        _ => unreachable!("non-window expression"),
+    }
+}
+
+fn write_collection_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::Array(values) => write_expr_list(f, "ARRAY[", "]", values),
+        Expr::HStore(entries) => write_hstore(f, entries),
+        Expr::Range {
+            lower,
+            upper,
+            bounds,
+        } => write!(f, "RANGE({lower}, {upper}, '{}')", bounds.as_str()),
+        _ => unreachable!("non-collection expression"),
+    }
+}
+
+fn write_expr_list(
+    f: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    suffix: &str,
+    values: &[Expr],
+) -> fmt::Result {
+    f.write_str(prefix)?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{value}")?;
+    }
+    f.write_str(suffix)
+}
+
+fn write_hstore(f: &mut fmt::Formatter<'_>, entries: &[(String, Option<String>)]) -> fmt::Result {
+    f.write_str("HSTORE(")?;
+    for (index, (key, value)) in entries.iter().enumerate() {
+        if index > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "'{}' => ", key.replace('\'', "''"))?;
+        write_hstore_value(f, value)?;
+    }
+    f.write_str(")")
+}
+
+fn write_hstore_value(f: &mut fmt::Formatter<'_>, value: &Option<String>) -> fmt::Result {
+    if let Some(value) = value {
+        write!(f, "'{}'", value.replace('\'', "''"))
+    } else {
+        f.write_str("NULL")
+    }
+}
+
+fn write_operator_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::Binary { left, op, right } => write!(f, "{left} {op} {right}"),
+        Expr::Unary { op, expr } => write!(f, "{op}{expr}"),
+        Expr::Not(expr) => write!(f, "NOT {expr}"),
+        _ => unreachable!("non-operator expression"),
+    }
+}
+
+fn write_predicate_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::IsNull { expr, negated } => write_is_null(f, expr, *negated),
+        Expr::IsTruth {
+            expr,
+            value,
+            negated,
+        } => write!(
+            f,
+            "{expr} IS{} {}",
+            if *negated { " NOT" } else { "" },
+            if *value { "TRUE" } else { "FALSE" }
+        ),
+        Expr::IsUnknown { expr, negated } => {
+            write!(f, "{expr} IS{} UNKNOWN", if *negated { " NOT" } else { "" })
+        }
+        Expr::IsDistinctFrom {
+            left,
+            right,
+            negated,
+        } => write!(
+            f,
+            "{left} IS{} DISTINCT FROM {right}",
+            if *negated { " NOT" } else { "" }
+        ),
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => write!(
+            f,
+            "{expr} {}BETWEEN {low} AND {high}",
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => write!(
+            f,
+            "{expr} {}LIKE {pattern}",
+            if *negated { "NOT " } else { "" }
+        ),
+        _ => unreachable!("non-predicate expression"),
+    }
+}
+
+fn write_is_null(f: &mut fmt::Formatter<'_>, expr: &Expr, negated: bool) -> fmt::Result {
+    write!(f, "{expr} IS{} NULL", if negated { " NOT" } else { "" })
+}
+
+fn write_subquery_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::InList {
+            expr,
+            values,
+            negated,
+        } => {
+            write!(f, "{expr} {}IN (", if *negated { "NOT " } else { "" })?;
+            write_expr_list(f, "", ")", values)
+        }
+        Expr::InSubquery { expr, negated, .. } => {
+            write!(
+                f,
+                "{expr} {}IN (subquery)",
+                if *negated { "NOT " } else { "" }
+            )
+        }
+        Expr::ExistsSubquery { .. } => f.write_str("EXISTS (subquery)"),
+        Expr::ScalarSubquery { .. } => f.write_str("(subquery)"),
+        _ => unreachable!("non-subquery expression"),
+    }
+}
+
+fn write_function_expr(expr: &Expr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match expr {
+        Expr::Coalesce(values) => write_expr_list(f, "coalesce(", ")", values),
+        Expr::NullIf { left, right } => write!(f, "nullif({left}, {right})"),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => write_case(f, operand.as_deref(), whens, else_expr.as_deref()),
+        Expr::Cast { expr, data_type } => {
+            write!(f, "CAST({expr} AS {})", format_sql_type(data_type))
+        }
+        Expr::Call { name, args, .. } => write_expr_list(f, &format!("{name}("), ")", args),
+        _ => unreachable!("non-function expression"),
+    }
+}
+
+fn write_case(
+    f: &mut fmt::Formatter<'_>,
+    operand: Option<&Expr>,
+    whens: &[CaseWhen],
+    else_expr: Option<&Expr>,
+) -> fmt::Result {
+    f.write_str("CASE")?;
+    if let Some(operand) = operand {
+        write!(f, " {operand}")?;
+    }
+    for arm in whens {
+        write!(f, " WHEN {} THEN {}", arm.condition, arm.result)?;
+    }
+    if let Some(else_expr) = else_expr {
+        write!(f, " ELSE {else_expr}")?;
+    }
+    f.write_str(" END")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +579,10 @@ fn format_sql_type(data_type: &SqlType) -> String {
         SqlType::Bool => "BOOL".to_string(),
         SqlType::Int64 => "INT64".to_string(),
         SqlType::UInt64 => "UINT64".to_string(),
+        SqlType::Float64 => "FLOAT64".to_string(),
+        SqlType::Uuid => "UUID".to_string(),
+        SqlType::Timestamp => "TIMESTAMP".to_string(),
+        SqlType::Json => "JSON".to_string(),
         SqlType::Text => "TEXT".to_string(),
         SqlType::Bytes => "BYTES".to_string(),
         SqlType::HStore => "HSTORE".to_string(),
@@ -508,6 +637,19 @@ pub struct LateralJoin {
     pub on: Expr,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JoinClause {
+    pub kind: JoinKind,
+    pub table: ObjectName,
+    pub on: Expr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecursiveCte {
     pub name: ObjectName,
@@ -547,6 +689,20 @@ pub enum ExplainFormat {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateFunctionImplementation {
+    MetadataOnly,
+    Wasm(WasmFunctionBody),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmFunctionBody {
+    pub module_bytes: Vec<u8>,
+    pub max_memory_bytes: u64,
+    pub max_instructions: u64,
+    pub timeout_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     CreateTable {
         name: ObjectName,
@@ -559,6 +715,14 @@ pub enum Statement {
         keys: Vec<IndexKeyDef>,
         method: IndexMethod,
         unique: bool,
+        if_not_exists: bool,
+    },
+    CreateTrigger {
+        name: Ident,
+        table: ObjectName,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
         if_not_exists: bool,
     },
     AlterTableAddColumn {
@@ -577,6 +741,11 @@ pub enum Statement {
     },
     DropIndex {
         name: ObjectName,
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: Ident,
+        table: ObjectName,
         if_exists: bool,
     },
     DropFunction {
@@ -608,6 +777,7 @@ pub enum Statement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {
@@ -670,6 +840,18 @@ pub enum Statement {
         distinct: bool,
         projection: Vec<SelectItem>,
         from: ObjectName,
+        selection: Option<Expr>,
+        group_by: Vec<Expr>,
+        having: Option<Expr>,
+        order_by: Vec<OrderByExpr>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    },
+    SelectJoin {
+        distinct: bool,
+        projection: Vec<SelectItem>,
+        from: ObjectName,
+        join: JoinClause,
         selection: Option<Expr>,
         group_by: Vec<Expr>,
         having: Option<Expr>,
@@ -793,6 +975,29 @@ pub struct BoundLateralJoin {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundHashJoinKeys {
+    pub left_column: String,
+    pub right_column: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundJoin {
+    pub kind: JoinKind,
+    pub right_relation_id: RelationId,
+    pub right_table: ObjectName,
+    pub predicate: Expr,
+    pub hash_keys: Option<BoundHashJoinKeys>,
+    pub applied_row_policies: Vec<String>,
+    pub row_policy_predicates: Vec<BoundRowPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundJoinSelect {
+    pub select: BoundSelect,
+    pub join: BoundJoin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundUnion {
     pub all: bool,
     pub columns: Vec<BoundColumn>,
@@ -887,6 +1092,15 @@ pub enum BoundStatement {
         unique: bool,
         if_not_exists: bool,
     },
+    CreateTrigger {
+        name: Ident,
+        relation_id: RelationId,
+        table: ObjectName,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        body: String,
+        if_not_exists: bool,
+    },
     AlterTableAddColumn {
         relation_id: RelationId,
         table: ObjectName,
@@ -906,6 +1120,12 @@ pub enum BoundStatement {
     },
     DropIndex {
         name: ObjectName,
+        if_exists: bool,
+    },
+    DropTrigger {
+        name: Ident,
+        relation_id: RelationId,
+        table: ObjectName,
         if_exists: bool,
     },
     DropFunction {
@@ -937,6 +1157,7 @@ pub enum BoundStatement {
         name: Ident,
         argument_types: Vec<SqlType>,
         return_type: SqlType,
+        implementation: CreateFunctionImplementation,
         if_not_exists: bool,
     },
     CreateProcedure {
@@ -974,6 +1195,7 @@ pub enum BoundStatement {
         args: Vec<Expr>,
     },
     Insert {
+        relation_id: RelationId,
         table: ObjectName,
         columns: Vec<BoundColumn>,
         values: Vec<Expr>,
@@ -981,6 +1203,7 @@ pub enum BoundStatement {
     Update(BoundUpdate),
     Delete(BoundDelete),
     Select(BoundSelect),
+    SelectJoin(BoundJoinSelect),
     Union(BoundUnion),
     Intersect(BoundIntersect),
     Except(BoundExcept),

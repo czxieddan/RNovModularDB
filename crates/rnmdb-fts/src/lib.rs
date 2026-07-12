@@ -559,40 +559,51 @@ impl<'a> QueryLexer<'a> {
         let mut chars = self.input.chars().peekable();
 
         while let Some(character) = chars.next() {
-            match character {
-                '&' => tokens.push(QueryToken::And),
-                '|' => tokens.push(QueryToken::Or),
-                '!' => tokens.push(QueryToken::Not),
-                '(' => tokens.push(QueryToken::LeftParen),
-                ')' => tokens.push(QueryToken::RightParen),
-                whitespace if whitespace.is_whitespace() => {}
-                term_start if term_start.is_alphanumeric() => {
-                    let mut term = String::new();
-                    term.extend(term_start.to_lowercase());
-                    while let Some(next) = chars.peek().copied() {
-                        if next.is_alphanumeric() {
-                            chars.next();
-                            term.extend(next.to_lowercase());
-                        } else {
-                            break;
-                        }
-                    }
-                    let term = stemmer.stem(&term)?;
-                    if !term.is_empty() {
-                        tokens.push(QueryToken::Term(term));
-                    }
-                }
-                invalid => {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("invalid text query character {invalid:?}"),
-                    ));
-                }
+            if let Some(token) = query_token(character, &mut chars, stemmer)? {
+                tokens.push(token);
             }
         }
 
         Ok(tokens)
     }
+}
+
+fn query_token(
+    character: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    stemmer: &impl TermStemmer,
+) -> Result<Option<QueryToken>> {
+    match character {
+        '&' => Ok(Some(QueryToken::And)),
+        '|' => Ok(Some(QueryToken::Or)),
+        '!' => Ok(Some(QueryToken::Not)),
+        '(' => Ok(Some(QueryToken::LeftParen)),
+        ')' => Ok(Some(QueryToken::RightParen)),
+        whitespace if whitespace.is_whitespace() => Ok(None),
+        term_start if term_start.is_alphanumeric() => query_term(term_start, chars, stemmer),
+        invalid => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("invalid text query character {invalid:?}"),
+        )),
+    }
+}
+
+fn query_term(
+    first: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    stemmer: &impl TermStemmer,
+) -> Result<Option<QueryToken>> {
+    let mut term = String::new();
+    term.extend(first.to_lowercase());
+    while let Some(next) = chars.peek().copied() {
+        if !next.is_alphanumeric() {
+            break;
+        }
+        chars.next();
+        term.extend(next.to_lowercase());
+    }
+    let term = stemmer.stem(&term)?;
+    Ok((!term.is_empty()).then_some(QueryToken::Term(term)))
 }
 
 struct QueryParser {

@@ -2,40 +2,27 @@ use rnmdb_common::Result;
 
 use crate::ast::{CaseWhen, Expr, Ident, OrderByExpr};
 
-struct QualifiedIdentifierRewriter<'a, F>
+struct ExprRewriter<'a, F>
 where
-    F: FnMut(&Ident, &Ident) -> Result<Expr>,
+    F: FnMut(&Expr) -> Result<Option<Expr>>,
 {
-    resolver: &'a mut F,
+    rewrite: &'a mut F,
 }
 
-impl<F> QualifiedIdentifierRewriter<'_, F>
+impl<F> ExprRewriter<'_, F>
 where
-    F: FnMut(&Ident, &Ident) -> Result<Expr>,
+    F: FnMut(&Expr) -> Result<Option<Expr>>,
 {
-    fn rewrite_qualified_identifier(&mut self, qualifier: &Ident, name: &Ident) -> Result<Expr> {
-        (self.resolver)(qualifier, name)
-    }
-
     fn rewrite_expr(&mut self, expr: &Expr) -> Result<Expr> {
         self.rewrite_expr_candidate(expr)?
             .map_or_else(|| Ok(expr.clone()), Ok)
     }
 
     fn rewrite_expr_candidate(&mut self, expr: &Expr) -> Result<Option<Expr>> {
-        if let Some(expr) = self.rewrite_qualified_identifier_expr(expr)? {
+        if let Some(expr) = (self.rewrite)(expr)? {
             return Ok(Some(expr));
         }
         self.rewrite_non_identifier_expr(expr)
-    }
-
-    fn rewrite_qualified_identifier_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
-        match expr {
-            Expr::QualifiedIdentifier { qualifier, name } => {
-                self.rewrite_qualified_identifier(qualifier, name).map(Some)
-            }
-            _ => Ok(None),
-        }
     }
 
     fn rewrite_non_identifier_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
@@ -129,6 +116,12 @@ where
         if let Some(expr) = self.rewrite_in_list_expr(expr)? {
             return Ok(Some(expr));
         }
+        if let Some(expr) = self.rewrite_in_subquery_expr(expr)? {
+            return Ok(Some(expr));
+        }
+        if let Some(expr) = self.rewrite_exists_subquery_expr(expr) {
+            return Ok(Some(expr));
+        }
         self.rewrite_like_expr(expr)
     }
 
@@ -169,6 +162,31 @@ where
         }
     }
 
+    fn rewrite_in_subquery_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
+        match expr {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => Ok(Expr::InSubquery {
+                expr: Box::new(self.rewrite_expr(expr)?),
+                query: query.clone(),
+                negated: *negated,
+            }
+            .into()),
+            _ => Ok(None),
+        }
+    }
+
+    fn rewrite_exists_subquery_expr(&mut self, expr: &Expr) -> Option<Expr> {
+        match expr {
+            Expr::ExistsSubquery { query } => Some(Expr::ExistsSubquery {
+                query: query.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     fn rewrite_like_expr(&mut self, expr: &Expr) -> Result<Option<Expr>> {
         match expr {
             Expr::Like {
@@ -204,11 +222,16 @@ where
                 data_type: data_type.clone(),
             }
             .into()),
-            Expr::Call { name, args } => args
+            Expr::Call {
+                function_id,
+                name,
+                args,
+            } => args
                 .iter()
                 .map(|arg| self.rewrite_expr(arg))
                 .collect::<Result<Vec<_>>>()
                 .map(|args| Expr::Call {
+                    function_id: *function_id,
                     name: name.clone(),
                     args,
                 })
@@ -312,9 +335,19 @@ where
     }
 }
 
+pub fn rewrite_expr_tree<F>(expr: &Expr, rewrite: &mut F) -> Result<Expr>
+where
+    F: FnMut(&Expr) -> Result<Option<Expr>>,
+{
+    ExprRewriter { rewrite }.rewrite_expr(expr)
+}
+
 pub(crate) fn rewrite_qualified_expr<F>(expr: &Expr, resolver: &mut F) -> Result<Expr>
 where
     F: FnMut(&Ident, &Ident) -> Result<Expr>,
 {
-    QualifiedIdentifierRewriter { resolver }.rewrite_expr(expr)
+    rewrite_expr_tree(expr, &mut |candidate| match candidate {
+        Expr::QualifiedIdentifier { qualifier, name } => resolver(qualifier, name).map(Some),
+        _ => Ok(None),
+    })
 }
