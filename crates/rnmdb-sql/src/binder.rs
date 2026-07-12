@@ -52,6 +52,16 @@ struct SelectInput<'a> {
     role_id: RoleId,
 }
 
+struct CteSelectInput<'a> {
+    distinct: bool,
+    projection: &'a [SelectItem],
+    from: &'a ObjectName,
+    selection: &'a Option<Expr>,
+    order_by: &'a [OrderByExpr],
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
 struct ProjectionOutputs<'a> {
     projection: &'a mut Vec<BoundSelectItem>,
     columns: &'a mut Vec<BoundColumn>,
@@ -1678,61 +1688,17 @@ impl<'a> Binder<'a> {
         source: &ObjectName,
         available_columns: &[BoundColumn],
     ) -> Result<BoundSelect> {
-        let Statement::Select {
-            distinct,
-            projection,
-            from,
-            selection,
-            group_by,
-            having,
-            order_by,
-            limit,
-            offset,
-        } = statement
-        else {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE clauses currently support SELECT queries only",
-            ));
-        };
-        if !object_names_equal(from, source) {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("recursive CTE SELECT must read from {source}, got {from}"),
-            ));
-        }
-        if !group_by.is_empty() || having.is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE SELECT does not support GROUP BY or HAVING yet",
-            ));
-        }
-
-        let (projection, columns) = self.bind_cte_projection(projection, available_columns)?;
-        let selection = selection
-            .as_ref()
-            .map(|selection| self.rewrite_cte_expr(available_columns, selection))
-            .transpose()?;
-        if let Some(selection) = &selection {
-            self.validate_predicate_from_columns(available_columns, selection)?;
-        }
-        let order_by = order_by
-            .iter()
-            .map(|order_by| {
-                let expr = self.rewrite_cte_expr(available_columns, &order_by.expr)?;
-                self.validate_sort_expr_from_columns(available_columns, &expr)?;
-                Ok(OrderByExpr {
-                    expr,
-                    direction: order_by.direction,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let input = recursive_cte_select_input(statement, source)?;
+        let (projection, columns) =
+            self.bind_cte_projection(input.projection, available_columns)?;
+        let selection = self.bind_cte_selection(input.selection, available_columns)?;
+        let order_by = self.bind_cte_order_by(input.order_by, available_columns)?;
 
         Ok(BoundSelect {
             relation_id: recursive_cte_relation_id(source),
-            table: from.clone(),
+            table: input.from.clone(),
             lateral_join: None,
-            distinct: *distinct,
+            distinct: input.distinct,
             projection,
             hidden_group_keys: Vec::new(),
             hidden_aggregates: Vec::new(),
@@ -1742,11 +1708,42 @@ impl<'a> Binder<'a> {
             grouping_sets: Vec::new(),
             having: None,
             order_by,
-            limit: *limit,
-            offset: *offset,
+            limit: input.limit,
+            offset: input.offset,
             applied_row_policies: Vec::new(),
             row_policy_predicates: Vec::new(),
         })
+    }
+
+    fn bind_cte_selection(
+        &self,
+        selection: &Option<Expr>,
+        available_columns: &[BoundColumn],
+    ) -> Result<Option<Expr>> {
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        let selection = self.rewrite_cte_expr(available_columns, selection)?;
+        self.validate_predicate_from_columns(available_columns, &selection)?;
+        Ok(Some(selection))
+    }
+
+    fn bind_cte_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        available_columns: &[BoundColumn],
+    ) -> Result<Vec<OrderByExpr>> {
+        order_by
+            .iter()
+            .map(|order_by| {
+                let expr = self.rewrite_cte_expr(available_columns, &order_by.expr)?;
+                self.validate_sort_expr_from_columns(available_columns, &expr)?;
+                Ok(OrderByExpr {
+                    expr,
+                    direction: order_by.direction,
+                })
+            })
+            .collect()
     }
 
     fn bind_cte_projection(
@@ -1757,74 +1754,112 @@ impl<'a> Binder<'a> {
         let mut projection = Vec::new();
         let mut columns = Vec::new();
         for item in select_items {
-            match item {
-                SelectItem::Wildcard => {
-                    for column in available_columns {
-                        projection.push(BoundSelectItem {
-                            column: column.clone(),
-                            expr: Expr::Identifier(Ident::new(column.name.as_str())),
-                        });
-                        columns.push(column.clone());
-                    }
-                }
-                SelectItem::Expr {
-                    expr: Expr::Identifier(identifier),
-                    alias,
-                } => {
-                    let column = self.resolve_column_from_bound(available_columns, identifier)?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(identifier.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: qualified @ Expr::QualifiedIdentifier { .. },
-                    alias,
-                } => {
-                    let expr = self.rewrite_cte_expr(available_columns, qualified)?;
-                    let Expr::Identifier(name) = expr else {
-                        return Err(RnovError::new(
-                            ErrorKind::Internal,
-                            "qualified recursive CTE column did not rewrite to identifier",
-                        ));
-                    };
-                    let column = self.resolve_column_from_bound(available_columns, &name)?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(name),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr { expr, alias } => {
-                    let expr = self.rewrite_cte_expr(available_columns, expr)?;
-                    let data_type = self
-                        .infer_expr_type_from_columns(available_columns, &expr)?
-                        .ok_or_else(|| {
-                            RnovError::new(
-                                ErrorKind::InvalidInput,
-                                format!("cannot infer recursive CTE expression type: {expr}"),
-                            )
-                        })?;
-                    let column = BoundColumn {
-                        name: format!("expr{}", columns.len() + 1),
-                        data_type,
-                        nullable: true,
-                        encrypted: false,
-                        generated: None,
-                    };
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr,
-                    });
-                    columns.push(column);
-                }
-            }
+            self.bind_cte_projection_item(item, available_columns, &mut projection, &mut columns)?;
         }
         Ok((projection, columns))
+    }
+
+    fn bind_cte_projection_item(
+        &self,
+        item: &SelectItem,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        match item {
+            SelectItem::Wildcard => {
+                bind_cte_wildcard(available_columns, projection, columns);
+                Ok(())
+            }
+            SelectItem::Expr {
+                expr: Expr::Identifier(identifier),
+                alias,
+            } => {
+                self.bind_cte_identifier(identifier, alias, available_columns, projection, columns)
+            }
+            SelectItem::Expr {
+                expr: qualified @ Expr::QualifiedIdentifier { .. },
+                alias,
+            } => self.bind_cte_qualified_identifier(
+                qualified,
+                alias,
+                available_columns,
+                projection,
+                columns,
+            ),
+            SelectItem::Expr { expr, alias } => {
+                self.bind_cte_expression(expr, alias, available_columns, projection, columns)
+            }
+        }
+    }
+
+    fn bind_cte_identifier(
+        &self,
+        identifier: &Ident,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let column = self.resolve_column_from_bound(available_columns, identifier)?;
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(
+            projection,
+            columns,
+            column,
+            Expr::Identifier(identifier.clone()),
+        );
+        Ok(())
+    }
+
+    fn bind_cte_qualified_identifier(
+        &self,
+        qualified: &Expr,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let expr = self.rewrite_cte_expr(available_columns, qualified)?;
+        let Expr::Identifier(name) = expr else {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "qualified recursive CTE column did not rewrite to identifier",
+            ));
+        };
+        let column = self.resolve_column_from_bound(available_columns, &name)?;
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(projection, columns, column, Expr::Identifier(name));
+        Ok(())
+    }
+
+    fn bind_cte_expression(
+        &self,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        available_columns: &[BoundColumn],
+        projection: &mut Vec<BoundSelectItem>,
+        columns: &mut Vec<BoundColumn>,
+    ) -> Result<()> {
+        let expr = self.rewrite_cte_expr(available_columns, expr)?;
+        let data_type = self
+            .infer_expr_type_from_columns(available_columns, &expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer recursive CTE expression type: {expr}"),
+                )
+            })?;
+        let column = BoundColumn {
+            name: format!("expr{}", columns.len() + 1),
+            data_type,
+            nullable: true,
+            encrypted: false,
+            generated: None,
+        };
+        let column = aliased_bound_column(column, alias);
+        push_cte_projection(projection, columns, column, expr);
+        Ok(())
     }
 
     fn bind_lateral_select(
@@ -5928,6 +5963,78 @@ fn single_query_output_type_for(statement: &BoundStatement, context: &str) -> Re
             ),
         )),
     }
+}
+
+fn recursive_cte_select_input<'a>(
+    statement: &'a Statement,
+    source: &ObjectName,
+) -> Result<CteSelectInput<'a>> {
+    let Statement::Select {
+        distinct,
+        projection,
+        from,
+        selection,
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
+    } = statement
+    else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE clauses currently support SELECT queries only",
+        ));
+    };
+    if !object_names_equal(from, source) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("recursive CTE SELECT must read from {source}, got {from}"),
+        ));
+    }
+    if !group_by.is_empty() || having.is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE SELECT does not support GROUP BY or HAVING yet",
+        ));
+    }
+    Ok(CteSelectInput {
+        distinct: *distinct,
+        projection,
+        from,
+        selection,
+        order_by,
+        limit: *limit,
+        offset: *offset,
+    })
+}
+
+fn bind_cte_wildcard(
+    available_columns: &[BoundColumn],
+    projection: &mut Vec<BoundSelectItem>,
+    columns: &mut Vec<BoundColumn>,
+) {
+    for column in available_columns {
+        push_cte_projection(
+            projection,
+            columns,
+            column.clone(),
+            Expr::Identifier(Ident::new(column.name.as_str())),
+        );
+    }
+}
+
+fn push_cte_projection(
+    projection: &mut Vec<BoundSelectItem>,
+    columns: &mut Vec<BoundColumn>,
+    column: BoundColumn,
+    expr: Expr,
+) {
+    projection.push(BoundSelectItem {
+        column: column.clone(),
+        expr,
+    });
+    columns.push(column);
 }
 
 fn validate_recursive_cte_name(name: &ObjectName) -> Result<()> {
