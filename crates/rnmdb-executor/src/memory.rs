@@ -2073,30 +2073,124 @@ impl MemoryExecutor {
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         cancellation.check()?;
+        self.execute_logical_plan(plan, cancellation)
+    }
+
+    fn execute_logical_plan(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::RecursiveScan { .. }
+            | LogicalPlan::TextSearch { .. } => self.execute_logical_scan(plan, cancellation),
+            LogicalPlan::Filter { .. }
+            | LogicalPlan::InSubqueryFilter { .. }
+            | LogicalPlan::ExistsSubqueryFilter { .. } => {
+                self.execute_logical_filter(plan, cancellation)
+            }
+            LogicalPlan::SidewaysLookup { .. }
+            | LogicalPlan::NestedLoopJoin { .. }
+            | LogicalPlan::HashJoin { .. } => self.execute_logical_join(plan, cancellation),
+            LogicalPlan::Project { .. }
+            | LogicalPlan::Window { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::GroupedAggregate { .. }
+            | LogicalPlan::GroupingSetsAggregate { .. } => {
+                self.execute_logical_projection(plan, cancellation)
+            }
+            LogicalPlan::Distinct { .. }
+            | LogicalPlan::Union { .. }
+            | LogicalPlan::Intersect { .. }
+            | LogicalPlan::Except { .. } => self.execute_logical_set_operation(plan, cancellation),
+            LogicalPlan::RecursiveCte {
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+            } => self.execute_recursive_cte_cancellable(
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+                cancellation,
+            ),
+            LogicalPlan::Sort { .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::Offset { .. }
+            | LogicalPlan::Parallel { .. } => self.execute_logical_ordering(plan, cancellation),
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory executor does not support this logical plan",
+            )),
+        }
+    }
+
+    fn execute_logical_scan(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         match plan {
             LogicalPlan::Scan { relation_id, table } => self.scan_table(*relation_id, table),
-            LogicalPlan::RecursiveScan { name, .. } => {
-                let tables = self.read_tables()?;
-                tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("recursive CTE is not active: {name}"),
-                    )
-                })
+            LogicalPlan::RecursiveScan { name, .. } => self.execute_recursive_scan(name),
+            LogicalPlan::TextSearch {
+                relation_id,
+                table,
+                column,
+                query,
+                ..
+            } => self.execute_logical_text_search(*relation_id, table, column, query, cancellation),
+            _ => Err(logical_plan_dispatch_error("scan")),
+        }
+    }
+
+    fn execute_recursive_scan(&self, name: &str) -> Result<VectorBatch> {
+        let tables = self.read_tables()?;
+        tables.get(name).map(MemoryTable::scan).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("recursive CTE is not active: {name}"),
+            )
+        })
+    }
+
+    fn execute_logical_text_search(
+        &self,
+        relation_id: RelationId,
+        table_name: &str,
+        column: &str,
+        query: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = {
+            let tables = self.read_tables()?;
+            let table = tables.get(table_name).ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table not found: {table_name}"),
+                )
+            })?;
+            if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                return self.column_crypto.decrypt_batch(relation_id, batch);
             }
+            table.scan()
+        };
+        let batch = self.column_crypto.decrypt_batch(relation_id, batch)?;
+        apply_text_search_cancellable(batch, column, query, cancellation)
+    }
+
+    fn execute_logical_filter(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Filter { predicate, input } => {
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    let batch = self.execute_cancellable(input, cancellation)?;
-                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                if let Some(batch) =
-                    self.execute_indexed_filter_scan(&predicate, input, cancellation)?
-                {
-                    return Ok(batch);
-                }
-                let batch = self.execute_cancellable(input, cancellation)?;
-                self.apply_filter_batch(batch, &predicate, cancellation)
+                self.execute_filter_plan(predicate, input, cancellation)
             }
             LogicalPlan::InSubqueryFilter {
                 expr,
@@ -2104,37 +2198,64 @@ impl MemoryExecutor {
                 negated,
                 input,
             } => {
-                let input = self.execute_cancellable(input, cancellation)?;
-                self.apply_logical_in_subquery_filter(input, subquery, expr, *negated, cancellation)
+                self.execute_in_subquery_filter_plan(expr, subquery, *negated, input, cancellation)
             }
             LogicalPlan::ExistsSubqueryFilter {
                 subquery,
                 negated,
                 input,
-            } => {
-                let input = self.execute_cancellable(input, cancellation)?;
-                self.apply_logical_exists_subquery_filter(input, subquery, *negated, cancellation)
-            }
-            LogicalPlan::TextSearch {
-                relation_id,
-                table,
-                column,
-                query,
-                ..
-            } => {
-                let batch = {
-                    let tables = self.read_tables()?;
-                    let table = tables.get(table).ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?;
-                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                        return self.column_crypto.decrypt_batch(*relation_id, batch);
-                    }
-                    table.scan()
-                };
-                let batch = self.column_crypto.decrypt_batch(*relation_id, batch)?;
-                apply_text_search_cancellable(batch, column, query, cancellation)
-            }
+            } => self.execute_exists_subquery_filter_plan(subquery, *negated, input, cancellation),
+            _ => Err(logical_plan_dispatch_error("filter")),
+        }
+    }
+
+    fn execute_filter_plan(
+        &self,
+        predicate: &Expr,
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            let batch = self.execute_cancellable(input, cancellation)?;
+            return self.apply_row_subquery_filter(batch, predicate, cancellation);
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        if let Some(batch) = self.execute_indexed_filter_scan(&predicate, input, cancellation)? {
+            return Ok(batch);
+        }
+        let batch = self.execute_cancellable(input, cancellation)?;
+        self.apply_filter_batch(batch, &predicate, cancellation)
+    }
+
+    fn execute_in_subquery_filter_plan(
+        &self,
+        expr: &Expr,
+        subquery: &LogicalPlan,
+        negated: bool,
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_cancellable(input, cancellation)?;
+        self.apply_logical_in_subquery_filter(input, subquery, expr, negated, cancellation)
+    }
+
+    fn execute_exists_subquery_filter_plan(
+        &self,
+        subquery: &LogicalPlan,
+        negated: bool,
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_cancellable(input, cancellation)?;
+        self.apply_logical_exists_subquery_filter(input, subquery, negated, cancellation)
+    }
+
+    fn execute_logical_join(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::SidewaysLookup {
                 outer,
                 inner_table,
@@ -2153,119 +2274,236 @@ impl MemoryExecutor {
                 left,
                 right,
                 predicate,
-            } => {
-                let left = self.execute_cancellable(left, cancellation)?;
-                let right = self.execute_cancellable(right, cancellation)?;
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    return self.apply_nested_loop_join_with_subqueries(
-                        left,
-                        right,
-                        *kind,
-                        predicate,
-                        cancellation,
-                    );
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(
-                    left,
-                    right,
-                    *kind,
-                    &predicate,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
-            }
+            } => self.execute_nested_loop_join_plan(*kind, left, right, predicate, cancellation),
             LogicalPlan::HashJoin {
                 kind,
                 left,
                 right,
                 left_key,
                 right_key,
-            } => {
-                let left = self.execute_cancellable(left, cancellation)?;
-                let right = self.execute_cancellable(right, cancellation)?;
-                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
-            }
+            } => self.execute_hash_join_plan(*kind, left, right, left_key, right_key, cancellation),
+            _ => Err(logical_plan_dispatch_error("join")),
+        }
+    }
+
+    fn execute_nested_loop_join_plan(
+        &self,
+        kind: JoinKind,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        predicate: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_cancellable(left, cancellation)?;
+        let right = self.execute_cancellable(right, cancellation)?;
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            return self.apply_nested_loop_join_with_subqueries(
+                left,
+                right,
+                kind,
+                predicate,
+                cancellation,
+            );
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        apply_nested_loop_join_cancellable(
+            left,
+            right,
+            kind,
+            &predicate,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_hash_join_plan(
+        &self,
+        kind: JoinKind,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        left_key: &str,
+        right_key: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_cancellable(left, cancellation)?;
+        let right = self.execute_cancellable(right, cancellation)?;
+        apply_hash_join_cancellable(left, right, kind, left_key, right_key, cancellation)
+    }
+
+    fn execute_logical_projection(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Project { items, input } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                self.apply_projection_with_subqueries(batch, items, cancellation)
+                self.execute_project_plan(items, input, cancellation)
             }
             LogicalPlan::Window { items, input } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                apply_window_cancellable(batch, items, cancellation)
+                self.execute_window_plan(items, input, cancellation)
             }
             LogicalPlan::Aggregate { items, input } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                apply_aggregate_cancellable(
-                    batch,
-                    items,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
+                self.execute_aggregate_plan(items, input, cancellation)
             }
             LogicalPlan::GroupedAggregate {
                 group_by,
                 items,
                 input,
-            } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                apply_grouped_aggregate_cancellable(
-                    batch,
-                    group_by,
-                    items,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
-            }
+            } => self.execute_grouped_aggregate_plan(group_by, items, input, cancellation),
             LogicalPlan::GroupingSetsAggregate {
                 group_by,
                 grouping_sets,
                 items,
                 input,
             } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                apply_grouping_sets_aggregate_cancellable(
-                    batch,
-                    group_by,
-                    grouping_sets,
-                    items,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
+                self.execute_grouping_sets_plan(group_by, grouping_sets, items, input, cancellation)
             }
-            LogicalPlan::Distinct { input } => {
-                let batch = self.execute_cancellable(input, cancellation)?;
-                apply_distinct_cancellable(batch, cancellation)
-            }
+            _ => Err(logical_plan_dispatch_error("projection or aggregate")),
+        }
+    }
+
+    fn execute_project_plan(
+        &self,
+        items: &[ProjectionItem],
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        self.apply_projection_with_subqueries(batch, items, cancellation)
+    }
+
+    fn execute_window_plan(
+        &self,
+        items: &[WindowItem],
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        apply_window_cancellable(batch, items, cancellation)
+    }
+
+    fn execute_aggregate_plan(
+        &self,
+        items: &[AggregateItem],
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        apply_aggregate_cancellable(
+            batch,
+            items,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_grouped_aggregate_plan(
+        &self,
+        group_by: &[Expr],
+        items: &[GroupedAggregateItem],
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        apply_grouped_aggregate_cancellable(
+            batch,
+            group_by,
+            items,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_grouping_sets_plan(
+        &self,
+        group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+        items: &[GroupedAggregateItem],
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        apply_grouping_sets_aggregate_cancellable(
+            batch,
+            group_by,
+            grouping_sets,
+            items,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_logical_set_operation(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            LogicalPlan::Distinct { input } => self.execute_distinct_plan(input, cancellation),
             LogicalPlan::Union { all, left, right } => {
-                let left = self.execute_cancellable(left, cancellation)?;
-                let right = self.execute_cancellable(right, cancellation)?;
-                apply_union_cancellable(left, right, *all, cancellation)
+                self.execute_union_plan(*all, left, right, cancellation)
             }
             LogicalPlan::Intersect { all, left, right } => {
-                let left = self.execute_cancellable(left, cancellation)?;
-                let right = self.execute_cancellable(right, cancellation)?;
-                apply_intersect_cancellable(left, right, *all, cancellation)
+                self.execute_intersect_plan(*all, left, right, cancellation)
             }
             LogicalPlan::Except { all, left, right } => {
-                let left = self.execute_cancellable(left, cancellation)?;
-                let right = self.execute_cancellable(right, cancellation)?;
-                apply_except_cancellable(left, right, *all, cancellation)
+                self.execute_except_plan(*all, left, right, cancellation)
             }
-            LogicalPlan::RecursiveCte {
-                name,
-                columns,
-                seed,
-                recursive,
-                query,
-            } => self.execute_recursive_cte_cancellable(
-                name,
-                columns,
-                seed,
-                recursive,
-                query,
-                cancellation,
-            ),
+            _ => Err(logical_plan_dispatch_error("set operation")),
+        }
+    }
+
+    fn execute_distinct_plan(
+        &self,
+        input: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_cancellable(input, cancellation)?;
+        apply_distinct_cancellable(batch, cancellation)
+    }
+
+    fn execute_union_plan(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_cancellable(left, cancellation)?;
+        let right = self.execute_cancellable(right, cancellation)?;
+        apply_union_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_intersect_plan(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_cancellable(left, cancellation)?;
+        let right = self.execute_cancellable(right, cancellation)?;
+        apply_intersect_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_except_plan(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_cancellable(left, cancellation)?;
+        let right = self.execute_cancellable(right, cancellation)?;
+        apply_except_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_logical_ordering(
+        &self,
+        plan: &LogicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_cancellable(input, cancellation)?;
                 self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
@@ -2279,10 +2517,7 @@ impl MemoryExecutor {
                 apply_offset_cancellable(batch, *count, cancellation)
             }
             LogicalPlan::Parallel { input, .. } => self.execute_cancellable(input, cancellation),
-            _ => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "memory executor does not support this logical plan",
-            )),
+            _ => Err(logical_plan_dispatch_error("ordering")),
         }
     }
 
@@ -2296,20 +2531,33 @@ impl MemoryExecutor {
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         let seed = self.execute_cancellable(seed, cancellation)?;
-        let mut accumulated = rename_batch_columns(seed, columns)?;
-        let mut working = accumulated.clone();
+        let accumulated = rename_batch_columns(seed, columns)?;
+        let accumulated =
+            self.expand_recursive_cte(name, columns, recursive, accumulated, cancellation)?;
+        let executor = self.with_recursive_table(name, &accumulated)?;
+        executor.execute_cancellable(query, cancellation)
+    }
 
+    fn expand_recursive_cte(
+        &self,
+        name: &str,
+        columns: &[String],
+        recursive: &LogicalPlan,
+        mut accumulated: VectorBatch,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let mut working = accumulated.clone();
         for iteration in 0..RECURSIVE_CTE_MAX_ITERATIONS {
-            cancellation.check()?;
-            if working.rows().is_empty() {
+            let Some(next) = self.execute_recursive_cte_iteration(
+                name,
+                columns,
+                recursive,
+                &working,
+                cancellation,
+            )?
+            else {
                 break;
-            }
-            let executor = self.with_recursive_table(name, &working)?;
-            let next = executor.execute_cancellable(recursive, cancellation)?;
-            let next = rename_batch_columns(next, columns)?;
-            if next.rows().is_empty() {
-                break;
-            }
+            };
             accumulated = append_batches(accumulated, &next, cancellation)?;
             working = next;
             if iteration + 1 == RECURSIVE_CTE_MAX_ITERATIONS {
@@ -2321,9 +2569,28 @@ impl MemoryExecutor {
                 ));
             }
         }
+        Ok(accumulated)
+    }
 
-        let executor = self.with_recursive_table(name, &accumulated)?;
-        executor.execute_cancellable(query, cancellation)
+    fn execute_recursive_cte_iteration(
+        &self,
+        name: &str,
+        columns: &[String],
+        recursive: &LogicalPlan,
+        working: &VectorBatch,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<VectorBatch>> {
+        cancellation.check()?;
+        if working.rows().is_empty() {
+            return Ok(None);
+        }
+        let executor = self.with_recursive_table(name, working)?;
+        let next = executor.execute_cancellable(recursive, cancellation)?;
+        let next = rename_batch_columns(next, columns)?;
+        if next.rows().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(next))
     }
 
     fn apply_logical_exists_subquery_filter(
@@ -4411,6 +4678,13 @@ impl MemoryExecutor {
         }
         Ok(None)
     }
+}
+
+fn logical_plan_dispatch_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("logical executor received an unexpected {category} plan"),
+    )
 }
 
 fn column_schema_from_def(column: &ColumnDef) -> ColumnSchema {
