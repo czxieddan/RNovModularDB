@@ -4425,6 +4425,77 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         config.validate()?;
         cancellation.check()?;
+        self.execute_parallel_logical_plan(plan, config, cancellation)
+    }
+
+    fn execute_parallel_logical_plan(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            LogicalPlan::Scan { .. }
+            | LogicalPlan::RecursiveScan { .. }
+            | LogicalPlan::TextSearch { .. } => {
+                self.execute_parallel_logical_scan(plan, config, cancellation)
+            }
+            LogicalPlan::Filter { .. }
+            | LogicalPlan::InSubqueryFilter { .. }
+            | LogicalPlan::ExistsSubqueryFilter { .. } => {
+                self.execute_parallel_logical_filter(plan, config, cancellation)
+            }
+            LogicalPlan::SidewaysLookup { .. }
+            | LogicalPlan::NestedLoopJoin { .. }
+            | LogicalPlan::HashJoin { .. } => {
+                self.execute_parallel_logical_join(plan, config, cancellation)
+            }
+            LogicalPlan::Project { .. }
+            | LogicalPlan::Window { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::GroupedAggregate { .. }
+            | LogicalPlan::GroupingSetsAggregate { .. } => {
+                self.execute_parallel_logical_projection(plan, config, cancellation)
+            }
+            LogicalPlan::Distinct { .. }
+            | LogicalPlan::Union { .. }
+            | LogicalPlan::Intersect { .. }
+            | LogicalPlan::Except { .. } => {
+                self.execute_parallel_logical_set_operation(plan, config, cancellation)
+            }
+            LogicalPlan::RecursiveCte {
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+            } => self.execute_recursive_cte_cancellable(
+                name,
+                columns,
+                seed,
+                recursive,
+                query,
+                cancellation,
+            ),
+            LogicalPlan::Sort { .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::Offset { .. }
+            | LogicalPlan::Parallel { .. } => {
+                self.execute_parallel_logical_ordering(plan, config, cancellation)
+            }
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory executor does not support this logical plan",
+            )),
+        }
+    }
+
+    fn execute_parallel_logical_scan(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         match plan {
             LogicalPlan::Scan { relation_id, table } => self.decrypt_physical_scan(
                 *relation_id,
@@ -4433,47 +4504,7 @@ impl MemoryExecutor {
                 })?,
             ),
             LogicalPlan::RecursiveScan { name, .. } => {
-                let tables = self.read_tables()?;
-                tables
-                    .get(name)
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!("recursive CTE is not active: {name}"),
-                        )
-                    })?
-                    .scan_parallel_cancellable(config, cancellation)
-            }
-            LogicalPlan::Filter { predicate, input } => {
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                if let Some(batch) =
-                    self.execute_indexed_filter_scan(&predicate, input, cancellation)?
-                {
-                    return Ok(batch);
-                }
-                let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
-                self.apply_filter_batch(batch, &predicate, cancellation)
-            }
-            LogicalPlan::InSubqueryFilter {
-                expr,
-                subquery,
-                negated,
-                input,
-            } => {
-                let input = self.execute_parallel_cancellable(input, config, cancellation)?;
-                self.apply_logical_in_subquery_filter(input, subquery, expr, *negated, cancellation)
-            }
-            LogicalPlan::ExistsSubqueryFilter {
-                subquery,
-                negated,
-                input,
-            } => {
-                let input = self.execute_parallel_cancellable(input, config, cancellation)?;
-                self.apply_logical_exists_subquery_filter(input, subquery, *negated, cancellation)
+                self.execute_parallel_recursive_scan(name, config, cancellation)
             }
             LogicalPlan::TextSearch {
                 relation_id,
@@ -4481,20 +4512,151 @@ impl MemoryExecutor {
                 column,
                 query,
                 ..
-            } => {
-                let batch = {
-                    let tables = self.read_tables()?;
-                    let table = tables.get(table).ok_or_else(|| {
-                        RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                    })?;
-                    if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
-                        return self.column_crypto.decrypt_batch(*relation_id, batch);
-                    }
-                    table.scan_parallel_cancellable(config, cancellation)?
-                };
-                let batch = self.column_crypto.decrypt_batch(*relation_id, batch)?;
-                apply_text_search_cancellable(batch, column, query, cancellation)
+            } => self.execute_parallel_logical_text_search(
+                *relation_id,
+                table,
+                column,
+                query,
+                config,
+                cancellation,
+            ),
+            _ => Err(logical_plan_dispatch_error("parallel scan")),
+        }
+    }
+
+    fn execute_parallel_recursive_scan(
+        &self,
+        name: &str,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let tables = self.read_tables()?;
+        tables
+            .get(name)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("recursive CTE is not active: {name}"),
+                )
+            })?
+            .scan_parallel_cancellable(config, cancellation)
+    }
+
+    fn execute_parallel_logical_text_search(
+        &self,
+        relation_id: RelationId,
+        table_name: &str,
+        column: &str,
+        query: &str,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = {
+            let tables = self.read_tables()?;
+            let table = tables.get(table_name).ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("table not found: {table_name}"),
+                )
+            })?;
+            if let Some(batch) = table.try_text_index_scan(column, query, cancellation)? {
+                return self.column_crypto.decrypt_batch(relation_id, batch);
             }
+            table.scan_parallel_cancellable(config, cancellation)?
+        };
+        let batch = self.column_crypto.decrypt_batch(relation_id, batch)?;
+        apply_text_search_cancellable(batch, column, query, cancellation)
+    }
+
+    fn execute_parallel_logical_filter(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            LogicalPlan::Filter { predicate, input } => {
+                self.execute_parallel_logical_filter_plan(predicate, input, config, cancellation)
+            }
+            LogicalPlan::InSubqueryFilter {
+                expr,
+                subquery,
+                negated,
+                input,
+            } => self.execute_parallel_logical_in_subquery(
+                expr,
+                subquery,
+                *negated,
+                input,
+                config,
+                cancellation,
+            ),
+            LogicalPlan::ExistsSubqueryFilter {
+                subquery,
+                negated,
+                input,
+            } => self.execute_parallel_logical_exists_subquery(
+                subquery,
+                *negated,
+                input,
+                config,
+                cancellation,
+            ),
+            _ => Err(logical_plan_dispatch_error("parallel filter")),
+        }
+    }
+
+    fn execute_parallel_logical_filter_plan(
+        &self,
+        predicate: &Expr,
+        input: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+            return self.apply_row_subquery_filter(batch, predicate, cancellation);
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        if let Some(batch) = self.execute_indexed_filter_scan(&predicate, input, cancellation)? {
+            return Ok(batch);
+        }
+        let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
+        self.apply_filter_batch(batch, &predicate, cancellation)
+    }
+
+    fn execute_parallel_logical_in_subquery(
+        &self,
+        expr: &Expr,
+        subquery: &LogicalPlan,
+        negated: bool,
+        input: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_parallel_cancellable(input, config, cancellation)?;
+        self.apply_logical_in_subquery_filter(input, subquery, expr, negated, cancellation)
+    }
+
+    fn execute_parallel_logical_exists_subquery(
+        &self,
+        subquery: &LogicalPlan,
+        negated: bool,
+        input: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_parallel_cancellable(input, config, cancellation)?;
+        self.apply_logical_exists_subquery_filter(input, subquery, negated, cancellation)
+    }
+
+    fn execute_parallel_logical_join(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::SidewaysLookup {
                 outer,
                 inner_table,
@@ -4513,39 +4675,80 @@ impl MemoryExecutor {
                 left,
                 right,
                 predicate,
-            } => {
-                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
-                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    return self.apply_nested_loop_join_with_subqueries(
-                        left,
-                        right,
-                        *kind,
-                        predicate,
-                        cancellation,
-                    );
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(
-                    left,
-                    right,
-                    *kind,
-                    &predicate,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
-            }
-            LogicalPlan::HashJoin {
-                kind,
+            } => self.execute_parallel_nested_loop_join(
+                *kind,
                 left,
                 right,
-                left_key,
-                right_key,
-            } => {
-                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
-                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
+                predicate,
+                config,
+                cancellation,
+            ),
+            LogicalPlan::HashJoin { .. } => {
+                self.execute_parallel_hash_join(plan, config, cancellation)
             }
+            _ => Err(logical_plan_dispatch_error("parallel join")),
+        }
+    }
+
+    fn execute_parallel_nested_loop_join(
+        &self,
+        kind: JoinKind,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        predicate: &Expr,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            return self.apply_nested_loop_join_with_subqueries(
+                left,
+                right,
+                kind,
+                predicate,
+                cancellation,
+            );
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        apply_nested_loop_join_cancellable(
+            left,
+            right,
+            kind,
+            &predicate,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_parallel_hash_join(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let LogicalPlan::HashJoin {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+        } = plan
+        else {
+            return Err(logical_plan_dispatch_error("parallel hash join"));
+        };
+        let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+        apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
+    }
+
+    fn execute_parallel_logical_projection(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Project { items, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 self.apply_projection_with_subqueries(batch, items, cancellation)
@@ -4594,39 +4797,82 @@ impl MemoryExecutor {
                     cancellation,
                 )
             }
+            _ => Err(logical_plan_dispatch_error(
+                "parallel projection or aggregate",
+            )),
+        }
+    }
+
+    fn execute_parallel_logical_set_operation(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Distinct { input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 apply_distinct_cancellable(batch, cancellation)
             }
             LogicalPlan::Union { all, left, right } => {
-                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
-                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_union_cancellable(left, right, *all, cancellation)
+                self.execute_parallel_union(*all, left, right, config, cancellation)
             }
             LogicalPlan::Intersect { all, left, right } => {
-                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
-                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_intersect_cancellable(left, right, *all, cancellation)
+                self.execute_parallel_intersect(*all, left, right, config, cancellation)
             }
             LogicalPlan::Except { all, left, right } => {
-                let left = self.execute_parallel_cancellable(left, config, cancellation)?;
-                let right = self.execute_parallel_cancellable(right, config, cancellation)?;
-                apply_except_cancellable(left, right, *all, cancellation)
+                self.execute_parallel_except(*all, left, right, config, cancellation)
             }
-            LogicalPlan::RecursiveCte {
-                name,
-                columns,
-                seed,
-                recursive,
-                query,
-            } => self.execute_recursive_cte_cancellable(
-                name,
-                columns,
-                seed,
-                recursive,
-                query,
-                cancellation,
-            ),
+            _ => Err(logical_plan_dispatch_error("parallel set operation")),
+        }
+    }
+
+    fn execute_parallel_union(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+        apply_union_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_parallel_intersect(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+        apply_intersect_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_parallel_except(
+        &self,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_parallel_cancellable(right, config, cancellation)?;
+        apply_except_cancellable(left, right, all, cancellation)
+    }
+
+    fn execute_parallel_logical_ordering(
+        &self,
+        plan: &LogicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             LogicalPlan::Sort { keys, input } => {
                 let batch = self.execute_parallel_cancellable(input, config, cancellation)?;
                 self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
@@ -4644,10 +4890,7 @@ impl MemoryExecutor {
                     ParallelQueryConfig::new(hint.workers, config.min_parallel_rows());
                 self.execute_parallel_cancellable(input, hinted_config, cancellation)
             }
-            _ => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "memory executor does not support this logical plan",
-            )),
+            _ => Err(logical_plan_dispatch_error("parallel ordering")),
         }
     }
 
