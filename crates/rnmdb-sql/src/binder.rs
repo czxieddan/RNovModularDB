@@ -11,9 +11,9 @@ use crate::ast::{
     Assignment, BoundAssignment, BoundColumn, BoundDelete, BoundExcept, BoundHashJoinKeys,
     BoundIndexKey, BoundIntersect, BoundJoin, BoundJoinSelect, BoundLateralJoin, BoundQuery,
     BoundRecursiveCte, BoundRowPolicy, BoundSelect, BoundSelectItem, BoundStatement, BoundUnion,
-    BoundUpdate, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef,
-    JoinClause, JoinKind, LateralJoin, ObjectName, OrderByExpr, SelectItem, SelectSubquery,
-    Statement, TransactionAction, WasmFunctionBody,
+    BoundUpdate, ColumnDef, CreateFunctionImplementation, Expr, Ident, IndexKeyDef, JoinClause,
+    JoinKind, LateralJoin, ObjectName, OrderByExpr, SelectItem, SelectSubquery, Statement,
+    TransactionAction, WasmFunctionBody,
 };
 use crate::expr_mutator::{rewrite_expr_tree, rewrite_qualified_expr};
 use crate::parser::{parse_expr, parse_statement};
@@ -4224,114 +4224,24 @@ impl<'a> Binder<'a> {
     }
 
     fn validate_cte_identifiers(&self, columns: &[BoundColumn], expr: &Expr) -> Result<()> {
-        match expr {
+        rewrite_expr_tree(expr, &mut |candidate| match candidate {
             Expr::Identifier(identifier) => {
                 let _ = self.resolve_column_from_bound(columns, identifier)?;
-                Ok(())
+                Ok(Some(candidate.clone()))
             }
             Expr::QualifiedIdentifier { .. } => Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "bound recursive CTE expression must not contain qualified column references",
             )),
-            Expr::RuntimeValue(_) => Ok(()),
-            Expr::Binary { left, right, .. } => {
-                self.validate_cte_identifiers(columns, left)?;
-                self.validate_cte_identifiers(columns, right)
+            Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } | Expr::ScalarSubquery { .. } => {
+                Err(RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "recursive CTE expressions do not support subqueries",
+                ))
             }
-            Expr::Unary { expr, .. }
-            | Expr::Not(expr)
-            | Expr::Count(expr)
-            | Expr::CountDistinct(expr)
-            | Expr::Sum(expr)
-            | Expr::Min(expr)
-            | Expr::Max(expr)
-            | Expr::Cast { expr, .. } => self.validate_cte_identifiers(columns, expr),
-            Expr::IsNull { expr, .. }
-            | Expr::IsTruth { expr, .. }
-            | Expr::IsUnknown { expr, .. } => self.validate_cte_identifiers(columns, expr),
-            Expr::IsDistinctFrom { left, right, .. } | Expr::NullIf { left, right } => {
-                self.validate_cte_identifiers(columns, left)?;
-                self.validate_cte_identifiers(columns, right)
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                self.validate_cte_identifiers(columns, low)?;
-                self.validate_cte_identifiers(columns, high)
-            }
-            Expr::InList { expr, values, .. } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                for value in values {
-                    self.validate_cte_identifiers(columns, value)?;
-                }
-                Ok(())
-            }
-            Expr::InSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE expressions do not support subqueries",
-            )),
-            Expr::ExistsSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE expressions do not support subqueries",
-            )),
-            Expr::ScalarSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE expressions do not support subqueries",
-            )),
-            Expr::Like { expr, pattern, .. } => {
-                self.validate_cte_identifiers(columns, expr)?;
-                self.validate_cte_identifiers(columns, pattern)
-            }
-            Expr::Coalesce(values) | Expr::Array(values) => {
-                for value in values {
-                    self.validate_cte_identifiers(columns, value)?;
-                }
-                Ok(())
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                if let Some(operand) = operand {
-                    self.validate_cte_identifiers(columns, operand)?;
-                }
-                for arm in whens {
-                    self.validate_cte_identifiers(columns, &arm.condition)?;
-                    self.validate_cte_identifiers(columns, &arm.result)?;
-                }
-                if let Some(else_expr) = else_expr {
-                    self.validate_cte_identifiers(columns, else_expr)?;
-                }
-                Ok(())
-            }
-            Expr::Call { args, .. } => {
-                for arg in args {
-                    self.validate_cte_identifiers(columns, arg)?;
-                }
-                Ok(())
-            }
-            Expr::RowNumberOver { order_by }
-            | Expr::RankOver { order_by }
-            | Expr::DenseRankOver { order_by } => {
-                for order_by in order_by {
-                    self.validate_cte_identifiers(columns, &order_by.expr)?;
-                }
-                Ok(())
-            }
-            Expr::Range { lower, upper, .. } => {
-                self.validate_cte_identifiers(columns, lower)?;
-                self.validate_cte_identifiers(columns, upper)
-            }
-            Expr::Integer(_)
-            | Expr::Float64(_)
-            | Expr::String(_)
-            | Expr::Bool(_)
-            | Expr::Null
-            | Expr::CountStar
-            | Expr::HStore(_) => Ok(()),
-        }
+            _ => Ok(None),
+        })
+        .map(|_| ())
     }
 
     fn bind_lateral_equality(
