@@ -5339,79 +5339,93 @@ impl MemoryExecutor {
         let LogicalPlan::Scan { table, .. } = input else {
             return Ok(None);
         };
-        let tables = self.read_tables()?;
-        let table = tables.get(table).ok_or_else(|| {
-            RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-        })?;
-        if table.has_encrypted_columns() {
-            return Ok(None);
-        }
-        if let Some((expr, value)) = indexable_expression_equality(predicate)
-            && let Some(batch) = table.try_expression_index_scan(expr, value)?
-        {
-            return self
-                .apply_filter_batch(batch, predicate, cancellation)
-                .map(Some);
-        }
-        if let Some((column, value)) = indexable_equality(predicate) {
-            if let Some(batch) = table.try_index_scan(column, value)? {
-                return self
-                    .apply_filter_batch(batch, predicate, cancellation)
-                    .map(Some);
-            }
-            if let Some(batch) = table.try_index_skip_scan(column, value)? {
-                return self
-                    .apply_filter_batch(batch, predicate, cancellation)
-                    .map(Some);
-            }
-        }
-        if let Some((column, range)) = indexable_range_overlap(predicate)
-            && let Some(batch) = table.try_range_overlap_scan(column, range)?
-        {
-            return self
-                .apply_filter_batch(batch, predicate, cancellation)
-                .map(Some);
-        }
-        if let Some((column, bounds)) = indexable_bounds_overlap(predicate)
-            && let Some(batch) = table.try_bounds_overlap_scan(column, bounds)?
-        {
-            return self
-                .apply_filter_batch(batch, predicate, cancellation)
-                .map(Some);
-        }
-        if let Some((column, query)) = indexable_inverted_value(predicate)
-            && let Some(batch) = table.try_inverted_value_scan(column, &query)?
-        {
-            return self
-                .apply_filter_batch(batch, predicate, cancellation)
-                .map(Some);
-        }
-        if let Some(range) = indexable_range(predicate) {
-            if let Some(batch) = table.try_block_summary_scan(
-                range.column,
-                range.lower,
-                range.lower_inclusive,
-                range.upper,
-                range.upper_inclusive,
-            )? {
-                return self
-                    .apply_filter_batch(batch, predicate, cancellation)
-                    .map(Some);
-            }
-            if let Some(batch) = table.try_index_range_scan(
-                range.column,
-                range.lower,
-                range.lower_inclusive,
-                range.upper,
-                range.upper_inclusive,
-            )? {
-                return self
-                    .apply_filter_batch(batch, predicate, cancellation)
-                    .map(Some);
-            }
-        }
-        Ok(None)
+        let candidate =
+            self.with_table(table, |table| indexed_filter_candidate(table, predicate))?;
+        candidate
+            .map(|batch| self.apply_filter_batch(batch, predicate, cancellation))
+            .transpose()
     }
+}
+
+fn indexed_filter_candidate(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    if table.has_encrypted_columns() {
+        return Ok(None);
+    }
+    if let Some(batch) = try_indexed_equality_scan(table, predicate)? {
+        return Ok(Some(batch));
+    }
+    if let Some(batch) = try_indexed_overlap_scan(table, predicate)? {
+        return Ok(Some(batch));
+    }
+    try_indexed_range_scan(table, predicate)
+}
+
+fn try_indexed_equality_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    if let Some((expr, value)) = indexable_expression_equality(predicate)
+        && let Some(batch) = table.try_expression_index_scan(expr, value)?
+    {
+        return Ok(Some(batch));
+    }
+    let Some((column, value)) = indexable_equality(predicate) else {
+        return Ok(None);
+    };
+    if let Some(batch) = table.try_index_scan(column, value)? {
+        return Ok(Some(batch));
+    }
+    table.try_index_skip_scan(column, value)
+}
+
+fn try_indexed_overlap_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    if let Some(batch) = try_range_overlap_scan(table, predicate)? {
+        return Ok(Some(batch));
+    }
+    if let Some(batch) = try_bounds_overlap_scan(table, predicate)? {
+        return Ok(Some(batch));
+    }
+    try_inverted_value_scan(table, predicate)
+}
+
+fn try_range_overlap_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    let Some((column, range)) = indexable_range_overlap(predicate) else {
+        return Ok(None);
+    };
+    table.try_range_overlap_scan(column, range)
+}
+
+fn try_bounds_overlap_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    let Some((column, bounds)) = indexable_bounds_overlap(predicate) else {
+        return Ok(None);
+    };
+    table.try_bounds_overlap_scan(column, bounds)
+}
+
+fn try_inverted_value_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    let Some((column, query)) = indexable_inverted_value(predicate) else {
+        return Ok(None);
+    };
+    table.try_inverted_value_scan(column, &query)
+}
+
+fn try_indexed_range_scan(table: &MemoryTable, predicate: &Expr) -> Result<Option<VectorBatch>> {
+    let Some(range) = indexable_range(predicate) else {
+        return Ok(None);
+    };
+    if let Some(batch) = table.try_block_summary_scan(
+        range.column,
+        range.lower,
+        range.lower_inclusive,
+        range.upper,
+        range.upper_inclusive,
+    )? {
+        return Ok(Some(batch));
+    }
+    table.try_index_range_scan(
+        range.column,
+        range.lower,
+        range.lower_inclusive,
+        range.upper,
+        range.upper_inclusive,
+    )
 }
 
 fn logical_plan_dispatch_error(category: &str) -> RnovError {
