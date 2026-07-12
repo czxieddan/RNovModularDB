@@ -1191,6 +1191,22 @@ impl MemoryTableIndex {
     }
 
     fn merge_from(&mut self, other: Self) -> Result<()> {
+        match self {
+            Self::BTree { .. }
+            | Self::ExpressionBTree { .. }
+            | Self::Hash { .. }
+            | Self::ExpressionHash { .. } => self.merge_key_index_from(other),
+            Self::GinText { .. }
+            | Self::GinValue { .. }
+            | Self::GistRange { .. }
+            | Self::GistBounds { .. } => self.merge_search_index_from(other),
+            Self::BrinSummary { .. } | Self::Composite { .. } => {
+                self.merge_summary_index_from(other)
+            }
+        }
+    }
+
+    fn merge_key_index_from(&mut self, other: Self) -> Result<()> {
         match (self, other) {
             (
                 Self::BTree {
@@ -1226,6 +1242,12 @@ impl MemoryTableIndex {
                     index: other_index,
                 },
             ) if *expr == other_expr => index.merge_from(other_index),
+            _ => Self::incompatible_index_merge(),
+        }
+    }
+
+    fn merge_search_index_from(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
             (
                 Self::GinText {
                     column_index,
@@ -1266,6 +1288,12 @@ impl MemoryTableIndex {
                     index: other_index,
                 },
             ) if *column_index == other_column_index => index.merge_from(other_index),
+            _ => Self::incompatible_index_merge(),
+        }
+    }
+
+    fn merge_summary_index_from(&mut self, other: Self) -> Result<()> {
+        match (self, other) {
             (
                 Self::BrinSummary {
                     column_index,
@@ -1291,11 +1319,15 @@ impl MemoryTableIndex {
                     index: other_index,
                 },
             ) if *column_indexes == other_column_indexes => index.merge_from(other_index),
-            _ => Err(RnovError::new(
-                ErrorKind::Internal,
-                "cannot merge incompatible memory table indexes",
-            )),
+            _ => Self::incompatible_index_merge(),
         }
+    }
+
+    fn incompatible_index_merge() -> Result<()> {
+        Err(RnovError::new(
+            ErrorKind::Internal,
+            "cannot merge incompatible memory table indexes",
+        ))
     }
 
     fn insert_row(
@@ -1305,115 +1337,224 @@ impl MemoryTableIndex {
         pointer: IndexPointer,
     ) -> Result<()> {
         match self {
+            Self::BTree { .. }
+            | Self::ExpressionBTree { .. }
+            | Self::Hash { .. }
+            | Self::ExpressionHash { .. } => self.insert_key_index_row(columns, row, pointer),
+            Self::GinText { .. } | Self::GinValue { .. } => {
+                self.insert_inverted_index_row(row, pointer)
+            }
+            Self::GistRange { .. } | Self::GistBounds { .. } => {
+                self.insert_spatial_index_row(row, pointer)
+            }
+            Self::BrinSummary { .. } | Self::Composite { .. } => {
+                self.insert_summary_index_row(row, pointer)
+            }
+        }
+    }
+
+    fn insert_key_index_row(
+        &mut self,
+        columns: &[ColumnSchema],
+        row: &Row,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        match self {
             Self::BTree {
                 column_index,
                 index,
-                ..
-            } => {
-                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
-                    return Ok(());
-                };
-                index.insert(key, pointer)
-            }
+            } => Self::insert_btree_value(index, &row.values()[*column_index], pointer),
             Self::ExpressionBTree { expr, index } => {
-                let Some(key) = index_key_from_value(&eval_expr(columns, row, expr)?)? else {
-                    return Ok(());
-                };
-                index.insert(key, pointer)
+                Self::insert_expression_btree(columns, row, expr, index, pointer)
             }
             Self::Hash {
                 column_index,
                 index,
-                ..
-            } => {
-                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
-                    return Ok(());
-                };
-                index.insert(key, pointer)
-            }
+            } => Self::insert_hash_value(index, &row.values()[*column_index], pointer),
             Self::ExpressionHash { expr, index } => {
-                let Some(key) = index_key_from_value(&eval_expr(columns, row, expr)?)? else {
-                    return Ok(());
-                };
-                index.insert(key, pointer)
+                Self::insert_expression_hash(columns, row, expr, index, pointer)
             }
+            _ => Self::invalid_index_insert_dispatch(),
+        }
+    }
+
+    fn insert_btree_value(
+        index: &mut MemoryBTreeIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(key) = index_key_from_value(value)? else {
+            return Ok(());
+        };
+        index.insert(key, pointer)
+    }
+
+    fn insert_expression_btree(
+        columns: &[ColumnSchema],
+        row: &Row,
+        expr: &Expr,
+        index: &mut MemoryBTreeIndex,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let value = eval_expr(columns, row, expr)?;
+        Self::insert_btree_value(index, &value, pointer)
+    }
+
+    fn insert_hash_value(
+        index: &mut MemoryHashIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(key) = index_key_from_value(value)? else {
+            return Ok(());
+        };
+        index.insert(key, pointer)
+    }
+
+    fn insert_expression_hash(
+        columns: &[ColumnSchema],
+        row: &Row,
+        expr: &Expr,
+        index: &mut MemoryHashIndex,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let value = eval_expr(columns, row, expr)?;
+        Self::insert_hash_value(index, &value, pointer)
+    }
+
+    fn insert_inverted_index_row(&mut self, row: &Row, pointer: IndexPointer) -> Result<()> {
+        match self {
             Self::GinText {
                 column_index,
                 index,
-                ..
-            } => {
-                let Some(vector) = text_vector_from_value(&row.values()[*column_index])? else {
-                    return Ok(());
-                };
-                index.insert_document(pointer, &vector)
-            }
+            } => Self::insert_text_index_value(index, &row.values()[*column_index], pointer),
             Self::GinValue {
                 column_index,
                 index,
-                ..
-            } => match &row.values()[*column_index] {
-                SqlValue::Null => Ok(()),
-                SqlValue::Array(array) if array.is_empty() => Ok(()),
-                SqlValue::Array(array) => index.insert_array(pointer, array),
-                SqlValue::HStore(hstore) if hstore.is_empty() => Ok(()),
-                SqlValue::HStore(hstore) => index.insert_hstore(pointer, hstore),
-                other => Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "gin value index cannot index value type {:?}",
-                        other.data_type()
-                    ),
-                )),
-            },
+            } => Self::insert_inverted_value(index, &row.values()[*column_index], pointer),
+            _ => Self::invalid_index_insert_dispatch(),
+        }
+    }
+
+    fn insert_text_index_value(
+        index: &mut InvertedTextIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(vector) = text_vector_from_value(value)? else {
+            return Ok(());
+        };
+        index.insert_document(pointer, &vector)
+    }
+
+    fn insert_inverted_value(
+        index: &mut InvertedValueIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        match value {
+            SqlValue::Null => Ok(()),
+            SqlValue::Array(array) if array.is_empty() => Ok(()),
+            SqlValue::Array(array) => index.insert_array(pointer, array),
+            SqlValue::HStore(hstore) if hstore.is_empty() => Ok(()),
+            SqlValue::HStore(hstore) => index.insert_hstore(pointer, hstore),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "gin value index cannot index value type {:?}",
+                    other.data_type()
+                ),
+            )),
+        }
+    }
+
+    fn insert_spatial_index_row(&mut self, row: &Row, pointer: IndexPointer) -> Result<()> {
+        match self {
             Self::GistRange {
                 column_index,
                 index,
-                ..
-            } => {
-                let SqlValue::Range(range) = &row.values()[*column_index] else {
-                    if row.values()[*column_index].is_null() {
-                        return Ok(());
-                    }
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "gist range index cannot index a non-range value",
-                    ));
-                };
-                index.insert_range(pointer, range)
-            }
+            } => Self::insert_range_index_value(index, &row.values()[*column_index], pointer),
             Self::GistBounds {
                 column_index,
                 index,
-                ..
-            } => {
-                let Some(bounds) = bounding_box_from_value(&row.values()[*column_index])? else {
-                    return Ok(());
-                };
-                index.insert_box(pointer, &bounds)
+            } => Self::insert_bounds_index_value(index, &row.values()[*column_index], pointer),
+            _ => Self::invalid_index_insert_dispatch(),
+        }
+    }
+
+    fn insert_range_index_value(
+        index: &mut MemoryRangeIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let SqlValue::Range(range) = value else {
+            if value.is_null() {
+                return Ok(());
             }
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "gist range index cannot index a non-range value",
+            ));
+        };
+        index.insert_range(pointer, range)
+    }
+
+    fn insert_bounds_index_value(
+        index: &mut MemoryBoundsIndex,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(bounds) = bounding_box_from_value(value)? else {
+            return Ok(());
+        };
+        index.insert_box(pointer, &bounds)
+    }
+
+    fn insert_summary_index_row(&mut self, row: &Row, pointer: IndexPointer) -> Result<()> {
+        match self {
             Self::BrinSummary {
                 column_index,
                 index,
                 entries,
-                ..
-            } => {
-                let Some(key) = index_key_from_value(&row.values()[*column_index])? else {
-                    return Ok(());
-                };
-                entries.push((key, pointer));
-                rebuild_block_summary_index(index, entries)
-            }
+            } => Self::insert_brin_value(index, entries, &row.values()[*column_index], pointer),
             Self::Composite {
                 column_indexes,
                 index,
-                ..
-            } => {
-                let Some(key) = composite_key_from_row(row, column_indexes)? else {
-                    return Ok(());
-                };
-                index.insert(key, pointer)
-            }
+            } => Self::insert_composite_value(index, row, column_indexes, pointer),
+            _ => Self::invalid_index_insert_dispatch(),
         }
+    }
+
+    fn insert_brin_value(
+        index: &mut BlockSummaryIndex,
+        entries: &mut Vec<(IndexKey, IndexPointer)>,
+        value: &SqlValue,
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(key) = index_key_from_value(value)? else {
+            return Ok(());
+        };
+        entries.push((key, pointer));
+        rebuild_block_summary_index(index, entries)
+    }
+
+    fn insert_composite_value(
+        index: &mut MemoryCompositeIndex,
+        row: &Row,
+        column_indexes: &[usize],
+        pointer: IndexPointer,
+    ) -> Result<()> {
+        let Some(key) = composite_key_from_row(row, column_indexes)? else {
+            return Ok(());
+        };
+        index.insert(key, pointer)
+    }
+
+    fn invalid_index_insert_dispatch() -> Result<()> {
+        Err(RnovError::new(
+            ErrorKind::Internal,
+            "memory index insert dispatch received an incompatible index",
+        ))
     }
 
     fn supports_leading_column(&self, column: usize) -> bool {
