@@ -5262,54 +5262,72 @@ impl<'a> Binder<'a> {
                 "operator inference requires binary expression",
             ));
         };
+        if let Some(result) = self.infer_builtin_operator_result_type(op, left_type, right_type) {
+            return result;
+        }
+        self.infer_catalog_operator_result_type(op, left_type, right_type)
+    }
 
-        if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-            return Ok(Some(SqlType::Bool));
+    fn infer_builtin_operator_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Option<Result<Option<SqlType>>> {
+        if is_comparison_operator(op) {
+            return Some(Ok(Some(SqlType::Bool)));
         }
         if is_arithmetic_operator(op) {
-            return self.infer_arithmetic_result_type(op, left_type, right_type);
+            return Some(self.infer_arithmetic_result_type(op, left_type, right_type));
         }
         if is_text_concat_operator(op) {
-            return self.infer_text_concat_result_type(op, left_type, right_type);
+            return Some(self.infer_text_concat_result_type(op, left_type, right_type));
         }
         if op == "&&" {
-            return self.infer_range_overlap_result_type(left_type, right_type);
+            return Some(self.infer_range_overlap_result_type(left_type, right_type));
         }
         if op == "@>" {
-            return self.infer_contains_result_type(left_type, right_type);
+            return Some(self.infer_contains_result_type(left_type, right_type));
         }
         if op == "?" {
-            return self.infer_hstore_key_result_type(left_type, right_type);
+            return Some(self.infer_hstore_key_result_type(left_type, right_type));
         }
-        if is_boolean_connector(op) {
-            if matches!(left_type, SqlType::Bool | SqlType::Null)
-                && matches!(right_type, SqlType::Bool | SqlType::Null)
-            {
-                return Ok(Some(SqlType::Bool));
-            }
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("boolean operator {op} requires BOOL operands"),
-            ));
-        }
+        is_boolean_connector(op)
+            .then(|| self.infer_boolean_connector_result_type(op, left_type, right_type))
+    }
 
+    fn infer_boolean_connector_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
+        if matches!(left_type, SqlType::Bool | SqlType::Null)
+            && matches!(right_type, SqlType::Bool | SqlType::Null)
+        {
+            return Ok(Some(SqlType::Bool));
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("boolean operator {op} requires BOOL operands"),
+        ))
+    }
+
+    fn infer_catalog_operator_result_type(
+        &self,
+        op: &str,
+        left_type: &SqlType,
+        right_type: &SqlType,
+    ) -> Result<Option<SqlType>> {
         let operator = self
             .catalog
-            .operators()
-            .iter()
-            .find(|operator| {
-                let signature = operator.signature();
-                signature.symbol() == op
-                    && signature.left_type() == left_type
-                    && signature.right_type() == right_type
-            })
+            .get_operator(op, left_type, right_type)
             .ok_or_else(|| {
                 RnovError::new(
                     ErrorKind::NotFound,
                     format!("operator does not exist: {left_type:?} {op} {right_type:?}"),
                 )
             })?;
-
         Ok(Some(operator.signature().result_type().clone()))
     }
 
@@ -5764,6 +5782,10 @@ fn operator_signature_with_metadata(
 
 fn is_boolean_connector(op: &str) -> bool {
     matches!(op, "AND" | "OR")
+}
+
+fn is_comparison_operator(op: &str) -> bool {
+    matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
 }
 
 fn is_arithmetic_operator(op: &str) -> bool {
