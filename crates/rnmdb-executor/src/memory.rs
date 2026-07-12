@@ -853,188 +853,244 @@ impl MemoryTableIndex {
         method: IndexMethod,
         unique: bool,
     ) -> Result<Self> {
+        let expression = Self::validate_index_key_shape(keys)?;
+        if let Some(expr) = expression {
+            return Self::new_expression_index(name, table_columns, expr, method, unique);
+        }
+        let column_indexes = Self::resolve_index_columns(table_columns, keys)?;
+        if let [column_index] = column_indexes.as_slice() {
+            return Self::new_single_column_index(
+                name,
+                table_columns,
+                *column_index,
+                method,
+                unique,
+            );
+        }
+        Self::new_composite_index(name, column_indexes, method, unique)
+    }
+
+    fn validate_index_key_shape(keys: &[IndexKeyDef]) -> Result<Option<&Expr>> {
         if keys.is_empty() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
                 "index must have at least one column",
             ));
         }
-        if let [IndexKeyDef::Expression(expr)] = keys {
-            return match method {
-                IndexMethod::BTree => {
-                    let _ = projection_type(table_columns, expr)?;
-                    let index = if unique {
-                        MemoryBTreeIndex::unique(name)
-                    } else {
-                        MemoryBTreeIndex::non_unique(name)
-                    };
-                    Ok(Self::ExpressionBTree {
-                        expr: expr.clone(),
-                        index,
-                    })
-                }
-                IndexMethod::Hash => {
-                    let _ = projection_type(table_columns, expr)?;
-                    let index = if unique {
-                        MemoryHashIndex::unique(name)
-                    } else {
-                        MemoryHashIndex::non_unique(name)
-                    };
-                    Ok(Self::ExpressionHash {
-                        expr: expr.clone(),
-                        index,
-                    })
-                }
-                _ => Err(RnovError::new(
+        match keys {
+            [IndexKeyDef::Expression(expr)] => Ok(Some(expr)),
+            _ if keys
+                .iter()
+                .any(|key| matches!(key, IndexKeyDef::Expression(_))) =>
+            {
+                Err(RnovError::new(
                     ErrorKind::InvalidInput,
-                    "expression indexes support only btree and hash methods",
-                )),
-            };
+                    "expression indexes support exactly one expression",
+                ))
+            }
+            _ => Ok(None),
         }
-        if keys
-            .iter()
-            .any(|key| matches!(key, IndexKeyDef::Expression(_)))
-        {
-            return Err(RnovError::new(
+    }
+
+    fn new_expression_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        expr: &Expr,
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<Self> {
+        match method {
+            IndexMethod::BTree => {
+                Self::new_expression_btree_index(name, table_columns, expr, unique)
+            }
+            IndexMethod::Hash => Self::new_expression_hash_index(name, table_columns, expr, unique),
+            _ => Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "expression indexes support exactly one expression",
-            ));
+                "expression indexes support only btree and hash methods",
+            )),
         }
-        let column_indexes = keys
-            .iter()
+    }
+
+    fn new_expression_btree_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        expr: &Expr,
+        unique: bool,
+    ) -> Result<Self> {
+        let _ = projection_type(table_columns, expr)?;
+        let index = if unique {
+            MemoryBTreeIndex::unique(name)
+        } else {
+            MemoryBTreeIndex::non_unique(name)
+        };
+        Ok(Self::ExpressionBTree {
+            expr: expr.clone(),
+            index,
+        })
+    }
+
+    fn new_expression_hash_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        expr: &Expr,
+        unique: bool,
+    ) -> Result<Self> {
+        let _ = projection_type(table_columns, expr)?;
+        let index = if unique {
+            MemoryHashIndex::unique(name)
+        } else {
+            MemoryHashIndex::non_unique(name)
+        };
+        Ok(Self::ExpressionHash {
+            expr: expr.clone(),
+            index,
+        })
+    }
+
+    fn resolve_index_columns(
+        table_columns: &[ColumnSchema],
+        keys: &[IndexKeyDef],
+    ) -> Result<Vec<usize>> {
+        keys.iter()
             .map(|key| match key {
                 IndexKeyDef::Column(column) => column_index(table_columns, column.as_str()),
-                IndexKeyDef::Expression(_) => unreachable!("handled above"),
+                IndexKeyDef::Expression(_) => unreachable!("expression keys validated above"),
             })
-            .collect::<Result<Vec<_>>>()?;
-        if column_indexes.len() == 1 {
-            return match method {
-                IndexMethod::BTree => {
-                    let index = if unique {
-                        MemoryBTreeIndex::unique(name)
-                    } else {
-                        MemoryBTreeIndex::non_unique(name)
-                    };
-                    Ok(Self::BTree {
-                        column_index: column_indexes[0],
-                        index,
-                    })
-                }
-                IndexMethod::Hash => {
-                    let index = if unique {
-                        MemoryHashIndex::unique(name)
-                    } else {
-                        MemoryHashIndex::non_unique(name)
-                    };
-                    Ok(Self::Hash {
-                        column_index: column_indexes[0],
-                        index,
-                    })
-                }
-                IndexMethod::Gin => {
-                    if unique {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "gin indexes do not support uniqueness",
-                        ));
-                    }
-                    let column_index = column_indexes[0];
-                    match table_columns[column_index].data_type() {
-                        SqlType::Text | SqlType::TextVector => Ok(Self::GinText {
-                            column_index,
-                            index: InvertedTextIndex::new(name),
-                        }),
-                        SqlType::Array(_) | SqlType::HStore => Ok(Self::GinValue {
-                            column_index,
-                            index: InvertedValueIndex::new(name),
-                        }),
-                        other => Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "gin index requires TEXT, TEXTVECTOR, ARRAY, or HSTORE column, got {other:?}"
-                            ),
-                        )),
-                    }
-                }
-                IndexMethod::Gist => {
-                    if unique {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "gist indexes do not support uniqueness",
-                        ));
-                    }
-                    let column_index = column_indexes[0];
-                    match table_columns[column_index].data_type() {
-                        SqlType::Range(_) => Ok(Self::GistRange {
-                            column_index,
-                            index: MemoryRangeIndex::new(name),
-                        }),
-                        SqlType::Array(element) if matches!(element.as_ref(), SqlType::Range(inner) if matches!(inner.as_ref(), SqlType::Int64)) => {
-                            Ok(Self::GistBounds {
-                                column_index,
-                                index: MemoryBoundsIndex::new(name),
-                            })
-                        }
-                        other => Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "gist index requires RANGE or RANGE<INT64>[] column, got {other:?}"
-                            ),
-                        )),
-                    }
-                }
-                IndexMethod::Brin => {
-                    if unique {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "brin indexes do not support uniqueness",
-                        ));
-                    }
-                    let column_index = column_indexes[0];
-                    match table_columns[column_index].data_type() {
-                        SqlType::Int64 | SqlType::Text => Ok(Self::BrinSummary {
-                            column_index,
-                            index: BlockSummaryIndex::new(name),
-                            entries: Vec::new(),
-                        }),
-                        other => Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "brin summary index requires INT64 or TEXT column, got {other:?}"
-                            ),
-                        )),
-                    }
-                }
-            };
-        }
-        match method {
-            IndexMethod::Hash => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "hash indexes support exactly one column",
-                ));
-            }
-            IndexMethod::Gin => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "gin indexes support exactly one column",
-                ));
-            }
-            IndexMethod::Gist => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "gist indexes support exactly one column",
-                ));
-            }
-            IndexMethod::Brin => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "brin indexes support exactly one column",
-                ));
-            }
-            IndexMethod::BTree => {}
-        }
+            .collect()
+    }
 
+    fn new_single_column_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        column_index: usize,
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<Self> {
+        match method {
+            IndexMethod::BTree => Ok(Self::new_btree_index(name, column_index, unique)),
+            IndexMethod::Hash => Ok(Self::new_hash_index(name, column_index, unique)),
+            IndexMethod::Gin => Self::new_gin_index(name, table_columns, column_index, unique),
+            IndexMethod::Gist => Self::new_gist_index(name, table_columns, column_index, unique),
+            IndexMethod::Brin => Self::new_brin_index(name, table_columns, column_index, unique),
+        }
+    }
+
+    fn new_btree_index(name: &str, column_index: usize, unique: bool) -> Self {
+        let index = if unique {
+            MemoryBTreeIndex::unique(name)
+        } else {
+            MemoryBTreeIndex::non_unique(name)
+        };
+        Self::BTree {
+            column_index,
+            index,
+        }
+    }
+
+    fn new_hash_index(name: &str, column_index: usize, unique: bool) -> Self {
+        let index = if unique {
+            MemoryHashIndex::unique(name)
+        } else {
+            MemoryHashIndex::non_unique(name)
+        };
+        Self::Hash {
+            column_index,
+            index,
+        }
+    }
+
+    fn new_gin_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        column_index: usize,
+        unique: bool,
+    ) -> Result<Self> {
+        if unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "gin indexes do not support uniqueness",
+            ));
+        }
+        match table_columns[column_index].data_type() {
+            SqlType::Text | SqlType::TextVector => Ok(Self::GinText {
+                column_index,
+                index: InvertedTextIndex::new(name),
+            }),
+            SqlType::Array(_) | SqlType::HStore => Ok(Self::GinValue {
+                column_index,
+                index: InvertedValueIndex::new(name),
+            }),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "gin index requires TEXT, TEXTVECTOR, ARRAY, or HSTORE column, got {other:?}"
+                ),
+            )),
+        }
+    }
+
+    fn new_gist_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        column_index: usize,
+        unique: bool,
+    ) -> Result<Self> {
+        if unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "gist indexes do not support uniqueness",
+            ));
+        }
+        match table_columns[column_index].data_type() {
+            SqlType::Range(_) => Ok(Self::GistRange {
+                column_index,
+                index: MemoryRangeIndex::new(name),
+            }),
+            SqlType::Array(element) if matches!(element.as_ref(), SqlType::Range(inner) if matches!(inner.as_ref(), SqlType::Int64)) => {
+                Ok(Self::GistBounds {
+                    column_index,
+                    index: MemoryBoundsIndex::new(name),
+                })
+            }
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("gist index requires RANGE or RANGE<INT64>[] column, got {other:?}"),
+            )),
+        }
+    }
+
+    fn new_brin_index(
+        name: &str,
+        table_columns: &[ColumnSchema],
+        column_index: usize,
+        unique: bool,
+    ) -> Result<Self> {
+        if unique {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "brin indexes do not support uniqueness",
+            ));
+        }
+        match table_columns[column_index].data_type() {
+            SqlType::Int64 | SqlType::Text => Ok(Self::BrinSummary {
+                column_index,
+                index: BlockSummaryIndex::new(name),
+                entries: Vec::new(),
+            }),
+            other => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("brin summary index requires INT64 or TEXT column, got {other:?}"),
+            )),
+        }
+    }
+
+    fn new_composite_index(
+        name: &str,
+        column_indexes: Vec<usize>,
+        method: IndexMethod,
+        unique: bool,
+    ) -> Result<Self> {
+        Self::validate_composite_index_method(method)?;
         let index = if unique {
             MemoryCompositeIndex::unique(name)
         } else {
@@ -1044,6 +1100,17 @@ impl MemoryTableIndex {
             column_indexes,
             index,
         })
+    }
+
+    fn validate_composite_index_method(method: IndexMethod) -> Result<()> {
+        let message = match method {
+            IndexMethod::BTree => return Ok(()),
+            IndexMethod::Hash => "hash indexes support exactly one column",
+            IndexMethod::Gin => "gin indexes support exactly one column",
+            IndexMethod::Gist => "gist indexes support exactly one column",
+            IndexMethod::Brin => "brin indexes support exactly one column",
+        };
+        Err(RnovError::new(ErrorKind::InvalidInput, message))
     }
 
     fn clear(&mut self) {
