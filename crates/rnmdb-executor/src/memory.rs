@@ -5688,30 +5688,43 @@ fn rebuild_block_summary_index(
     let name = index.name().to_string();
     *index = BlockSummaryIndex::new(name);
     for (block_index, chunk) in entries.chunks(MEMORY_SUMMARY_BLOCK_ROWS).enumerate() {
-        let first_slot = block_index
-            .checked_mul(MEMORY_SUMMARY_BLOCK_ROWS)
-            .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "summary block overflow"))?;
-        let last_slot = first_slot + chunk.len() - 1;
-        let mut min_key = chunk[0].0.clone();
-        let mut max_key = chunk[0].0.clone();
-        for (key, _) in &chunk[1..] {
-            if *key < min_key {
-                min_key = key.clone();
-            }
-            if *key > max_key {
-                max_key = key.clone();
-            }
-        }
-        index.insert_summary(
-            BlockRange::new(
-                PageId::new(first_slot as u64),
-                PageId::new(last_slot as u64),
-            )?,
-            min_key,
-            max_key,
-        )?;
+        insert_block_summary(index, block_index, chunk)?;
     }
     Ok(())
+}
+
+fn insert_block_summary(
+    index: &mut BlockSummaryIndex,
+    block_index: usize,
+    chunk: &[(IndexKey, IndexPointer)],
+) -> Result<()> {
+    let first_slot = block_index
+        .checked_mul(MEMORY_SUMMARY_BLOCK_ROWS)
+        .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "summary block overflow"))?;
+    let last_slot = first_slot + chunk.len() - 1;
+    let (min_key, max_key) = summary_key_bounds(chunk);
+    index.insert_summary(
+        BlockRange::new(
+            PageId::new(first_slot as u64),
+            PageId::new(last_slot as u64),
+        )?,
+        min_key,
+        max_key,
+    )
+}
+
+fn summary_key_bounds(chunk: &[(IndexKey, IndexPointer)]) -> (IndexKey, IndexKey) {
+    let mut min_key = chunk[0].0.clone();
+    let mut max_key = chunk[0].0.clone();
+    for (key, _) in &chunk[1..] {
+        if *key < min_key {
+            min_key = key.clone();
+        }
+        if *key > max_key {
+            max_key = key.clone();
+        }
+    }
+    (min_key, max_key)
 }
 
 fn block_ranges_to_pointers(ranges: &[BlockRange], row_count: usize) -> Result<Vec<IndexPointer>> {
@@ -5865,6 +5878,13 @@ fn is_indexable_expression(expr: &Expr) -> bool {
 }
 
 fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
+    if let Some(range) = indexable_between_range(predicate) {
+        return Some(range);
+    }
+    indexable_comparison_range(predicate)
+}
+
+fn indexable_between_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
     if let Expr::Between {
         expr,
         low,
@@ -5883,75 +5903,77 @@ fn indexable_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
             upper_inclusive: true,
         });
     }
+    None
+}
+
+fn indexable_comparison_range(predicate: &Expr) -> Option<IndexableRange<'_>> {
     let Expr::Binary { left, op, right } = predicate else {
         return None;
     };
-    match (left.as_ref(), op.as_str(), right.as_ref()) {
-        (Expr::Identifier(column), ">", value) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: Some(value),
-            lower_inclusive: false,
-            upper: None,
-            upper_inclusive: true,
-        }),
-        (Expr::Identifier(column), ">=", value) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: Some(value),
-                lower_inclusive: true,
-                upper: None,
-                upper_inclusive: true,
-            })
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), value) if is_index_literal(value) => {
+            indexable_column_comparison(column.as_str(), op, value)
         }
-        (Expr::Identifier(column), "<", value) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: None,
-            lower_inclusive: true,
-            upper: Some(value),
-            upper_inclusive: false,
-        }),
-        (Expr::Identifier(column), "<=", value) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: None,
-                lower_inclusive: true,
-                upper: Some(value),
-                upper_inclusive: true,
-            })
-        }
-        (value, "<", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: Some(value),
-            lower_inclusive: false,
-            upper: None,
-            upper_inclusive: true,
-        }),
-        (value, "<=", Expr::Identifier(column)) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: Some(value),
-                lower_inclusive: true,
-                upper: None,
-                upper_inclusive: true,
-            })
-        }
-        (value, ">", Expr::Identifier(column)) if is_index_literal(value) => Some(IndexableRange {
-            column: column.as_str(),
-            lower: None,
-            lower_inclusive: true,
-            upper: Some(value),
-            upper_inclusive: false,
-        }),
-        (value, ">=", Expr::Identifier(column)) if is_index_literal(value) => {
-            Some(IndexableRange {
-                column: column.as_str(),
-                lower: None,
-                lower_inclusive: true,
-                upper: Some(value),
-                upper_inclusive: true,
-            })
+        (value, Expr::Identifier(column)) if is_index_literal(value) => {
+            indexable_value_comparison(value, op, column.as_str())
         }
         _ => None,
+    }
+}
+
+fn indexable_column_comparison<'a>(
+    column: &'a str,
+    op: &str,
+    value: &'a Expr,
+) -> Option<IndexableRange<'a>> {
+    match op {
+        ">" => Some(lower_indexable_range(column, value, false)),
+        ">=" => Some(lower_indexable_range(column, value, true)),
+        "<" => Some(upper_indexable_range(column, value, false)),
+        "<=" => Some(upper_indexable_range(column, value, true)),
+        _ => None,
+    }
+}
+
+fn indexable_value_comparison<'a>(
+    value: &'a Expr,
+    op: &str,
+    column: &'a str,
+) -> Option<IndexableRange<'a>> {
+    match op {
+        "<" => Some(lower_indexable_range(column, value, false)),
+        "<=" => Some(lower_indexable_range(column, value, true)),
+        ">" => Some(upper_indexable_range(column, value, false)),
+        ">=" => Some(upper_indexable_range(column, value, true)),
+        _ => None,
+    }
+}
+
+fn lower_indexable_range<'a>(
+    column: &'a str,
+    value: &'a Expr,
+    inclusive: bool,
+) -> IndexableRange<'a> {
+    IndexableRange {
+        column,
+        lower: Some(value),
+        lower_inclusive: inclusive,
+        upper: None,
+        upper_inclusive: true,
+    }
+}
+
+fn upper_indexable_range<'a>(
+    column: &'a str,
+    value: &'a Expr,
+    inclusive: bool,
+) -> IndexableRange<'a> {
+    IndexableRange {
+        column,
+        lower: None,
+        lower_inclusive: true,
+        upper: Some(value),
+        upper_inclusive: inclusive,
     }
 }
 
