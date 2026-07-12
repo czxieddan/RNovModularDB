@@ -76,6 +76,29 @@ struct LateralBindingContext<'a> {
     outer_column: String,
 }
 
+struct SelectGrouping {
+    group_by: Vec<Expr>,
+    grouping_sets: Vec<Vec<Expr>>,
+    grouped: bool,
+    aggregate_count: usize,
+}
+
+#[derive(Default)]
+struct SelectHavingOutputs {
+    having: Option<Expr>,
+    hidden_group_keys: Vec<BoundSelectItem>,
+    hidden_aggregates: Vec<BoundSelectItem>,
+}
+
+struct SelectSortContext<'a> {
+    table: &'a Table,
+    projection: &'a [BoundSelectItem],
+    group_by: &'a [Expr],
+    grouped: bool,
+    aggregate_count: usize,
+    role_id: RoleId,
+}
+
 struct ProjectionOutputs<'a> {
     projection: &'a mut Vec<BoundSelectItem>,
     columns: &'a mut Vec<BoundColumn>,
@@ -1724,99 +1747,36 @@ impl<'a> Binder<'a> {
         mut projection: Vec<BoundSelectItem>,
         mut columns: Vec<BoundColumn>,
     ) -> Result<BoundStatement> {
-        let aggregate_count = projection
-            .iter()
-            .filter(|item| is_aggregate_expr(&item.expr))
-            .count();
-        let bound_group_by = self.bind_group_by_exprs(table, &projection, input.group_by)?;
-        let bound_grouping_sets =
-            self.bind_grouping_sets(table, &projection, input.grouping_sets)?;
-        if !bound_group_by.is_empty() {
-            self.validate_group_by_exprs(table, &bound_group_by)?;
-        }
-        for grouping_set in &bound_grouping_sets {
-            self.validate_group_by_exprs(table, grouping_set)?;
-        }
-        if !bound_grouping_sets.is_empty() {
-            mark_grouping_set_projection_columns_nullable(
-                &mut projection,
-                &mut columns,
-                &bound_group_by,
-            );
-        }
-        let grouped = !bound_group_by.is_empty() || !bound_grouping_sets.is_empty();
-        if aggregate_count > 0 && aggregate_count != projection.len() {
-            self.validate_grouped_projection(&projection, &bound_group_by)?;
-        }
-        if aggregate_count == 0 && grouped {
-            self.validate_grouped_projection(&projection, &bound_group_by)?;
-        }
-        let mut hidden_group_keys = Vec::new();
-        let mut hidden_aggregates = Vec::new();
-        let having = if let Some(having) = input.having {
-            if !grouped && aggregate_count == 0 {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "HAVING requires GROUP BY or aggregate projection in this SQL slice",
-                ));
-            }
-            let having = self.rewrite_grouped_having_expr(
-                table,
-                &projection,
-                &bound_group_by,
-                &mut hidden_group_keys,
-                &mut hidden_aggregates,
-                having,
-            )?;
-            let mut grouped_outputs = projection.clone();
-            grouped_outputs.extend(hidden_group_keys.iter().cloned());
-            grouped_outputs.extend(hidden_aggregates.iter().cloned());
-            let mut infer =
-                |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
-            let having =
-                self.bind_predicate_subqueries(&having, input.role_id, &mut infer, None)?;
-            self.validate_grouped_having_expr(&grouped_outputs, &having)?;
-            Some(having)
-        } else {
-            None
-        };
+        let grouping = self.bind_select_grouping(
+            table,
+            input.group_by,
+            input.grouping_sets,
+            ProjectionOutputs {
+                projection: &mut projection,
+                columns: &mut columns,
+            },
+        )?;
+        let mut having_outputs = self.bind_select_having(
+            table,
+            &projection,
+            &grouping,
+            input.having.as_ref(),
+            input.role_id,
+        )?;
         let selection =
             self.bind_select_selection(table, input.selection, input.role_id, outer_scope)?;
-        let mut bound_order_by = Vec::with_capacity(input.order_by.len());
-        for order_by in input.order_by {
-            let order_by = OrderByExpr {
-                expr: self.rewrite_table_qualified_expr(table, &order_by.expr)?,
-                direction: order_by.direction,
-            };
-            if !grouped {
-                if aggregate_count > 0 {
-                    bound_order_by.push(self.bind_grouped_sort_expr(
-                        table,
-                        &projection,
-                        &mut hidden_aggregates,
-                        &bound_group_by,
-                        &order_by,
-                        input.role_id,
-                    )?);
-                } else {
-                    bound_order_by.push(self.bind_plain_sort_expr(
-                        table,
-                        &projection,
-                        &order_by,
-                        input.role_id,
-                    )?);
-                }
-            } else {
-                bound_order_by.push(self.bind_grouped_sort_expr(
-                    table,
-                    &projection,
-                    &mut hidden_aggregates,
-                    &bound_group_by,
-                    &order_by,
-                    input.role_id,
-                )?);
-            }
-        }
+        let bound_order_by = self.bind_select_order_by(
+            input.order_by,
+            SelectSortContext {
+                table,
+                projection: &projection,
+                group_by: &grouping.group_by,
+                grouped: grouping.grouped,
+                aggregate_count: grouping.aggregate_count,
+                role_id: input.role_id,
+            },
+            &mut having_outputs.hidden_aggregates,
+        )?;
 
         Ok(BoundStatement::Select(BoundSelect {
             relation_id: table.relation_id(),
@@ -1824,19 +1784,171 @@ impl<'a> Binder<'a> {
             lateral_join: None,
             distinct: input.distinct,
             projection,
-            hidden_group_keys,
-            hidden_aggregates,
+            hidden_group_keys: having_outputs.hidden_group_keys,
+            hidden_aggregates: having_outputs.hidden_aggregates,
             columns,
             selection,
-            group_by: bound_group_by,
-            grouping_sets: bound_grouping_sets,
-            having,
+            group_by: grouping.group_by,
+            grouping_sets: grouping.grouping_sets,
+            having: having_outputs.having,
             order_by: bound_order_by,
             limit: input.limit,
             offset: input.offset,
             applied_row_policies: self.applied_row_policy_names(input.role_id, table.relation_id()),
             row_policy_predicates: self.bind_row_policies(input.role_id, table)?,
         }))
+    }
+
+    fn bind_select_grouping(
+        &self,
+        table: &Table,
+        group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+        outputs: ProjectionOutputs<'_>,
+    ) -> Result<SelectGrouping> {
+        let aggregate_count = outputs
+            .projection
+            .iter()
+            .filter(|item| is_aggregate_expr(&item.expr))
+            .count();
+        let (group_by, grouping_sets) =
+            self.bind_grouping_expressions(table, outputs.projection, group_by, grouping_sets)?;
+        if !grouping_sets.is_empty() {
+            mark_grouping_set_projection_columns_nullable(
+                outputs.projection,
+                outputs.columns,
+                &group_by,
+            );
+        }
+        let grouped = !group_by.is_empty() || !grouping_sets.is_empty();
+        self.validate_select_grouping_projection(
+            outputs.projection,
+            &group_by,
+            grouped,
+            aggregate_count,
+        )?;
+        Ok(SelectGrouping {
+            group_by,
+            grouping_sets,
+            grouped,
+            aggregate_count,
+        })
+    }
+
+    fn bind_grouping_expressions(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+        grouping_sets: &[Vec<Expr>],
+    ) -> Result<(Vec<Expr>, Vec<Vec<Expr>>)> {
+        let group_by = self.bind_group_by_exprs(table, projection, group_by)?;
+        let grouping_sets = self.bind_grouping_sets(table, projection, grouping_sets)?;
+        if !group_by.is_empty() {
+            self.validate_group_by_exprs(table, &group_by)?;
+        }
+        for grouping_set in &grouping_sets {
+            self.validate_group_by_exprs(table, grouping_set)?;
+        }
+        Ok((group_by, grouping_sets))
+    }
+
+    fn validate_select_grouping_projection(
+        &self,
+        projection: &[BoundSelectItem],
+        group_by: &[Expr],
+        grouped: bool,
+        aggregate_count: usize,
+    ) -> Result<()> {
+        if aggregate_count > 0 && aggregate_count != projection.len() {
+            self.validate_grouped_projection(projection, group_by)?;
+        }
+        if aggregate_count == 0 && grouped {
+            self.validate_grouped_projection(projection, group_by)?;
+        }
+        Ok(())
+    }
+
+    fn bind_select_having(
+        &self,
+        table: &Table,
+        projection: &[BoundSelectItem],
+        grouping: &SelectGrouping,
+        having: Option<&Expr>,
+        role_id: RoleId,
+    ) -> Result<SelectHavingOutputs> {
+        let Some(having) = having else {
+            return Ok(SelectHavingOutputs::default());
+        };
+        if !grouping.grouped && grouping.aggregate_count == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "HAVING requires GROUP BY or aggregate projection in this SQL slice",
+            ));
+        }
+        let mut outputs = SelectHavingOutputs::default();
+        let having = self.rewrite_grouped_having_expr(
+            table,
+            projection,
+            &grouping.group_by,
+            &mut outputs.hidden_group_keys,
+            &mut outputs.hidden_aggregates,
+            having,
+        )?;
+        let mut grouped_outputs = projection.to_vec();
+        grouped_outputs.extend(outputs.hidden_group_keys.iter().cloned());
+        grouped_outputs.extend(outputs.hidden_aggregates.iter().cloned());
+        let mut infer =
+            |candidate: &Expr| self.infer_grouped_output_expr_type(&grouped_outputs, candidate);
+        let having = self.bind_predicate_subqueries(&having, role_id, &mut infer, None)?;
+        self.validate_grouped_having_expr(&grouped_outputs, &having)?;
+        outputs.having = Some(having);
+        Ok(outputs)
+    }
+
+    fn bind_select_order_by(
+        &self,
+        order_by: &[OrderByExpr],
+        context: SelectSortContext<'_>,
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
+    ) -> Result<Vec<OrderByExpr>> {
+        let mut bound_order_by = Vec::with_capacity(order_by.len());
+        for order_by in order_by {
+            bound_order_by.push(self.bind_select_order_item(
+                order_by,
+                &context,
+                hidden_aggregates,
+            )?);
+        }
+        Ok(bound_order_by)
+    }
+
+    fn bind_select_order_item(
+        &self,
+        order_by: &OrderByExpr,
+        context: &SelectSortContext<'_>,
+        hidden_aggregates: &mut Vec<BoundSelectItem>,
+    ) -> Result<OrderByExpr> {
+        let order_by = OrderByExpr {
+            expr: self.rewrite_table_qualified_expr(context.table, &order_by.expr)?,
+            direction: order_by.direction,
+        };
+        if context.grouped || context.aggregate_count > 0 {
+            return self.bind_grouped_sort_expr(
+                context.table,
+                context.projection,
+                hidden_aggregates,
+                context.group_by,
+                &order_by,
+                context.role_id,
+            );
+        }
+        self.bind_plain_sort_expr(
+            context.table,
+            context.projection,
+            &order_by,
+            context.role_id,
+        )
     }
 
     fn bind_select_from_columns(
