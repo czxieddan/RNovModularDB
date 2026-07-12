@@ -1334,253 +1334,396 @@ impl<'a> Binder<'a> {
             return self.bind_join_select(&input, table, join);
         }
 
+        self.bind_table_select(input, outer_scope, table)
+    }
+
+    fn bind_table_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        table: &Table,
+    ) -> Result<BoundStatement> {
+        let (projection, columns) =
+            self.bind_select_projection(table, input.select_items, input.role_id)?;
+        self.finish_table_select(input, outer_scope, table, projection, columns)
+    }
+
+    fn bind_select_projection(
+        &self,
+        table: &Table,
+        select_items: &[SelectItem],
+        role_id: RoleId,
+    ) -> Result<(Vec<BoundSelectItem>, Vec<BoundColumn>)> {
         let mut columns = Vec::new();
         let mut projection = Vec::new();
-        for item in input.select_items {
-            match item {
-                SelectItem::Wildcard => {
-                    for column in table.columns() {
-                        let bound_column = BoundColumn {
-                            name: column.name().to_string(),
-                            data_type: column.data_type().clone(),
-                            nullable: column.nullable(),
-                            encrypted: column.is_encrypted(),
-                            generated: column
-                                .generated_expr()
-                                .map(|expr| {
-                                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
-                                        expr,
-                                        stored: column.generated_stored(),
-                                    })
-                                })
-                                .transpose()?,
-                        };
-                        projection.push(BoundSelectItem {
-                            column: bound_column.clone(),
-                            expr: Expr::Identifier(Ident::new(column.name())),
-                        });
-                        columns.push(bound_column);
-                    }
-                }
-                SelectItem::Expr {
-                    expr: Expr::Identifier(identifier),
-                    alias,
-                } => {
-                    let column = self.resolve_column(table, identifier.as_str())?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(identifier.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::QualifiedIdentifier { qualifier, name },
-                    alias,
-                } => {
-                    self.ensure_table_qualifier(table, qualifier)?;
-                    let column = self.resolve_column(table, name.as_str())?;
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Identifier(name.clone()),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::CountStar,
-                    alias,
-                } => {
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::CountStar,
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Count(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer COUNT expression type: {expr}"),
-                        )
-                    })?;
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Count(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::CountDistinct(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer COUNT DISTINCT expression type: {expr}"),
-                        )
-                    })?;
-                    let column = aggregate_bound_column(&columns, "count", SqlType::Int64, false);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::CountDistinct(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Sum(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer SUM expression type: {expr}"),
-                        )
-                    })?;
-                    if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("SUM expression must be INT64, got {expr_type:?}"),
-                        ));
-                    }
-                    let column = aggregate_bound_column(&columns, "sum", SqlType::Int64, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Sum(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Min(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer MIN expression type: {expr}"),
-                        )
-                    })?;
-                    self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
-                    let column = aggregate_bound_column(&columns, "min", expr_type, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Min(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::Max(expr),
-                    alias,
-                } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer MAX expression type: {expr}"),
-                        )
-                    })?;
-                    self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
-                    let column = aggregate_bound_column(&columns, "max", expr_type, true);
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr: Expr::Max(Box::new(expr)),
-                    });
-                    columns.push(column);
-                }
-                SelectItem::Expr {
-                    expr: Expr::RowNumberOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "row_number",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::RowNumberOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr {
-                    expr: Expr::RankOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "rank",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::RankOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr {
-                    expr: Expr::DenseRankOver { order_by },
-                    alias,
-                } => {
-                    self.bind_ranking_window_projection(
-                        table,
-                        "dense_rank",
-                        order_by,
-                        alias,
-                        ProjectionOutputs {
-                            projection: &mut projection,
-                            columns: &mut columns,
-                        },
-                        |order_by| Expr::DenseRankOver { order_by },
-                    )?;
-                }
-                SelectItem::Expr { expr, alias } => {
-                    let expr = self.rewrite_table_qualified_expr(table, expr)?;
-                    let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
-                    let expr = self.bind_predicate_subqueries(
-                        &expr,
-                        input.role_id,
-                        &mut infer,
-                        Some(OuterQueryScope::Table(table)),
-                    )?;
-                    let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!("cannot infer select expression type: {expr}"),
-                        )
-                    })?;
-                    let column = BoundColumn {
-                        name: format!("expr{}", columns.len() + 1),
-                        data_type,
-                        nullable: true,
-                        encrypted: false,
-                        generated: None,
-                    };
-                    let column = aliased_bound_column(column, alias);
-                    projection.push(BoundSelectItem {
-                        column: column.clone(),
-                        expr,
-                    });
-                    columns.push(column);
-                }
-            }
+        for item in select_items {
+            self.bind_select_projection_item(
+                table,
+                item,
+                role_id,
+                ProjectionOutputs {
+                    projection: &mut projection,
+                    columns: &mut columns,
+                },
+            )?;
         }
+        Ok((projection, columns))
+    }
+
+    fn bind_select_projection_item(
+        &self,
+        table: &Table,
+        item: &SelectItem,
+        role_id: RoleId,
+        outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let ProjectionOutputs {
+            projection,
+            columns,
+        } = outputs;
+        match item {
+            SelectItem::Wildcard => self.bind_table_wildcard_projection(
+                table,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Identifier(identifier),
+                alias,
+            } => self.bind_table_identifier_projection(
+                table,
+                identifier,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::QualifiedIdentifier { qualifier, name },
+                alias,
+            } => self.bind_table_qualified_projection(
+                table,
+                qualifier,
+                name,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::CountStar,
+                alias,
+            } => bind_count_star_projection(
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Count(expr),
+                alias,
+            } => self.bind_count_projection(
+                table,
+                expr,
+                alias,
+                false,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::CountDistinct(expr),
+                alias,
+            } => self.bind_count_projection(
+                table,
+                expr,
+                alias,
+                true,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Sum(expr),
+                alias,
+            } => self.bind_sum_projection(
+                table,
+                expr,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Min(expr),
+                alias,
+            } => self.bind_ordered_aggregate_projection(
+                table,
+                expr,
+                alias,
+                "MIN",
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::Max(expr),
+                alias,
+            } => self.bind_ordered_aggregate_projection(
+                table,
+                expr,
+                alias,
+                "MAX",
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+            SelectItem::Expr {
+                expr: Expr::RowNumberOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "row_number",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::RowNumberOver { order_by },
+            ),
+            SelectItem::Expr {
+                expr: Expr::RankOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "rank",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::RankOver { order_by },
+            ),
+            SelectItem::Expr {
+                expr: Expr::DenseRankOver { order_by },
+                alias,
+            } => self.bind_ranking_window_projection(
+                table,
+                "dense_rank",
+                order_by,
+                alias,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+                |order_by| Expr::DenseRankOver { order_by },
+            ),
+            SelectItem::Expr { expr, alias } => self.bind_general_select_projection(
+                table,
+                expr,
+                alias,
+                role_id,
+                ProjectionOutputs {
+                    projection,
+                    columns,
+                },
+            ),
+        }
+    }
+
+    fn bind_table_wildcard_projection(
+        &self,
+        table: &Table,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        for column in table.columns() {
+            let generated = column
+                .generated_expr()
+                .map(|expr| {
+                    parse_expr(expr).map(|expr| crate::ast::GeneratedColumn {
+                        expr,
+                        stored: column.generated_stored(),
+                    })
+                })
+                .transpose()?;
+            let bound_column = BoundColumn {
+                name: column.name().to_string(),
+                data_type: column.data_type().clone(),
+                nullable: column.nullable(),
+                encrypted: column.is_encrypted(),
+                generated,
+            };
+            push_select_projection(
+                &mut outputs,
+                bound_column,
+                Expr::Identifier(Ident::new(column.name())),
+            );
+        }
+        Ok(())
+    }
+
+    fn bind_table_identifier_projection(
+        &self,
+        table: &Table,
+        identifier: &Ident,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let column = self.resolve_column(table, identifier.as_str())?;
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Identifier(identifier.clone()));
+        Ok(())
+    }
+
+    fn bind_table_qualified_projection(
+        &self,
+        table: &Table,
+        qualifier: &Ident,
+        name: &Ident,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        self.ensure_table_qualifier(table, qualifier)?;
+        let column = self.resolve_column(table, name.as_str())?;
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Identifier(name.clone()));
+        Ok(())
+    }
+
+    fn bind_count_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        distinct: bool,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let aggregate_name = if distinct { "COUNT DISTINCT" } else { "COUNT" };
+        let _ = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        let column = aggregate_bound_column(outputs.columns, "count", SqlType::Int64, false);
+        let column = aliased_bound_column(column, alias);
+        let expr = if distinct {
+            Expr::CountDistinct(Box::new(expr))
+        } else {
+            Expr::Count(Box::new(expr))
+        };
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn bind_sum_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer SUM expression type: {expr}"),
+            )
+        })?;
+        if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("SUM expression must be INT64, got {expr_type:?}"),
+            ));
+        }
+        let column = aggregate_bound_column(outputs.columns, "sum", SqlType::Int64, true);
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, Expr::Sum(Box::new(expr)));
+        Ok(())
+    }
+
+    fn bind_ordered_aggregate_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        aggregate_name: &'static str,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let expr_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        self.ensure_ordered_aggregate_type(aggregate_name, &expr_type)?;
+        let (column_name, expr) = match aggregate_name {
+            "MIN" => ("min", Expr::Min(Box::new(expr))),
+            "MAX" => ("max", Expr::Max(Box::new(expr))),
+            _ => unreachable!("ordered aggregate binding supports MIN and MAX"),
+        };
+        let column = aggregate_bound_column(outputs.columns, column_name, expr_type, true);
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn bind_general_select_projection(
+        &self,
+        table: &Table,
+        expr: &Expr,
+        alias: &Option<Ident>,
+        role_id: RoleId,
+        mut outputs: ProjectionOutputs<'_>,
+    ) -> Result<()> {
+        let expr = self.rewrite_table_qualified_expr(table, expr)?;
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        let expr = self.bind_predicate_subqueries(
+            &expr,
+            role_id,
+            &mut infer,
+            Some(OuterQueryScope::Table(table)),
+        )?;
+        let data_type = self.infer_expr_type(table, &expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer select expression type: {expr}"),
+            )
+        })?;
+        let column = BoundColumn {
+            name: format!("expr{}", outputs.columns.len() + 1),
+            data_type,
+            nullable: true,
+            encrypted: false,
+            generated: None,
+        };
+        let column = aliased_bound_column(column, alias);
+        push_select_projection(&mut outputs, column, expr);
+        Ok(())
+    }
+
+    fn finish_table_select(
+        &self,
+        input: SelectInput<'_>,
+        outer_scope: Option<OuterQueryScope<'_>>,
+        table: &Table,
+        mut projection: Vec<BoundSelectItem>,
+        mut columns: Vec<BoundColumn>,
+    ) -> Result<BoundStatement> {
         let aggregate_count = projection
             .iter()
             .filter(|item| is_aggregate_expr(&item.expr))
@@ -6529,6 +6672,24 @@ fn validate_set_operation_columns(
         }
     }
     Ok(left_columns.to_vec())
+}
+
+fn bind_count_star_projection(
+    alias: &Option<Ident>,
+    mut outputs: ProjectionOutputs<'_>,
+) -> Result<()> {
+    let column = aggregate_bound_column(outputs.columns, "count", SqlType::Int64, false);
+    let column = aliased_bound_column(column, alias);
+    push_select_projection(&mut outputs, column, Expr::CountStar);
+    Ok(())
+}
+
+fn push_select_projection(outputs: &mut ProjectionOutputs<'_>, column: BoundColumn, expr: Expr) {
+    outputs.projection.push(BoundSelectItem {
+        column: column.clone(),
+        expr,
+    });
+    outputs.columns.push(column);
 }
 
 fn aggregate_bound_column(
