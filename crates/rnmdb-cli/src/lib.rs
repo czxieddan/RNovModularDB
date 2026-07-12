@@ -179,6 +179,15 @@ impl LocalSession {
         self.transaction.is_some()
     }
 
+    pub fn set_active_role(&mut self, role_id: RoleId) -> Result<()> {
+        if self.catalog.get_role_by_id(role_id).is_none() {
+            return Err(RnovError::new(ErrorKind::NotFound, "role does not exist"));
+        }
+        self.role_id = role_id;
+        self.executor.set_active_role(role_id);
+        Ok(())
+    }
+
     pub fn configure_column_encryption(
         &mut self,
         schema_name: &str,

@@ -10,7 +10,7 @@ use rnmdb_cli::LocalSession;
 use rnmdb_common::ids::{DatabaseId, InstanceId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_instance::{InstanceConfig, InstanceManager, ResourceLimits, ResourceUsage};
-use rnmdb_security::{AuthenticationProvider, LocalCredentialStore};
+use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider, LocalCredentialStore};
 use rnmdb_storage::PageCryptoKey;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,20 +379,33 @@ fn auth_command_response(
     let Some((username, password)) = parse_auth_command(command) else {
         return Ok("ERR usage: AUTH <username> <password>");
     };
-    if authenticate_client(runtime, username, password)? {
-        *session = Some(runtime.open_session()?);
-        return Ok("OK authenticated");
-    }
-    Ok("ERR authentication failed")
+    let Some(principal) = authenticate_client(runtime, username, password)? else {
+        return Ok("ERR authentication failed");
+    };
+    *session = Some(open_authenticated_session(runtime, &principal)?);
+    Ok("OK authenticated")
 }
 
-fn authenticate_client(runtime: &EmbeddedRuntime, username: &str, password: &str) -> Result<bool> {
+fn authenticate_client(
+    runtime: &EmbeddedRuntime,
+    username: &str,
+    password: &str,
+) -> Result<Option<AuthenticatedPrincipal>> {
     let Some(credentials) = runtime.config().credentials() else {
-        return Ok(true);
+        return Ok(None);
     };
-    credentials
-        .authenticate(username, password)
-        .map(|principal| principal.is_some())
+    credentials.authenticate(username, password)
+}
+
+fn open_authenticated_session(
+    runtime: &EmbeddedRuntime,
+    principal: &AuthenticatedPrincipal,
+) -> Result<LocalSession> {
+    let mut session = runtime.open_session()?;
+    if let Some(role_id) = principal.role_id() {
+        session.set_active_role(role_id)?;
+    }
+    Ok(session)
 }
 
 fn command_output_needs_checkpoint(output: &CommandOutput) -> bool {

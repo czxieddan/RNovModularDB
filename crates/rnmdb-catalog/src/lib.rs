@@ -425,6 +425,10 @@ impl Catalog {
         self.roles.get(name)
     }
 
+    pub fn get_role_by_id(&self, role_id: RoleId) -> Option<&Role> {
+        self.roles.values().find(|role| role.role_id == role_id)
+    }
+
     pub fn drop_role(&mut self, name: &str) -> Result<Option<Role>> {
         validate_identifier("role", name)?;
         let Some(role) = self.roles.remove(name) else {
