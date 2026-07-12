@@ -1165,35 +1165,8 @@ impl<'a> Binder<'a> {
         query: &Statement,
         role_id: RoleId,
     ) -> Result<BoundStatement> {
-        if name.schema().is_some() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "recursive CTE name must be unqualified",
-            ));
-        }
-        let seed = self.bind_for_role(seed, role_id)?;
-        let seed_columns = query_output_columns(&seed)?;
-        if seed_columns.len() != column_names.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "recursive CTE column count mismatch: declared {}, seed returns {}",
-                    column_names.len(),
-                    seed_columns.len()
-                ),
-            ));
-        }
-        let cte_columns = seed_columns
-            .iter()
-            .zip(column_names.iter())
-            .map(|(column, name)| BoundColumn {
-                name: name.as_str().to_string(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-                encrypted: false,
-                generated: None,
-            })
-            .collect::<Vec<_>>();
+        validate_recursive_cte_name(name)?;
+        let (seed, cte_columns) = self.bind_recursive_cte_seed(seed, column_names, role_id)?;
         let recursive = self.bind_recursive_cte_step(name, &cte_columns, recursive)?;
         let recursive_columns = query_output_columns(&recursive)?;
         validate_recursive_cte_columns(&cte_columns, recursive_columns)?;
@@ -1206,6 +1179,18 @@ impl<'a> Binder<'a> {
             recursive: Box::new(recursive),
             query,
         }))
+    }
+
+    fn bind_recursive_cte_seed(
+        &self,
+        statement: &Statement,
+        column_names: &[Ident],
+        role_id: RoleId,
+    ) -> Result<(BoundStatement, Vec<BoundColumn>)> {
+        let seed = self.bind_for_role(statement, role_id)?;
+        let seed_columns = query_output_columns(&seed)?;
+        let cte_columns = recursive_cte_columns(seed_columns, column_names)?;
+        Ok((seed, cte_columns))
     }
 
     fn bind_recursive_cte_step(
@@ -5879,6 +5864,43 @@ fn single_query_output_type_for(statement: &BoundStatement, context: &str) -> Re
             ),
         )),
     }
+}
+
+fn validate_recursive_cte_name(name: &ObjectName) -> Result<()> {
+    if name.schema().is_some() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "recursive CTE name must be unqualified",
+        ));
+    }
+    Ok(())
+}
+
+fn recursive_cte_columns(
+    seed_columns: &[BoundColumn],
+    column_names: &[Ident],
+) -> Result<Vec<BoundColumn>> {
+    if seed_columns.len() != column_names.len() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "recursive CTE column count mismatch: declared {}, seed returns {}",
+                column_names.len(),
+                seed_columns.len()
+            ),
+        ));
+    }
+    Ok(seed_columns
+        .iter()
+        .zip(column_names.iter())
+        .map(|(column, name)| BoundColumn {
+            name: name.as_str().to_string(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            encrypted: false,
+            generated: None,
+        })
+        .collect())
 }
 
 fn validate_recursive_cte_columns(expected: &[BoundColumn], actual: &[BoundColumn]) -> Result<()> {
