@@ -9195,35 +9195,49 @@ fn eval_range_overlap_expr(
     left: &Expr,
     right: &Expr,
 ) -> Result<SqlValue> {
-    match (
-        eval_expr(columns, row, left)?,
-        eval_expr(columns, row, right)?,
-    ) {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    eval_range_overlap_values(left, right)
+}
+
+fn eval_range_overlap_values(left: SqlValue, right: SqlValue) -> Result<SqlValue> {
+    match (left, right) {
         (SqlValue::Null, _) | (_, SqlValue::Null) => Ok(SqlValue::Bool(false)),
         (SqlValue::Range(left), SqlValue::Range(right)) => {
             Ok(SqlValue::Bool(left.overlaps(&right)?))
         }
-        (SqlValue::Array(left), SqlValue::Array(right))
-            if matches!(left.element_type(), SqlType::Range(_))
-                && matches!(right.element_type(), SqlType::Range(_)) =>
-        {
-            let Some(left) = bounding_box_from_value(&SqlValue::Array(left))? else {
-                return Ok(SqlValue::Bool(false));
-            };
-            let Some(right) = bounding_box_from_value(&SqlValue::Array(right))? else {
-                return Ok(SqlValue::Bool(false));
-            };
-            Ok(SqlValue::Bool(left.intersects(&right)?))
-        }
-        (left, right) => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "range overlap operator && requires RANGE or RANGE[] operands, got {:?} and {:?}",
-                left.data_type(),
-                right.data_type()
-            ),
-        )),
+        (SqlValue::Array(left), SqlValue::Array(right)) => eval_array_range_overlap(left, right),
+        (left, right) => Err(range_overlap_type_error(&left, &right)),
     }
+}
+
+fn eval_array_range_overlap(left: SqlArray, right: SqlArray) -> Result<SqlValue> {
+    if !matches!(left.element_type(), SqlType::Range(_))
+        || !matches!(right.element_type(), SqlType::Range(_))
+    {
+        return Err(range_overlap_type_error(
+            &SqlValue::Array(left),
+            &SqlValue::Array(right),
+        ));
+    }
+    let Some(left) = bounding_box_from_value(&SqlValue::Array(left))? else {
+        return Ok(SqlValue::Bool(false));
+    };
+    let Some(right) = bounding_box_from_value(&SqlValue::Array(right))? else {
+        return Ok(SqlValue::Bool(false));
+    };
+    Ok(SqlValue::Bool(left.intersects(&right)?))
+}
+
+fn range_overlap_type_error(left: &SqlValue, right: &SqlValue) -> RnovError {
+    RnovError::new(
+        ErrorKind::InvalidInput,
+        format!(
+            "range overlap operator && requires RANGE or RANGE[] operands, got {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        ),
+    )
 }
 
 fn eval_arithmetic_expr(
