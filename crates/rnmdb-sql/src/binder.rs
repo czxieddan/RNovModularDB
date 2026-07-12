@@ -2353,19 +2353,32 @@ impl<'a> Binder<'a> {
     {
         let expr = self.bind_predicate_subqueries(expr, role_id, infer, None)?;
         let bound = self.bind_in_subquery(query, role_id, outer_scope)?;
-        let expr_type = infer(&expr)?.ok_or_else(|| {
-            RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("cannot infer IN subquery expression type: {expr}"),
-            )
-        })?;
-        let subquery_type = single_query_output_type(&bound)?;
-        self.infer_in_list_result_type(&expr_type, std::slice::from_ref(&subquery_type))?;
+        self.validate_in_subquery_types(&expr, &bound, infer)?;
         Ok(Expr::InSubquery {
             expr: Box::new(expr),
             query: SelectSubquery::Bound(Box::new(bound)),
             negated,
         })
+    }
+
+    fn validate_in_subquery_types<F>(
+        &self,
+        expr: &Expr,
+        bound: &BoundStatement,
+        infer: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        let expr_type = infer(expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer IN subquery expression type: {expr}"),
+            )
+        })?;
+        let subquery_type = single_query_output_type(bound)?;
+        self.infer_in_list_result_type(&expr_type, std::slice::from_ref(&subquery_type))?;
+        Ok(())
     }
 
     fn bind_in_subquery(
