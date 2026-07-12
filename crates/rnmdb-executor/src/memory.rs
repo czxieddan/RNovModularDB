@@ -216,6 +216,22 @@ impl MemoryTable {
             .map(|(name, _)| name.as_str())
     }
 
+    fn indexed_value_exists(&self, column: usize, value: &SqlValue) -> Result<Option<bool>> {
+        let Some(index_name) = self.point_lookup_index_for_column(column) else {
+            return Ok(None);
+        };
+        let Some(key) = index_key_from_value(value)? else {
+            return Ok(Some(false));
+        };
+        let index = self.lookup_index(index_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("index not found: {index_name}"),
+            )
+        })?;
+        Ok(Some(!index.point_lookup(column, &key)?.is_empty()))
+    }
+
     fn lookup_index(&self, name: &str) -> Option<&MemoryTableIndex> {
         self.indexes.get(name).or_else(|| {
             name.rsplit_once('.')
@@ -1914,6 +1930,40 @@ pub enum ExecutionResult {
     SchemaChanged,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationDelta {
+    relation_id: RelationId,
+    before: VectorBatch,
+    after: VectorBatch,
+}
+
+impl MutationDelta {
+    fn new(
+        relation_id: RelationId,
+        columns: Vec<ColumnSchema>,
+        before: Vec<Row>,
+        after: Vec<Row>,
+    ) -> Result<Self> {
+        Ok(Self {
+            relation_id,
+            before: VectorBatch::new(columns.clone(), before)?,
+            after: VectorBatch::new(columns, after)?,
+        })
+    }
+
+    pub fn relation_id(&self) -> RelationId {
+        self.relation_id
+    }
+
+    pub fn before(&self) -> &VectorBatch {
+        &self.before
+    }
+
+    pub fn after(&self) -> &VectorBatch {
+        &self.after
+    }
+}
+
 impl MemoryExecutor {
     pub fn new() -> Self {
         Self::default()
@@ -1987,6 +2037,40 @@ impl MemoryExecutor {
             executor_table_key_for_catalog_name(&tables, table.schema_name(), table.name())?
         };
         self.scan_table(table.relation_id(), &table_key)
+    }
+
+    pub fn catalog_table_contains_value(
+        &self,
+        table: &CatalogTable,
+        column: &str,
+        value: &SqlValue,
+    ) -> Result<bool> {
+        let catalog_column = table
+            .columns()
+            .iter()
+            .find(|candidate| candidate.name() == column)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("column does not exist: {}.{column}", table.name()),
+                )
+            })?;
+        let table_key = {
+            let tables = self.read_tables()?;
+            executor_table_key_for_catalog_name(&tables, table.schema_name(), table.name())?
+        };
+        if !catalog_column.is_encrypted() {
+            let indexed = self.with_table(&table_key, |memory_table| {
+                let index = column_index(memory_table.columns(), column)?;
+                memory_table.indexed_value_exists(index, value)
+            })?;
+            if let Some(found) = indexed {
+                return Ok(found);
+            }
+        }
+        let batch = self.scan_table(table.relation_id(), &table_key)?;
+        let index = column_index(batch.columns(), column)?;
+        Ok(batch.rows().iter().any(|row| row.values()[index] == *value))
     }
 
     fn decrypt_physical_scan(
@@ -5122,6 +5206,13 @@ impl MemoryExecutor {
     }
 
     fn execute_mut_rows(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        self.execute_row_mutation(plan).map(|(result, _)| result)
+    }
+
+    pub fn execute_row_mutation(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<(ExecutionResult, MutationDelta)> {
         match plan {
             LogicalPlan::Insert {
                 relation_id,
@@ -5152,7 +5243,7 @@ impl MemoryExecutor {
         table_name: &str,
         columns: &[String],
         values: &[Expr],
-    ) -> Result<ExecutionResult> {
+    ) -> Result<(ExecutionResult, MutationDelta)> {
         let values = self.evaluate_insert_values(values)?;
         let column_crypto = self.column_crypto.clone();
         let mut tables = self.write_tables()?;
@@ -5162,8 +5253,10 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        insert_values(table, relation_id, columns, &values, &column_crypto)?;
-        Ok(ExecutionResult::RowsAffected(1))
+        let row = insert_values(table, relation_id, columns, &values, &column_crypto)?;
+        let delta =
+            MutationDelta::new(relation_id, table.columns().to_vec(), Vec::new(), vec![row])?;
+        Ok((ExecutionResult::RowsAffected(1), delta))
     }
 
     fn execute_update_mutation(
@@ -5172,7 +5265,7 @@ impl MemoryExecutor {
         table_name: &str,
         assignments: &[(String, Expr)],
         selection: Option<&Expr>,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<(ExecutionResult, MutationDelta)> {
         let column_crypto = self.column_crypto.clone();
         let mut tables = self.write_tables()?;
         let table = tables.get_mut(table_name).ok_or_else(|| {
@@ -5181,15 +5274,18 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        update_rows(
+        let delta = update_rows(
             table,
             relation_id,
             assignments,
             selection,
             &column_crypto,
             self.scalar_function_runtime.as_deref(),
-        )
-        .map(ExecutionResult::RowsAffected)
+        )?;
+        let affected = u64::try_from(delta.after().rows().len()).map_err(|_| {
+            RnovError::new(ErrorKind::Internal, "updated row count does not fit u64")
+        })?;
+        Ok((ExecutionResult::RowsAffected(affected), delta))
     }
 
     fn execute_delete_mutation(
@@ -5197,7 +5293,7 @@ impl MemoryExecutor {
         relation_id: RelationId,
         table_name: &str,
         selection: Option<&Expr>,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<(ExecutionResult, MutationDelta)> {
         let column_crypto = self.column_crypto.clone();
         let mut tables = self.write_tables()?;
         let table = tables.get_mut(table_name).ok_or_else(|| {
@@ -5206,14 +5302,17 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        delete_rows(
+        let delta = delete_rows(
             table,
             relation_id,
             selection,
             &column_crypto,
             self.scalar_function_runtime.as_deref(),
-        )
-        .map(ExecutionResult::RowsAffected)
+        )?;
+        let affected = u64::try_from(delta.before().rows().len()).map_err(|_| {
+            RnovError::new(ErrorKind::Internal, "deleted row count does not fit u64")
+        })?;
+        Ok((ExecutionResult::RowsAffected(affected), delta))
     }
 
     fn evaluate_insert_values(&self, values: &[Expr]) -> Result<Vec<SqlValue>> {
@@ -6183,12 +6282,12 @@ fn update_rows(
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
     runtime: Option<&dyn ScalarFunctionRuntime>,
-) -> Result<u64> {
+) -> Result<MutationDelta> {
     let columns = table.columns.clone();
     let assignments = compile_assignments(&columns, assignments)?;
     let original_rows = table.rows.clone();
     let original_indexes = table.indexes.clone();
-    let (rows, affected) = build_updated_rows(
+    let (rows, before, after) = build_updated_rows(
         &original_rows,
         &columns,
         relation_id,
@@ -6198,7 +6297,7 @@ fn update_rows(
         runtime,
     )?;
     replace_rows_and_rebuild_indexes(table, rows, original_rows, original_indexes)?;
-    Ok(affected)
+    MutationDelta::new(relation_id, columns, before, after)
 }
 
 fn build_updated_rows(
@@ -6209,11 +6308,12 @@ fn build_updated_rows(
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
     runtime: Option<&dyn ScalarFunctionRuntime>,
-) -> Result<(Vec<Row>, u64)> {
+) -> Result<(Vec<Row>, Vec<Row>, Vec<Row>)> {
     let mut rows = original_rows.to_vec();
-    let mut affected = 0;
+    let mut before = Vec::new();
+    let mut after = Vec::new();
     for row in &mut rows {
-        if update_row(
+        if let Some((old_row, new_row)) = update_row(
             row,
             columns,
             relation_id,
@@ -6222,10 +6322,11 @@ fn build_updated_rows(
             column_crypto,
             runtime,
         )? {
-            affected += 1;
+            before.push(old_row);
+            after.push(new_row);
         }
     }
-    Ok((rows, affected))
+    Ok((rows, before, after))
 }
 
 fn update_row(
@@ -6236,10 +6337,10 @@ fn update_row(
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
     runtime: Option<&dyn ScalarFunctionRuntime>,
-) -> Result<bool> {
+) -> Result<Option<(Row, Row)>> {
     let logical_row = column_crypto.decrypt_row(relation_id, columns, row)?;
     if !row_matches(columns, &logical_row, selection, runtime)? {
-        return Ok(false);
+        return Ok(None);
     }
     let mut updated = logical_row.clone();
     apply_update_assignments(runtime, columns, &logical_row, assignments, &mut updated)?;
@@ -6247,7 +6348,7 @@ fn update_row(
     let encrypted = column_crypto.encrypt_row(relation_id, columns, &updated)?;
     validate_row_against_columns(columns, &encrypted)?;
     *row = encrypted;
-    Ok(true)
+    Ok(Some((logical_row, updated)))
 }
 
 fn apply_update_assignments(
@@ -6272,24 +6373,24 @@ fn delete_rows(
     selection: Option<&Expr>,
     column_crypto: &ColumnCryptoState,
     runtime: Option<&dyn ScalarFunctionRuntime>,
-) -> Result<u64> {
+) -> Result<MutationDelta> {
     let columns = table.columns.clone();
     let original_rows = table.rows.clone();
     let original_indexes = table.indexes.clone();
     let mut kept = Vec::with_capacity(original_rows.len());
-    let mut affected = 0;
+    let mut removed = Vec::new();
 
     for row in original_rows.iter().cloned() {
         let logical_row = column_crypto.decrypt_row(relation_id, &columns, &row)?;
         if row_matches(&columns, &logical_row, selection, runtime)? {
-            affected += 1;
+            removed.push(logical_row);
         } else {
             kept.push(row);
         }
     }
 
     replace_rows_and_rebuild_indexes(table, kept, original_rows, original_indexes)?;
-    Ok(affected)
+    MutationDelta::new(relation_id, columns, removed, Vec::new())
 }
 
 fn replace_rows_and_rebuild_indexes(
@@ -6340,7 +6441,7 @@ fn insert_values(
     columns: &[String],
     values: &[SqlValue],
     column_crypto: &ColumnCryptoState,
-) -> Result<()> {
+) -> Result<Row> {
     validate_insert_inputs(table.columns(), columns, values.len())?;
     let row_values = table
         .columns()
@@ -6349,8 +6450,10 @@ fn insert_values(
         .collect();
     let mut row = Row::new(row_values);
     recompute_generated_values(table.columns(), &mut row)?;
+    let logical_row = row.clone();
     let row = column_crypto.encrypt_insert_row(relation_id, table.columns(), &row)?;
-    table.insert(row)
+    table.insert(row)?;
+    Ok(logical_row)
 }
 
 fn validate_insert_inputs(

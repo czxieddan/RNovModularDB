@@ -227,18 +227,7 @@ impl SetOperationKind {
 impl SelectCoreParts {
     fn into_statement(self) -> Statement {
         if !self.grouping_sets.is_empty() {
-            return Statement::SelectGroupingSets {
-                distinct: self.distinct,
-                projection: self.projection,
-                from: self.from,
-                selection: self.selection,
-                group_by: self.group_by,
-                grouping_sets: self.grouping_sets,
-                having: self.having,
-                order_by: Vec::new(),
-                limit: None,
-                offset: None,
-            };
+            return self.into_grouping_sets_statement();
         }
         if let Some(lateral_join) = self.lateral_join {
             return Statement::SelectLateral {
@@ -274,6 +263,21 @@ impl SelectCoreParts {
             from: self.from,
             selection: self.selection,
             group_by: self.group_by,
+            having: self.having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    fn into_grouping_sets_statement(self) -> Statement {
+        Statement::SelectGroupingSets {
+            distinct: self.distinct,
+            projection: self.projection,
+            from: self.from,
+            selection: self.selection,
+            group_by: self.group_by,
+            grouping_sets: self.grouping_sets,
             having: self.having,
             order_by: Vec::new(),
             limit: None,
@@ -470,7 +474,10 @@ impl Parser {
         if !self.consume_identifier_keyword("sql") {
             return Err(self.error("expected SQL after EXECUTE"));
         }
-        self.parse_string_literal("trigger SQL body")
+        let body = self.parse_string_literal("trigger SQL body")?;
+        crate::parser::parse_statement(&body)
+            .map_err(|err| self.error(format!("invalid trigger SQL body: {err}")))?;
+        Ok(body)
     }
 
     fn parse_trigger_event(&mut self) -> Result<TriggerEvent> {

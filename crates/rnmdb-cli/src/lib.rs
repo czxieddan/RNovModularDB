@@ -21,7 +21,9 @@ use rnmdb_executor::{
         DurableExecutorImage, read_image_from_single_file_backend,
         write_image_to_single_file_backend,
     },
-    memory::{ExecutionResult, MemoryExecutor, ParallelQueryConfig, ScalarFunctionRuntime},
+    memory::{
+        ExecutionResult, MemoryExecutor, MutationDelta, ParallelQueryConfig, ScalarFunctionRuntime,
+    },
     vector::VectorBatch,
 };
 use rnmdb_planner::{
@@ -476,21 +478,7 @@ impl LocalSession {
         bound: &BoundStatement,
     ) -> Result<CommandOutput> {
         match bound {
-            BoundStatement::CreateFunction {
-                name,
-                argument_types,
-                return_type,
-                implementation,
-                if_not_exists,
-            } => self
-                .apply_catalog_create_function(
-                    name.as_str(),
-                    argument_types,
-                    return_type,
-                    implementation,
-                    *if_not_exists,
-                )
-                .map(|()| CommandOutput::SchemaChanged),
+            BoundStatement::CreateFunction { .. } => self.execute_create_function_catalog(bound),
             BoundStatement::CreateProcedure {
                 name,
                 argument_types,
@@ -514,16 +502,46 @@ impl LocalSession {
                 relation_id,
                 predicate,
                 if_not_exists,
-            } => self
-                .apply_catalog_create_policy(
-                    name.as_str(),
-                    *relation_id,
-                    predicate.as_str(),
-                    *if_not_exists,
-                )
-                .map(|()| CommandOutput::SchemaChanged),
+            } => self.execute_create_policy_catalog(
+                name.as_str(),
+                *relation_id,
+                predicate.as_str(),
+                *if_not_exists,
+            ),
             _ => Err(command_dispatch_error("catalog creation")),
         }
+    }
+
+    fn execute_create_function_catalog(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        let BoundStatement::CreateFunction {
+            name,
+            argument_types,
+            return_type,
+            implementation,
+            if_not_exists,
+        } = bound
+        else {
+            return Err(command_dispatch_error("function creation"));
+        };
+        self.apply_catalog_create_function(
+            name.as_str(),
+            argument_types,
+            return_type,
+            implementation,
+            *if_not_exists,
+        )
+        .map(|()| CommandOutput::SchemaChanged)
+    }
+
+    fn execute_create_policy_catalog(
+        &mut self,
+        name: &str,
+        relation_id: RelationId,
+        predicate: &str,
+        if_not_exists: bool,
+    ) -> Result<CommandOutput> {
+        self.apply_catalog_create_policy(name, relation_id, predicate, if_not_exists)
+            .map(|()| CommandOutput::SchemaChanged)
     }
 
     fn execute_drop_catalog_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
@@ -671,8 +689,14 @@ impl LocalSession {
     ) -> Result<CommandOutput> {
         let plan = self.planner.plan(statement)?;
         let snapshot = self.executor.snapshot()?;
-        let output = self.executor.execute_mut(&plan)?;
-        if let Err(err) = self.finish_mutation_statement(statement, &output) {
+        let (output, delta) = match self.executor.execute_row_mutation(&plan) {
+            Ok(execution) => execution,
+            Err(err) => {
+                self.executor = snapshot;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.finish_mutation_statement(statement, &output, &delta) {
             self.executor = snapshot;
             return Err(err);
         }
@@ -683,70 +707,130 @@ impl LocalSession {
         &mut self,
         statement: &BoundStatement,
         output: &ExecutionResult,
+        delta: &MutationDelta,
     ) -> Result<()> {
-        self.validate_foreign_keys_after_mutation(statement)?;
+        self.validate_foreign_keys_after_mutation(statement, delta)?;
         self.execute_after_triggers(statement, output)
     }
 
-    fn validate_foreign_keys_after_mutation(&self, statement: &BoundStatement) -> Result<()> {
-        match statement {
-            BoundStatement::Insert { table, .. } => self.validate_table_foreign_keys(table),
-            BoundStatement::Update(_) | BoundStatement::Delete(_) => {
-                self.validate_all_foreign_keys()
-            }
-            _ => Ok(()),
-        }
+    fn validate_foreign_keys_after_mutation(
+        &self,
+        statement: &BoundStatement,
+        delta: &MutationDelta,
+    ) -> Result<()> {
+        let table = self.mutation_catalog_table(statement, delta)?;
+        self.validate_changed_child_values(table, delta.after())?;
+        self.validate_removed_parent_values(table, delta.before())
     }
 
-    fn validate_table_foreign_keys(&self, table_name: &ObjectName) -> Result<()> {
-        let table = self.catalog_table_for_name(table_name)?;
-        self.validate_catalog_table_foreign_keys(table)
+    fn mutation_catalog_table<'a>(
+        &'a self,
+        statement: &BoundStatement,
+        delta: &MutationDelta,
+    ) -> Result<&'a CatalogTable> {
+        let name = mutation_table_name(statement)?;
+        let table = self.catalog_table_for_name(name)?;
+        if table.relation_id() != delta.relation_id() {
+            return Err(RnovError::new(
+                ErrorKind::Internal,
+                "mutation delta relation does not match the bound statement",
+            ));
+        }
+        Ok(table)
     }
 
-    fn validate_all_foreign_keys(&self) -> Result<()> {
-        for table in self.catalog.tables() {
-            self.validate_catalog_table_foreign_keys(table)?;
-        }
-        Ok(())
-    }
-
-    fn validate_catalog_table_foreign_keys(&self, table: &CatalogTable) -> Result<()> {
-        if !table
-            .columns()
-            .iter()
-            .any(|column| column.foreign_key().is_some())
-        {
-            return Ok(());
-        }
-        let batch = self.executor.scan_catalog_table(table)?;
+    fn validate_changed_child_values(
+        &self,
+        table: &CatalogTable,
+        changed: &VectorBatch,
+    ) -> Result<()> {
         for column in table.columns() {
             if let Some(reference) = column.foreign_key() {
-                self.validate_column_foreign_key(&batch, table, column.name(), reference)?;
+                self.validate_changed_child_column(changed, table, column.name(), reference)?;
             }
         }
         Ok(())
     }
 
-    fn validate_column_foreign_key(
+    fn validate_changed_child_column(
         &self,
-        child_batch: &VectorBatch,
+        changed: &VectorBatch,
         child_table: &CatalogTable,
         child_column: &str,
         reference: &ForeignKeyReference,
     ) -> Result<()> {
-        let child_index = batch_column_index(child_batch, child_column)?;
+        let child_index = batch_column_index(changed, child_column)?;
         let parent_table = self.foreign_key_parent(reference)?;
-        let parent_batch = self.executor.scan_catalog_table(parent_table)?;
-        let parent_index = batch_column_index(&parent_batch, reference.column_name())?;
-        let parent_values = collect_non_null_values(&parent_batch, parent_index);
-        validate_child_values_exist(
-            child_batch,
-            child_table,
-            child_column,
-            child_index,
-            reference,
-            &parent_values,
-        )
+        for value in collect_non_null_values(changed, child_index) {
+            if !self.executor.catalog_table_contains_value(
+                parent_table,
+                reference.column_name(),
+                &value,
+            )? {
+                return Err(foreign_key_violation(
+                    child_table,
+                    child_column,
+                    reference,
+                    &value,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_removed_parent_values(
+        &self,
+        parent_table: &CatalogTable,
+        removed: &VectorBatch,
+    ) -> Result<()> {
+        for child_table in self.catalog.tables() {
+            for child_column in child_table.columns() {
+                let Some(reference) = child_column.foreign_key() else {
+                    continue;
+                };
+                if foreign_key_targets_table(reference, parent_table) {
+                    self.validate_removed_parent_column(
+                        removed,
+                        parent_table,
+                        child_table,
+                        child_column.name(),
+                        reference,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_removed_parent_column(
+        &self,
+        removed: &VectorBatch,
+        parent_table: &CatalogTable,
+        child_table: &CatalogTable,
+        child_column: &str,
+        reference: &ForeignKeyReference,
+    ) -> Result<()> {
+        let parent_index = batch_column_index(removed, reference.column_name())?;
+        for value in collect_non_null_values(removed, parent_index) {
+            let parent_exists = self.executor.catalog_table_contains_value(
+                parent_table,
+                reference.column_name(),
+                &value,
+            )?;
+            if !parent_exists
+                && self
+                    .executor
+                    .catalog_table_contains_value(child_table, child_column, &value)?
+            {
+                return Err(foreign_key_violation(
+                    child_table,
+                    child_column,
+                    reference,
+                    &value,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn catalog_table_for_name(&self, name: &ObjectName) -> Result<&CatalogTable> {
@@ -1747,26 +1831,20 @@ fn non_null_value(value: SqlValue) -> Option<SqlValue> {
     }
 }
 
-fn validate_child_values_exist(
-    child_batch: &VectorBatch,
-    child_table: &CatalogTable,
-    child_column: &str,
-    child_index: usize,
-    reference: &ForeignKeyReference,
-    parent_values: &HashSet<SqlValue>,
-) -> Result<()> {
-    for row in child_batch.rows() {
-        let value = &row.values()[child_index];
-        if *value != SqlValue::Null && !parent_values.contains(value) {
-            return Err(foreign_key_violation(
-                child_table,
-                child_column,
-                reference,
-                value,
-            ));
-        }
+fn mutation_table_name(statement: &BoundStatement) -> Result<&ObjectName> {
+    match statement {
+        BoundStatement::Insert { table, .. } => Ok(table),
+        BoundStatement::Update(update) => Ok(&update.table),
+        BoundStatement::Delete(delete) => Ok(&delete.table),
+        _ => Err(RnovError::new(
+            ErrorKind::Internal,
+            "foreign key validation requires a row mutation",
+        )),
     }
-    Ok(())
+}
+
+fn foreign_key_targets_table(reference: &ForeignKeyReference, table: &CatalogTable) -> bool {
+    reference.schema_name() == table.schema_name() && reference.table_name() == table.name()
 }
 
 fn foreign_key_violation(

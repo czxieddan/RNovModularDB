@@ -383,11 +383,9 @@ fn format_timestamp_fraction(micros: u32) -> String {
     if micros == 0 {
         return String::new();
     }
-    let mut fraction = format!("{micros:06}");
-    while fraction.ends_with('0') {
-        fraction.pop();
-    }
-    format!(".{fraction}")
+    let padded = (micros + 1_000_000).to_string();
+    let fraction = padded[1..].trim_end_matches('0');
+    [".", fraction].concat()
 }
 
 fn invalid_timestamp(message: &str) -> RnovError {
