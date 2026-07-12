@@ -29,10 +29,10 @@ pub const SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VER
 pub const SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION: u16 = SINGLE_FILE_FORMAT_VERSION;
 
 const PAGE_CRC64: Crc<u64> = Crc::<u64>::new(&CRC_64_ECMA_182);
-type SingleFileWriteLock = Arc<Mutex<()>>;
-type SingleFileWriteLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
+type SingleFileAccessLock = Arc<Mutex<()>>;
+type SingleFileAccessLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
 
-static SINGLE_FILE_WRITE_LOCKS: OnceLock<SingleFileWriteLockRegistry> = OnceLock::new();
+static SINGLE_FILE_ACCESS_LOCKS: OnceLock<SingleFileAccessLockRegistry> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendMode {
@@ -462,25 +462,78 @@ impl MemorySnapshot {
                 "memory checkpoint page size must match the destination page size",
             ));
         }
+        validate_memory_snapshot_pages(self)?;
 
         let destination = destination.as_ref();
-        let backend = SingleFileBackend::create(destination, options)?;
-        for page in &self.pages {
-            backend.write_page(page.clone())?;
-        }
-        backend.sync()?;
-        let verification = backend.verify_with_key()?;
-
-        Ok(MemoryCheckpointReport {
-            destination_path: destination.to_path_buf(),
-            pages_exported: self.pages.len(),
-            bytes_written: verification.file_len_bytes(),
-            page_size: self.page_size,
-            superblock_generation: backend.superblock_generation(),
-            page_record_slots: verification.page_record_slots(),
-            present_page_records: verification.present_page_records(),
-        })
+        let key = options.page_key().expect("page key validated above");
+        export_memory_snapshot(destination, self, key)
     }
+}
+
+fn validate_memory_snapshot_pages(snapshot: &MemorySnapshot) -> Result<()> {
+    if snapshot
+        .pages
+        .iter()
+        .all(|page| page.payload().len() == snapshot.page_size.bytes())
+    {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "memory checkpoint page size mismatch",
+    ))
+}
+
+fn export_memory_snapshot(
+    destination: &Path,
+    snapshot: &MemorySnapshot,
+    key: PageCryptoKey,
+) -> Result<MemoryCheckpointReport> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(destination)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to create memory checkpoint file: {err}"),
+            )
+        })?;
+    let result = with_new_single_file_exclusive(&mut file, |file| {
+        write_memory_snapshot_locked(file, destination, snapshot, key)
+    });
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    result
+}
+
+fn write_memory_snapshot_locked(
+    file: &mut File,
+    destination: &Path,
+    snapshot: &MemorySnapshot,
+    key: PageCryptoKey,
+) -> Result<MemoryCheckpointReport> {
+    let generation = 1;
+    write_single_file_header(file, snapshot.page_size, generation)?;
+    let data_start = single_file_data_start();
+    let record_size = single_file_page_record_size(snapshot.page_size);
+    for page in &snapshot.pages {
+        write_single_file_page(file, key, page.clone(), data_start, record_size)?;
+    }
+    sync_single_file(file, "memory checkpoint")?;
+    let inspection = inspect_single_file_with_key_locked(destination, key, file)?;
+    Ok(MemoryCheckpointReport {
+        destination_path: destination.to_path_buf(),
+        pages_exported: snapshot.pages.len(),
+        bytes_written: inspection.file_len_bytes(),
+        page_size: snapshot.page_size,
+        superblock_generation: inspection.superblock_generation(),
+        page_record_slots: inspection.page_record_slots(),
+        present_page_records: inspection.present_page_records(),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1226,16 +1279,16 @@ impl Default for SingleFileOptions {
     }
 }
 
-fn single_file_write_locks() -> &'static SingleFileWriteLockRegistry {
-    SINGLE_FILE_WRITE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn single_file_access_locks() -> &'static SingleFileAccessLockRegistry {
+    SINGLE_FILE_ACCESS_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn single_file_write_lock_for(path: &Path) -> Result<SingleFileWriteLock> {
+fn single_file_access_lock_for(path: &Path) -> Result<SingleFileAccessLock> {
     let lock_path = canonical_lock_path(path)?;
-    let mut locks = single_file_write_locks().lock().map_err(|_| {
+    let mut locks = single_file_access_locks().lock().map_err(|_| {
         RnovError::new(
             ErrorKind::Internal,
-            "single-file write lock registry poisoned",
+            "single-file access lock registry poisoned",
         )
     })?;
     locks.retain(|_, lock| lock.strong_count() > 0);
@@ -1271,7 +1324,7 @@ pub struct SingleFileBackend {
     superblock_generation: u64,
     catalog_root: u64,
     page_key: Option<PageCryptoKey>,
-    write_lock: SingleFileWriteLock,
+    access_lock: SingleFileAccessLock,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1311,7 +1364,7 @@ struct CatalogPageCommit {
     metadata: SingleFileMetadata,
 }
 
-struct SingleFileCommitLock {
+struct SingleFileProcessLock {
     file: File,
     locked: bool,
 }
@@ -1325,18 +1378,24 @@ impl SingleFileMetadata {
     }
 }
 
-impl SingleFileCommitLock {
-    fn acquire(source: &File) -> Result<Self> {
-        let file = source.try_clone().map_err(|err| {
+impl SingleFileProcessLock {
+    fn acquire_shared(source: &File) -> Result<Self> {
+        let file = clone_single_file_handle(source)?;
+        file.lock_shared().map_err(|err| {
             RnovError::new(
                 ErrorKind::Io,
-                format!("failed to clone database file handle: {err}"),
+                format!("failed to acquire shared database file lock: {err}"),
             )
         })?;
+        Ok(Self { file, locked: true })
+    }
+
+    fn acquire_exclusive(source: &File) -> Result<Self> {
+        let file = clone_single_file_handle(source)?;
         file.lock().map_err(|err| {
             RnovError::new(
                 ErrorKind::Io,
-                format!("failed to lock database file for catalog commit: {err}"),
+                format!("failed to acquire exclusive database file lock: {err}"),
             )
         })?;
         Ok(Self { file, locked: true })
@@ -1350,7 +1409,7 @@ impl SingleFileCommitLock {
         let result = self.file.unlock().map_err(|err| {
             RnovError::new(
                 ErrorKind::Io,
-                format!("failed to unlock database file after catalog commit: {err}"),
+                format!("failed to release database file lock: {err}"),
             )
         });
         self.locked = result.is_err();
@@ -1358,12 +1417,83 @@ impl SingleFileCommitLock {
     }
 }
 
-impl Drop for SingleFileCommitLock {
+impl Drop for SingleFileProcessLock {
     fn drop(&mut self) {
         if self.locked {
             let _ = self.file.unlock();
         }
     }
+}
+
+fn with_single_file_shared<T>(
+    database_path: &Path,
+    operation: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
+    let file = OpenOptions::new()
+        .read(true)
+        .open(database_path)
+        .map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to open database file for shared access: {err}"),
+            )
+        })?;
+    let access_lock = single_file_access_lock_for(database_path)?;
+    with_single_file_handle_shared(&file, &access_lock, operation)
+}
+
+fn with_single_file_handle_shared<T>(
+    source: &File,
+    access_lock: &SingleFileAccessLock,
+    operation: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
+    let _access_guard = access_lock.lock().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Internal,
+            "single-file backend access lock poisoned",
+        )
+    })?;
+    let mut process_lock = SingleFileProcessLock::acquire_shared(source)?;
+    let result = operation(process_lock.file_mut());
+    let unlock_result = process_lock.release();
+    finish_single_file_io(result, unlock_result)
+}
+
+fn with_single_file_handle_exclusive<T>(
+    source: &File,
+    access_lock: &SingleFileAccessLock,
+    operation: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
+    let _access_guard = access_lock.lock().map_err(|_| {
+        RnovError::new(
+            ErrorKind::Internal,
+            "single-file backend access lock poisoned",
+        )
+    })?;
+    let mut process_lock = SingleFileProcessLock::acquire_exclusive(source)?;
+    let result = operation(process_lock.file_mut());
+    let unlock_result = process_lock.release();
+    finish_single_file_io(result, unlock_result)
+}
+
+fn with_new_single_file_exclusive<T>(
+    file: &mut File,
+    operation: impl FnOnce(&mut File) -> Result<T>,
+) -> Result<T> {
+    file.lock().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to lock new database file: {err}"),
+        )
+    })?;
+    let result = operation(file);
+    let unlock_result = file.unlock().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to unlock new database file: {err}"),
+        )
+    });
+    finish_single_file_io(result, unlock_result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1976,14 +2106,16 @@ impl SingleFileBackend {
             })?;
 
         let superblock_generation = 1;
-        write_single_file_header(&mut file, options.page_size(), superblock_generation)?;
-        file.sync_all().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to sync database file: {err}"),
-            )
+        with_new_single_file_exclusive(&mut file, |locked_file| {
+            write_single_file_header(locked_file, options.page_size(), superblock_generation)?;
+            locked_file.sync_all().map_err(|err| {
+                RnovError::new(
+                    ErrorKind::Io,
+                    format!("failed to sync database file: {err}"),
+                )
+            })
         })?;
-        let write_lock = single_file_write_lock_for(path)?;
+        let access_lock = single_file_access_lock_for(path)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1992,7 +2124,7 @@ impl SingleFileBackend {
             superblock_generation,
             catalog_root: 0,
             page_key: options.page_key(),
-            write_lock,
+            access_lock,
         })
     }
 
@@ -2009,25 +2141,30 @@ impl SingleFileBackend {
     }
 
     pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<SingleFileBackupReport> {
-        self.file.sync_all().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to sync source database before backup: {err}"),
-            )
-        })?;
-        backup_single_file(&self.path, destination)
+        self.sync()?;
+        let destination = destination.as_ref();
+        with_single_file_handle_shared(&self.file, &self.access_lock, |file| {
+            backup_single_file_from_file(&self.path, destination, file)
+        })
     }
 
     pub fn verify(&self) -> Result<SingleFileVerificationReport> {
-        verify_single_file(&self.path)
+        with_single_file_handle_shared(&self.file, &self.access_lock, |file| {
+            let inspection = inspect_single_file_from_file(&self.path, file)?;
+            Ok(single_file_verification_report(inspection, false))
+        })
     }
 
     pub fn verify_with_key(&self) -> Result<SingleFileVerificationReport> {
-        verify_single_file_with_key(&self.path, self.page_key()?)
+        let key = self.page_key()?;
+        with_single_file_handle_shared(&self.file, &self.access_lock, |file| {
+            let inspection = inspect_single_file_with_key_locked(&self.path, key, file)?;
+            Ok(single_file_verification_report(inspection, true))
+        })
     }
 
     fn open_internal(path: &Path, page_key: Option<PageCryptoKey>) -> Result<Self> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -2037,8 +2174,9 @@ impl SingleFileBackend {
                     format!("failed to open database file: {err}"),
                 )
             })?;
-        let metadata = read_single_file_metadata(&mut file)?;
-        let write_lock = single_file_write_lock_for(path)?;
+        let access_lock = single_file_access_lock_for(path)?;
+        let metadata =
+            with_single_file_handle_shared(&file, &access_lock, read_single_file_metadata)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -2047,7 +2185,7 @@ impl SingleFileBackend {
             superblock_generation: metadata.superblock.generation,
             catalog_root: metadata.superblock.catalog_root,
             page_key,
-            write_lock,
+            access_lock,
         })
     }
 
@@ -2069,17 +2207,11 @@ impl SingleFileBackend {
 
     pub fn commit_catalog_pages(&mut self, payloads: &[Vec<u8>]) -> Result<PageId> {
         validate_catalog_page_payloads(payloads, self.page_size)?;
-        let write_lock = Arc::clone(&self.write_lock);
-        let _write_guard = write_lock.lock().map_err(|_| {
-            RnovError::new(
-                ErrorKind::Internal,
-                "single-file backend write lock poisoned",
-            )
-        })?;
-        let mut commit_lock = SingleFileCommitLock::acquire(&self.file)?;
-        let result = self.commit_catalog_pages_locked(commit_lock.file_mut(), payloads);
-        let unlock_result = commit_lock.release();
-        finish_single_file_commit(result, unlock_result)
+        let file = clone_single_file_handle(&self.file)?;
+        let access_lock = Arc::clone(&self.access_lock);
+        with_single_file_handle_exclusive(&file, &access_lock, |file| {
+            self.commit_catalog_pages_locked(file, payloads)
+        })
     }
 
     fn commit_catalog_pages_locked(
@@ -2119,19 +2251,11 @@ impl SingleFileBackend {
     }
 
     fn data_start(&self) -> u64 {
-        (Self::HEADER_LEN + Self::SUPERBLOCK_LEN * 2) as u64
+        single_file_data_start()
     }
 
     fn page_record_size(&self) -> u64 {
-        (Self::PAGE_RECORD_HEADER_LEN + self.max_page_ciphertext_len()) as u64
-    }
-
-    fn max_page_ciphertext_len(&self) -> usize {
-        PageCodec::HEADER_LEN + self.page_size.bytes() + 16
-    }
-
-    fn page_offset(&self, page_id: PageId) -> Result<u64> {
-        single_file_page_offset(page_id, self.data_start(), self.page_record_size())
+        single_file_page_record_size(self.page_size)
     }
 
     fn page_key(&self) -> Result<PageCryptoKey> {
@@ -2143,32 +2267,8 @@ impl SingleFileBackend {
         })
     }
 
-    fn page_reader(&self, id: PageId) -> Result<File> {
-        let mut file = self.file.try_clone().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to clone database file handle: {err}"),
-            )
-        })?;
-        let offset = self.page_offset(id)?;
-        file.seek(SeekFrom::Start(offset)).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to seek encrypted page record: {err}"),
-            )
-        })?;
-        Ok(file)
-    }
-
-    fn read_page_record_header(&self, file: &mut File) -> Result<Option<PageRecordHeader>> {
-        let mut header = [0_u8; Self::PAGE_RECORD_HEADER_LEN];
-        let read = file.read(&mut header).map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to read encrypted page record header: {err}"),
-            )
-        })?;
-        Self::classify_page_record_header(read, &header, self.max_page_ciphertext_len())
+    fn read_page_process_locked(&self, file: &mut File, id: PageId) -> Result<Option<Page>> {
+        read_single_file_page(file, self.page_size, self.page_key()?, id)
     }
 
     fn classify_page_record_header(
@@ -2219,6 +2319,11 @@ impl SingleFileBackend {
         })?;
         Ok(ciphertext)
     }
+
+    fn write_page_process_locked(&self, file: &mut File, page: Page) -> Result<()> {
+        let key = self.page_key()?;
+        write_single_file_page(file, key, page, self.data_start(), self.page_record_size())
+    }
 }
 
 struct PageRecordHeader {
@@ -2226,22 +2331,58 @@ struct PageRecordHeader {
     ciphertext_len: usize,
 }
 
+fn single_file_data_start() -> u64 {
+    (SingleFileBackend::HEADER_LEN + SingleFileBackend::SUPERBLOCK_LEN * 2) as u64
+}
+
+fn single_file_page_record_size(page_size: PageSize) -> u64 {
+    let max_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
+    (SingleFileBackend::PAGE_RECORD_HEADER_LEN + max_ciphertext_len) as u64
+}
+
+fn read_single_file_page(
+    file: &mut File,
+    page_size: PageSize,
+    key: PageCryptoKey,
+    id: PageId,
+) -> Result<Option<Page>> {
+    let max_ciphertext_len = PageCodec::HEADER_LEN + page_size.bytes() + 16;
+    let record_size = single_file_page_record_size(page_size);
+    let data_start = single_file_data_start();
+    let offset = single_file_page_offset(id, data_start, record_size)?;
+    file.seek(SeekFrom::Start(offset)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to seek encrypted page record: {err}"),
+        )
+    })?;
+    let mut encoded_header = [0_u8; SingleFileBackend::PAGE_RECORD_HEADER_LEN];
+    let read = file.read(&mut encoded_header).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to read encrypted page record header: {err}"),
+        )
+    })?;
+    let Some(header) =
+        SingleFileBackend::classify_page_record_header(read, &encoded_header, max_ciphertext_len)?
+    else {
+        return Ok(None);
+    };
+    let ciphertext = SingleFileBackend::read_page_ciphertext(file, header.ciphertext_len)?;
+    PageCrypto::decrypt(
+        &key,
+        PageNonce::from_page_counter(id, header.counter),
+        id,
+        &ciphertext,
+    )
+    .map(Some)
+}
+
 impl StorageBackend for SingleFileBackend {
     fn read_page(&self, id: PageId) -> Result<Option<Page>> {
-        let key = self.page_key()?;
-        let mut file = self.page_reader(id)?;
-        let Some(header) = self.read_page_record_header(&mut file)? else {
-            return Ok(None);
-        };
-        let ciphertext = Self::read_page_ciphertext(&mut file, header.ciphertext_len)?;
-
-        PageCrypto::decrypt(
-            &key,
-            PageNonce::from_page_counter(id, header.counter),
-            id,
-            &ciphertext,
-        )
-        .map(Some)
+        with_single_file_handle_shared(&self.file, &self.access_lock, |file| {
+            self.read_page_process_locked(file, id)
+        })
     }
 
     fn write_page(&self, page: Page) -> Result<()> {
@@ -2256,34 +2397,19 @@ impl StorageBackend for SingleFileBackend {
             ));
         }
 
-        let _write_guard = self.write_lock.lock().map_err(|_| {
-            RnovError::new(
-                ErrorKind::Internal,
-                "single-file backend write lock poisoned",
-            )
-        })?;
-        let key = self.page_key()?;
-        let mut file = self.file.try_clone().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to clone database file handle: {err}"),
-            )
-        })?;
-        write_single_file_page(
-            &mut file,
-            key,
-            page,
-            self.data_start(),
-            self.page_record_size(),
-        )
+        with_single_file_handle_exclusive(&self.file, &self.access_lock, |file| {
+            self.write_page_process_locked(file, page)
+        })
     }
 
     fn sync(&self) -> Result<SyncStatus> {
-        self.file.sync_all().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to sync database file: {err}"),
-            )
+        with_single_file_handle_exclusive(&self.file, &self.access_lock, |file| {
+            file.sync_all().map_err(|err| {
+                RnovError::new(
+                    ErrorKind::Io,
+                    format!("failed to sync database file: {err}"),
+                )
+            })
         })?;
         Ok(SyncStatus::new(0, 0, BackendMode::DiskOnly))
     }
@@ -2340,11 +2466,20 @@ fn persist_catalog_page_commit(
     Ok(next)
 }
 
-fn finish_single_file_commit<T>(commit_result: Result<T>, unlock_result: Result<()>) -> Result<T> {
-    match commit_result {
+fn finish_single_file_io<T>(operation_result: Result<T>, unlock_result: Result<()>) -> Result<T> {
+    match operation_result {
         Ok(value) => unlock_result.map(|()| value),
         Err(err) => Err(err),
     }
+}
+
+fn clone_single_file_handle(file: &File) -> Result<File> {
+    file.try_clone().map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to clone database file handle: {err}"),
+        )
+    })
 }
 
 fn ensure_catalog_snapshot_current(
@@ -2531,13 +2666,7 @@ pub fn check_single_file_format_compatibility(
     path: impl AsRef<Path>,
 ) -> Result<SingleFileFormatCompatibility> {
     let path = path.as_ref();
-    let mut file = OpenOptions::new().read(true).open(path).map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to inspect database file compatibility: {err}"),
-        )
-    })?;
-    let format_version = read_single_file_format_version(&mut file)?;
+    let format_version = with_single_file_shared(path, read_single_file_format_version)?;
     Ok(SingleFileFormatCompatibility::new(
         path.to_path_buf(),
         format_version,
@@ -2546,19 +2675,7 @@ pub fn check_single_file_format_compatibility(
 
 pub fn verify_single_file(path: impl AsRef<Path>) -> Result<SingleFileVerificationReport> {
     let inspection = inspect_single_file(path)?;
-    Ok(SingleFileVerificationReport {
-        path: inspection.path().to_path_buf(),
-        format_version: inspection.format_version(),
-        min_supported_format_version: SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
-        max_supported_format_version: SINGLE_FILE_MAX_SUPPORTED_FORMAT_VERSION,
-        format_compatibility: single_file_format_compatibility_status(inspection.format_version()),
-        file_len_bytes: inspection.file_len_bytes(),
-        page_record_slots: inspection.page_record_slots(),
-        present_page_records: inspection.present_page_records(),
-        empty_page_slots: inspection.empty_page_slots(),
-        authenticated_page_records: 0,
-        encryption_authenticated: false,
-    })
+    Ok(single_file_verification_report(inspection, false))
 }
 
 pub fn verify_single_file_with_key(
@@ -2566,8 +2683,14 @@ pub fn verify_single_file_with_key(
     key: PageCryptoKey,
 ) -> Result<SingleFileVerificationReport> {
     let inspection = inspect_single_file_with_key(path.as_ref(), key)?;
+    Ok(single_file_verification_report(inspection, true))
+}
 
-    Ok(SingleFileVerificationReport {
+fn single_file_verification_report(
+    inspection: SingleFileInspection,
+    encryption_authenticated: bool,
+) -> SingleFileVerificationReport {
+    SingleFileVerificationReport {
         path: inspection.path().to_path_buf(),
         format_version: inspection.format_version(),
         min_supported_format_version: SINGLE_FILE_MIN_SUPPORTED_FORMAT_VERSION,
@@ -2578,8 +2701,8 @@ pub fn verify_single_file_with_key(
         present_page_records: inspection.present_page_records(),
         empty_page_slots: inspection.empty_page_slots(),
         authenticated_page_records: inspection.authenticated_page_records(),
-        encryption_authenticated: true,
-    })
+        encryption_authenticated,
+    }
 }
 
 pub fn inspect_single_file_with_key(
@@ -2587,8 +2710,18 @@ pub fn inspect_single_file_with_key(
     key: PageCryptoKey,
 ) -> Result<SingleFileInspection> {
     let path = path.as_ref();
-    let mut inspection = inspect_single_file(path)?;
-    let backend = SingleFileBackend::open_with_key(path, key)?;
+    with_single_file_shared(path, |file| {
+        inspect_single_file_with_key_locked(path, key, file)
+    })
+}
+
+fn inspect_single_file_with_key_locked(
+    path: &Path,
+    key: PageCryptoKey,
+    file: &mut File,
+) -> Result<SingleFileInspection> {
+    let mut inspection = inspect_single_file_from_file(path, file)?;
+    let page_size = inspection.page_size;
     let mut authenticated_page_records = 0_u64;
     let mut checksum_verified_page_records = 0_u64;
 
@@ -2596,7 +2729,7 @@ pub fn inspect_single_file_with_key(
         if !record.is_present() {
             continue;
         }
-        if backend.read_page(record.page_id())?.is_none() {
+        if read_single_file_page(file, page_size, key, record.page_id())?.is_none() {
             return Err(RnovError::new(
                 ErrorKind::Corruption,
                 format!(
@@ -2621,6 +2754,16 @@ pub fn backup_single_file(
 ) -> Result<SingleFileBackupReport> {
     let source = source.as_ref();
     let destination = destination.as_ref();
+    with_single_file_shared(source, |file| {
+        backup_single_file_from_file(source, destination, file)
+    })
+}
+
+fn backup_single_file_from_file(
+    source: &Path,
+    destination: &Path,
+    source_file: &mut File,
+) -> Result<SingleFileBackupReport> {
     if source == destination {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
@@ -2628,11 +2771,11 @@ pub fn backup_single_file(
         ));
     }
 
-    let (_, destination_inspection, bytes_copied) = copy_single_file(
+    let (_, destination_inspection, bytes_copied) = copy_single_file_locked(
         source,
         destination,
+        source_file,
         SingleFileCopyMessages {
-            open_source: "failed to open backup source",
             create_destination: "failed to create backup destination",
             copy_bytes: "failed to copy backup bytes",
             sync_destination: "failed to sync backup destination",
@@ -2692,7 +2835,6 @@ pub fn restore_single_file(
         backup,
         target,
         SingleFileCopyMessages {
-            open_source: "failed to open restore backup",
             create_destination: "failed to create restore target",
             copy_bytes: "failed to restore bytes",
             sync_destination: "failed to sync restore target",
@@ -2709,7 +2851,6 @@ pub fn restore_single_file(
 }
 
 struct SingleFileCopyMessages {
-    open_source: &'static str,
     create_destination: &'static str,
     copy_bytes: &'static str,
     sync_destination: &'static str,
@@ -2720,13 +2861,38 @@ fn copy_single_file(
     destination: &Path,
     messages: SingleFileCopyMessages,
 ) -> Result<(SingleFileInspection, SingleFileInspection, u64)> {
-    let source_inspection = inspect_single_file(source)?;
-    let mut source_file = OpenOptions::new()
-        .read(true)
-        .open(source)
-        .map_err(|err| RnovError::new(ErrorKind::Io, format!("{}: {err}", messages.open_source)))?;
+    with_single_file_shared(source, |source_file| {
+        copy_single_file_locked(source, destination, source_file, messages)
+    })
+}
+
+fn copy_single_file_locked(
+    source: &Path,
+    destination: &Path,
+    source_file: &mut File,
+    messages: SingleFileCopyMessages,
+) -> Result<(SingleFileInspection, SingleFileInspection, u64)> {
+    let source_inspection = inspect_single_file_from_file(source, source_file)?;
+    source_file.seek(SeekFrom::Start(0)).map_err(|err| {
+        RnovError::new(
+            ErrorKind::Io,
+            format!("failed to rewind single-file copy source: {err}"),
+        )
+    })?;
+    let (destination_inspection, bytes_copied) =
+        copy_single_file_destination(source_file, &source_inspection, destination, messages)?;
+    Ok((source_inspection, destination_inspection, bytes_copied))
+}
+
+fn copy_single_file_destination(
+    source_file: &mut File,
+    source_inspection: &SingleFileInspection,
+    destination: &Path,
+    messages: SingleFileCopyMessages,
+) -> Result<(SingleFileInspection, u64)> {
     let mut destination_file = OpenOptions::new()
         .create_new(true)
+        .read(true)
         .write(true)
         .open(destination)
         .map_err(|err| {
@@ -2735,19 +2901,20 @@ fn copy_single_file(
                 format!("{}: {err}", messages.create_destination),
             )
         })?;
-    let bytes_copied = copy(&mut source_file, &mut destination_file)
-        .map_err(|err| RnovError::new(ErrorKind::Io, format!("{}: {err}", messages.copy_bytes)))?;
-    destination_file.sync_all().map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("{}: {err}", messages.sync_destination),
-        )
-    })?;
-    drop(destination_file);
-
-    let destination_inspection = inspect_single_file(destination)?;
-    validate_backup_copy(&source_inspection, &destination_inspection)?;
-    Ok((source_inspection, destination_inspection, bytes_copied))
+    with_new_single_file_exclusive(&mut destination_file, |destination_file| {
+        let bytes_copied = copy(source_file, destination_file).map_err(|err| {
+            RnovError::new(ErrorKind::Io, format!("{}: {err}", messages.copy_bytes))
+        })?;
+        destination_file.sync_all().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("{}: {err}", messages.sync_destination),
+            )
+        })?;
+        let destination_inspection = inspect_single_file_from_file(destination, destination_file)?;
+        validate_backup_copy(source_inspection, &destination_inspection)?;
+        Ok((destination_inspection, bytes_copied))
+    })
 }
 
 fn validate_backup_copy(
@@ -2786,10 +2953,14 @@ fn validate_backup_copy(
 
 pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspection> {
     let path = path.as_ref();
-    let mut file = OpenOptions::new().read(true).open(path).map_err(|err| {
+    with_single_file_shared(path, |file| inspect_single_file_from_file(path, file))
+}
+
+fn inspect_single_file_from_file(path: &Path, file: &mut File) -> Result<SingleFileInspection> {
+    file.seek(SeekFrom::Start(0)).map_err(|err| {
         RnovError::new(
             ErrorKind::Io,
-            format!("failed to inspect database file: {err}"),
+            format!("failed to seek database file for inspection: {err}"),
         )
     })?;
     let file_len_bytes = file
@@ -2801,10 +2972,10 @@ pub fn inspect_single_file(path: impl AsRef<Path>) -> Result<SingleFileInspectio
             )
         })?
         .len();
-    let (format_version, page_size, superblock_generation) = read_single_file_header(&mut file)?;
+    let (format_version, page_size, superblock_generation) = read_single_file_header(file)?;
     let layout = SingleFileInspectionLayout::new(page_size, file_len_bytes);
     let (page_records, present_page_records, empty_page_slots) =
-        inspect_single_file_page_records(&mut file, file_len_bytes, &layout)?;
+        inspect_single_file_page_records(file, file_len_bytes, &layout)?;
 
     Ok(SingleFileInspection {
         path: path.to_path_buf(),
