@@ -4973,29 +4973,32 @@ impl<'a> Binder<'a> {
     where
         F: FnMut(&Expr) -> Result<Option<SqlType>>,
     {
-        let lower_type = match infer(lower)? {
-            Some(data_type) => data_type,
-            None if unknown_as_null => SqlType::Null,
-            None => return Ok(None),
+        let Some(lower_type) = self.infer_range_bound_type(lower, unknown_as_null, &mut infer)?
+        else {
+            return Ok(None);
         };
-        let upper_type = match infer(upper)? {
-            Some(data_type) => data_type,
-            None if unknown_as_null => SqlType::Null,
-            None => return Ok(None),
+        let Some(upper_type) = self.infer_range_bound_type(upper, unknown_as_null, &mut infer)?
+        else {
+            return Ok(None);
         };
-        let element_type = match (lower_type, upper_type) {
-            (SqlType::Null, SqlType::Null) => SqlType::Null,
-            (SqlType::Null, upper_type) => upper_type,
-            (lower_type, SqlType::Null) => lower_type,
-            (lower_type, upper_type) if lower_type == upper_type => lower_type,
-            _ => {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "range literal bounds have different types",
-                ));
-            }
-        };
+        let element_type = merge_range_bound_types(lower_type, upper_type)?;
         Ok(Some(SqlType::Range(Box::new(element_type))))
+    }
+
+    fn infer_range_bound_type<F>(
+        &self,
+        bound: &Expr,
+        unknown_as_null: bool,
+        infer: &mut F,
+    ) -> Result<Option<SqlType>>
+    where
+        F: FnMut(&Expr) -> Result<Option<SqlType>>,
+    {
+        match infer(bound)? {
+            Some(data_type) => Ok(Some(data_type)),
+            None if unknown_as_null => Ok(Some(SqlType::Null)),
+            None => Ok(None),
+        }
     }
 
     fn infer_expr_type_list<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<Vec<SqlType>>>
@@ -5765,6 +5768,19 @@ fn is_boolean_connector(op: &str) -> bool {
 
 fn is_arithmetic_operator(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%")
+}
+
+fn merge_range_bound_types(lower_type: SqlType, upper_type: SqlType) -> Result<SqlType> {
+    match (lower_type, upper_type) {
+        (SqlType::Null, SqlType::Null) => Ok(SqlType::Null),
+        (SqlType::Null, upper_type) => Ok(upper_type),
+        (lower_type, SqlType::Null) => Ok(lower_type),
+        (lower_type, upper_type) if lower_type == upper_type => Ok(lower_type),
+        _ => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "range literal bounds have different types",
+        )),
+    }
 }
 
 fn is_numeric_or_null(data_type: &SqlType) -> bool {
