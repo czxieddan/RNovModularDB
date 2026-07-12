@@ -702,67 +702,13 @@ impl<'a> Binder<'a> {
         unique: bool,
         if_not_exists: bool,
     ) -> Result<BoundStatement> {
-        let table_schema = table.schema().unwrap_or("public");
-        let index_schema = name.schema().unwrap_or(table_schema);
-        if self
-            .catalog
-            .get_index(index_schema, name.object())
-            .is_some()
-            && !if_not_exists
-        {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("index already exists: {index_schema}.{}", name.object()),
-            ));
-        }
+        let index_name = qualified_index_name(name, table);
+        self.ensure_index_available(&index_name, if_not_exists)?;
         let resolved = self.resolve_table(table)?;
         let available_columns = bound_columns_for_table(resolved)?;
-        let mut bound_keys = Vec::with_capacity(keys.len());
-        for key in keys {
-            match key {
-                IndexKeyDef::Column(column) => {
-                    bound_keys.push(BoundIndexKey::Column(
-                        self.resolve_column(resolved, column.as_str())?,
-                    ));
-                }
-                IndexKeyDef::Expression(expr) => {
-                    if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "expression indexes support only btree and hash methods",
-                        ));
-                    }
-                    if keys.len() != 1 {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            "expression indexes support exactly one expression",
-                        ));
-                    }
-                    let data_type = self
-                        .infer_expr_type_from_columns(&available_columns, expr)?
-                        .ok_or_else(|| {
-                            RnovError::new(
-                                ErrorKind::InvalidInput,
-                                format!("cannot infer expression index type: {expr}"),
-                            )
-                        })?;
-                    if !matches!(data_type, SqlType::Int64 | SqlType::Text) {
-                        return Err(RnovError::new(
-                            ErrorKind::InvalidInput,
-                            format!(
-                                "expression index requires INT64 or TEXT expression, got {data_type:?}"
-                            ),
-                        ));
-                    }
-                    bound_keys.push(BoundIndexKey::Expression {
-                        expr: expr.clone(),
-                        data_type,
-                    });
-                }
-            }
-        }
+        let bound_keys = self.bind_index_keys(resolved, &available_columns, keys, method)?;
         Ok(BoundStatement::CreateIndex {
-            name: ObjectName::qualified(index_schema, name.object()),
+            name: index_name,
             relation_id: resolved.relation_id(),
             table: table.clone(),
             keys: bound_keys,
@@ -770,6 +716,91 @@ impl<'a> Binder<'a> {
             unique,
             if_not_exists,
         })
+    }
+
+    fn ensure_index_available(&self, name: &ObjectName, if_not_exists: bool) -> Result<()> {
+        let schema = name.schema().expect("qualified index name");
+        if self.catalog.get_index(schema, name.object()).is_some() && !if_not_exists {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("index already exists: {schema}.{}", name.object()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn bind_index_keys(
+        &self,
+        table: &Table,
+        available_columns: &[BoundColumn],
+        keys: &[IndexKeyDef],
+        method: IndexMethod,
+    ) -> Result<Vec<BoundIndexKey>> {
+        keys.iter()
+            .map(|key| self.bind_index_key(table, available_columns, keys.len(), method, key))
+            .collect()
+    }
+
+    fn bind_index_key(
+        &self,
+        table: &Table,
+        available_columns: &[BoundColumn],
+        key_count: usize,
+        method: IndexMethod,
+        key: &IndexKeyDef,
+    ) -> Result<BoundIndexKey> {
+        match key {
+            IndexKeyDef::Column(column) => Ok(BoundIndexKey::Column(
+                self.resolve_column(table, column.as_str())?,
+            )),
+            IndexKeyDef::Expression(expr) => {
+                self.bind_expression_index_key(available_columns, key_count, method, expr)
+            }
+        }
+    }
+
+    fn bind_expression_index_key(
+        &self,
+        available_columns: &[BoundColumn],
+        key_count: usize,
+        method: IndexMethod,
+        expr: &Expr,
+    ) -> Result<BoundIndexKey> {
+        self.validate_expression_index_shape(method, key_count)?;
+        let data_type = self
+            .infer_expr_type_from_columns(available_columns, expr)?
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    format!("cannot infer expression index type: {expr}"),
+                )
+            })?;
+        if !matches!(data_type, SqlType::Int64 | SqlType::Text) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("expression index requires INT64 or TEXT expression, got {data_type:?}"),
+            ));
+        }
+        Ok(BoundIndexKey::Expression {
+            expr: expr.clone(),
+            data_type,
+        })
+    }
+
+    fn validate_expression_index_shape(&self, method: IndexMethod, key_count: usize) -> Result<()> {
+        if !matches!(method, IndexMethod::BTree | IndexMethod::Hash) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "expression indexes support only btree and hash methods",
+            ));
+        }
+        if key_count != 1 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "expression indexes support exactly one expression",
+            ));
+        }
+        Ok(())
     }
 
     fn bind_query(
@@ -806,44 +837,10 @@ impl<'a> Binder<'a> {
             selectivity,
         } = input;
         let argument_types = [left_type.clone(), right_type.clone()];
-        let function = self
-            .catalog
-            .functions()
-            .iter()
-            .find(|function| {
-                function.name() == function_name
-                    && function.argument_types() == argument_types
-                    && function.return_type() == result_type
-            })
-            .ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::NotFound,
-                    format!("function does not exist for operator {symbol}: {function_name}"),
-                )
-            })?;
-        let selectivity_function_id = if let Some(selectivity) = selectivity {
-            Some(
-                self.catalog
-                    .functions()
-                    .iter()
-                    .find(|function| {
-                        function.name() == selectivity
-                            && function.argument_types() == argument_types
-                            && function.return_type() == &SqlType::Int64
-                    })
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!(
-                                "selectivity function does not exist for operator {symbol}: {selectivity}"
-                            ),
-                        )
-                    })?
-                    .function_id(),
-            )
-        } else {
-            None
-        };
+        let function_id =
+            self.resolve_operator_function_id(symbol, function_name, &argument_types, result_type)?;
+        let selectivity_function_id =
+            self.resolve_operator_selectivity_function_id(symbol, selectivity, &argument_types)?;
 
         Ok(BoundStatement::CreateOperator {
             signature: operator_signature_with_metadata(
@@ -851,7 +848,7 @@ impl<'a> Binder<'a> {
                 left_type.clone(),
                 right_type.clone(),
                 result_type.clone(),
-                function.function_id(),
+                function_id,
                 OperatorSignatureMetadata {
                     precedence,
                     commutator,
@@ -860,6 +857,56 @@ impl<'a> Binder<'a> {
                 },
             ),
         })
+    }
+
+    fn resolve_operator_function_id(
+        &self,
+        symbol: &str,
+        name: &str,
+        argument_types: &[SqlType; 2],
+        result_type: &SqlType,
+    ) -> Result<rnmdb_common::ids::FunctionId> {
+        self.catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name
+                    && function.argument_types() == *argument_types
+                    && function.return_type() == result_type
+            })
+            .map(|function| function.function_id())
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("function does not exist for operator {symbol}: {name}"),
+                )
+            })
+    }
+
+    fn resolve_operator_selectivity_function_id(
+        &self,
+        symbol: &str,
+        selectivity: Option<&str>,
+        argument_types: &[SqlType; 2],
+    ) -> Result<Option<rnmdb_common::ids::FunctionId>> {
+        let Some(name) = selectivity else {
+            return Ok(None);
+        };
+        self.catalog
+            .functions()
+            .iter()
+            .find(|function| {
+                function.name() == name
+                    && function.argument_types() == *argument_types
+                    && function.return_type() == &SqlType::Int64
+            })
+            .map(|function| Some(function.function_id()))
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("selectivity function does not exist for operator {symbol}: {name}"),
+                )
+            })
     }
 
     fn bind_call_procedure(
@@ -5888,6 +5935,12 @@ fn object_names_equal(left: &ObjectName, right: &ObjectName) -> bool {
         })
         .unwrap_or_else(|| right.schema().is_none())
         && left.object().eq_ignore_ascii_case(right.object())
+}
+
+fn qualified_index_name(name: &ObjectName, table: &ObjectName) -> ObjectName {
+    let table_schema = table.schema().unwrap_or("public");
+    let index_schema = name.schema().unwrap_or(table_schema);
+    ObjectName::qualified(index_schema, name.object())
 }
 
 fn bound_columns_for_table(table: &Table) -> Result<Vec<BoundColumn>> {
