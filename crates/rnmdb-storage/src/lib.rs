@@ -1306,10 +1306,14 @@ struct SingleFileMetadata {
 }
 
 struct CatalogPageCommit {
-    file: File,
     key: PageCryptoKey,
     root: PageId,
     metadata: SingleFileMetadata,
+}
+
+struct SingleFileCommitLock {
+    file: File,
+    locked: bool,
 }
 
 impl SingleFileMetadata {
@@ -1317,6 +1321,47 @@ impl SingleFileMetadata {
         match slot {
             SuperblockSlot::Primary => self.primary_offset,
             SuperblockSlot::Secondary => self.secondary_offset,
+        }
+    }
+}
+
+impl SingleFileCommitLock {
+    fn acquire(source: &File) -> Result<Self> {
+        let file = source.try_clone().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to clone database file handle: {err}"),
+            )
+        })?;
+        file.lock().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to lock database file for catalog commit: {err}"),
+            )
+        })?;
+        Ok(Self { file, locked: true })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    fn release(mut self) -> Result<()> {
+        let result = self.file.unlock().map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to unlock database file after catalog commit: {err}"),
+            )
+        });
+        self.locked = result.is_err();
+        result
+    }
+}
+
+impl Drop for SingleFileCommitLock {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = self.file.unlock();
         }
     }
 }
@@ -2031,9 +2076,21 @@ impl SingleFileBackend {
                 "single-file backend write lock poisoned",
             )
         })?;
-        let commit = self.prepare_catalog_page_commit()?;
+        let mut commit_lock = SingleFileCommitLock::acquire(&self.file)?;
+        let result = self.commit_catalog_pages_locked(commit_lock.file_mut(), payloads);
+        let unlock_result = commit_lock.release();
+        finish_single_file_commit(result, unlock_result)
+    }
+
+    fn commit_catalog_pages_locked(
+        &mut self,
+        file: &mut File,
+        payloads: &[Vec<u8>],
+    ) -> Result<PageId> {
+        let commit = self.prepare_catalog_page_commit(file)?;
         let root = commit.root;
         let next = persist_catalog_page_commit(
+            file,
             commit,
             payloads,
             self.data_start(),
@@ -2044,19 +2101,17 @@ impl SingleFileBackend {
         Ok(root)
     }
 
-    fn prepare_catalog_page_commit(&self) -> Result<CatalogPageCommit> {
+    fn prepare_catalog_page_commit(&self, file: &mut File) -> Result<CatalogPageCommit> {
         let key = self.page_key()?;
-        let mut file = self.file.try_clone().map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to clone database file handle: {err}"),
-            )
-        })?;
-        let metadata = read_single_file_metadata(&mut file)?;
+        let metadata = read_single_file_metadata(file)?;
         ensure_page_size_matches(self.page_size, metadata.page_size)?;
-        let root = next_append_page_id(&file, self.data_start(), self.page_record_size())?;
+        ensure_catalog_snapshot_current(
+            self.superblock_generation,
+            self.catalog_root,
+            metadata.superblock,
+        )?;
+        let root = next_append_page_id(file, self.data_start(), self.page_record_size())?;
         Ok(CatalogPageCommit {
-            file,
             key,
             root,
             metadata,
@@ -2264,28 +2319,46 @@ fn validate_catalog_page_payloads(payloads: &[Vec<u8>], page_size: PageSize) -> 
 }
 
 fn persist_catalog_page_commit(
-    mut commit: CatalogPageCommit,
+    file: &mut File,
+    commit: CatalogPageCommit,
     payloads: &[Vec<u8>],
     data_start: u64,
     record_size: u64,
 ) -> Result<SelectedSuperblock> {
     write_catalog_pages(
-        &mut commit.file,
+        file,
         commit.key,
         commit.root,
         payloads,
         data_start,
         record_size,
     )?;
-    sync_single_file(&commit.file, "catalog checkpoint pages")?;
+    sync_single_file(file, "catalog checkpoint pages")?;
     let next = next_catalog_superblock(commit.metadata.superblock, commit.root)?;
-    write_superblock_at(
-        &mut commit.file,
-        commit.metadata.superblock_offset(next.slot),
-        next,
-    )?;
-    sync_single_file(&commit.file, "catalog checkpoint superblock")?;
+    write_superblock_at(file, commit.metadata.superblock_offset(next.slot), next)?;
+    sync_single_file(file, "catalog checkpoint superblock")?;
     Ok(next)
+}
+
+fn finish_single_file_commit<T>(commit_result: Result<T>, unlock_result: Result<()>) -> Result<T> {
+    match commit_result {
+        Ok(value) => unlock_result.map(|()| value),
+        Err(err) => Err(err),
+    }
+}
+
+fn ensure_catalog_snapshot_current(
+    expected_generation: u64,
+    expected_catalog_root: u64,
+    actual: SelectedSuperblock,
+) -> Result<()> {
+    if actual.generation == expected_generation && actual.catalog_root == expected_catalog_root {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Storage,
+        "stale single-file backend commit rejected: catalog metadata changed",
+    ))
 }
 
 fn ensure_page_size_matches(expected: PageSize, actual: PageSize) -> Result<()> {
