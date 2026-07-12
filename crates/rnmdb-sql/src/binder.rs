@@ -3395,18 +3395,21 @@ impl<'a> Binder<'a> {
             return self.ensure_sortable_type(&column.column.data_type);
         }
         if group_by.iter().any(|group| group == expr) {
-            return match self.infer_expr_type(table, expr)? {
-                Some(data_type) => self.ensure_sortable_type(&data_type),
-                None => Ok(()),
-            };
+            let data_type = self.infer_expr_type(table, expr)?;
+            return self.ensure_optional_sortable_type(data_type);
         }
         if grouped_sort_expr_references_outputs(projection, expr) {
-            return match self.infer_grouped_output_expr_type(projection, expr)? {
-                Some(data_type) => self.ensure_sortable_type(&data_type),
-                None => Ok(()),
-            };
+            let data_type = self.infer_grouped_output_expr_type(projection, expr)?;
+            return self.ensure_optional_sortable_type(data_type);
         }
         Err(grouped_sort_reference_error(expr))
+    }
+
+    fn ensure_optional_sortable_type(&self, data_type: Option<SqlType>) -> Result<()> {
+        match data_type {
+            Some(data_type) => self.ensure_sortable_type(&data_type),
+            None => Ok(()),
+        }
     }
 
     fn ensure_sortable_type(&self, data_type: &SqlType) -> Result<()> {
@@ -3939,65 +3942,97 @@ impl<'a> Binder<'a> {
             .map(|item| item.column.clone())
             .collect::<Vec<_>>();
         let column = match expr {
-            Expr::CountStar => {
-                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
-            }
+            Expr::CountStar => Ok(aggregate_bound_column(
+                &existing_columns,
+                "count",
+                SqlType::Int64,
+                false,
+            )),
             Expr::Count(expr) | Expr::CountDistinct(expr) => {
-                let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer COUNT expression type: {expr}"),
-                    )
-                })?;
-                aggregate_bound_column(&existing_columns, "count", SqlType::Int64, false)
+                self.hidden_count_column(table, &existing_columns, expr)
             }
-            Expr::Sum(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer SUM expression type: {expr}"),
-                    )
-                })?;
-                if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("SUM expression must be INT64, got {expr_type:?}"),
-                    ));
-                }
-                aggregate_bound_column(&existing_columns, "sum", SqlType::Int64, true)
-            }
-            Expr::Min(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer MIN expression type: {expr}"),
-                    )
-                })?;
-                self.ensure_ordered_aggregate_type("MIN", &expr_type)?;
-                aggregate_bound_column(&existing_columns, "min", expr_type, true)
-            }
-            Expr::Max(expr) => {
-                let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("cannot infer MAX expression type: {expr}"),
-                    )
-                })?;
-                self.ensure_ordered_aggregate_type("MAX", &expr_type)?;
-                aggregate_bound_column(&existing_columns, "max", expr_type, true)
-            }
-            _ => {
-                return Err(RnovError::new(
-                    ErrorKind::Internal,
-                    "hidden HAVING aggregate requires aggregate expression",
-                ));
-            }
-        };
+            Expr::Sum(expr) => self.hidden_sum_column(table, &existing_columns, expr),
+            Expr::Min(expr) => self.hidden_ordered_column(table, &existing_columns, expr, "MIN"),
+            Expr::Max(expr) => self.hidden_ordered_column(table, &existing_columns, expr, "MAX"),
+            _ => Err(RnovError::new(
+                ErrorKind::Internal,
+                "hidden HAVING aggregate requires aggregate expression",
+            )),
+        }?;
 
         Ok(BoundSelectItem {
             column,
             expr: expr.clone(),
         })
+    }
+
+    fn hidden_count_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<BoundColumn> {
+        let _ = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer COUNT expression type: {expr}"),
+            )
+        })?;
+        Ok(aggregate_bound_column(
+            existing_columns,
+            "count",
+            SqlType::Int64,
+            false,
+        ))
+    }
+
+    fn hidden_sum_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+    ) -> Result<BoundColumn> {
+        let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer SUM expression type: {expr}"),
+            )
+        })?;
+        if expr_type != SqlType::Int64 && expr_type != SqlType::Null {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("SUM expression must be INT64, got {expr_type:?}"),
+            ));
+        }
+        Ok(aggregate_bound_column(
+            existing_columns,
+            "sum",
+            SqlType::Int64,
+            true,
+        ))
+    }
+
+    fn hidden_ordered_column(
+        &self,
+        table: &Table,
+        existing_columns: &[BoundColumn],
+        expr: &Expr,
+        aggregate_name: &'static str,
+    ) -> Result<BoundColumn> {
+        let expr_type = self.infer_expr_type(table, expr)?.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("cannot infer {aggregate_name} expression type: {expr}"),
+            )
+        })?;
+        self.ensure_ordered_aggregate_type(aggregate_name, &expr_type)?;
+        let column_name = aggregate_name.to_ascii_lowercase();
+        Ok(aggregate_bound_column(
+            existing_columns,
+            &column_name,
+            expr_type,
+            true,
+        ))
     }
 
     fn infer_grouped_output_expr_type(
