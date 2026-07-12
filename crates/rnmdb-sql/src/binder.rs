@@ -90,14 +90,7 @@ impl<'a> Binder<'a> {
                 name,
                 columns,
                 if_not_exists,
-            } => {
-                self.validate_create_columns(columns)?;
-                Ok(BoundStatement::CreateTable {
-                    name: name.clone(),
-                    columns: columns.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_table(name, columns, *if_not_exists),
             Statement::CreateIndex {
                 name,
                 table,
@@ -118,27 +111,7 @@ impl<'a> Binder<'a> {
                 table,
                 column,
                 if_not_exists,
-            } => {
-                let resolved = self.resolve_table(table)?;
-                if resolved
-                    .columns()
-                    .iter()
-                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("column already exists: {}", column.name),
-                    ));
-                }
-                self.validate_column_definition(column)?;
-                Ok(BoundStatement::AlterTableAddColumn {
-                    relation_id: resolved.relation_id(),
-                    table: table.clone(),
-                    column: column.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_alter_table_add_column(table, column, *if_not_exists),
             Statement::AlterColumnEncryption {
                 table,
                 column,
@@ -150,15 +123,7 @@ impl<'a> Binder<'a> {
                 name,
                 table,
                 if_exists,
-            } => {
-                let resolved = self.resolve_table(table)?;
-                Ok(BoundStatement::DropTrigger {
-                    name: name.clone(),
-                    relation_id: resolved.relation_id(),
-                    table: table.clone(),
-                    if_exists: *if_exists,
-                })
-            }
+            } => self.bind_drop_trigger(name, table, *if_exists),
             Statement::DropFunction {
                 name,
                 argument_types,
@@ -199,26 +164,7 @@ impl<'a> Binder<'a> {
                 argument_types,
                 body,
                 if_not_exists,
-            } => {
-                validate_sql_procedure_body(body)?;
-                if self
-                    .catalog
-                    .get_procedure(name.as_str(), argument_types)
-                    .is_some()
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("procedure already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateProcedure {
-                    name: name.clone(),
-                    argument_types: argument_types.clone(),
-                    body: body.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_procedure(name, argument_types, body, *if_not_exists),
             Statement::CreateOperator {
                 symbol,
                 left_type,
@@ -243,95 +189,24 @@ impl<'a> Binder<'a> {
             Statement::CreateRole {
                 name,
                 if_not_exists,
-            } => {
-                if self.catalog.get_role(name.as_str()).is_some() && !if_not_exists {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("role already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreateRole {
-                    name: name.clone(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_role(name, *if_not_exists),
             Statement::CreatePolicy {
                 name,
                 table,
                 predicate,
                 if_not_exists,
-            } => {
-                let table = self.resolve_table(table)?;
-                if self
-                    .catalog
-                    .row_policies(table.relation_id())
-                    .iter()
-                    .any(|policy| policy.name() == name.as_str())
-                    && !if_not_exists
-                {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        format!("row policy already exists: {}", name.as_str()),
-                    ));
-                }
-                Ok(BoundStatement::CreatePolicy {
-                    name: name.clone(),
-                    relation_id: table.relation_id(),
-                    predicate: predicate.to_string(),
-                    if_not_exists: *if_not_exists,
-                })
-            }
+            } => self.bind_create_policy(name, table, predicate, *if_not_exists),
             Statement::GrantTablePrivilege {
                 privilege,
                 table,
                 role,
-            } => {
-                let table = self.resolve_table(table)?;
-                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("role does not exist: {}", role.as_str()),
-                    )
-                })?;
-                Ok(BoundStatement::GrantTablePrivilege {
-                    role_id: role.role_id(),
-                    relation_id: table.relation_id(),
-                    privilege: *privilege,
-                })
-            }
+            } => self.bind_grant_table_privilege(*privilege, table, role),
             Statement::GrantProcedurePrivilege {
                 privilege,
                 name,
                 argument_types,
                 role,
-            } => {
-                if *privilege != Privilege::Execute {
-                    return Err(RnovError::new(
-                        ErrorKind::InvalidInput,
-                        "procedure grants only support EXECUTE privilege",
-                    ));
-                }
-                let procedure = self
-                    .catalog
-                    .get_procedure(name.as_str(), argument_types)
-                    .ok_or_else(|| {
-                        RnovError::new(
-                            ErrorKind::NotFound,
-                            format!("procedure does not exist: {}", name.as_str()),
-                        )
-                    })?;
-                let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
-                    RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("role does not exist: {}", role.as_str()),
-                    )
-                })?;
-                Ok(BoundStatement::GrantProcedurePrivilege {
-                    role_id: role.role_id(),
-                    procedure_id: procedure.procedure_id(),
-                    privilege: *privilege,
-                })
-            }
+            } => self.bind_grant_procedure_privilege(*privilege, name, argument_types, role),
             Statement::CallProcedure { name, args } => {
                 self.bind_call_procedure(name, args, role_id)
             }
@@ -490,12 +365,201 @@ impl<'a> Binder<'a> {
                 analyze,
                 format,
                 statement,
-            } => Ok(BoundStatement::Explain {
-                analyze: *analyze,
-                format: *format,
-                statement: Box::new(self.bind_for_role(statement, role_id)?),
-            }),
+            } => self.bind_explain(*analyze, *format, statement, role_id),
         }
+    }
+
+    fn bind_create_table(
+        &self,
+        name: &ObjectName,
+        columns: &[ColumnDef],
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        self.validate_create_columns(columns)?;
+        Ok(BoundStatement::CreateTable {
+            name: name.clone(),
+            columns: columns.to_vec(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_alter_table_add_column(
+        &self,
+        table: &ObjectName,
+        column: &ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        if resolved
+            .columns()
+            .iter()
+            .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("column already exists: {}", column.name),
+            ));
+        }
+        self.validate_column_definition(column)?;
+        Ok(BoundStatement::AlterTableAddColumn {
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            column: column.clone(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_drop_trigger(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        if_exists: bool,
+    ) -> Result<BoundStatement> {
+        let resolved = self.resolve_table(table)?;
+        Ok(BoundStatement::DropTrigger {
+            name: name.clone(),
+            relation_id: resolved.relation_id(),
+            table: table.clone(),
+            if_exists,
+        })
+    }
+
+    fn bind_create_procedure(
+        &self,
+        name: &Ident,
+        argument_types: &[SqlType],
+        body: &str,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        validate_sql_procedure_body(body)?;
+        if self
+            .catalog
+            .get_procedure(name.as_str(), argument_types)
+            .is_some()
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("procedure already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreateProcedure {
+            name: name.clone(),
+            argument_types: argument_types.to_vec(),
+            body: body.to_string(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_create_role(&self, name: &Ident, if_not_exists: bool) -> Result<BoundStatement> {
+        if self.catalog.get_role(name.as_str()).is_some() && !if_not_exists {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("role already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreateRole {
+            name: name.clone(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_create_policy(
+        &self,
+        name: &Ident,
+        table: &ObjectName,
+        predicate: &Expr,
+        if_not_exists: bool,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table)?;
+        if self
+            .catalog
+            .row_policies(table.relation_id())
+            .iter()
+            .any(|policy| policy.name() == name.as_str())
+            && !if_not_exists
+        {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!("row policy already exists: {}", name.as_str()),
+            ));
+        }
+        Ok(BoundStatement::CreatePolicy {
+            name: name.clone(),
+            relation_id: table.relation_id(),
+            predicate: predicate.to_string(),
+            if_not_exists,
+        })
+    }
+
+    fn bind_grant_table_privilege(
+        &self,
+        privilege: Privilege,
+        table: &ObjectName,
+        role: &Ident,
+    ) -> Result<BoundStatement> {
+        let table = self.resolve_table(table)?;
+        let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("role does not exist: {}", role.as_str()),
+            )
+        })?;
+        Ok(BoundStatement::GrantTablePrivilege {
+            role_id: role.role_id(),
+            relation_id: table.relation_id(),
+            privilege,
+        })
+    }
+
+    fn bind_grant_procedure_privilege(
+        &self,
+        privilege: Privilege,
+        name: &Ident,
+        argument_types: &[SqlType],
+        role: &Ident,
+    ) -> Result<BoundStatement> {
+        if privilege != Privilege::Execute {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "procedure grants only support EXECUTE privilege",
+            ));
+        }
+        let procedure = self
+            .catalog
+            .get_procedure(name.as_str(), argument_types)
+            .ok_or_else(|| {
+                RnovError::new(
+                    ErrorKind::NotFound,
+                    format!("procedure does not exist: {}", name.as_str()),
+                )
+            })?;
+        let role = self.catalog.get_role(role.as_str()).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("role does not exist: {}", role.as_str()),
+            )
+        })?;
+        Ok(BoundStatement::GrantProcedurePrivilege {
+            role_id: role.role_id(),
+            procedure_id: procedure.procedure_id(),
+            privilege,
+        })
+    }
+
+    fn bind_explain(
+        &self,
+        analyze: bool,
+        format: crate::ast::ExplainFormat,
+        statement: &Statement,
+        role_id: RoleId,
+    ) -> Result<BoundStatement> {
+        Ok(BoundStatement::Explain {
+            analyze,
+            format,
+            statement: Box::new(self.bind_for_role(statement, role_id)?),
+        })
     }
 
     fn bind_drop_table(&self, name: &ObjectName, if_exists: bool) -> Result<BoundStatement> {
