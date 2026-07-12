@@ -3313,6 +3313,85 @@ impl MemoryExecutor {
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         cancellation.check()?;
+        self.execute_physical_plan(plan, cancellation)
+    }
+
+    fn execute_physical_plan(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::ExpressionIndexScan { .. }
+            | PhysicalPlan::IndexRangeScan { .. }
+            | PhysicalPlan::IndexSkipScan { .. }
+            | PhysicalPlan::TextSearchScan { .. }
+            | PhysicalPlan::InvertedTextScan { .. }
+            | PhysicalPlan::InvertedValueScan { .. }
+            | PhysicalPlan::BlockSummaryScan { .. }
+            | PhysicalPlan::RangeOverlapScan { .. }
+            | PhysicalPlan::BoundsOverlapScan { .. } => {
+                self.execute_physical_scan(plan, cancellation)
+            }
+            PhysicalPlan::SidewaysIndexLookup { .. }
+            | PhysicalPlan::NestedLoopJoin { .. }
+            | PhysicalPlan::HashJoin { .. } => self.execute_physical_join(plan, cancellation),
+            PhysicalPlan::Filter { .. }
+            | PhysicalPlan::InSubqueryFilter { .. }
+            | PhysicalPlan::ExistsSubqueryFilter { .. } => {
+                self.execute_physical_filter(plan, cancellation)
+            }
+            PhysicalPlan::Projection { .. }
+            | PhysicalPlan::Window { .. }
+            | PhysicalPlan::Aggregate { .. }
+            | PhysicalPlan::GroupedAggregate { .. }
+            | PhysicalPlan::GroupingSetsAggregate { .. } => {
+                self.execute_physical_projection(plan, cancellation)
+            }
+            PhysicalPlan::Distinct { .. }
+            | PhysicalPlan::Sort { .. }
+            | PhysicalPlan::Limit { .. }
+            | PhysicalPlan::Offset { .. }
+            | PhysicalPlan::SetOperation { .. }
+            | PhysicalPlan::Parallel { .. } => self.execute_physical_ordering(plan, cancellation),
+            PhysicalPlan::Unsupported { reason, .. } => {
+                Err(RnovError::new(ErrorKind::InvalidInput, reason.clone()))
+            }
+            _ => Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "memory executor cannot execute this physical plan",
+            )),
+        }
+    }
+
+    fn execute_physical_scan(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            PhysicalPlan::SeqScan { .. }
+            | PhysicalPlan::IndexScan { .. }
+            | PhysicalPlan::ExpressionIndexScan { .. }
+            | PhysicalPlan::IndexSkipScan { .. } => self.execute_physical_point_scan(plan),
+            PhysicalPlan::IndexRangeScan { .. } | PhysicalPlan::BlockSummaryScan { .. } => {
+                self.execute_physical_range_scan(plan)
+            }
+            PhysicalPlan::TextSearchScan { .. }
+            | PhysicalPlan::InvertedTextScan { .. }
+            | PhysicalPlan::InvertedValueScan { .. } => {
+                self.execute_physical_text_scan(plan, cancellation)
+            }
+            PhysicalPlan::RangeOverlapScan { .. } | PhysicalPlan::BoundsOverlapScan { .. } => {
+                self.execute_physical_spatial_scan(plan)
+            }
+            _ => Err(physical_plan_dispatch_error("scan")),
+        }
+    }
+
+    fn execute_physical_point_scan(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
         match plan {
             PhysicalPlan::SeqScan {
                 relation_id, table, ..
@@ -3341,6 +3420,23 @@ impl MemoryExecutor {
                     table.expression_index_scan(index, expr, value)
                 })?,
             ),
+            PhysicalPlan::IndexSkipScan {
+                relation_id,
+                table,
+                index,
+                column,
+                value,
+                ..
+            } => self.decrypt_physical_scan(
+                *relation_id,
+                self.with_table(table, |table| table.index_skip_scan(index, column, value))?,
+            ),
+            _ => Err(physical_plan_dispatch_error("point scan")),
+        }
+    }
+
+    fn execute_physical_range_scan(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::IndexRangeScan {
                 relation_id,
                 table,
@@ -3364,17 +3460,39 @@ impl MemoryExecutor {
                     )
                 })?,
             ),
-            PhysicalPlan::IndexSkipScan {
+            PhysicalPlan::BlockSummaryScan {
                 relation_id,
                 table,
                 index,
                 column,
-                value,
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
                 ..
             } => self.decrypt_physical_scan(
                 *relation_id,
-                self.with_table(table, |table| table.index_skip_scan(index, column, value))?,
+                self.with_table(table, |table| {
+                    table.block_summary_scan(
+                        index,
+                        column,
+                        lower,
+                        *lower_inclusive,
+                        upper,
+                        *upper_inclusive,
+                    )
+                })?,
             ),
+            _ => Err(physical_plan_dispatch_error("range scan")),
+        }
+    }
+
+    fn execute_physical_text_scan(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::TextSearchScan {
                 relation_id,
                 table,
@@ -3412,29 +3530,12 @@ impl MemoryExecutor {
                     table.inverted_value_scan(index, column, query)
                 })?,
             ),
-            PhysicalPlan::BlockSummaryScan {
-                relation_id,
-                table,
-                index,
-                column,
-                lower,
-                lower_inclusive,
-                upper,
-                upper_inclusive,
-                ..
-            } => self.decrypt_physical_scan(
-                *relation_id,
-                self.with_table(table, |table| {
-                    table.block_summary_scan(
-                        index,
-                        column,
-                        lower,
-                        *lower_inclusive,
-                        upper,
-                        *upper_inclusive,
-                    )
-                })?,
-            ),
+            _ => Err(physical_plan_dispatch_error("text or inverted scan")),
+        }
+    }
+
+    fn execute_physical_spatial_scan(&self, plan: &PhysicalPlan) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::RangeOverlapScan {
                 relation_id,
                 table,
@@ -3461,6 +3562,16 @@ impl MemoryExecutor {
                     table.bounds_overlap_scan(index, column, bounds)
                 })?,
             ),
+            _ => Err(physical_plan_dispatch_error("spatial scan")),
+        }
+    }
+
+    fn execute_physical_join(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::SidewaysIndexLookup {
                 outer,
                 inner_table,
@@ -3483,26 +3594,7 @@ impl MemoryExecutor {
                 predicate,
                 ..
             } => {
-                let left = self.execute_physical_cancellable(left, cancellation)?;
-                let right = self.execute_physical_cancellable(right, cancellation)?;
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    return self.apply_nested_loop_join_with_subqueries(
-                        left,
-                        right,
-                        *kind,
-                        predicate,
-                        cancellation,
-                    );
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                apply_nested_loop_join_cancellable(
-                    left,
-                    right,
-                    *kind,
-                    &predicate,
-                    self.scalar_function_runtime.as_deref(),
-                    cancellation,
-                )
+                self.execute_physical_nested_loop_join(*kind, left, right, predicate, cancellation)
             }
             PhysicalPlan::HashJoin {
                 kind,
@@ -3511,47 +3603,140 @@ impl MemoryExecutor {
                 left_key,
                 right_key,
                 ..
-            } => {
-                let left = self.execute_physical_cancellable(left, cancellation)?;
-                let right = self.execute_physical_cancellable(right, cancellation)?;
-                apply_hash_join_cancellable(left, right, *kind, left_key, right_key, cancellation)
-            }
+            } => self.execute_physical_hash_join(
+                *kind,
+                left,
+                right,
+                left_key,
+                right_key,
+                cancellation,
+            ),
+            _ => Err(physical_plan_dispatch_error("join")),
+        }
+    }
+
+    fn execute_physical_nested_loop_join(
+        &self,
+        kind: JoinKind,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        predicate: &Expr,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_physical_cancellable(left, cancellation)?;
+        let right = self.execute_physical_cancellable(right, cancellation)?;
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            return self.apply_nested_loop_join_with_subqueries(
+                left,
+                right,
+                kind,
+                predicate,
+                cancellation,
+            );
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        apply_nested_loop_join_cancellable(
+            left,
+            right,
+            kind,
+            &predicate,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn execute_physical_hash_join(
+        &self,
+        kind: JoinKind,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        left_key: &str,
+        right_key: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_physical_cancellable(left, cancellation)?;
+        let right = self.execute_physical_cancellable(right, cancellation)?;
+        apply_hash_join_cancellable(left, right, kind, left_key, right_key, cancellation)
+    }
+
+    fn execute_physical_filter(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Filter {
                 predicate, input, ..
-            } => {
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    let batch = self.execute_physical_cancellable(input, cancellation)?;
-                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                let batch = self.execute_physical_cancellable(input, cancellation)?;
-                self.apply_filter_batch(batch, &predicate, cancellation)
-            }
+            } => self.execute_physical_filter_plan(predicate, input, cancellation),
             PhysicalPlan::InSubqueryFilter {
                 expr,
                 subquery,
                 negated,
                 input,
                 ..
-            } => {
-                let input = self.execute_physical_cancellable(input, cancellation)?;
-                self.apply_physical_in_subquery_filter(
-                    input,
-                    subquery,
-                    expr,
-                    *negated,
-                    cancellation,
-                )
-            }
+            } => self.execute_physical_in_subquery_plan(
+                expr,
+                subquery,
+                *negated,
+                input,
+                cancellation,
+            ),
             PhysicalPlan::ExistsSubqueryFilter {
                 subquery,
                 negated,
                 input,
                 ..
             } => {
-                let input = self.execute_physical_cancellable(input, cancellation)?;
-                self.apply_physical_exists_subquery_filter(input, subquery, *negated, cancellation)
+                self.execute_physical_exists_subquery_plan(subquery, *negated, input, cancellation)
             }
+            _ => Err(physical_plan_dispatch_error("filter")),
+        }
+    }
+
+    fn execute_physical_filter_plan(
+        &self,
+        predicate: &Expr,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            let batch = self.execute_physical_cancellable(input, cancellation)?;
+            return self.apply_row_subquery_filter(batch, predicate, cancellation);
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        let batch = self.execute_physical_cancellable(input, cancellation)?;
+        self.apply_filter_batch(batch, &predicate, cancellation)
+    }
+
+    fn execute_physical_in_subquery_plan(
+        &self,
+        expr: &Expr,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_physical_cancellable(input, cancellation)?;
+        self.apply_physical_in_subquery_filter(input, subquery, expr, negated, cancellation)
+    }
+
+    fn execute_physical_exists_subquery_plan(
+        &self,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_physical_cancellable(input, cancellation)?;
+        self.apply_physical_exists_subquery_filter(input, subquery, negated, cancellation)
+    }
+
+    fn execute_physical_projection(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch = self.execute_physical_cancellable(input, cancellation)?;
                 self.apply_projection_with_subqueries(batch, items, cancellation)
@@ -3601,21 +3786,27 @@ impl MemoryExecutor {
                     cancellation,
                 )
             }
+            _ => Err(physical_plan_dispatch_error("projection or aggregate")),
+        }
+    }
+
+    fn execute_physical_ordering(
+        &self,
+        plan: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Distinct { input, .. } => {
-                let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_distinct_cancellable(batch, cancellation)
+                self.execute_physical_distinct(input, cancellation)
             }
             PhysicalPlan::Sort { keys, input, .. } => {
-                let batch = self.execute_physical_cancellable(input, cancellation)?;
-                self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
+                self.execute_physical_sort(keys, input, cancellation)
             }
             PhysicalPlan::Limit { count, input, .. } => {
-                let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_limit_cancellable(batch, *count, cancellation)
+                self.execute_physical_limit(*count, input, cancellation)
             }
             PhysicalPlan::Offset { count, input, .. } => {
-                let batch = self.execute_physical_cancellable(input, cancellation)?;
-                apply_offset_cancellable(batch, *count, cancellation)
+                self.execute_physical_offset(*count, input, cancellation)
             }
             PhysicalPlan::SetOperation {
                 kind,
@@ -3623,31 +3814,69 @@ impl MemoryExecutor {
                 left,
                 right,
                 ..
-            } => {
-                let left = self.execute_physical_cancellable(left, cancellation)?;
-                let right = self.execute_physical_cancellable(right, cancellation)?;
-                match kind {
-                    SetOperationKind::Union => {
-                        apply_union_cancellable(left, right, *all, cancellation)
-                    }
-                    SetOperationKind::Intersect => {
-                        apply_intersect_cancellable(left, right, *all, cancellation)
-                    }
-                    SetOperationKind::Except => {
-                        apply_except_cancellable(left, right, *all, cancellation)
-                    }
-                }
-            }
+            } => self.execute_physical_set_operation(*kind, *all, left, right, cancellation),
             PhysicalPlan::Parallel { input, .. } => {
                 self.execute_physical_cancellable(input, cancellation)
             }
-            PhysicalPlan::Unsupported { reason, .. } => {
-                Err(RnovError::new(ErrorKind::InvalidInput, reason.clone()))
+            _ => Err(physical_plan_dispatch_error("ordering")),
+        }
+    }
+
+    fn execute_physical_distinct(
+        &self,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_physical_cancellable(input, cancellation)?;
+        apply_distinct_cancellable(batch, cancellation)
+    }
+
+    fn execute_physical_sort(
+        &self,
+        keys: &[OrderByExpr],
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_physical_cancellable(input, cancellation)?;
+        self.apply_sort_with_scalar_subqueries(batch, keys, cancellation)
+    }
+
+    fn execute_physical_limit(
+        &self,
+        count: usize,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_physical_cancellable(input, cancellation)?;
+        apply_limit_cancellable(batch, count, cancellation)
+    }
+
+    fn execute_physical_offset(
+        &self,
+        count: usize,
+        input: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let batch = self.execute_physical_cancellable(input, cancellation)?;
+        apply_offset_cancellable(batch, count, cancellation)
+    }
+
+    fn execute_physical_set_operation(
+        &self,
+        kind: SetOperationKind,
+        all: bool,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_physical_cancellable(left, cancellation)?;
+        let right = self.execute_physical_cancellable(right, cancellation)?;
+        match kind {
+            SetOperationKind::Union => apply_union_cancellable(left, right, all, cancellation),
+            SetOperationKind::Intersect => {
+                apply_intersect_cancellable(left, right, all, cancellation)
             }
-            _ => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "memory executor cannot execute this physical plan",
-            )),
+            SetOperationKind::Except => apply_except_cancellable(left, right, all, cancellation),
         }
     }
 
@@ -4684,6 +4913,13 @@ fn logical_plan_dispatch_error(category: &str) -> RnovError {
     RnovError::new(
         ErrorKind::Internal,
         format!("logical executor received an unexpected {category} plan"),
+    )
+}
+
+fn physical_plan_dispatch_error(category: &str) -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        format!("physical executor received an unexpected {category} plan"),
     )
 }
 
