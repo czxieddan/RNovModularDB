@@ -3888,6 +3888,67 @@ impl MemoryExecutor {
     ) -> Result<VectorBatch> {
         config.validate()?;
         cancellation.check()?;
+        self.execute_physical_parallel_plan(plan, config, cancellation)
+    }
+
+    fn execute_physical_parallel_plan(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
+            PhysicalPlan::SeqScan { .. } | PhysicalPlan::TextSearchScan { .. } => {
+                self.execute_physical_parallel_scan(plan, config, cancellation)
+            }
+            PhysicalPlan::SidewaysIndexLookup {
+                outer,
+                inner_table,
+                inner_index,
+                inner_column,
+                outer_column,
+                ..
+            } => self.execute_sideways_index_lookup_parallel(
+                SidewaysIndexLookupInput {
+                    outer,
+                    inner_table,
+                    inner_index,
+                    inner_column,
+                    outer_column,
+                },
+                config,
+                cancellation,
+            ),
+            PhysicalPlan::Filter { .. }
+            | PhysicalPlan::InSubqueryFilter { .. }
+            | PhysicalPlan::ExistsSubqueryFilter { .. } => {
+                self.execute_physical_parallel_filter(plan, config, cancellation)
+            }
+            PhysicalPlan::Projection { .. }
+            | PhysicalPlan::Window { .. }
+            | PhysicalPlan::Aggregate { .. }
+            | PhysicalPlan::GroupedAggregate { .. }
+            | PhysicalPlan::GroupingSetsAggregate { .. } => {
+                self.execute_physical_parallel_projection(plan, config, cancellation)
+            }
+            PhysicalPlan::Distinct { .. }
+            | PhysicalPlan::Sort { .. }
+            | PhysicalPlan::Limit { .. }
+            | PhysicalPlan::Offset { .. }
+            | PhysicalPlan::SetOperation { .. }
+            | PhysicalPlan::Parallel { .. } => {
+                self.execute_physical_parallel_ordering(plan, config, cancellation)
+            }
+            _ => self.execute_physical_cancellable(plan, cancellation),
+        }
+    }
+
+    fn execute_physical_parallel_scan(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
         match plan {
             PhysicalPlan::SeqScan {
                 relation_id, table, ..
@@ -3910,71 +3971,111 @@ impl MemoryExecutor {
                 let batch = self.decrypt_physical_scan(*relation_id, batch)?;
                 apply_text_search_cancellable(batch, column, query, cancellation)
             }
-            PhysicalPlan::SidewaysIndexLookup {
-                outer,
-                inner_table,
-                inner_index,
-                inner_column,
-                outer_column,
-                ..
-            } => self.execute_sideways_index_lookup_parallel(
-                SidewaysIndexLookupInput {
-                    outer,
-                    inner_table,
-                    inner_index,
-                    inner_column,
-                    outer_column,
-                },
-                config,
-                cancellation,
-            ),
+            _ => Err(physical_plan_dispatch_error("parallel scan")),
+        }
+    }
+
+    fn execute_physical_parallel_filter(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Filter {
                 predicate, input, ..
-            } => {
-                if self.expr_needs_row_subquery_resolution(predicate)? {
-                    let batch =
-                        self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                    return self.apply_row_subquery_filter(batch, predicate, cancellation);
-                }
-                let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
-                let batch =
-                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                self.apply_filter_batch(batch, &predicate, cancellation)
-            }
+            } => self.execute_parallel_filter_plan(predicate, input, config, cancellation),
             PhysicalPlan::InSubqueryFilter {
                 expr,
                 subquery,
                 negated,
                 input,
                 ..
-            } => {
-                let input =
-                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                self.apply_physical_in_subquery_filter_parallel(
-                    input,
-                    subquery,
-                    expr,
-                    *negated,
-                    config,
-                    cancellation,
-                )
-            }
+            } => self.execute_parallel_in_subquery_plan(
+                expr,
+                subquery,
+                *negated,
+                input,
+                config,
+                cancellation,
+            ),
             PhysicalPlan::ExistsSubqueryFilter {
                 subquery,
                 negated,
                 input,
                 ..
-            } => {
-                let input =
-                    self.execute_physical_parallel_cancellable(input, config, cancellation)?;
-                self.apply_physical_exists_subquery_filter_parallel(
-                    input,
-                    subquery,
-                    *negated,
-                    config,
-                    cancellation,
-                )
-            }
+            } => self.execute_parallel_exists_subquery_plan(
+                subquery,
+                *negated,
+                input,
+                config,
+                cancellation,
+            ),
+            _ => Err(physical_plan_dispatch_error("parallel filter")),
+        }
+    }
+
+    fn execute_parallel_filter_plan(
+        &self,
+        predicate: &Expr,
+        input: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if self.expr_needs_row_subquery_resolution(predicate)? {
+            let batch = self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+            return self.apply_row_subquery_filter(batch, predicate, cancellation);
+        }
+        let predicate = self.resolve_scalar_subqueries(predicate, cancellation)?;
+        let batch = self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+        self.apply_filter_batch(batch, &predicate, cancellation)
+    }
+
+    fn execute_parallel_in_subquery_plan(
+        &self,
+        expr: &Expr,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        input: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+        self.apply_physical_in_subquery_filter_parallel(
+            input,
+            subquery,
+            expr,
+            negated,
+            config,
+            cancellation,
+        )
+    }
+
+    fn execute_parallel_exists_subquery_plan(
+        &self,
+        subquery: &PhysicalPlan,
+        negated: bool,
+        input: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let input = self.execute_physical_parallel_cancellable(input, config, cancellation)?;
+        self.apply_physical_exists_subquery_filter_parallel(
+            input,
+            subquery,
+            negated,
+            config,
+            cancellation,
+        )
+    }
+
+    fn execute_physical_parallel_projection(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Projection { items, input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
@@ -4030,6 +4131,19 @@ impl MemoryExecutor {
                     cancellation,
                 )
             }
+            _ => Err(physical_plan_dispatch_error(
+                "parallel projection or aggregate",
+            )),
+        }
+    }
+
+    fn execute_physical_parallel_ordering(
+        &self,
+        plan: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        match plan {
             PhysicalPlan::Distinct { input, .. } => {
                 let batch =
                     self.execute_physical_parallel_cancellable(input, config, cancellation)?;
@@ -4057,26 +4171,32 @@ impl MemoryExecutor {
                 right,
                 ..
             } => {
-                let left =
-                    self.execute_physical_parallel_cancellable(left, config, cancellation)?;
-                let right =
-                    self.execute_physical_parallel_cancellable(right, config, cancellation)?;
-                match kind {
-                    SetOperationKind::Union => {
-                        apply_union_cancellable(left, right, *all, cancellation)
-                    }
-                    SetOperationKind::Intersect => {
-                        apply_intersect_cancellable(left, right, *all, cancellation)
-                    }
-                    SetOperationKind::Except => {
-                        apply_except_cancellable(left, right, *all, cancellation)
-                    }
-                }
+                self.execute_parallel_set_operation(*kind, *all, left, right, config, cancellation)
             }
             PhysicalPlan::Parallel { input, .. } => {
                 self.execute_physical_parallel_cancellable(input, config, cancellation)
             }
-            _ => self.execute_physical_cancellable(plan, cancellation),
+            _ => Err(physical_plan_dispatch_error("parallel ordering")),
+        }
+    }
+
+    fn execute_parallel_set_operation(
+        &self,
+        kind: SetOperationKind,
+        all: bool,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        let left = self.execute_physical_parallel_cancellable(left, config, cancellation)?;
+        let right = self.execute_physical_parallel_cancellable(right, config, cancellation)?;
+        match kind {
+            SetOperationKind::Union => apply_union_cancellable(left, right, all, cancellation),
+            SetOperationKind::Intersect => {
+                apply_intersect_cancellable(left, right, all, cancellation)
+            }
+            SetOperationKind::Except => apply_except_cancellable(left, right, all, cancellation),
         }
     }
 
