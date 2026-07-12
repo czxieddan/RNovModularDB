@@ -64,7 +64,7 @@ use set_ops::{
     apply_union_cancellable,
 };
 use sort::{
-    apply_sort_cancellable, apply_sort_with_key_values_cancellable, compare_sort_row_keys,
+    SortRow, apply_sort_cancellable, apply_sort_with_key_values_cancellable, compare_sort_row_keys,
     compare_sort_rows, sort_rows,
 };
 
@@ -7472,26 +7472,43 @@ fn apply_window_cancellable(
         return Ok(batch);
     }
 
+    let (columns, item_values) = window_columns_and_values(&batch, items, cancellation)?;
+    let rows = append_window_values(&batch, &item_values, cancellation)?;
+
+    cancellation.check()?;
+    VectorBatch::new(columns, rows)
+}
+
+fn window_columns_and_values(
+    batch: &VectorBatch,
+    items: &[WindowItem],
+    cancellation: &CancellationToken,
+) -> Result<(Vec<ColumnSchema>, Vec<Vec<SqlValue>>)> {
     let mut columns = batch.columns().to_vec();
     let mut item_values = Vec::with_capacity(items.len());
     for item in items {
         cancellation.check()?;
         columns.push(window_column_schema(item));
-        item_values.push(window_values(&batch, &item.function, cancellation)?);
+        item_values.push(window_values(batch, &item.function, cancellation)?);
     }
+    Ok((columns, item_values))
+}
 
+fn append_window_values(
+    batch: &VectorBatch,
+    item_values: &[Vec<SqlValue>],
+    cancellation: &CancellationToken,
+) -> Result<Vec<Row>> {
     let mut rows = Vec::with_capacity(batch.rows().len());
     for row_index in 0..batch.rows().len() {
         cancellation.check()?;
         let mut values = batch.rows()[row_index].values().to_vec();
-        for values_by_item in &item_values {
+        for values_by_item in item_values {
             values.push(values_by_item[row_index].clone());
         }
         rows.push(Row::new(values));
     }
-
-    cancellation.check()?;
-    VectorBatch::new(columns, rows)
+    Ok(rows)
 }
 
 fn window_column_schema(item: &WindowItem) -> ColumnSchema {
@@ -7575,23 +7592,36 @@ fn ranking_window_values(
     let mut dense_rank = 0_i64;
     for index in 0..rows.len() {
         cancellation.check()?;
-        if index == 0
-            || compare_sort_row_keys(&rows[index - 1], &rows[index], order_by) != Ordering::Equal
-        {
-            current_rank = i64::try_from(index + 1).map_err(|_| {
-                RnovError::new(ErrorKind::InvalidInput, "rank() result exceeds int64")
-            })?;
-            dense_rank = dense_rank.checked_add(1).ok_or_else(|| {
-                RnovError::new(ErrorKind::InvalidInput, "dense_rank() result exceeds int64")
-            })?;
+        if starts_ranking_group(&rows, index, order_by) {
+            current_rank = rank_for_index(index)?;
+            dense_rank = next_dense_rank(dense_rank)?;
         }
-        let value = match mode {
-            RankingMode::Rank => current_rank,
-            RankingMode::DenseRank => dense_rank,
-        };
+        let value = ranking_value(mode, current_rank, dense_rank);
         values[rows[index].original_index] = SqlValue::Int64(value);
     }
     Ok(values)
+}
+
+fn starts_ranking_group(rows: &[SortRow], index: usize, order_by: &[OrderByExpr]) -> bool {
+    index == 0 || compare_sort_row_keys(&rows[index - 1], &rows[index], order_by) != Ordering::Equal
+}
+
+fn rank_for_index(index: usize) -> Result<i64> {
+    i64::try_from(index + 1)
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "rank() result exceeds int64"))
+}
+
+fn next_dense_rank(dense_rank: i64) -> Result<i64> {
+    dense_rank
+        .checked_add(1)
+        .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "dense_rank() result exceeds int64"))
+}
+
+fn ranking_value(mode: RankingMode, current_rank: i64, dense_rank: i64) -> i64 {
+    match mode {
+        RankingMode::Rank => current_rank,
+        RankingMode::DenseRank => dense_rank,
+    }
 }
 
 fn joined_columns(outer: &[ColumnSchema], inner: &[ColumnSchema]) -> Result<Vec<ColumnSchema>> {
