@@ -1,8 +1,14 @@
 use std::{
     fmt,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 
 use rnmdb_cli::CommandOutput;
@@ -12,6 +18,11 @@ use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_instance::{InstanceConfig, InstanceManager, ResourceLimits, ResourceUsage};
 use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider, LocalCredentialStore};
 use rnmdb_storage::PageCryptoKey;
+
+const MAX_ACTIVE_CLIENTS: usize = 64;
+const MAX_SQL_COMMAND_BYTES: usize = 65_536;
+const MAX_SQL_COMMAND_READ_BYTES: usize = MAX_SQL_COMMAND_BYTES + 2;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
@@ -148,6 +159,7 @@ impl EmbeddedRuntimeConfig {
 pub struct SqlTcpServer {
     listener: TcpListener,
     runtime: EmbeddedRuntime,
+    active_clients: Arc<AtomicUsize>,
 }
 
 impl SqlTcpServer {
@@ -157,6 +169,7 @@ impl SqlTcpServer {
         Ok(Self {
             listener,
             runtime: EmbeddedRuntime::new(config)?,
+            active_clients: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -167,18 +180,73 @@ impl SqlTcpServer {
     }
 
     pub fn accept_one(&self) -> Result<()> {
-        let (stream, _) = self
-            .listener
-            .accept()
-            .map_err(|err| io_error("failed to accept SQL TCP client", err))?;
+        let stream = self.accept_client()?;
         handle_sql_client(stream, &self.runtime)
     }
 
     pub fn serve(&self) -> Result<()> {
         loop {
-            self.accept_one()?;
+            self.dispatch_client(self.accept_client()?)?;
         }
     }
+
+    fn accept_client(&self) -> Result<TcpStream> {
+        self.listener
+            .accept()
+            .map(|(stream, _)| stream)
+            .map_err(|err| io_error("failed to accept SQL TCP client", err))
+    }
+
+    fn dispatch_client(&self, stream: TcpStream) -> Result<()> {
+        let Some(permit) = ClientPermit::acquire(&self.active_clients) else {
+            reject_busy_client(stream);
+            return Ok(());
+        };
+        spawn_client_thread(stream, self.runtime.clone(), permit)
+    }
+}
+
+struct ClientPermit {
+    active_clients: Arc<AtomicUsize>,
+}
+
+impl ClientPermit {
+    fn acquire(active_clients: &Arc<AtomicUsize>) -> Option<Self> {
+        active_clients
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_ACTIVE_CLIENTS).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self {
+            active_clients: Arc::clone(active_clients),
+        })
+    }
+}
+
+impl Drop for ClientPermit {
+    fn drop(&mut self) {
+        self.active_clients.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn spawn_client_thread(
+    stream: TcpStream,
+    runtime: EmbeddedRuntime,
+    permit: ClientPermit,
+) -> Result<()> {
+    thread::Builder::new()
+        .name("rnmdb-sql-client".to_string())
+        .spawn(move || {
+            let _permit = permit;
+            let _ = handle_sql_client(stream, &runtime);
+        })
+        .map(|_| ())
+        .map_err(|err| io_error("failed to spawn SQL TCP client worker", err))
+}
+
+fn reject_busy_client(mut stream: TcpStream) {
+    let _ = configure_client_stream(&stream);
+    let _ = write_protocol_line(&mut stream, "ERR server busy");
 }
 
 #[cfg(feature = "tokio-runtime")]
@@ -235,9 +303,7 @@ impl TokioEmbeddedRuntime {
 }
 
 fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()> {
-    let reader_stream = stream
-        .try_clone()
-        .map_err(|err| io_error("failed to clone SQL TCP client stream", err))?;
+    let reader_stream = configured_reader_stream(&stream)?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut session = initial_client_session(runtime)?;
@@ -254,6 +320,13 @@ fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()>
     }
 }
 
+fn configured_reader_stream(stream: &TcpStream) -> Result<TcpStream> {
+    configure_client_stream(stream)?;
+    stream
+        .try_clone()
+        .map_err(|err| io_error("failed to clone SQL TCP client stream", err))
+}
+
 fn initial_client_session(runtime: &EmbeddedRuntime) -> Result<Option<LocalSession>> {
     if runtime.config().authentication_required() {
         Ok(None)
@@ -263,9 +336,45 @@ fn initial_client_session(runtime: &EmbeddedRuntime) -> Result<Option<LocalSessi
 }
 
 fn read_sql_command(reader: &mut BufReader<TcpStream>, command: &mut String) -> Result<usize> {
-    reader
-        .read_line(command)
-        .map_err(|err| io_error("failed to read SQL TCP command", err))
+    let mut bytes = Vec::new();
+    let mut limited = reader.by_ref().take(MAX_SQL_COMMAND_READ_BYTES as u64);
+    let bytes_read = limited
+        .read_until(b'\n', &mut bytes)
+        .map_err(|err| io_error("failed to read SQL TCP command", err))?;
+    ensure_command_size(&bytes)?;
+    append_utf8_command(command, &bytes)?;
+    Ok(bytes_read)
+}
+
+fn ensure_command_size(bytes: &[u8]) -> Result<()> {
+    if command_payload_len(bytes) <= MAX_SQL_COMMAND_BYTES {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("SQL command exceeds {MAX_SQL_COMMAND_BYTES} bytes"),
+    ))
+}
+
+fn command_payload_len(bytes: &[u8]) -> usize {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes).len()
+}
+
+fn append_utf8_command(command: &mut String, bytes: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| RnovError::new(ErrorKind::InvalidInput, "SQL command is not valid UTF-8"))?;
+    command.push_str(text);
+    Ok(())
+}
+
+fn configure_client_stream(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+        .map_err(|err| io_error("failed to set SQL TCP client read timeout", err))?;
+    stream
+        .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+        .map_err(|err| io_error("failed to set SQL TCP client write timeout", err))
 }
 
 fn execute_sql_command_line(
