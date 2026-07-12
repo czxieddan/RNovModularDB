@@ -154,6 +154,16 @@ impl LocalSession {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.in_transaction() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot checkpoint while a transaction is active",
+            ));
+        }
+        self.checkpoint_current_state()
+    }
+
+    fn checkpoint_current_state(&mut self) -> Result<()> {
         let image = self.encode_durable_image()?;
         let durable = self.durable.as_mut().ok_or_else(|| {
             RnovError::new(
@@ -323,9 +333,16 @@ impl LocalSession {
         column: &ColumnDef,
         if_not_exists: bool,
     ) -> Result<CommandOutput> {
-        self.apply_catalog_add_column(table, column, if_not_exists)?;
         let plan = self.planner.plan(bound)?;
-        self.executor.execute_mut(&plan).map(CommandOutput::from)
+        let catalog_snapshot = self.catalog.clone();
+        self.apply_catalog_add_column(table, column, if_not_exists)?;
+        match self.executor.execute_mut(&plan) {
+            Ok(output) => Ok(CommandOutput::from(output)),
+            Err(error) => {
+                self.catalog = catalog_snapshot;
+                Err(error)
+            }
+        }
     }
 
     fn execute_drop_table_statement(
@@ -837,7 +854,7 @@ impl LocalSession {
     fn commit_transaction(&mut self) -> Result<CommandOutput> {
         let transaction = self.active_transaction("commit")?;
         if self.durable.is_some() {
-            self.checkpoint()?;
+            self.checkpoint_current_state()?;
         }
         self.transaction_manager.commit(transaction.id())?;
         self.transaction = None;
