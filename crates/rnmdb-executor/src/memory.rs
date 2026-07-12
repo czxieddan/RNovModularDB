@@ -4920,14 +4920,121 @@ impl MemoryExecutor {
 
     pub fn execute_mut(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
         match plan {
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::DropTrigger { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterColumnEncryption { .. }
+            | LogicalPlan::DropTable { .. } => self.execute_mut_schema(plan),
+            LogicalPlan::Insert { .. }
+            | LogicalPlan::Update { .. }
+            | LogicalPlan::Delete { .. } => self.execute_mut_rows(plan),
+            _ => self.execute(plan).map(ExecutionResult::Batch),
+        }
+    }
+
+    fn execute_mut_schema(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        match plan {
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterColumnEncryption { .. }
+            | LogicalPlan::DropTable { .. } => self.execute_mut_table_schema(plan),
+            LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropIndex { .. }
+            | LogicalPlan::DropTrigger { .. } => self.execute_mut_index_trigger_schema(plan),
+            _ => Err(logical_plan_dispatch_error("mutation schema")),
+        }
+    }
+
+    fn execute_mut_table_schema(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        match plan {
             LogicalPlan::CreateTable {
                 table,
                 columns,
                 if_not_exists,
-            } => {
-                self.create_table(table, columns, *if_not_exists)?;
-                Ok(ExecutionResult::SchemaChanged)
-            }
+            } => self
+                .create_table(table, columns, *if_not_exists)
+                .map(|()| ExecutionResult::SchemaChanged),
+            LogicalPlan::AlterTableAddColumn {
+                table,
+                column,
+                if_not_exists,
+                ..
+            } => self.execute_add_column_mutation(table, column, *if_not_exists),
+            LogicalPlan::AlterColumnEncryption {
+                table,
+                column,
+                encrypted,
+                ..
+            } => self.execute_column_encryption_mutation(table, column, *encrypted),
+            LogicalPlan::DropTable {
+                table, if_exists, ..
+            } => self.execute_drop_table_mutation(table, *if_exists),
+            _ => Err(logical_plan_dispatch_error("table schema mutation")),
+        }
+    }
+
+    fn execute_add_column_mutation(
+        &mut self,
+        table_name: &str,
+        column: &ColumnDef,
+        if_not_exists: bool,
+    ) -> Result<ExecutionResult> {
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(table_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {table_name}"),
+            )
+        })?;
+        if table
+            .columns()
+            .iter()
+            .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
+            && if_not_exists
+        {
+            return Ok(ExecutionResult::SchemaChanged);
+        }
+        table.add_column(column_schema_from_def(column))?;
+        Ok(ExecutionResult::SchemaChanged)
+    }
+
+    fn execute_column_encryption_mutation(
+        &mut self,
+        table_name: &str,
+        column: &str,
+        encrypted: bool,
+    ) -> Result<ExecutionResult> {
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(table_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {table_name}"),
+            )
+        })?;
+        table.set_column_encrypted(column, encrypted)?;
+        Ok(ExecutionResult::SchemaChanged)
+    }
+
+    fn execute_drop_table_mutation(
+        &mut self,
+        table: &str,
+        if_exists: bool,
+    ) -> Result<ExecutionResult> {
+        if self.write_tables()?.remove(table).is_some() || if_exists {
+            return Ok(ExecutionResult::SchemaChanged);
+        }
+        Err(RnovError::new(
+            ErrorKind::NotFound,
+            format!("table not found: {table}"),
+        ))
+    }
+
+    fn execute_mut_index_trigger_schema(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        match plan {
             LogicalPlan::CreateIndex {
                 name,
                 table,
@@ -4936,134 +5043,135 @@ impl MemoryExecutor {
                 unique,
                 if_not_exists,
                 ..
-            } => {
-                self.create_index(CreateIndexInput {
+            } => self
+                .create_index(CreateIndexInput {
                     name,
                     table,
                     keys,
                     method: *method,
                     unique: *unique,
                     if_not_exists: *if_not_exists,
-                })?;
+                })
+                .map(|()| ExecutionResult::SchemaChanged),
+            LogicalPlan::CreateTrigger { .. } | LogicalPlan::DropTrigger { .. } => {
                 Ok(ExecutionResult::SchemaChanged)
             }
-            LogicalPlan::CreateTrigger { .. } => Ok(ExecutionResult::SchemaChanged),
             LogicalPlan::DropIndex { name, if_exists } => {
-                if self.drop_index(name)? || *if_exists {
-                    Ok(ExecutionResult::SchemaChanged)
-                } else {
-                    Err(RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("index not found: {name}"),
-                    ))
-                }
+                self.execute_drop_index_mutation(name, *if_exists)
             }
-            LogicalPlan::DropTrigger { .. } => Ok(ExecutionResult::SchemaChanged),
-            LogicalPlan::AlterTableAddColumn {
-                table,
-                column,
-                if_not_exists,
-                ..
-            } => {
-                let mut tables = self.write_tables()?;
-                let table = tables.get_mut(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                if table
-                    .columns()
-                    .iter()
-                    .any(|existing| existing.name().eq_ignore_ascii_case(column.name.as_str()))
-                    && *if_not_exists
-                {
-                    return Ok(ExecutionResult::SchemaChanged);
-                }
-                table.add_column(column_schema_from_def(column))?;
-                Ok(ExecutionResult::SchemaChanged)
-            }
-            LogicalPlan::AlterColumnEncryption {
-                table,
-                column,
-                encrypted,
-                ..
-            } => {
-                let mut tables = self.write_tables()?;
-                let table = tables.get_mut(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                table.set_column_encrypted(column, *encrypted)?;
-                Ok(ExecutionResult::SchemaChanged)
-            }
-            LogicalPlan::DropTable {
-                table, if_exists, ..
-            } => {
-                if self.write_tables()?.remove(table).is_some() || *if_exists {
-                    Ok(ExecutionResult::SchemaChanged)
-                } else {
-                    Err(RnovError::new(
-                        ErrorKind::NotFound,
-                        format!("table not found: {table}"),
-                    ))
-                }
-            }
+            _ => Err(logical_plan_dispatch_error(
+                "index or trigger schema mutation",
+            )),
+        }
+    }
+
+    fn execute_drop_index_mutation(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<ExecutionResult> {
+        if self.drop_index(name)? || if_exists {
+            return Ok(ExecutionResult::SchemaChanged);
+        }
+        Err(RnovError::new(
+            ErrorKind::NotFound,
+            format!("index not found: {name}"),
+        ))
+    }
+
+    fn execute_mut_rows(&mut self, plan: &LogicalPlan) -> Result<ExecutionResult> {
+        match plan {
             LogicalPlan::Insert {
                 relation_id,
                 table,
                 columns,
                 values,
-            } => {
-                let values = self.evaluate_insert_values(values)?;
-                let column_crypto = self.column_crypto.clone();
-                let mut tables = self.write_tables()?;
-                let table = tables.get_mut(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                insert_values(table, *relation_id, columns, &values, &column_crypto)?;
-                Ok(ExecutionResult::RowsAffected(1))
-            }
+            } => self.execute_insert_mutation(*relation_id, table, columns, values),
             LogicalPlan::Update {
                 relation_id,
                 table,
                 assignments,
                 selection,
                 ..
-            } => {
-                let column_crypto = self.column_crypto.clone();
-                let mut tables = self.write_tables()?;
-                let table = tables.get_mut(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                update_rows(
-                    table,
-                    *relation_id,
-                    assignments,
-                    selection.as_ref(),
-                    &column_crypto,
-                    self.scalar_function_runtime.as_deref(),
-                )
-                .map(ExecutionResult::RowsAffected)
-            }
+            } => self.execute_update_mutation(*relation_id, table, assignments, selection.as_ref()),
             LogicalPlan::Delete {
                 relation_id,
                 table,
                 selection,
                 ..
-            } => {
-                let column_crypto = self.column_crypto.clone();
-                let mut tables = self.write_tables()?;
-                let table = tables.get_mut(table).ok_or_else(|| {
-                    RnovError::new(ErrorKind::NotFound, format!("table not found: {table}"))
-                })?;
-                delete_rows(
-                    table,
-                    *relation_id,
-                    selection.as_ref(),
-                    &column_crypto,
-                    self.scalar_function_runtime.as_deref(),
-                )
-                .map(ExecutionResult::RowsAffected)
-            }
-            _ => self.execute(plan).map(ExecutionResult::Batch),
+            } => self.execute_delete_mutation(*relation_id, table, selection.as_ref()),
+            _ => Err(logical_plan_dispatch_error("row mutation")),
         }
+    }
+
+    fn execute_insert_mutation(
+        &mut self,
+        relation_id: RelationId,
+        table_name: &str,
+        columns: &[String],
+        values: &[Expr],
+    ) -> Result<ExecutionResult> {
+        let values = self.evaluate_insert_values(values)?;
+        let column_crypto = self.column_crypto.clone();
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(table_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {table_name}"),
+            )
+        })?;
+        insert_values(table, relation_id, columns, &values, &column_crypto)?;
+        Ok(ExecutionResult::RowsAffected(1))
+    }
+
+    fn execute_update_mutation(
+        &mut self,
+        relation_id: RelationId,
+        table_name: &str,
+        assignments: &[(String, Expr)],
+        selection: Option<&Expr>,
+    ) -> Result<ExecutionResult> {
+        let column_crypto = self.column_crypto.clone();
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(table_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {table_name}"),
+            )
+        })?;
+        update_rows(
+            table,
+            relation_id,
+            assignments,
+            selection,
+            &column_crypto,
+            self.scalar_function_runtime.as_deref(),
+        )
+        .map(ExecutionResult::RowsAffected)
+    }
+
+    fn execute_delete_mutation(
+        &mut self,
+        relation_id: RelationId,
+        table_name: &str,
+        selection: Option<&Expr>,
+    ) -> Result<ExecutionResult> {
+        let column_crypto = self.column_crypto.clone();
+        let mut tables = self.write_tables()?;
+        let table = tables.get_mut(table_name).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("table not found: {table_name}"),
+            )
+        })?;
+        delete_rows(
+            table,
+            relation_id,
+            selection,
+            &column_crypto,
+            self.scalar_function_runtime.as_deref(),
+        )
+        .map(ExecutionResult::RowsAffected)
     }
 
     fn evaluate_insert_values(&self, values: &[Expr]) -> Result<Vec<SqlValue>> {
