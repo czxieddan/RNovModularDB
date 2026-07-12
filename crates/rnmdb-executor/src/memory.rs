@@ -659,6 +659,20 @@ impl MemoryTable {
         config: ParallelQueryConfig,
         cancellation: &CancellationToken,
     ) -> Result<()> {
+        self.validate_index_build_request(name, config, cancellation)?;
+        let index = MemoryTableIndex::new(name, &self.columns, keys, method, unique)?;
+        let index = self.populate_index(index, config, cancellation)?;
+        cancellation.check()?;
+        self.indexes.insert(name.to_string(), index);
+        Ok(())
+    }
+
+    fn validate_index_build_request(
+        &self,
+        name: &str,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
         config.validate()?;
         cancellation.check()?;
         if self.indexes.contains_key(name) {
@@ -667,21 +681,38 @@ impl MemoryTable {
                 format!("index already exists: {name}"),
             ));
         }
-        let mut index = MemoryTableIndex::new(name, &self.columns, keys, method, unique)?;
-        if self.rows.is_empty()
-            || config.worker_threads() == 1
-            || self.rows.len() < config.min_parallel_rows()
-        {
-            for (slot, row) in self.rows.iter().enumerate() {
-                cancellation.check()?;
-                index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
-            }
-        } else {
-            index = self.build_index_parallel(index, config, cancellation)?;
-        }
-        cancellation.check()?;
-        self.indexes.insert(name.to_string(), index);
         Ok(())
+    }
+
+    fn populate_index(
+        &self,
+        index: MemoryTableIndex,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<MemoryTableIndex> {
+        if self.should_build_index_parallel(config) {
+            self.build_index_parallel(index, config, cancellation)
+        } else {
+            self.build_index_sequential(index, cancellation)
+        }
+    }
+
+    fn should_build_index_parallel(&self, config: ParallelQueryConfig) -> bool {
+        !self.rows.is_empty()
+            && config.worker_threads() > 1
+            && self.rows.len() >= config.min_parallel_rows()
+    }
+
+    fn build_index_sequential(
+        &self,
+        mut index: MemoryTableIndex,
+        cancellation: &CancellationToken,
+    ) -> Result<MemoryTableIndex> {
+        for (slot, row) in self.rows.iter().enumerate() {
+            cancellation.check()?;
+            index.insert_row(&self.columns, row, pointer_for_slot(slot)?)?;
+        }
+        Ok(index)
     }
 
     fn build_index_parallel(
@@ -700,17 +731,11 @@ impl MemoryTable {
             let mut handles = Vec::with_capacity(worker_count);
             for (chunk_index, chunk) in self.rows.chunks(chunk_size).enumerate() {
                 let columns = &self.columns;
-                let mut local_index = index.empty_clone();
+                let local_index = index.empty_clone();
                 let cancellation = cancellation.clone();
                 let start_slot = chunk_index * chunk_size;
                 handles.push(scope.spawn(move || {
-                    for (offset, row) in chunk.iter().enumerate() {
-                        cancellation.check()?;
-                        let pointer = pointer_for_slot(start_slot + offset)?;
-                        local_index.insert_row(columns, row, pointer)?;
-                    }
-                    cancellation.check()?;
-                    Ok::<MemoryTableIndex, RnovError>(local_index)
+                    Self::build_index_chunk(local_index, columns, chunk, start_slot, &cancellation)
                 }));
             }
 
@@ -720,9 +745,23 @@ impl MemoryTable {
                 })??;
                 index.merge_from(local_index)?;
             }
-            Ok::<(), RnovError>(())
-        })?;
+            Ok(index)
+        })
+    }
 
+    fn build_index_chunk(
+        mut index: MemoryTableIndex,
+        columns: &[ColumnSchema],
+        rows: &[Row],
+        start_slot: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<MemoryTableIndex> {
+        for (offset, row) in rows.iter().enumerate() {
+            cancellation.check()?;
+            let pointer = pointer_for_slot(start_slot + offset)?;
+            index.insert_row(columns, row, pointer)?;
+        }
+        cancellation.check()?;
         Ok(index)
     }
 
