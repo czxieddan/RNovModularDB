@@ -6798,21 +6798,33 @@ fn replace_input_only_outer_refs(
             format: *format,
             input: Box::new(replace_logical_outer_refs(input, columns, row)?),
         }),
-        LogicalPlan::HashJoin {
-            kind,
-            left,
-            right,
-            left_key,
-            right_key,
-        } => Ok(LogicalPlan::HashJoin {
-            kind: *kind,
-            left: Box::new(replace_logical_outer_refs(left, columns, row)?),
-            right: Box::new(replace_logical_outer_refs(right, columns, row)?),
-            left_key: left_key.clone(),
-            right_key: right_key.clone(),
-        }),
+        LogicalPlan::HashJoin { .. } => replace_input_hash_join_outer_refs(plan, columns, row),
         _ => Ok(plan.clone()),
     }
+}
+
+fn replace_input_hash_join_outer_refs(
+    plan: &LogicalPlan,
+    columns: &[ColumnSchema],
+    row: &Row,
+) -> Result<LogicalPlan> {
+    let LogicalPlan::HashJoin {
+        kind,
+        left,
+        right,
+        left_key,
+        right_key,
+    } = plan
+    else {
+        unreachable!("replace_input_hash_join_outer_refs only accepts hash joins")
+    };
+    Ok(LogicalPlan::HashJoin {
+        kind: *kind,
+        left: Box::new(replace_logical_outer_refs(left, columns, row)?),
+        right: Box::new(replace_logical_outer_refs(right, columns, row)?),
+        left_key: left_key.clone(),
+        right_key: right_key.clone(),
+    })
 }
 
 fn replace_physical_outer_refs(
