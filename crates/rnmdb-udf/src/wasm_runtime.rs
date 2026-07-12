@@ -1,8 +1,8 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::Display,
     sync::{
-        Arc, Mutex,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
@@ -14,7 +14,8 @@ use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_types::{SqlType, SqlValue};
 
 use super::{
-    FunctionClass, FunctionKind, UdfBudget, UdfDefinition, UdfSandboxPolicy, WasmModuleDefinition,
+    FunctionClass, FunctionKind, UdfBudget, UdfDefinition, UdfSandboxPolicy, WasmModuleCacheKey,
+    WasmModuleDefinition,
 };
 
 const WASM_SCALAR_ENTRYPOINT: &str = "run";
@@ -29,13 +30,14 @@ pub struct WasmScalarRuntime {
 
 struct WasmRuntimeInner {
     engine: wasmtime::Engine,
-    compiled_modules: Mutex<CompiledModuleCache>,
+    compiled_modules: RwLock<CompiledModuleCache>,
     _epoch_ticker: EpochTicker,
 }
 
 #[derive(Default)]
 struct CompiledModuleCache {
-    entries: VecDeque<(Vec<u8>, wasmtime::Module)>,
+    entries: HashMap<WasmModuleCacheKey, wasmtime::Module>,
+    insertion_order: VecDeque<WasmModuleCacheKey>,
 }
 
 struct WasmStoreState {
@@ -65,7 +67,7 @@ impl WasmScalarRuntime {
         Ok(Self {
             inner: Arc::new(WasmRuntimeInner {
                 engine,
-                compiled_modules: Mutex::new(CompiledModuleCache::default()),
+                compiled_modules: RwLock::new(CompiledModuleCache::default()),
                 _epoch_ticker: epoch_ticker,
             }),
         })
@@ -154,20 +156,36 @@ impl WasmScalarRuntime {
     }
 
     fn compile_module(&self, module: &WasmModuleDefinition) -> Result<wasmtime::Module> {
-        let bytes = module.module_bytes();
-        let mut cache = self.inner.compiled_modules.lock().map_err(|_| {
-            RnovError::new(
-                ErrorKind::Internal,
-                "wasm compiled-module cache lock was poisoned",
-            )
-        })?;
-        if let Some(compiled) = cache.get(bytes) {
+        let cache_key = module.cache_key();
+        if let Some(compiled) = self.cached_module(&cache_key)? {
             return Ok(compiled);
         }
+        let bytes = module.module_bytes();
         let compiled = wasmtime::Module::from_binary(&self.inner.engine, bytes)
             .map_err(|err| wasm_invalid_guest_error("failed to compile wasm module", err))?;
-        cache.insert(bytes.to_vec(), compiled.clone());
-        Ok(compiled)
+        self.cache_compiled_module(cache_key, compiled)
+    }
+
+    fn cached_module(&self, cache_key: &WasmModuleCacheKey) -> Result<Option<wasmtime::Module>> {
+        let cache = self
+            .inner
+            .compiled_modules
+            .read()
+            .map_err(|_| module_cache_lock_error())?;
+        Ok(cache.get(cache_key))
+    }
+
+    fn cache_compiled_module(
+        &self,
+        cache_key: WasmModuleCacheKey,
+        compiled: wasmtime::Module,
+    ) -> Result<wasmtime::Module> {
+        let mut cache = self
+            .inner
+            .compiled_modules
+            .write()
+            .map_err(|_| module_cache_lock_error())?;
+        Ok(cache.insert(cache_key, compiled))
     }
 
     fn create_store(&self, policy: &UdfSandboxPolicy) -> Result<wasmtime::Store<WasmStoreState>> {
@@ -188,19 +206,39 @@ impl WasmScalarRuntime {
 }
 
 impl CompiledModuleCache {
-    fn get(&self, bytes: &[u8]) -> Option<wasmtime::Module> {
-        self.entries
-            .iter()
-            .find(|(cached_bytes, _)| cached_bytes == bytes)
-            .map(|(_, module)| module.clone())
+    fn get(&self, cache_key: &WasmModuleCacheKey) -> Option<wasmtime::Module> {
+        self.entries.get(cache_key).cloned()
     }
 
-    fn insert(&mut self, bytes: Vec<u8>, module: wasmtime::Module) {
-        if self.entries.len() >= MAX_CACHED_WASM_MODULES {
-            self.entries.pop_front();
+    fn insert(
+        &mut self,
+        cache_key: WasmModuleCacheKey,
+        module: wasmtime::Module,
+    ) -> wasmtime::Module {
+        if let Some(compiled) = self.get(&cache_key) {
+            return compiled;
         }
-        self.entries.push_back((bytes, module));
+        self.evict_oldest_if_full();
+        self.insertion_order.push_back(cache_key);
+        self.entries.insert(cache_key, module.clone());
+        module
     }
+
+    fn evict_oldest_if_full(&mut self) {
+        if self.entries.len() < MAX_CACHED_WASM_MODULES {
+            return;
+        }
+        if let Some(cache_key) = self.insertion_order.pop_front() {
+            self.entries.remove(&cache_key);
+        }
+    }
+}
+
+fn module_cache_lock_error() -> RnovError {
+    RnovError::new(
+        ErrorKind::Internal,
+        "wasm compiled-module cache lock was poisoned",
+    )
 }
 
 impl EpochTicker {

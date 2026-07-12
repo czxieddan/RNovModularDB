@@ -1087,6 +1087,7 @@ version = "0.1.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
+ "sha2",
  "wasmtime",
 ]
 

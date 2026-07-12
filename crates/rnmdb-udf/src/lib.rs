@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::FunctionId};
 use rnmdb_types::SqlType;
+use sha2::{Digest, Sha256};
 
 mod registry;
 mod wasm_runtime;
@@ -9,8 +10,9 @@ mod wasm_runtime;
 pub use registry::UdfRegistry;
 pub use wasm_runtime::WasmScalarRuntime;
 
-/// Maximum accepted module size; accepted modules are lazily compiled and cached by exact bytes.
+/// Maximum accepted module size; accepted modules are lazily compiled and cached by content key.
 pub const MAX_WASM_MODULE_BYTES: usize = 1024 * 1024;
+pub(crate) type WasmModuleCacheKey = [u8; 32];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UdfBudget {
@@ -89,6 +91,7 @@ pub enum WasmImportCapability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WasmModuleDefinition {
     module_bytes: Vec<u8>,
+    cache_key: WasmModuleCacheKey,
     initial_memory_bytes: usize,
     imports: Vec<WasmImportCapability>,
 }
@@ -113,8 +116,10 @@ impl WasmModuleDefinition {
                 ),
             ));
         }
+        let cache_key = wasm_module_cache_key(&module_bytes);
         Ok(Self {
             module_bytes,
+            cache_key,
             initial_memory_bytes,
             imports,
         })
@@ -122,6 +127,10 @@ impl WasmModuleDefinition {
 
     pub fn module_bytes(&self) -> &[u8] {
         &self.module_bytes
+    }
+
+    pub(crate) fn cache_key(&self) -> WasmModuleCacheKey {
+        self.cache_key
     }
 
     pub fn initial_memory_bytes(&self) -> usize {
@@ -169,6 +178,13 @@ impl WasmModuleDefinition {
 
         Ok(())
     }
+}
+
+fn wasm_module_cache_key(module_bytes: &[u8]) -> WasmModuleCacheKey {
+    let digest = Sha256::digest(module_bytes);
+    let mut cache_key = [0; 32];
+    cache_key.copy_from_slice(&digest);
+    cache_key
 }
 
 impl UdfSandboxPolicy {
