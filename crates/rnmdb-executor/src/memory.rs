@@ -1889,6 +1889,15 @@ struct SidewaysIndexLookupInput<'a> {
     outer_column: &'a str,
 }
 
+struct PreparedSidewaysLookup<'a> {
+    outer_rows: &'a [Row],
+    outer_column_index: usize,
+    inner: &'a MemoryTable,
+    inner_index: &'a str,
+    inner_column: &'a str,
+    columns: Vec<ColumnSchema>,
+}
+
 struct CreateIndexInput<'a> {
     name: &'a str,
     table: &'a str,
@@ -4239,25 +4248,15 @@ impl MemoryExecutor {
             )
         })?;
         let columns = joined_columns(outer_batch.columns(), inner.columns())?;
-        let mut rows = Vec::new();
-
-        for outer_row in outer_batch.rows() {
-            cancellation.check()?;
-            let lookup_value = &outer_row.values()[outer_column_index];
-            let inner_batch =
-                inner.index_point_lookup_value(inner_index, inner_column, lookup_value)?;
-            for inner_row in inner_batch.rows() {
-                cancellation.check()?;
-                let mut values =
-                    Vec::with_capacity(outer_row.values().len() + inner_row.values().len());
-                values.extend_from_slice(outer_row.values());
-                values.extend_from_slice(inner_row.values());
-                rows.push(Row::new(values));
-            }
-        }
-
-        cancellation.check()?;
-        VectorBatch::new(columns, rows)
+        join_sideways_lookup_rows(
+            outer_batch.rows(),
+            outer_column_index,
+            inner,
+            inner_index,
+            inner_column,
+            columns,
+            cancellation,
+        )
     }
 
     fn execute_sideways_index_lookup_parallel(
@@ -4277,33 +4276,62 @@ impl MemoryExecutor {
             )
         })?;
         let columns = joined_columns(outer_batch.columns(), inner.columns())?;
-        if outer_batch.rows().is_empty()
-            || config.worker_threads() == 1
-            || outer_batch.rows().len() < config.min_parallel_rows()
-        {
-            return join_sideways_lookup_rows(
-                outer_batch.rows(),
+        self.execute_prepared_sideways_lookup(
+            PreparedSidewaysLookup {
+                outer_rows: outer_batch.rows(),
                 outer_column_index,
                 inner,
+                inner_index: input.inner_index,
+                inner_column: input.inner_column,
+                columns,
+            },
+            config,
+            cancellation,
+        )
+    }
+
+    fn execute_prepared_sideways_lookup(
+        &self,
+        input: PreparedSidewaysLookup<'_>,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<VectorBatch> {
+        if !Self::should_parallelize_sideways(input.outer_rows.len(), config) {
+            return join_sideways_lookup_rows(
+                input.outer_rows,
+                input.outer_column_index,
+                input.inner,
                 input.inner_index,
                 input.inner_column,
-                columns,
+                input.columns,
                 cancellation,
             );
         }
+        let rows = Self::execute_parallel_sideways_rows(&input, config, cancellation)?;
+        cancellation.check()?;
+        VectorBatch::new(input.columns, rows)
+    }
 
-        let worker_count = config.worker_threads().min(outer_batch.rows().len());
-        let chunk_size = outer_batch.rows().len().div_ceil(worker_count);
-        let mut rows = Vec::new();
+    fn should_parallelize_sideways(row_count: usize, config: ParallelQueryConfig) -> bool {
+        row_count > 0 && config.worker_threads() > 1 && row_count >= config.min_parallel_rows()
+    }
+
+    fn execute_parallel_sideways_rows(
+        input: &PreparedSidewaysLookup<'_>,
+        config: ParallelQueryConfig,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<Row>> {
+        let worker_count = config.worker_threads().min(input.outer_rows.len());
+        let chunk_size = input.outer_rows.len().div_ceil(worker_count);
         thread::scope(|scope| {
             let mut handles = Vec::with_capacity(worker_count);
-            for chunk in outer_batch.rows().chunks(chunk_size) {
+            for chunk in input.outer_rows.chunks(chunk_size) {
                 let cancellation = cancellation.clone();
                 handles.push(scope.spawn(move || {
                     join_sideways_lookup_chunk(
                         chunk,
-                        outer_column_index,
-                        inner,
+                        input.outer_column_index,
+                        input.inner,
                         input.inner_index,
                         input.inner_column,
                         &cancellation,
@@ -4311,6 +4339,7 @@ impl MemoryExecutor {
                 }));
             }
 
+            let mut rows = Vec::new();
             for handle in handles {
                 let mut chunk_rows = handle.join().map_err(|_| {
                     RnovError::new(
@@ -4320,11 +4349,8 @@ impl MemoryExecutor {
                 })??;
                 rows.append(&mut chunk_rows);
             }
-            Ok::<(), RnovError>(())
-        })?;
-
-        cancellation.check()?;
-        VectorBatch::new(columns, rows)
+            Ok(rows)
+        })
     }
 
     fn execute_logical_sideways_lookup(
@@ -4336,7 +4362,6 @@ impl MemoryExecutor {
         cancellation: &CancellationToken,
     ) -> Result<VectorBatch> {
         let outer_batch = self.execute_cancellable(outer, cancellation)?;
-        let outer_column_index = column_index(outer_batch.columns(), outer_column)?;
         let tables = self.read_tables()?;
         let inner = tables.get(inner_table).ok_or_else(|| {
             RnovError::new(
@@ -4344,35 +4369,44 @@ impl MemoryExecutor {
                 format!("table not found: {inner_table}"),
             )
         })?;
+        let inner_index = Self::logical_sideways_index(inner, inner_table, inner_column)?;
+        let (outer_column_index, columns) =
+            Self::sideways_output_columns(&outer_batch, inner, outer_column)?;
+        join_sideways_lookup_rows(
+            outer_batch.rows(),
+            outer_column_index,
+            inner,
+            inner_index,
+            inner_column,
+            columns,
+            cancellation,
+        )
+    }
+
+    fn logical_sideways_index<'a>(
+        inner: &'a MemoryTable,
+        inner_table: &str,
+        inner_column: &str,
+    ) -> Result<&'a str> {
         let inner_column_index = column_index(inner.columns(), inner_column)?;
-        let inner_index = inner
+        inner
             .point_lookup_index_for_column(inner_column_index)
             .ok_or_else(|| {
                 RnovError::new(
                     ErrorKind::InvalidInput,
                     format!("JOIN LATERAL requires an index on {inner_table}.{inner_column}"),
                 )
-            })?;
-        let columns = joined_columns(outer_batch.columns(), inner.columns())?;
-        let mut rows = Vec::new();
+            })
+    }
 
-        for outer_row in outer_batch.rows() {
-            cancellation.check()?;
-            let lookup_value = &outer_row.values()[outer_column_index];
-            let inner_batch =
-                inner.index_point_lookup_value(inner_index, inner_column, lookup_value)?;
-            for inner_row in inner_batch.rows() {
-                cancellation.check()?;
-                let mut values =
-                    Vec::with_capacity(outer_row.values().len() + inner_row.values().len());
-                values.extend_from_slice(outer_row.values());
-                values.extend_from_slice(inner_row.values());
-                rows.push(Row::new(values));
-            }
-        }
-
-        cancellation.check()?;
-        VectorBatch::new(columns, rows)
+    fn sideways_output_columns(
+        outer: &VectorBatch,
+        inner: &MemoryTable,
+        outer_column: &str,
+    ) -> Result<(usize, Vec<ColumnSchema>)> {
+        let outer_column_index = column_index(outer.columns(), outer_column)?;
+        let columns = joined_columns(outer.columns(), inner.columns())?;
+        Ok((outer_column_index, columns))
     }
 
     pub fn execute_parallel(
