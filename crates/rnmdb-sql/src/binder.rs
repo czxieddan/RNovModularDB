@@ -62,6 +62,12 @@ struct CteSelectInput<'a> {
     offset: Option<usize>,
 }
 
+struct JoinBindingContext<'a> {
+    right_table: &'a Table,
+    joined_columns: Vec<LateralColumn>,
+    bound_columns: Vec<BoundColumn>,
+}
+
 struct ProjectionOutputs<'a> {
     projection: &'a mut Vec<BoundSelectItem>,
     columns: &'a mut Vec<BoundColumn>,
@@ -2006,37 +2012,29 @@ impl<'a> Binder<'a> {
         left_table: &Table,
         join: &JoinClause,
     ) -> Result<BoundStatement> {
-        self.validate_join_select_shape(input)?;
-        let right_table = self.resolve_table(&join.table)?;
-        self.require_table_privilege(input.role_id, right_table.relation_id(), Privilege::Select)?;
-
-        let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
-        let bound_columns = lateral_columns_to_bound(&joined_columns);
-        let hash_keys = hash_join_keys(&joined_columns, &join.on);
-        let predicate = self.rewrite_lateral_expr(&joined_columns, &join.on)?;
-        let predicate = self.bind_join_predicate_subqueries(
-            &joined_columns,
-            &bound_columns,
-            &predicate,
+        let context = self.bind_join_context(input, left_table, join)?;
+        let (predicate, hash_keys) = self.bind_join_on_predicate(
+            join,
+            &context.joined_columns,
+            &context.bound_columns,
             input.role_id,
         )?;
-        self.validate_predicate_from_columns(&bound_columns, &predicate)?;
         let (projection, columns) = self.bind_join_projection(
             input.select_items,
-            &joined_columns,
-            &bound_columns,
+            &context.joined_columns,
+            &context.bound_columns,
             input.role_id,
         )?;
         let selection = self.bind_join_selection(
             input.selection,
-            &joined_columns,
-            &bound_columns,
+            &context.joined_columns,
+            &context.bound_columns,
             input.role_id,
         )?;
         let order_by = self.bind_join_order_by(
             input.order_by,
-            &joined_columns,
-            &bound_columns,
+            &context.joined_columns,
+            &context.bound_columns,
             &projection,
             input.role_id,
         )?;
@@ -2065,15 +2063,53 @@ impl<'a> Binder<'a> {
             select,
             join: BoundJoin {
                 kind: join.kind,
-                right_relation_id: right_table.relation_id(),
+                right_relation_id: context.right_table.relation_id(),
                 right_table: join.table.clone(),
                 predicate,
                 hash_keys,
                 applied_row_policies: self
-                    .applied_row_policy_names(input.role_id, right_table.relation_id()),
-                row_policy_predicates: self.bind_row_policies(input.role_id, right_table)?,
+                    .applied_row_policy_names(input.role_id, context.right_table.relation_id()),
+                row_policy_predicates: self
+                    .bind_row_policies(input.role_id, context.right_table)?,
             },
         }))
+    }
+
+    fn bind_join_context<'b>(
+        &'b self,
+        input: &SelectInput<'_>,
+        left_table: &Table,
+        join: &JoinClause,
+    ) -> Result<JoinBindingContext<'b>> {
+        self.validate_join_select_shape(input)?;
+        let right_table = self.resolve_table(&join.table)?;
+        self.require_table_privilege(input.role_id, right_table.relation_id(), Privilege::Select)?;
+        let joined_columns = join_clause_columns(left_table, right_table, join.kind)?;
+        let bound_columns = lateral_columns_to_bound(&joined_columns);
+        Ok(JoinBindingContext {
+            right_table,
+            joined_columns,
+            bound_columns,
+        })
+    }
+
+    fn bind_join_on_predicate(
+        &self,
+        join: &JoinClause,
+        joined_columns: &[LateralColumn],
+        bound_columns: &[BoundColumn],
+        role_id: RoleId,
+    ) -> Result<(Expr, Option<BoundHashJoinKeys>)> {
+        let hash_keys = hash_join_keys(joined_columns, &join.on);
+        let predicate = self.rewrite_lateral_expr(joined_columns, &join.on)?;
+        let predicate = self.bind_join_predicate_subqueries(
+            joined_columns,
+            bound_columns,
+            &predicate,
+            role_id,
+        )?;
+        self.validate_predicate_from_columns(bound_columns, &predicate)?;
+        Ok((predicate, hash_keys))
     }
 
     fn validate_join_select_shape(&self, input: &SelectInput<'_>) -> Result<()> {
