@@ -2639,7 +2639,14 @@ impl MemoryExecutor {
             );
         }
         let subquery = self.execute_cancellable(subquery, cancellation)?;
-        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+        apply_in_subquery_filter_cancellable(
+            input,
+            subquery,
+            expr,
+            negated,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
     }
 
     fn apply_correlated_logical_in_filter(
@@ -2656,7 +2663,14 @@ impl MemoryExecutor {
             let subquery = replace_logical_outer_refs(subquery, input.columns(), row)?;
             let subquery = self.execute_cancellable(&subquery, cancellation)?;
             let values = collect_in_subquery_values(&subquery, cancellation)?;
-            if in_subquery_keeps_row(input.columns(), row, expr, &values, negated)? {
+            if in_subquery_keeps_row(
+                input.columns(),
+                row,
+                expr,
+                &values,
+                negated,
+                self.scalar_function_runtime.as_deref(),
+            )? {
                 rows.push(row.clone());
             }
         }
@@ -2743,7 +2757,14 @@ impl MemoryExecutor {
             );
         }
         let subquery = self.execute_physical_cancellable(subquery, cancellation)?;
-        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+        apply_in_subquery_filter_cancellable(
+            input,
+            subquery,
+            expr,
+            negated,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
     }
 
     fn apply_physical_in_subquery_filter_parallel(
@@ -2767,7 +2788,14 @@ impl MemoryExecutor {
         }
         let subquery =
             self.execute_physical_parallel_cancellable(subquery, config, cancellation)?;
-        apply_in_subquery_filter_cancellable(input, subquery, expr, negated, cancellation)
+        apply_in_subquery_filter_cancellable(
+            input,
+            subquery,
+            expr,
+            negated,
+            self.scalar_function_runtime.as_deref(),
+            cancellation,
+        )
     }
 
     fn apply_correlated_physical_in_filter(
@@ -2790,7 +2818,14 @@ impl MemoryExecutor {
                 cancellation,
             )?;
             let values = collect_in_subquery_values(&subquery, cancellation)?;
-            if in_subquery_keeps_row(input.columns(), row, expr, &values, negated)? {
+            if in_subquery_keeps_row(
+                input.columns(),
+                row,
+                expr,
+                &values,
+                negated,
+                self.scalar_function_runtime.as_deref(),
+            )? {
                 rows.push(row.clone());
             }
         }
@@ -3245,7 +3280,14 @@ impl MemoryExecutor {
         let expr = self.resolve_subqueries_for_row(expr, columns, row, cancellation)?;
         let batch = self.execute_select_subquery_for_row(query, columns, row, cancellation)?;
         let values = collect_in_subquery_values(&batch, cancellation)?;
-        in_subquery_value(columns, row, &expr, &values, negated)
+        in_subquery_value(
+            columns,
+            row,
+            &expr,
+            &values,
+            negated,
+            self.scalar_function_runtime.as_deref(),
+        )
     }
 
     fn resolve_exists_subquery_for_row(
@@ -6477,13 +6519,14 @@ fn apply_in_subquery_filter_cancellable(
     subquery: VectorBatch,
     expr: &Expr,
     negated: bool,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
     cancellation: &CancellationToken,
 ) -> Result<VectorBatch> {
     let values = collect_in_subquery_values(&subquery, cancellation)?;
     let mut rows = Vec::new();
     for row in batch.rows() {
         cancellation.check()?;
-        if in_subquery_keeps_row(batch.columns(), row, expr, &values, negated)? {
+        if in_subquery_keeps_row(batch.columns(), row, expr, &values, negated, runtime)? {
             rows.push(row.clone());
         }
     }
@@ -6523,9 +6566,10 @@ fn in_subquery_keeps_row(
     expr: &Expr,
     values: &InSubqueryValues,
     negated: bool,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<bool> {
     Ok(matches!(
-        in_subquery_value(columns, row, expr, values, negated)?,
+        in_subquery_value(columns, row, expr, values, negated, runtime)?,
         SqlValue::Bool(true)
     ))
 }
@@ -6536,8 +6580,12 @@ fn in_subquery_value(
     expr: &Expr,
     values: &InSubqueryValues,
     negated: bool,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
 ) -> Result<SqlValue> {
-    let value = eval_expr(columns, row, expr)?;
+    let value = eval_expr_with_runtime(runtime, columns, row, expr)?;
+    if values.values.is_empty() && !values.has_null {
+        return Ok(SqlValue::Bool(negated));
+    }
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
