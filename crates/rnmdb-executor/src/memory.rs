@@ -8973,46 +8973,54 @@ fn eval_text_phrase_match(columns: &[ColumnSchema], row: &Row, args: &[Expr]) ->
         return Ok(SqlValue::Bool(false));
     };
 
-    let phrase_text = match eval_expr(columns, row, &args[1])? {
-        SqlValue::Null => return Ok(SqlValue::Bool(false)),
-        SqlValue::Text(phrase) => phrase,
-        other => {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "text_phrase_match phrase argument requires TEXT, got {:?}",
-                    other.data_type()
-                ),
-            ));
-        }
+    let Some(phrase_text) = eval_text_phrase(columns, row, &args[1])? else {
+        return Ok(SqlValue::Bool(false));
     };
-    let max_gap = match eval_expr(columns, row, &args[2])? {
-        SqlValue::Null => return Ok(SqlValue::Bool(false)),
-        SqlValue::Int64(max_gap) if max_gap > 0 => u32::try_from(max_gap).map_err(|_| {
-            RnovError::new(
-                ErrorKind::InvalidInput,
-                "text_phrase_match gap argument exceeds UINT32",
-            )
-        })?,
-        SqlValue::Int64(_) => {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "text_phrase_match gap argument must be greater than zero",
-            ));
-        }
-        other => {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "text_phrase_match gap argument requires INT64, got {:?}",
-                    other.data_type()
-                ),
-            ));
-        }
+    let Some(max_gap) = eval_text_phrase_gap(columns, row, &args[2])? else {
+        return Ok(SqlValue::Bool(false));
     };
 
     let phrase = TextPhraseQuery::within(phrase_text.split_whitespace(), max_gap)?;
     Ok(SqlValue::Bool(phrase.matches(&vector)))
+}
+
+fn eval_text_phrase(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<Option<String>> {
+    match eval_expr(columns, row, expr)? {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(phrase) => Ok(Some(phrase)),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "text_phrase_match phrase argument requires TEXT, got {:?}",
+                other.data_type()
+            ),
+        )),
+    }
+}
+
+fn eval_text_phrase_gap(columns: &[ColumnSchema], row: &Row, expr: &Expr) -> Result<Option<u32>> {
+    match eval_expr(columns, row, expr)? {
+        SqlValue::Null => Ok(None),
+        SqlValue::Int64(max_gap) if max_gap > 0 => u32::try_from(max_gap)
+            .map_err(|_| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "text_phrase_match gap argument exceeds UINT32",
+                )
+            })
+            .map(Some),
+        SqlValue::Int64(_) => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "text_phrase_match gap argument must be greater than zero",
+        )),
+        other => Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "text_phrase_match gap argument requires INT64, got {:?}",
+                other.data_type()
+            ),
+        )),
+    }
 }
 
 fn eval_binary_expr(
