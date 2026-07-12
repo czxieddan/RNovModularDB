@@ -120,7 +120,18 @@ enum OuterQueryScope<'a> {
 #[derive(Clone, Copy)]
 enum ExpressionTypeScope<'a> {
     Table(&'a Table),
+    Policy(&'a Table),
     Grouped(&'a [BoundSelectItem]),
+}
+
+impl ExpressionTypeScope<'_> {
+    fn is_policy(self) -> bool {
+        matches!(self, Self::Policy(_))
+    }
+
+    fn unknown_type(self, policy_type: SqlType) -> Option<SqlType> {
+        self.is_policy().then_some(policy_type)
+    }
 }
 
 impl<'a> Binder<'a> {
@@ -4237,227 +4248,7 @@ impl<'a> Binder<'a> {
     }
 
     fn infer_policy_expr_type(&self, table: &Table, expr: &Expr) -> Result<Option<SqlType>> {
-        match expr {
-            Expr::Identifier(identifier) => {
-                let column = self.resolve_column(table, identifier.as_str())?;
-                Ok(Some(column.data_type))
-            }
-            Expr::QualifiedIdentifier { qualifier, name } => {
-                self.ensure_table_qualifier(table, qualifier)?;
-                let column = self.resolve_column(table, name.as_str())?;
-                Ok(Some(column.data_type))
-            }
-            Expr::Integer(_) => Ok(Some(SqlType::Int64)),
-            Expr::Float64(_) => Ok(Some(SqlType::Float64)),
-            Expr::String(_) => Ok(Some(SqlType::Text)),
-            Expr::Bool(_) => Ok(Some(SqlType::Bool)),
-            Expr::Null => Ok(Some(SqlType::Null)),
-            Expr::RuntimeValue(value) => Ok(Some(value.data_type())),
-            Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
-            Expr::CountStar => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "COUNT(*) is only supported as a SELECT projection",
-            )),
-            Expr::Count(_) | Expr::CountDistinct(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "COUNT(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Sum(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "SUM(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Min(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "MIN(expr) is only supported as a SELECT projection",
-            )),
-            Expr::Max(_) => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "MAX(expr) is only supported as a SELECT projection",
-            )),
-            Expr::RowNumberOver { .. } | Expr::RankOver { .. } | Expr::DenseRankOver { .. } => {
-                Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "window expressions are only supported as SELECT projections",
-                ))
-            }
-            Expr::Array(values) => self
-                .infer_array_expr_type(values, |value| self.infer_policy_expr_type(table, value)),
-            Expr::HStore(_) => Ok(Some(SqlType::HStore)),
-            Expr::Range { lower, upper, .. } => {
-                self.infer_range_expr_type(lower, upper, false, |expr| {
-                    self.infer_policy_expr_type(table, expr)
-                })
-            }
-            Expr::Binary { left, right, .. } => {
-                let left_type = self.infer_policy_expr_type(table, left)?;
-                let right_type = self.infer_policy_expr_type(table, right)?;
-                match (left_type, right_type) {
-                    (Some(left_type), Some(right_type)) => {
-                        self.infer_operator_result_type(expr, &left_type, &right_type)
-                    }
-                    _ => Ok(policy_unknown_side_operator_type(expr)),
-                }
-            }
-            Expr::Unary { op, expr } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Int64));
-                };
-                self.infer_unary_arithmetic_result_type(op, &data_type)
-            }
-            Expr::Not(expr) => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_not_result_type(&data_type)
-            }
-            Expr::IsNull { expr, .. } => {
-                let _ = self.infer_policy_expr_type(table, expr)?;
-                Ok(Some(SqlType::Bool))
-            }
-            Expr::IsTruth { expr, value, .. } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_truth_test_result_type(truth_test_name(*value), &data_type)
-            }
-            Expr::IsUnknown { expr, .. } => {
-                let Some(data_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_truth_test_result_type("IS UNKNOWN", &data_type)
-            }
-            Expr::IsDistinctFrom { left, right, .. } => {
-                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_null_safe_comparison_result_type(
-                    "IS DISTINCT FROM",
-                    &left_type,
-                    &right_type,
-                )
-            }
-            Expr::Between {
-                expr, low, high, ..
-            } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(low_type) = self.infer_policy_expr_type(table, low)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(high_type) = self.infer_policy_expr_type(table, high)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_between_result_type(&expr_type, &low_type, &high_type)
-            }
-            Expr::InList { expr, values, .. } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(value_types) = self.infer_expr_type_list(values, |value| {
-                    self.infer_policy_expr_type(table, value)
-                })?
-                else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_in_list_result_type(&expr_type, &value_types)
-            }
-            Expr::InSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "row policy predicates do not support subqueries",
-            )),
-            Expr::ExistsSubquery { .. } => Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "row policy predicates do not support subqueries",
-            )),
-            Expr::Like { expr, pattern, .. } => {
-                let Some(expr_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                let Some(pattern_type) = self.infer_policy_expr_type(table, pattern)? else {
-                    return Ok(Some(SqlType::Bool));
-                };
-                self.infer_like_result_type(&expr_type, &pattern_type)
-            }
-            Expr::Coalesce(values) => {
-                let Some(value_types) = self.infer_expr_type_list(values, |value| {
-                    self.infer_policy_expr_type(table, value)
-                })?
-                else {
-                    return Ok(None);
-                };
-                self.infer_coalesce_result_type(&value_types)
-            }
-            Expr::NullIf { left, right } => {
-                let Some(left_type) = self.infer_policy_expr_type(table, left)? else {
-                    return Ok(None);
-                };
-                let Some(right_type) = self.infer_policy_expr_type(table, right)? else {
-                    return Ok(None);
-                };
-                self.infer_nullif_result_type(&left_type, &right_type)
-            }
-            Expr::Case {
-                operand,
-                whens,
-                else_expr,
-            } => {
-                let operand_type = match operand {
-                    Some(operand) => match self.infer_policy_expr_type(table, operand)? {
-                        Some(data_type) => Some(data_type),
-                        None => return Ok(None),
-                    },
-                    None => None,
-                };
-                let mut result_types = Vec::with_capacity(whens.len());
-                for arm in whens {
-                    let Some(condition_type) =
-                        self.infer_policy_expr_type(table, &arm.condition)?
-                    else {
-                        return Ok(None);
-                    };
-                    self.infer_case_condition_type(operand_type.as_ref(), &condition_type)?;
-                    let Some(result_type) = self.infer_policy_expr_type(table, &arm.result)? else {
-                        return Ok(None);
-                    };
-                    result_types.push(result_type);
-                }
-                let else_type = match else_expr {
-                    Some(else_expr) => self.infer_policy_expr_type(table, else_expr)?,
-                    None => Some(SqlType::Null),
-                };
-                let Some(else_type) = else_type else {
-                    return Ok(None);
-                };
-                self.infer_case_result_type(&result_types, &else_type)
-            }
-            Expr::Cast { expr, data_type } => {
-                let Some(source_type) = self.infer_policy_expr_type(table, expr)? else {
-                    return Ok(Some(data_type.clone()));
-                };
-                self.infer_cast_result_type(&source_type, data_type)
-            }
-            Expr::Call { name, args, .. } => {
-                let Some(argument_types) =
-                    self.infer_expr_type_list(args, |arg| self.infer_policy_expr_type(table, arg))?
-                else {
-                    return Ok(None);
-                };
-
-                Ok(self
-                    .catalog
-                    .functions()
-                    .iter()
-                    .find(|function| {
-                        function.name() == name.object()
-                            && function.argument_types() == argument_types
-                    })
-                    .map(|function| function.return_type().clone()))
-            }
-        }
+        self.infer_scoped_expr_type(ExpressionTypeScope::Policy(table), expr)
     }
 
     fn ensure_expr_assignable(
@@ -4516,7 +4307,7 @@ impl<'a> Binder<'a> {
             | Expr::Null
             | Expr::RuntimeValue(_) => Self::infer_bound_literal_type(expr),
             Expr::ScalarSubquery { .. } | Expr::InSubquery { .. } | Expr::ExistsSubquery { .. } => {
-                self.infer_scoped_subquery_type(expr)
+                self.infer_scoped_subquery_type(scope, expr)
             }
             Expr::CountStar
             | Expr::Count(_)
@@ -4568,7 +4359,7 @@ impl<'a> Binder<'a> {
         identifier: &Ident,
     ) -> Result<Option<SqlType>> {
         match scope {
-            ExpressionTypeScope::Table(table) => {
+            ExpressionTypeScope::Table(table) | ExpressionTypeScope::Policy(table) => {
                 let column = self.resolve_column(table, identifier.as_str())?;
                 Ok(Some(column.data_type))
             }
@@ -4595,7 +4386,7 @@ impl<'a> Binder<'a> {
         name: &Ident,
     ) -> Result<Option<SqlType>> {
         match scope {
-            ExpressionTypeScope::Table(table) => {
+            ExpressionTypeScope::Table(table) | ExpressionTypeScope::Policy(table) => {
                 self.ensure_table_qualifier(table, qualifier)?;
                 let column = self.resolve_column(table, name.as_str())?;
                 Ok(Some(column.data_type))
@@ -4607,17 +4398,36 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn infer_scoped_subquery_type(&self, expr: &Expr) -> Result<Option<SqlType>> {
+    fn infer_scoped_subquery_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        expr: &Expr,
+    ) -> Result<Option<SqlType>> {
         match expr {
             Expr::ScalarSubquery { query } => self.infer_bound_scalar_subquery_type(query),
             Expr::InSubquery { query, .. } => {
-                self.infer_bound_predicate_subquery_type(query, "IN subquery")
+                self.infer_scoped_predicate_subquery_type(scope, query, "IN subquery")
             }
             Expr::ExistsSubquery { query } => {
-                self.infer_bound_predicate_subquery_type(query, "EXISTS subquery")
+                self.infer_scoped_predicate_subquery_type(scope, query, "EXISTS subquery")
             }
             _ => Err(expression_type_inference_error("subquery")),
         }
+    }
+
+    fn infer_scoped_predicate_subquery_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        query: &SelectSubquery,
+        context: &str,
+    ) -> Result<Option<SqlType>> {
+        if scope.is_policy() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "row policy predicates do not support subqueries",
+            ));
+        }
+        self.infer_bound_predicate_subquery_type(query, context)
     }
 
     fn reject_scoped_special_expression(
@@ -4669,7 +4479,7 @@ impl<'a> Binder<'a> {
         grouped_message: &'static str,
     ) -> Result<Option<SqlType>> {
         let message = match scope {
-            ExpressionTypeScope::Table(_) => table_message,
+            ExpressionTypeScope::Table(_) | ExpressionTypeScope::Policy(_) => table_message,
             ExpressionTypeScope::Grouped(_) => grouped_message,
         };
         Err(RnovError::new(ErrorKind::InvalidInput, message))
@@ -4685,7 +4495,7 @@ impl<'a> Binder<'a> {
                 .infer_array_expr_type(values, |value| self.infer_scoped_expr_type(scope, value)),
             Expr::HStore(_) => Ok(Some(SqlType::HStore)),
             Expr::Range { lower, upper, .. } => {
-                self.infer_range_expr_type(lower, upper, true, |value| {
+                self.infer_range_expr_type(lower, upper, !scope.is_policy(), |value| {
                     self.infer_scoped_expr_type(scope, value)
                 })
             }
@@ -4722,6 +4532,9 @@ impl<'a> Binder<'a> {
         left: &Expr,
         right: &Expr,
     ) -> Result<Option<SqlType>> {
+        if scope.is_policy() {
+            return self.infer_policy_binary_type(scope, binary, left, right);
+        }
         let Some(left_type) = self.infer_scoped_expr_type(scope, left)? else {
             return Ok(None);
         };
@@ -4731,6 +4544,23 @@ impl<'a> Binder<'a> {
         self.infer_operator_result_type(binary, &left_type, &right_type)
     }
 
+    fn infer_policy_binary_type(
+        &self,
+        scope: ExpressionTypeScope<'_>,
+        binary: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<SqlType>> {
+        let left_type = self.infer_scoped_expr_type(scope, left)?;
+        let right_type = self.infer_scoped_expr_type(scope, right)?;
+        match (left_type, right_type) {
+            (Some(left_type), Some(right_type)) => {
+                self.infer_operator_result_type(binary, &left_type, &right_type)
+            }
+            _ => Ok(policy_unknown_side_operator_type(binary)),
+        }
+    }
+
     fn infer_scoped_unary_type(
         &self,
         scope: ExpressionTypeScope<'_>,
@@ -4738,7 +4568,7 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Int64));
         };
         self.infer_unary_arithmetic_result_type(op, &data_type)
     }
@@ -4749,7 +4579,7 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_not_result_type(&data_type)
     }
@@ -4770,7 +4600,7 @@ impl<'a> Binder<'a> {
         expr: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(data_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_truth_test_result_type(name, &data_type)
     }
@@ -4802,10 +4632,10 @@ impl<'a> Binder<'a> {
         right: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(left_type) = self.infer_scoped_expr_type(scope, left)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         let Some(right_type) = self.infer_scoped_expr_type(scope, right)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_null_safe_comparison_result_type("IS DISTINCT FROM", &left_type, &right_type)
     }
@@ -4818,13 +4648,13 @@ impl<'a> Binder<'a> {
         high: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         let Some(low_type) = self.infer_scoped_expr_type(scope, low)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         let Some(high_type) = self.infer_scoped_expr_type(scope, high)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_between_result_type(&expr_type, &low_type, &high_type)
     }
@@ -4836,12 +4666,12 @@ impl<'a> Binder<'a> {
         values: &[Expr],
     ) -> Result<Option<SqlType>> {
         let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         let Some(value_types) =
             self.infer_expr_type_list(values, |value| self.infer_scoped_expr_type(scope, value))?
         else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_in_list_result_type(&expr_type, &value_types)
     }
@@ -4853,10 +4683,10 @@ impl<'a> Binder<'a> {
         pattern: &Expr,
     ) -> Result<Option<SqlType>> {
         let Some(expr_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         let Some(pattern_type) = self.infer_scoped_expr_type(scope, pattern)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(SqlType::Bool));
         };
         self.infer_like_result_type(&expr_type, &pattern_type)
     }
@@ -4974,7 +4804,7 @@ impl<'a> Binder<'a> {
         data_type: &SqlType,
     ) -> Result<Option<SqlType>> {
         let Some(source_type) = self.infer_scoped_expr_type(scope, expr)? else {
-            return Ok(None);
+            return Ok(scope.unknown_type(data_type.clone()));
         };
         self.infer_cast_result_type(&source_type, data_type)
     }
@@ -4998,16 +4828,20 @@ impl<'a> Binder<'a> {
         else {
             return Ok(None);
         };
-        let function = self
+        let return_type = self
             .catalog
             .get_function(name.object(), &argument_types)
-            .ok_or_else(|| {
-                RnovError::new(
-                    ErrorKind::NotFound,
-                    format!("function does not exist: {name}"),
-                )
-            })?;
-        Ok(Some(function.return_type().clone()))
+            .map(|function| function.return_type().clone());
+        if scope.is_policy() {
+            return Ok(return_type);
+        }
+        let return_type = return_type.ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::NotFound,
+                format!("function does not exist: {name}"),
+            )
+        })?;
+        Ok(Some(return_type))
     }
 
     fn infer_array_expr_type<F>(&self, values: &[Expr], mut infer: F) -> Result<Option<SqlType>>
