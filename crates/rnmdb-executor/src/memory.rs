@@ -9030,54 +9030,105 @@ fn eval_binary_expr(
     op: &str,
     right: &Expr,
 ) -> Result<SqlValue> {
-    match op {
-        "AND" | "OR" => eval_boolean_connector(columns, row, left, op, right),
-        "+" | "-" | "*" | "/" | "%" => eval_arithmetic_expr(columns, row, left, op, right),
-        "||" => eval_text_concat_expr(columns, row, left, right),
-        "&&" => eval_range_overlap_expr(columns, row, left, right),
-        "@>" => eval_contains_expr(columns, row, left, right),
-        "?" => eval_hstore_key_expr(columns, row, left, right),
-        "=" | "<>" | "!=" => {
-            let left = eval_expr(columns, row, left)?;
-            let right = eval_expr(columns, row, right)?;
-            let truth = left.sql_eq(&right);
-            Ok(SqlValue::Bool(match op {
-                "=" => truth == Truth::True,
-                "<>" | "!=" => truth == Truth::False,
-                _ => unreachable!("matched equality operators"),
-            }))
-        }
-        "<" | "<=" | ">" | ">=" => {
-            let left = eval_expr(columns, row, left)?;
-            let right = eval_expr(columns, row, right)?;
-            let Some(ordering) = left.sql_cmp(&right)? else {
-                return Ok(SqlValue::Bool(false));
-            };
-            Ok(SqlValue::Bool(match op {
-                "<" => ordering == Ordering::Less,
-                "<=" => matches!(ordering, Ordering::Less | Ordering::Equal),
-                ">" => ordering == Ordering::Greater,
-                ">=" => matches!(ordering, Ordering::Greater | Ordering::Equal),
-                _ => unreachable!("matched ordering operators"),
-            }))
-        }
-        "@@" => {
-            let left = eval_expr(columns, row, left)?;
-            let SqlValue::Text(query) = eval_expr(columns, row, right)? else {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "text search expression requires a text query",
-                ));
-            };
-            let query = TextQuery::parse(&query)?;
-            let builder = TextVectorBuilder::new(SimpleTokenizer::new());
-            Ok(SqlValue::Bool(text_value_matches(&left, &query, &builder)?))
-        }
-        other => Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("memory projection does not support operator {other}"),
-        )),
+    if let Some(result) = try_eval_binary_value_operator(columns, row, left, op, right) {
+        return result;
     }
+    if let Some(result) = try_eval_binary_comparison(columns, row, left, op, right) {
+        return result;
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("memory projection does not support operator {op}"),
+    ))
+}
+
+fn try_eval_binary_value_operator(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Option<Result<SqlValue>> {
+    match op {
+        "AND" | "OR" => Some(eval_boolean_connector(columns, row, left, op, right)),
+        "+" | "-" | "*" | "/" | "%" => Some(eval_arithmetic_expr(columns, row, left, op, right)),
+        "||" => Some(eval_text_concat_expr(columns, row, left, right)),
+        "&&" => Some(eval_range_overlap_expr(columns, row, left, right)),
+        "@>" => Some(eval_contains_expr(columns, row, left, right)),
+        "?" => Some(eval_hstore_key_expr(columns, row, left, right)),
+        _ => None,
+    }
+}
+
+fn try_eval_binary_comparison(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Option<Result<SqlValue>> {
+    match op {
+        "=" | "<>" | "!=" => Some(eval_equality_expr(columns, row, left, op, right)),
+        "<" | "<=" | ">" | ">=" => Some(eval_ordering_expr(columns, row, left, op, right)),
+        "@@" => Some(eval_text_search_expr(columns, row, left, right)),
+        _ => None,
+    }
+}
+
+fn eval_equality_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    let truth = left.sql_eq(&right);
+    Ok(SqlValue::Bool(match op {
+        "=" => truth == Truth::True,
+        "<>" | "!=" => truth == Truth::False,
+        _ => unreachable!("matched equality operators"),
+    }))
+}
+
+fn eval_ordering_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    op: &str,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let right = eval_expr(columns, row, right)?;
+    let Some(ordering) = left.sql_cmp(&right)? else {
+        return Ok(SqlValue::Bool(false));
+    };
+    Ok(SqlValue::Bool(match op {
+        "<" => ordering == Ordering::Less,
+        "<=" => matches!(ordering, Ordering::Less | Ordering::Equal),
+        ">" => ordering == Ordering::Greater,
+        ">=" => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        _ => unreachable!("matched ordering operators"),
+    }))
+}
+
+fn eval_text_search_expr(
+    columns: &[ColumnSchema],
+    row: &Row,
+    left: &Expr,
+    right: &Expr,
+) -> Result<SqlValue> {
+    let left = eval_expr(columns, row, left)?;
+    let SqlValue::Text(query) = eval_expr(columns, row, right)? else {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "text search expression requires a text query",
+        ));
+    };
+    let query = TextQuery::parse(&query)?;
+    let builder = TextVectorBuilder::new(SimpleTokenizer::new());
+    Ok(SqlValue::Bool(text_value_matches(&left, &query, &builder)?))
 }
 
 fn eval_contains_expr(
