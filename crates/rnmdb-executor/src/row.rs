@@ -27,64 +27,83 @@ impl RowCodec {
     }
 
     pub fn decode(columns: &[ColumnSchema], bytes: &[u8]) -> Result<Row> {
-        let version = *bytes.first().ok_or_else(|| {
-            RnovError::new(ErrorKind::InvalidInput, "truncated row encoding version")
-        })?;
-        if version != Self::VERSION {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!("unsupported row encoding version {version}"),
-            ));
-        }
-        if bytes.len() < 1 + Self::CHECKSUM_LEN {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "truncated row checksum",
-            ));
-        }
-
-        let checksum_offset = bytes.len() - Self::CHECKSUM_LEN;
-        let (payload, stored_checksum) = bytes.split_at(checksum_offset);
-        let expected_checksum = checksum(payload).to_be_bytes();
-        if expected_checksum.as_slice() != stored_checksum {
-            return Err(RnovError::new(
-                ErrorKind::Corruption,
-                "row checksum mismatch",
-            ));
-        }
-
+        validate_row_version(bytes)?;
+        let payload = verified_row_payload(bytes)?;
         let mut cursor = Cursor::new(payload);
         let _ = cursor.read_u8("row encoding version")?;
-
-        let value_count = cursor.read_u32("row value count")? as usize;
-        if value_count != columns.len() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "row value count {value_count} does not match schema column count {}",
-                    columns.len()
-                ),
-            ));
-        }
-
-        let mut values = Vec::with_capacity(value_count);
-        for _ in 0..value_count {
-            let len = cursor.read_u32("row value payload length")? as usize;
-            values.push(SqlValue::decode(
-                cursor.read_exact(len, "row value payload")?,
-            )?);
-        }
-        if !cursor.is_complete() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "row payload has trailing bytes",
-            ));
-        }
-
+        let value_count = read_row_value_count(&mut cursor, columns.len())?;
+        let values = read_row_values(&mut cursor, value_count)?;
+        ensure_row_payload_complete(&cursor)?;
         let row = Row::new(values);
         let _ = VectorBatch::new(columns.to_vec(), vec![row.clone()])?;
         Ok(row)
     }
+}
+
+fn validate_row_version(bytes: &[u8]) -> Result<()> {
+    let version = *bytes
+        .first()
+        .ok_or_else(|| RnovError::new(ErrorKind::InvalidInput, "truncated row encoding version"))?;
+    if version == RowCodec::VERSION {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("unsupported row encoding version {version}"),
+    ))
+}
+
+fn verified_row_payload(bytes: &[u8]) -> Result<&[u8]> {
+    if bytes.len() < 1 + RowCodec::CHECKSUM_LEN {
+        return Err(RnovError::new(
+            ErrorKind::Corruption,
+            "truncated row checksum",
+        ));
+    }
+    let checksum_offset = bytes.len() - RowCodec::CHECKSUM_LEN;
+    let (payload, stored_checksum) = bytes.split_at(checksum_offset);
+    if checksum(payload).to_be_bytes().as_slice() == stored_checksum {
+        return Ok(payload);
+    }
+    Err(RnovError::new(
+        ErrorKind::Corruption,
+        "row checksum mismatch",
+    ))
+}
+
+fn read_row_value_count(cursor: &mut Cursor<'_>, column_count: usize) -> Result<usize> {
+    let value_count = cursor.read_u32("row value count")? as usize;
+    if value_count == column_count {
+        return Ok(value_count);
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("row value count {value_count} does not match schema column count {column_count}"),
+    ))
+}
+
+fn read_row_values(cursor: &mut Cursor<'_>, value_count: usize) -> Result<Vec<SqlValue>> {
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(read_row_value(cursor)?);
+    }
+    Ok(values)
+}
+
+fn read_row_value(cursor: &mut Cursor<'_>) -> Result<SqlValue> {
+    let len = cursor.read_u32("row value payload length")? as usize;
+    let bytes = cursor.read_exact(len, "row value payload")?;
+    SqlValue::decode(bytes)
+}
+
+fn ensure_row_payload_complete(cursor: &Cursor<'_>) -> Result<()> {
+    if cursor.is_complete() {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        "row payload has trailing bytes",
+    ))
 }
 
 fn checked_len(len: usize, name: &'static str) -> Result<[u8; 4]> {

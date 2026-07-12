@@ -43,14 +43,8 @@ impl DurableExecutorImage {
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut reader = ImageReader::new(bytes);
-        ensure_image_magic(reader.read_exact(8, "image magic")?)?;
-        ensure_image_version(reader.read_u16("image version")?)?;
-        let catalog = reader.read_bytes("catalog image")?.to_vec();
-        let table_count = reader.read_u32("table count")? as usize;
-        let mut tables = Vec::with_capacity(table_count);
-        for _ in 0..table_count {
-            tables.push(read_table(&mut reader)?);
-        }
+        let catalog = read_image_catalog(&mut reader)?;
+        let tables = read_image_tables(&mut reader)?;
         reader.ensure_complete("durable SQL image")?;
         Ok(Self { catalog, tables })
     }
@@ -147,6 +141,21 @@ fn read_table(reader: &mut ImageReader<'_>) -> Result<DurableTableRows> {
         rows.push(reader.read_bytes("row image")?.to_vec());
     }
     Ok(DurableTableRows::new(name, rows))
+}
+
+fn read_image_catalog(reader: &mut ImageReader<'_>) -> Result<Vec<u8>> {
+    ensure_image_magic(reader.read_exact(8, "image magic")?)?;
+    ensure_image_version(reader.read_u16("image version")?)?;
+    Ok(reader.read_bytes("catalog image")?.to_vec())
+}
+
+fn read_image_tables(reader: &mut ImageReader<'_>) -> Result<Vec<DurableTableRows>> {
+    let table_count = reader.read_u32("table count")? as usize;
+    let mut tables = Vec::with_capacity(table_count);
+    for _ in 0..table_count {
+        tables.push(read_table(reader)?);
+    }
+    Ok(tables)
 }
 
 fn encode_page_frame(page_size: PageSize, image: &[u8]) -> Result<Vec<u8>> {
@@ -277,11 +286,7 @@ struct FrameMetadata {
 impl FrameMetadata {
     fn decode(payload: &[u8]) -> Result<Self> {
         let mut reader = FrameReader::new(payload);
-        ensure_frame_magic(reader.read_exact(8, "frame magic")?)?;
-        ensure_frame_version(reader.read_u16("frame version")?)?;
-        let image_len = checked_usize(reader.read_u64("image length")?, "image length")?;
-        let page_count = reader.read_u32("image page count")? as usize;
-        let checksum = reader.read_u32("image checksum")?;
+        let (image_len, page_count, checksum) = read_frame_metadata(&mut reader)?;
         let page_size = PageSize::new(payload.len());
         validate_frame_metadata(page_size, image_len, page_count)?;
         Ok(Self {
@@ -303,6 +308,24 @@ impl FrameMetadata {
         ensure_frame_checksum(image, self.checksum)?;
         Ok(image.to_vec())
     }
+}
+
+fn read_frame_metadata(reader: &mut FrameReader<'_>) -> Result<(usize, usize, u32)> {
+    read_frame_identity(reader)?;
+    let image_len = read_frame_image_len(reader)?;
+    let page_count = reader.read_u32("image page count")? as usize;
+    let checksum = reader.read_u32("image checksum")?;
+    Ok((image_len, page_count, checksum))
+}
+
+fn read_frame_identity(reader: &mut FrameReader<'_>) -> Result<()> {
+    ensure_frame_magic(reader.read_exact(8, "frame magic")?)?;
+    ensure_frame_version(reader.read_u16("frame version")?)?;
+    Ok(())
+}
+
+fn read_frame_image_len(reader: &mut FrameReader<'_>) -> Result<usize> {
+    checked_usize(reader.read_u64("image length")?, "image length")
 }
 
 fn validate_frame_metadata(page_size: PageSize, image_len: usize, page_count: usize) -> Result<()> {
