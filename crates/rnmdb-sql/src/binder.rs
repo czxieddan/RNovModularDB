@@ -1163,6 +1163,16 @@ impl<'a> Binder<'a> {
         columns: &[Ident],
         values: &[Expr],
     ) -> Result<(Vec<BoundColumn>, Vec<Expr>)> {
+        if columns.len() != values.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "INSERT statement has {} columns but {} values",
+                    columns.len(),
+                    values.len()
+                ),
+            ));
+        }
         let mut bound_columns = Vec::with_capacity(columns.len());
         let mut bound_values = Vec::with_capacity(values.len());
         for (ident, value) in columns.iter().zip(values) {
