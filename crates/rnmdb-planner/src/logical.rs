@@ -3,9 +3,9 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundStatement, BoundUnion, ColumnDef,
-    CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName,
-    OrderByExpr, TransactionAction,
+    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundRowPolicy, BoundStatement,
+    BoundUnion, ColumnDef, CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef,
+    JoinKind, ObjectName, OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -128,17 +128,26 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<String>,
         values: Vec<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     Update {
         relation_id: RelationId,
         table: String,
         assignments: Vec<(String, Expr)>,
         selection: Option<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     Delete {
         relation_id: RelationId,
         table: String,
         selection: Option<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     CreateTable {
         table: String,
@@ -499,12 +508,16 @@ impl LogicalPlanner {
                 table,
                 columns,
                 values,
-                ..
+                applied_row_policies,
+                row_policy_predicates,
             } => Ok(LogicalPlan::Insert {
                 relation_id: *relation_id,
                 table: object_name(table),
                 columns: columns.iter().map(|column| column.name.clone()).collect(),
                 values: values.clone(),
+                applied_row_policies: applied_row_policies.clone(),
+                policy_predicates: Vec::new(),
+                check_predicates: mutation_policy_predicates(row_policy_predicates),
             }),
             BoundStatement::Update(update) => Ok(LogicalPlan::Update {
                 relation_id: update.relation_id,
@@ -515,11 +528,17 @@ impl LogicalPlanner {
                     .map(|assignment| (assignment.column.name.clone(), assignment.value.clone()))
                     .collect(),
                 selection: update.selection.clone(),
+                applied_row_policies: update.applied_row_policies.clone(),
+                policy_predicates: mutation_policy_predicates(&update.row_policy_predicates),
+                check_predicates: mutation_policy_predicates(&update.row_policy_predicates),
             }),
             BoundStatement::Delete(delete) => Ok(LogicalPlan::Delete {
                 relation_id: delete.relation_id,
                 table: object_name(&delete.table),
                 selection: delete.selection.clone(),
+                applied_row_policies: delete.applied_row_policies.clone(),
+                policy_predicates: mutation_policy_predicates(&delete.row_policy_predicates),
+                check_predicates: Vec::new(),
             }),
             BoundStatement::Select(select) => {
                 let input = LogicalPlan::Scan {
@@ -1889,6 +1908,13 @@ fn bound_select_from_statement(statement: &BoundStatement) -> Result<&rnmdb_sql:
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn mutation_policy_predicates(policies: &[BoundRowPolicy]) -> Vec<Expr> {
+    policies
+        .iter()
+        .map(|policy| policy.predicate.clone())
+        .collect()
 }
 
 fn index_key_def_from_bound(key: &BoundIndexKey) -> IndexKeyDef {

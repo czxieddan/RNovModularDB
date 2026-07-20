@@ -206,7 +206,12 @@ pub enum PhysicalPlan {
     },
     Mutation {
         kind: MutationKind,
+        relation_id: RelationId,
         table: String,
+        selection: Option<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
         cost: PlanCost,
     },
     Ddl {
@@ -703,19 +708,56 @@ impl PhysicalPlanner {
                 input: Box::new(self.plan(input)),
                 cost,
             },
-            LogicalPlan::Insert { table, .. } => PhysicalPlan::Mutation {
+            LogicalPlan::Insert {
+                relation_id,
+                table,
+                applied_row_policies,
+                policy_predicates,
+                check_predicates,
+                ..
+            } => PhysicalPlan::Mutation {
                 kind: MutationKind::Insert,
+                relation_id: *relation_id,
                 table: table.clone(),
+                selection: None,
+                applied_row_policies: applied_row_policies.clone(),
+                policy_predicates: policy_predicates.clone(),
+                check_predicates: check_predicates.clone(),
                 cost,
             },
-            LogicalPlan::Update { table, .. } => PhysicalPlan::Mutation {
+            LogicalPlan::Update {
+                relation_id,
+                table,
+                selection,
+                applied_row_policies,
+                policy_predicates,
+                check_predicates,
+                ..
+            } => PhysicalPlan::Mutation {
                 kind: MutationKind::Update,
+                relation_id: *relation_id,
                 table: table.clone(),
+                selection: selection.clone(),
+                applied_row_policies: applied_row_policies.clone(),
+                policy_predicates: policy_predicates.clone(),
+                check_predicates: check_predicates.clone(),
                 cost,
             },
-            LogicalPlan::Delete { table, .. } => PhysicalPlan::Mutation {
+            LogicalPlan::Delete {
+                relation_id,
+                table,
+                selection,
+                applied_row_policies,
+                policy_predicates,
+                check_predicates,
+            } => PhysicalPlan::Mutation {
                 kind: MutationKind::Delete,
+                relation_id: *relation_id,
                 table: table.clone(),
+                selection: selection.clone(),
+                applied_row_policies: applied_row_policies.clone(),
+                policy_predicates: policy_predicates.clone(),
+                check_predicates: check_predicates.clone(),
                 cost,
             },
             LogicalPlan::Transaction { action } => PhysicalPlan::Transaction {
@@ -1171,9 +1213,24 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
-        PhysicalPlan::Mutation { kind, table, cost } => {
+        PhysicalPlan::Mutation {
+            kind,
+            table,
+            selection,
+            applied_row_policies,
+            policy_predicates,
+            check_predicates,
+            cost,
+            ..
+        } => {
             out.push_str(&format!(
-                "{prefix}{kind:?} table={table}{}\n",
+                "{prefix}{kind:?} table={table}{}{}\n",
+                mutation_security_suffix(
+                    selection.as_ref(),
+                    applied_row_policies,
+                    policy_predicates,
+                    check_predicates,
+                ),
                 cost_suffix(*cost)
             ));
         }
@@ -1213,6 +1270,43 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             write_physical_plan(input, indent + 1, out);
         }
     }
+}
+
+fn mutation_security_suffix(
+    selection: Option<&Expr>,
+    policy_names: &[String],
+    policy_predicates: &[Expr],
+    check_predicates: &[Expr],
+) -> String {
+    let mut fields = Vec::new();
+    if let Some(selection) = selection {
+        fields.push(format!("selection=({selection})"));
+    }
+    if !policy_names.is_empty() {
+        fields.push(format!("policies=[{}]", policy_names.join(", ")));
+    }
+    if !policy_predicates.is_empty() {
+        fields.push(format!(
+            "visibility=[{}]",
+            display_predicates(policy_predicates)
+        ));
+    }
+    if !check_predicates.is_empty() {
+        fields.push(format!("checks=[{}]", display_predicates(check_predicates)));
+    }
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", fields.join(" "))
+    }
+}
+
+fn display_predicates(predicates: &[Expr]) -> String {
+    predicates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl PhysicalPlanner {
