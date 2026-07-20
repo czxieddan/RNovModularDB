@@ -1199,6 +1199,8 @@ pub enum BoundStatement {
         table: ObjectName,
         columns: Vec<BoundColumn>,
         values: Vec<Expr>,
+        applied_row_policies: Vec<String>,
+        row_policy_predicates: Vec<BoundRowPolicy>,
     },
     Update(BoundUpdate),
     Delete(BoundDelete),

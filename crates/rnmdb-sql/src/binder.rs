@@ -1170,6 +1170,8 @@ impl<'a> Binder<'a> {
             table: table_name.clone(),
             columns: bound_columns,
             values: bound_values,
+            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, table)?,
         })
     }
 

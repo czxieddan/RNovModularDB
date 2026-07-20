@@ -499,6 +499,7 @@ impl LogicalPlanner {
                 table,
                 columns,
                 values,
+                ..
             } => Ok(LogicalPlan::Insert {
                 relation_id: *relation_id,
                 table: object_name(table),
