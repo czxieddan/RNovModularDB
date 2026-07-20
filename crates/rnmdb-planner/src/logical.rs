@@ -517,6 +517,21 @@ impl LogicalPlanner {
 
     fn plan_table_definition_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
         match statement {
+            BoundStatement::CreateTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateTrigger { .. } => {
+                Self::plan_table_creation_statement(statement)
+            }
+            BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterColumnEncryption { .. } => {
+                Self::plan_table_alteration_statement(statement)
+            }
+            _ => unreachable!("table definition dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_creation_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::CreateTable {
                 name,
                 columns,
@@ -560,6 +575,12 @@ impl LogicalPlanner {
                 body: body.clone(),
                 if_not_exists: *if_not_exists,
             }),
+            _ => unreachable!("table creation dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_alteration_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::AlterTableAddColumn {
                 relation_id,
                 table,
@@ -582,7 +603,7 @@ impl LogicalPlanner {
                 column: column.as_str().to_string(),
                 encrypted: *encrypted,
             }),
-            _ => unreachable!("table definition dispatcher received a different family"),
+            _ => unreachable!("table alteration dispatcher received a different family"),
         }
     }
 
@@ -1104,57 +1125,54 @@ enum PlanWriteFamily {
     AccessControl,
 }
 
+#[rustfmt::skip]
 fn plan_write_family(plan: &LogicalPlan) -> PlanWriteFamily {
+    use LogicalPlan::*;
     match plan {
-        LogicalPlan::Scan { .. }
-        | LogicalPlan::RecursiveScan { .. }
-        | LogicalPlan::TextSearch { .. } => PlanWriteFamily::Source,
-        LogicalPlan::Filter { .. }
-        | LogicalPlan::InSubqueryFilter { .. }
-        | LogicalPlan::ExistsSubqueryFilter { .. }
-        | LogicalPlan::SidewaysLookup { .. }
-        | LogicalPlan::NestedLoopJoin { .. }
-        | LogicalPlan::HashJoin { .. } => PlanWriteFamily::Relational,
-        LogicalPlan::Project { .. }
-        | LogicalPlan::Window { .. }
-        | LogicalPlan::Aggregate { .. }
-        | LogicalPlan::GroupedAggregate { .. }
-        | LogicalPlan::GroupingSetsAggregate { .. }
-        | LogicalPlan::Distinct { .. } => PlanWriteFamily::Output,
-        LogicalPlan::Union { .. }
-        | LogicalPlan::Intersect { .. }
-        | LogicalPlan::Except { .. }
-        | LogicalPlan::RecursiveCte { .. }
-        | LogicalPlan::Sort { .. }
-        | LogicalPlan::Limit { .. }
-        | LogicalPlan::Offset { .. }
-        | LogicalPlan::Parallel { .. } => PlanWriteFamily::Composition,
-        LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
-            PlanWriteFamily::Mutation
-        }
-        LogicalPlan::CreateTable { .. }
-        | LogicalPlan::CreateIndex { .. }
-        | LogicalPlan::CreateTrigger { .. }
-        | LogicalPlan::AlterTableAddColumn { .. }
-        | LogicalPlan::AlterColumnEncryption { .. }
-        | LogicalPlan::DropTable { .. }
-        | LogicalPlan::DropIndex { .. }
-        | LogicalPlan::DropTrigger { .. } => PlanWriteFamily::TableDefinition,
-        LogicalPlan::CreateFunction { .. }
-        | LogicalPlan::CreateProcedure { .. }
-        | LogicalPlan::CreateOperator { .. }
-        | LogicalPlan::DropFunction { .. }
-        | LogicalPlan::DropProcedure { .. }
-        | LogicalPlan::DropOperator { .. }
-        | LogicalPlan::CallProcedure { .. } => PlanWriteFamily::Routine,
-        LogicalPlan::CreateRole { .. }
-        | LogicalPlan::CreatePolicy { .. }
-        | LogicalPlan::DropRole { .. }
-        | LogicalPlan::DropPolicy { .. }
-        | LogicalPlan::GrantTablePrivilege { .. }
-        | LogicalPlan::GrantProcedurePrivilege { .. }
-        | LogicalPlan::Transaction { .. }
-        | LogicalPlan::Explain { .. } => PlanWriteFamily::AccessControl,
+        Scan { .. } | RecursiveScan { .. } | TextSearch { .. } => PlanWriteFamily::Source,
+        Filter { .. }
+        | InSubqueryFilter { .. }
+        | ExistsSubqueryFilter { .. }
+        | SidewaysLookup { .. }
+        | NestedLoopJoin { .. }
+        | HashJoin { .. } => PlanWriteFamily::Relational,
+        Project { .. }
+        | Window { .. }
+        | Aggregate { .. }
+        | GroupedAggregate { .. }
+        | GroupingSetsAggregate { .. }
+        | Distinct { .. } => PlanWriteFamily::Output,
+        Union { .. }
+        | Intersect { .. }
+        | Except { .. }
+        | RecursiveCte { .. }
+        | Sort { .. }
+        | Limit { .. }
+        | Offset { .. }
+        | Parallel { .. } => PlanWriteFamily::Composition,
+        Insert { .. } | Update { .. } | Delete { .. } => PlanWriteFamily::Mutation,
+        CreateTable { .. }
+        | CreateIndex { .. }
+        | CreateTrigger { .. }
+        | AlterTableAddColumn { .. }
+        | AlterColumnEncryption { .. }
+        | DropTable { .. }
+        | DropIndex { .. }
+        | DropTrigger { .. } => PlanWriteFamily::TableDefinition,
+        CreateFunction { .. }
+        | CreateProcedure { .. }
+        | CreateOperator { .. }
+        | DropFunction { .. }
+        | DropProcedure { .. }
+        | DropOperator { .. }
+        | CallProcedure { .. } => PlanWriteFamily::Routine,
+        CreateRole { .. } | CreatePolicy { .. }
+        | DropRole { .. }
+        | DropPolicy { .. }
+        | GrantTablePrivilege { .. }
+        | GrantProcedurePrivilege { .. }
+        | Transaction { .. }
+        | Explain { .. } => PlanWriteFamily::AccessControl,
     }
 }
 
@@ -1178,6 +1196,18 @@ fn write_source_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
 }
 
 fn write_relational_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::Filter { .. }
+        | LogicalPlan::InSubqueryFilter { .. }
+        | LogicalPlan::ExistsSubqueryFilter { .. } => write_filter_plan(plan, prefix, indent, out),
+        LogicalPlan::SidewaysLookup { .. }
+        | LogicalPlan::NestedLoopJoin { .. }
+        | LogicalPlan::HashJoin { .. } => write_join_plan(plan, prefix, indent, out),
+        _ => unreachable!("relational plan writer received a different family"),
+    }
+}
+
+fn write_filter_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
     match plan {
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
@@ -1208,6 +1238,12 @@ fn write_relational_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &
             write_plan(input, indent + 1, out);
             write_plan(subquery, indent + 1, out);
         }
+        _ => unreachable!("filter plan writer received a different family"),
+    }
+}
+
+fn write_join_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::SidewaysLookup {
             outer,
             inner_table,
@@ -1247,11 +1283,25 @@ fn write_relational_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
-        _ => unreachable!("relational plan writer received a different family"),
+        _ => unreachable!("join plan writer received a different family"),
     }
 }
 
 fn write_output_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::Project { .. } | LogicalPlan::Window { .. } | LogicalPlan::Distinct { .. } => {
+            write_projection_plan(plan, prefix, indent, out)
+        }
+        LogicalPlan::Aggregate { .. }
+        | LogicalPlan::GroupedAggregate { .. }
+        | LogicalPlan::GroupingSetsAggregate { .. } => {
+            write_aggregate_plan(plan, prefix, indent, out)
+        }
+        _ => unreachable!("output plan writer received a different family"),
+    }
+}
+
+fn write_projection_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
     match plan {
         LogicalPlan::Project { items, input } => {
             out.push_str(&format!(
@@ -1264,6 +1314,16 @@ fn write_output_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut 
             out.push_str(&format!("{prefix}Window {}\n", window_item_list(items)));
             write_plan(input, indent + 1, out);
         }
+        LogicalPlan::Distinct { input } => {
+            out.push_str(&format!("{prefix}Distinct\n"));
+            write_plan(input, indent + 1, out);
+        }
+        _ => unreachable!("projection plan writer received a different family"),
+    }
+}
+
+fn write_aggregate_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Aggregate { items, input } => {
             out.push_str(&format!(
                 "{prefix}Aggregate {}\n",
@@ -1297,11 +1357,7 @@ fn write_output_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut 
             ));
             write_plan(input, indent + 1, out);
         }
-        LogicalPlan::Distinct { input } => {
-            out.push_str(&format!("{prefix}Distinct\n"));
-            write_plan(input, indent + 1, out);
-        }
-        _ => unreachable!("output plan writer received a different family"),
+        _ => unreachable!("aggregate plan writer received a different family"),
     }
 }
 
@@ -1454,6 +1510,18 @@ fn write_table_definition_plan(plan: &LogicalPlan, prefix: &str, out: &mut Strin
 
 fn write_table_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
     match plan {
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreateTrigger { .. } => write_schema_object_creation_plan(plan, prefix, out),
+        LogicalPlan::AlterTableAddColumn { .. } | LogicalPlan::AlterColumnEncryption { .. } => {
+            write_table_alteration_plan(plan, prefix, out)
+        }
+        _ => unreachable!("table creation writer received a different family"),
+    }
+}
+
+fn write_schema_object_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::CreateTable {
             table,
             columns,
@@ -1496,6 +1564,12 @@ fn write_table_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String)
             "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{}\n",
             if_not_exists_suffix(*if_not_exists)
         )),
+        _ => unreachable!("schema object creation writer received a different family"),
+    }
+}
+
+fn write_table_alteration_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::AlterTableAddColumn {
             table,
             column,
@@ -1514,7 +1588,7 @@ fn write_table_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String)
         } => out.push_str(&format!(
             "{prefix}AlterColumnEncryption table={table} column={column} encrypted={encrypted}\n"
         )),
-        _ => unreachable!("table creation writer received a different family"),
+        _ => unreachable!("table alteration writer received a different family"),
     }
 }
 
@@ -1541,6 +1615,19 @@ fn write_table_drop_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
 }
 
 fn write_routine_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::CreateFunction { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::CreateOperator { .. } => write_routine_creation_plan(plan, prefix, out),
+        LogicalPlan::DropFunction { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::DropOperator { .. } => write_routine_drop_plan(plan, prefix, out),
+        LogicalPlan::CallProcedure { .. } => write_procedure_call_plan(plan, prefix, out),
+        _ => unreachable!("routine writer received a different family"),
+    }
+}
+
+fn write_routine_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
     match plan {
         LogicalPlan::CreateFunction {
             name,
@@ -1583,6 +1670,12 @@ fn write_routine_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
                 *selectivity_function_id,
             )
         )),
+        _ => unreachable!("routine creation writer received a different family"),
+    }
+}
+
+fn write_routine_drop_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::DropFunction {
             name,
             argument_types,
@@ -1607,11 +1700,17 @@ fn write_routine_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
         } => out.push_str(&format!(
             "{prefix}DropOperator symbol={symbol} left={left_type:?} right={right_type:?} if_exists={if_exists}\n"
         )),
+        _ => unreachable!("routine drop writer received a different family"),
+    }
+}
+
+fn write_procedure_call_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::CallProcedure { name, args, .. } => out.push_str(&format!(
             "{prefix}CallProcedure name={name} args={}\n",
             args.len()
         )),
-        _ => unreachable!("routine writer received a different family"),
+        _ => unreachable!("procedure call writer received a different family"),
     }
 }
 
