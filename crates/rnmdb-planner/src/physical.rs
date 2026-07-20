@@ -552,21 +552,14 @@ impl PhysicalPlanner {
                 column,
                 query,
                 cost_hint,
-            } => Some(
-                PhysicalPlan::TextSearchScan {
-                    relation_id: *relation_id,
-                    table: table.clone(),
-                    column: column.clone(),
-                    query: query.clone(),
-                    cost,
-                }
-                .indexed_if_cheaper(
-                    &self.indexes,
-                    &self.cost_model,
-                    *relation_id,
-                    &cost_hint.required_terms,
-                ),
-            ),
+            } => Some(self.text_search_plan(
+                *relation_id,
+                table,
+                column,
+                query,
+                &cost_hint.required_terms,
+                cost,
+            )),
             LogicalPlan::SidewaysLookup {
                 outer,
                 inner_relation_id,
@@ -624,6 +617,15 @@ impl PhysicalPlanner {
                 right_key: right_key.clone(),
                 cost,
             }),
+            LogicalPlan::InSubqueryFilter { .. } | LogicalPlan::ExistsSubqueryFilter { .. } => {
+                self.plan_subquery_filter(logical, cost)
+            }
+            _ => None,
+        }
+    }
+
+    fn plan_subquery_filter(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
             LogicalPlan::InSubqueryFilter {
                 expr,
                 subquery,
@@ -648,6 +650,25 @@ impl PhysicalPlanner {
             }),
             _ => None,
         }
+    }
+
+    fn text_search_plan(
+        &self,
+        relation_id: RelationId,
+        table: &str,
+        column: &str,
+        query: &str,
+        required_terms: &[String],
+        cost: PlanCost,
+    ) -> PhysicalPlan {
+        PhysicalPlan::TextSearchScan {
+            relation_id,
+            table: table.to_owned(),
+            column: column.to_owned(),
+            query: query.to_owned(),
+            cost,
+        }
+        .indexed_if_cheaper(&self.indexes, &self.cost_model, relation_id, required_terms)
     }
 
     fn plan_projection(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
@@ -780,6 +801,15 @@ impl PhysicalPlanner {
                 check_predicates: check_predicates.clone(),
                 cost,
             }),
+            LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => {
+                Self::plan_existing_row_mutation(logical, cost)
+            }
+            _ => None,
+        }
+    }
+
+    fn plan_existing_row_mutation(logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
             LogicalPlan::Update {
                 relation_id,
                 table,
@@ -1156,7 +1186,12 @@ fn write_summary_spatial_scans(plan: &PhysicalPlan, prefix: &str, out: &mut Stri
     true
 }
 
-fn write_join_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+fn write_sideways_lookup_plan(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
     match plan {
         PhysicalPlan::SidewaysIndexLookup {
             outer,
@@ -1173,6 +1208,16 @@ fn write_join_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut S
             ));
             write_physical_plan(outer, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_join_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    if write_sideways_lookup_plan(plan, prefix, indent, out) {
+        return true;
+    }
+    match plan {
         PhysicalPlan::NestedLoopJoin {
             kind,
             left,
