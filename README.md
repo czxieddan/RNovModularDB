@@ -34,7 +34,8 @@ Implemented product surfaces include:
 - Wasmtime-backed scalar UDF execution with import denial, fuel, epoch, memory,
   result-size, and module-cache limits.
 - Encrypted single-file inspection, verification, backup, restore, explicit
-  version 1 to version 2 upgrade, and cross-process file coordination.
+  version 1 to version 2 upgrade, authenticated version 2 page-key rotation,
+  and cross-process file coordination.
 - A bounded TCP line protocol for embedded deployments.
 
 ## Build And Test
@@ -107,6 +108,32 @@ cargo run -q -p rnmdb-cli --bin rnmdb -- \
 The upgrade never modifies the source and refuses an existing target. The
 library-level `SingleFileUpgradeOptions` API can use separate source and target
 keys for key rotation.
+
+Rotate the page key of an existing version 2 database through the embedded
+storage API while the database is offline:
+
+```rust
+use std::path::Path;
+
+use rnmdb_storage::{PageCryptoKey, rekey_single_file};
+
+fn rotate_page_key(
+    path: &Path,
+    old_key: PageCryptoKey,
+    fresh_key: PageCryptoKey,
+) -> rnmdb_common::Result<()> {
+    let report = rekey_single_file(path, old_key, fresh_key)?;
+    assert!(report.key_rotated());
+    Ok(())
+}
+```
+
+`rekey_single_file` authenticates every source page with the old key, writes
+and verifies a same-directory temporary database with the fresh key, then
+atomically replaces the original pathname. It rejects reused keys, symbolic or
+hard-linked sources, and live local backends. Other processes must also be
+quiesced, and callers must supply a key that has never been used for this
+database's page-nonce domain.
 
 ## Embedded API
 
@@ -198,6 +225,8 @@ Opening, inspection, verification, backup, restore, and upgrade reject unknown
 versions rather than attempting partial decoding.
 
 - Version 1 files can be detected and explicitly upgraded to version 2.
+- Version 2 files can be re-encrypted in place with a fresh page key through an
+  offline, verified atomic replacement.
 - Upgrade and restore create new targets and never overwrite existing files.
 - Backup sources are held under a shared OS file lock for inspection and copy.
 - Writes, sync, checkpoints, restore targets, and upgrade targets use exclusive
