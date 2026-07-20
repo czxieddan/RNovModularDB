@@ -1064,6 +1064,7 @@ dependencies = [
  "rnmdb-common",
  "sha2 0.11.0",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1087,7 +1088,7 @@ version = "0.1.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
- "sha2",
+ "sha2 0.11.0",
  "wasmtime",
 ]
 

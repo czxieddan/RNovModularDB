@@ -18,10 +18,12 @@ use rnmdb_common::{
 };
 
 pub use rnmdb_common::config::PageSize;
+pub use single_file_rekey::rekey_single_file;
 pub use single_file_upgrade::{
     upgrade_single_file, upgrade_single_file_with_key, upgrade_single_file_with_options,
 };
 
+mod single_file_rekey;
 mod single_file_upgrade;
 
 pub const SINGLE_FILE_FORMAT_VERSION: u16 = 2;
@@ -1627,6 +1629,27 @@ pub struct SingleFileUpgradeReport {
     page_reports: Vec<SingleFileUpgradePageReport>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileRekeyPageReport {
+    page_id: PageId,
+    source_counter: u32,
+    target_counter: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleFileRekeyReport {
+    path: PathBuf,
+    source_format_version: u16,
+    target_format_version: u16,
+    key_rotated: bool,
+    bytes_written: u64,
+    page_size: PageSize,
+    superblock_generation: u64,
+    page_record_slots: u64,
+    pages_rekeyed: u64,
+    page_reports: Vec<SingleFileRekeyPageReport>,
+}
+
 impl SingleFileFormatCompatibility {
     fn new(path: PathBuf, format_version: u16) -> Self {
         Self {
@@ -1833,6 +1856,62 @@ impl SingleFileUpgradeReport {
     }
 
     pub fn page_reports(&self) -> &[SingleFileUpgradePageReport] {
+        &self.page_reports
+    }
+}
+
+impl SingleFileRekeyPageReport {
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn source_counter(&self) -> u32 {
+        self.source_counter
+    }
+
+    pub fn target_counter(&self) -> u32 {
+        self.target_counter
+    }
+}
+
+impl SingleFileRekeyReport {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn source_format_version(&self) -> u16 {
+        self.source_format_version
+    }
+
+    pub fn target_format_version(&self) -> u16 {
+        self.target_format_version
+    }
+
+    pub fn key_rotated(&self) -> bool {
+        self.key_rotated
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn superblock_generation(&self) -> u64 {
+        self.superblock_generation
+    }
+
+    pub fn page_record_slots(&self) -> u64 {
+        self.page_record_slots
+    }
+
+    pub fn pages_rekeyed(&self) -> u64 {
+        self.pages_rekeyed
+    }
+
+    pub fn page_reports(&self) -> &[SingleFileRekeyPageReport] {
         &self.page_reports
     }
 }
