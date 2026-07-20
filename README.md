@@ -130,10 +130,11 @@ fn rotate_page_key(
 
 `rekey_single_file` authenticates every source page with the old key, writes
 and verifies a same-directory temporary database with the fresh key, then
-atomically replaces the original pathname. It rejects reused keys, symbolic or
-hard-linked sources, and live local backends. Other processes must also be
-quiesced, and callers must supply a key that has never been used for this
-database's page-nonce domain.
+atomically replaces the original pathname. It rejects a target key equal to the
+current source key, symbolic or hard-linked sources, and live local backends.
+The file format does not track historical key identities, so other processes
+must be quiesced and callers must supply a key that has never been used for
+this database's page-nonce domain.
 
 ## Embedded API
 

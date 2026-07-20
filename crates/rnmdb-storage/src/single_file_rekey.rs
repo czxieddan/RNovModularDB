@@ -1,6 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{File, Metadata, OpenOptions, remove_file, rename, symlink_metadata},
+    fs::{File, OpenOptions, remove_file, rename},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -20,6 +20,12 @@ use super::{
 };
 
 static NEXT_REKEY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceIdentity {
+    namespace: u64,
+    file: u64,
+}
 
 struct RekeySource<'a> {
     file: &'a mut File,
@@ -49,7 +55,7 @@ pub fn rekey_single_file(
     target_page_key: PageCryptoKey,
 ) -> Result<SingleFileRekeyReport> {
     let path = path.as_ref();
-    validate_rekey_request(path, source_page_key, target_page_key)?;
+    validate_rekey_keys(source_page_key, target_page_key)?;
     let access_lock = single_file_access_lock_for(path)?;
     let _access_guard = access_lock.lock().map_err(|_| {
         RnovError::new(
@@ -59,16 +65,7 @@ pub fn rekey_single_file(
     })?;
     ensure_no_live_local_backend(&access_lock)?;
 
-    let source_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|err| {
-            RnovError::new(
-                ErrorKind::Io,
-                format!("failed to open database file for rekey: {err}"),
-            )
-        })?;
+    let (source_file, source_identity) = open_rekey_source(path)?;
     let mut process_lock = SingleFileProcessLock::acquire_exclusive(&source_file)?;
     let result = rekey_single_file_locked(
         path,
@@ -76,13 +73,16 @@ pub fn rekey_single_file(
         target_page_key,
         process_lock.file_mut(),
         &access_lock,
+        source_identity,
     );
     let unlock_result = process_lock.release();
-    finish_single_file_io(result, unlock_result)
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => finish_single_file_io(Err(error), unlock_result),
+    }
 }
 
-fn validate_rekey_request(
-    path: &Path,
+fn validate_rekey_keys(
     source_page_key: PageCryptoKey,
     target_page_key: PageCryptoKey,
 ) -> Result<()> {
@@ -92,70 +92,129 @@ fn validate_rekey_request(
             "single-file rekey requires a different target page key",
         ));
     }
-    let metadata = symlink_metadata(path).map_err(|err| {
-        RnovError::new(
-            ErrorKind::InvalidInput,
-            format!("rekey source must be a regular file: {err}"),
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "rekey source must be a regular file and cannot be a symbolic link",
-        ));
-    }
-    if has_multiple_hard_links(path, &metadata)? {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "single-file rekey rejects hard links because another name would retain old-key ciphertext",
-        ));
-    }
     Ok(())
 }
 
-#[cfg(unix)]
-fn has_multiple_hard_links(_path: &Path, metadata: &Metadata) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
+fn open_rekey_source(path: &Path) -> Result<(File, SourceIdentity)> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_rekey_source_open(&mut options);
+    let file = options.open(path).map_err(rekey_source_open_error)?;
+    let identity = validate_open_rekey_source(&file)?;
+    Ok((file, identity))
+}
 
-    Ok(metadata.nlink() > 1)
+#[cfg(unix)]
+fn configure_rekey_source_open(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
 }
 
 #[cfg(windows)]
-fn has_multiple_hard_links(path: &Path, _metadata: &Metadata) -> Result<bool> {
+fn configure_rekey_source_open(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_rekey_source_open(_options: &mut OpenOptions) {}
+
+fn rekey_source_open_error(err: io::Error) -> RnovError {
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ELOOP) {
+        return RnovError::new(
+            ErrorKind::InvalidInput,
+            "rekey source cannot be a symbolic link",
+        );
+    }
+    RnovError::new(
+        ErrorKind::Io,
+        format!("failed to open database file for rekey: {err}"),
+    )
+}
+
+#[cfg(unix)]
+fn validate_open_rekey_source(file: &File) -> Result<SourceIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(rekey_source_metadata_error)?;
+    validate_source_file_shape(metadata.is_file(), metadata.nlink())?;
+    Ok(SourceIdentity {
+        namespace: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn validate_open_rekey_source(file: &File) -> Result<SourceIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let information = windows_file_information(file)?;
+    let is_regular = information.dwFileAttributes
+        & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+        == 0;
+    validate_source_file_shape(is_regular, u64::from(information.nNumberOfLinks))?;
+    Ok(SourceIdentity {
+        namespace: u64::from(information.dwVolumeSerialNumber),
+        file: u64::from(information.nFileIndexHigh) << 32 | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_information(
+    file: &File,
+) -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::{mem, os::windows::io::AsRawHandle};
     use windows_sys::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
     };
 
-    let file = File::open(path).map_err(|err| {
-        RnovError::new(
-            ErrorKind::Io,
-            format!("failed to inspect rekey source hard links: {err}"),
-        )
-    })?;
-    // SAFETY: BY_HANDLE_FILE_INFORMATION is a C data structure for which an
-    // all-zero value is a valid output buffer before the operating-system call.
+    // SAFETY: This C output structure permits an all-zero initial buffer.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-    // SAFETY: `file` owns a live Windows handle for the duration of this call,
-    // and `information` points to a writable buffer of the required type.
+    // SAFETY: The owned file handle remains live and the output pointer is valid.
     let result =
         unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
-    if result == 0 {
-        return Err(RnovError::new(
-            ErrorKind::Io,
-            format!(
-                "failed to inspect rekey source hard links: {}",
-                io::Error::last_os_error()
-            ),
-        ));
+    if result != 0 {
+        return Ok(information);
     }
-    Ok(information.nNumberOfLinks > 1)
+    Err(rekey_source_metadata_error(io::Error::last_os_error()))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn has_multiple_hard_links(_path: &Path, _metadata: &Metadata) -> Result<bool> {
-    Ok(false)
+fn validate_open_rekey_source(_file: &File) -> Result<SourceIdentity> {
+    Err(RnovError::new(
+        ErrorKind::Storage,
+        "single-file rekey cannot verify source identity on this platform",
+    ))
+}
+
+fn rekey_source_metadata_error(err: io::Error) -> RnovError {
+    RnovError::new(
+        ErrorKind::Io,
+        format!("failed to inspect opened rekey source: {err}"),
+    )
+}
+
+fn validate_source_file_shape(is_regular: bool, links: u64) -> Result<()> {
+    if !is_regular {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "rekey source must be a regular file and cannot be a symbolic link",
+        ));
+    }
+    if links > 1 {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "single-file rekey rejects hard links because another name would retain old-key ciphertext",
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_no_live_local_backend(access_lock: &Arc<std::sync::Mutex<()>>) -> Result<()> {
@@ -174,6 +233,7 @@ fn rekey_single_file_locked(
     target_page_key: PageCryptoKey,
     source_file: &mut File,
     access_lock: &Arc<std::sync::Mutex<()>>,
+    source_identity: SourceIdentity,
 ) -> Result<SingleFileRekeyReport> {
     let source_inspection =
         inspect_single_file_with_key_locked(path, source_page_key, source_file)?;
@@ -196,6 +256,9 @@ fn rekey_single_file_locked(
     if let Err(error) = ensure_no_live_local_backend(access_lock) {
         return Err(remove_temporary_after_error(&temporary_path, error));
     }
+    if let Err(error) = ensure_rekey_source_unchanged(path, source_identity) {
+        return Err(remove_temporary_after_error(&temporary_path, error));
+    }
     if let Err(err) = rename(&temporary_path, path) {
         let error = RnovError::new(
             ErrorKind::Io,
@@ -205,6 +268,17 @@ fn rekey_single_file_locked(
     }
     sync_rekey_parent(path)?;
     Ok(report)
+}
+
+fn ensure_rekey_source_unchanged(path: &Path, expected: SourceIdentity) -> Result<()> {
+    let (_file, actual) = open_rekey_source(path)?;
+    if actual == expected {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Storage,
+        "rekey source pathname changed during the offline operation",
+    ))
 }
 
 fn create_rekey_temporary_file(path: &Path) -> Result<(PathBuf, File)> {
@@ -287,6 +361,7 @@ fn write_rekey_target(
         &target_metadata,
         page_reports.len() as u64,
     )?;
+    validate_rekey_page_contents(target_file, source, target_page_key)?;
     Ok(SingleFileRekeyReport {
         path: source.inspection.path().to_path_buf(),
         source_format_version: SINGLE_FILE_FORMAT_VERSION,
@@ -299,6 +374,32 @@ fn write_rekey_target(
         pages_rekeyed: page_reports.len() as u64,
         page_reports,
     })
+}
+
+fn validate_rekey_page_contents(
+    target_file: &mut File,
+    source: &mut RekeySource<'_>,
+    target_page_key: PageCryptoKey,
+) -> Result<()> {
+    let page_size = source.inspection.page_size();
+    for record in source
+        .inspection
+        .page_records()
+        .iter()
+        .filter(|record| record.is_present())
+    {
+        let source_page =
+            read_single_file_page(source.file, page_size, source.page_key, record.page_id())?;
+        let target_page =
+            read_single_file_page(target_file, page_size, target_page_key, record.page_id())?;
+        if source_page != target_page || source_page.is_none() {
+            return Err(RnovError::new(
+                ErrorKind::Corruption,
+                "rekey target page content does not match the authenticated source",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn write_rekey_pages(
@@ -343,28 +444,44 @@ fn validate_rekey_target(
     target_metadata: &SingleFileMetadata,
     pages_rekeyed: u64,
 ) -> Result<()> {
-    let metadata_matches = source_metadata.page_size == target_metadata.page_size
-        && source_metadata.superblock.generation == target_metadata.superblock.generation
-        && source_metadata.superblock.catalog_root == target_metadata.superblock.catalog_root
-        && source_metadata.superblock.free_map_root == target_metadata.superblock.free_map_root;
-    let layout_matches = source.file_len_bytes() == target.file_len_bytes()
-        && source.page_record_slots() == target.page_record_slots()
-        && source.present_page_records() == target.present_page_records()
-        && source.empty_page_slots() == target.empty_page_slots()
-        && target.authenticated_page_records() == pages_rekeyed
-        && target.checksum_verified_page_records() == pages_rekeyed;
-    let counters_reset = target
-        .page_records()
-        .iter()
-        .filter(|record| record.is_present())
-        .all(|record| record.encryption_counter() == Some(1));
-    if metadata_matches && layout_matches && counters_reset {
+    if rekey_metadata_matches(source_metadata, target_metadata)
+        && rekey_layout_matches(source, target, pages_rekeyed)
+        && rekey_counters_reset(target)
+    {
         return Ok(());
     }
     Err(RnovError::new(
         ErrorKind::Corruption,
         "rekey target validation does not match the source database",
     ))
+}
+
+fn rekey_metadata_matches(source: &SingleFileMetadata, target: &SingleFileMetadata) -> bool {
+    source.page_size == target.page_size
+        && source.superblock.generation == target.superblock.generation
+        && source.superblock.catalog_root == target.superblock.catalog_root
+        && source.superblock.free_map_root == target.superblock.free_map_root
+}
+
+fn rekey_layout_matches(
+    source: &SingleFileInspection,
+    target: &SingleFileInspection,
+    pages_rekeyed: u64,
+) -> bool {
+    source.file_len_bytes() == target.file_len_bytes()
+        && source.page_record_slots() == target.page_record_slots()
+        && source.present_page_records() == target.present_page_records()
+        && source.empty_page_slots() == target.empty_page_slots()
+        && target.authenticated_page_records() == pages_rekeyed
+        && target.checksum_verified_page_records() == pages_rekeyed
+}
+
+fn rekey_counters_reset(target: &SingleFileInspection) -> bool {
+    target
+        .page_records()
+        .iter()
+        .filter(|record| record.is_present())
+        .all(|record| record.encryption_counter() == Some(1))
 }
 
 fn remove_temporary_after_error(path: &Path, primary: RnovError) -> RnovError {
