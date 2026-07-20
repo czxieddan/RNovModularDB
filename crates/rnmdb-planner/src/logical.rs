@@ -1167,16 +1167,25 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{prefix}Offset count={count}\n"));
             write_plan(input, indent + 1, out);
         }
-        LogicalPlan::Insert { table, columns, .. } => {
+        LogicalPlan::Insert {
+            table,
+            columns,
+            policy_predicates,
+            check_predicates,
+            ..
+        } => {
             out.push_str(&format!(
-                "{prefix}Insert table={table} columns={}\n",
-                columns.join(", ")
+                "{prefix}Insert table={table} columns={}{}\n",
+                columns.join(", "),
+                mutation_security_summary(policy_predicates, check_predicates),
             ));
         }
         LogicalPlan::Update {
             table,
             assignments,
             selection,
+            policy_predicates,
+            check_predicates,
             ..
         } => {
             let assignments = assignments
@@ -1185,16 +1194,22 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
-                "{prefix}Update table={table} set={assignments}{}\n",
-                selection_suffix(selection.as_ref())
+                "{prefix}Update table={table} set={assignments}{}{}\n",
+                selection_suffix(selection.as_ref()),
+                mutation_security_summary(policy_predicates, check_predicates),
             ));
         }
         LogicalPlan::Delete {
-            table, selection, ..
+            table,
+            selection,
+            policy_predicates,
+            check_predicates,
+            ..
         } => {
             out.push_str(&format!(
-                "{prefix}Delete table={table}{}\n",
-                selection_suffix(selection.as_ref())
+                "{prefix}Delete table={table}{}{}\n",
+                selection_suffix(selection.as_ref()),
+                mutation_security_summary(policy_predicates, check_predicates),
             ));
         }
         LogicalPlan::CreateTable {
@@ -1491,6 +1506,14 @@ fn selection_suffix(selection: Option<&Expr>) -> String {
     selection
         .map(|selection| format!(" where={selection}"))
         .unwrap_or_default()
+}
+
+fn mutation_security_summary(policy_predicates: &[Expr], check_predicates: &[Expr]) -> String {
+    format!(
+        " rls_visibility={} rls_checks={}",
+        policy_predicates.len(),
+        check_predicates.len()
+    )
 }
 
 fn if_not_exists_suffix(if_not_exists: bool) -> &'static str {

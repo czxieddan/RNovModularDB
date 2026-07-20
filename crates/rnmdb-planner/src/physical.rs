@@ -1217,7 +1217,6 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             kind,
             table,
             selection,
-            applied_row_policies,
             policy_predicates,
             check_predicates,
             cost,
@@ -1225,12 +1224,7 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         } => {
             out.push_str(&format!(
                 "{prefix}{kind:?} table={table}{}{}\n",
-                mutation_security_suffix(
-                    selection.as_ref(),
-                    applied_row_policies,
-                    policy_predicates,
-                    check_predicates,
-                ),
+                mutation_security_suffix(selection.as_ref(), policy_predicates, check_predicates,),
                 cost_suffix(*cost)
             ));
         }
@@ -1274,7 +1268,6 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
 
 fn mutation_security_suffix(
     selection: Option<&Expr>,
-    policy_names: &[String],
     policy_predicates: &[Expr],
     check_predicates: &[Expr],
 ) -> String {
@@ -1282,31 +1275,9 @@ fn mutation_security_suffix(
     if let Some(selection) = selection {
         fields.push(format!("selection=({selection})"));
     }
-    if !policy_names.is_empty() {
-        fields.push(format!("policies=[{}]", policy_names.join(", ")));
-    }
-    if !policy_predicates.is_empty() {
-        fields.push(format!(
-            "visibility=[{}]",
-            display_predicates(policy_predicates)
-        ));
-    }
-    if !check_predicates.is_empty() {
-        fields.push(format!("checks=[{}]", display_predicates(check_predicates)));
-    }
-    if fields.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", fields.join(" "))
-    }
-}
-
-fn display_predicates(predicates: &[Expr]) -> String {
-    predicates
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+    fields.push(format!("rls_visibility={}", policy_predicates.len()));
+    fields.push(format!("rls_checks={}", check_predicates.len()));
+    format!(" {}", fields.join(" "))
 }
 
 impl PhysicalPlanner {
