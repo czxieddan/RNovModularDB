@@ -529,30 +529,43 @@ impl PhysicalPlanner {
 
     pub fn plan(&self, logical: &LogicalPlan) -> PhysicalPlan {
         let cost = self.cost_model.estimate(logical);
+        self.plan_access(logical, cost)
+            .or_else(|| self.plan_join(logical, cost))
+            .or_else(|| self.plan_projection(logical, cost))
+            .or_else(|| self.plan_aggregate(logical, cost))
+            .or_else(|| self.plan_ordering(logical, cost))
+            .or_else(|| self.plan_set_operation(logical, cost))
+            .or_else(|| self.plan_mutation(logical, cost))
+            .unwrap_or_else(|| self.plan_command(logical, cost))
+    }
+
+    fn plan_access(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
         match logical {
-            LogicalPlan::Scan { relation_id, table } => PhysicalPlan::SeqScan {
+            LogicalPlan::Scan { relation_id, table } => Some(PhysicalPlan::SeqScan {
                 relation_id: *relation_id,
                 table: table.clone(),
                 cost,
-            },
+            }),
             LogicalPlan::TextSearch {
                 relation_id,
                 table,
                 column,
                 query,
                 cost_hint,
-            } => PhysicalPlan::TextSearchScan {
-                relation_id: *relation_id,
-                table: table.clone(),
-                column: column.clone(),
-                query: query.clone(),
-                cost,
-            }
-            .indexed_if_cheaper(
-                &self.indexes,
-                &self.cost_model,
-                *relation_id,
-                &cost_hint.required_terms,
+            } => Some(
+                PhysicalPlan::TextSearchScan {
+                    relation_id: *relation_id,
+                    table: table.clone(),
+                    column: column.clone(),
+                    query: query.clone(),
+                    cost,
+                }
+                .indexed_if_cheaper(
+                    &self.indexes,
+                    &self.cost_model,
+                    *relation_id,
+                    &cost_hint.required_terms,
+                ),
             ),
             LogicalPlan::SidewaysLookup {
                 outer,
@@ -560,154 +573,196 @@ impl PhysicalPlanner {
                 inner_table,
                 inner_column,
                 outer_column,
-            } => self.sideways_lookup_plan(
-                outer,
-                *inner_relation_id,
-                inner_table,
-                inner_column,
-                outer_column,
+            } => Some(self.sideways_lookup_plan(
+                SidewaysLookupContext {
+                    outer,
+                    inner_relation_id: *inner_relation_id,
+                    inner_table,
+                    inner_column,
+                    outer_column,
+                },
                 cost,
-            ),
+            )),
+            LogicalPlan::Filter { predicate, input } => {
+                Some(self.index_scan(predicate, input, cost).unwrap_or_else(|| {
+                    PhysicalPlan::Filter {
+                        predicate: predicate.clone(),
+                        input: Box::new(self.plan(input)),
+                        cost,
+                    }
+                }))
+            }
+            _ => None,
+        }
+    }
+
+    fn plan_join(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
             LogicalPlan::NestedLoopJoin {
                 kind,
                 left,
                 right,
                 predicate,
-            } => PhysicalPlan::NestedLoopJoin {
+            } => Some(PhysicalPlan::NestedLoopJoin {
                 kind: *kind,
                 left: Box::new(self.plan(left)),
                 right: Box::new(self.plan(right)),
                 predicate: predicate.clone(),
                 cost,
-            },
+            }),
             LogicalPlan::HashJoin {
                 kind,
                 left,
                 right,
                 left_key,
                 right_key,
-            } => PhysicalPlan::HashJoin {
+            } => Some(PhysicalPlan::HashJoin {
                 kind: *kind,
                 left: Box::new(self.plan(left)),
                 right: Box::new(self.plan(right)),
                 left_key: left_key.clone(),
                 right_key: right_key.clone(),
                 cost,
-            },
-            LogicalPlan::Filter { predicate, input } => {
-                if let Some(scan) = self.index_scan(predicate, input, cost) {
-                    return scan;
-                }
-                PhysicalPlan::Filter {
-                    predicate: predicate.clone(),
-                    input: Box::new(self.plan(input)),
-                    cost,
-                }
-            }
+            }),
             LogicalPlan::InSubqueryFilter {
                 expr,
                 subquery,
                 negated,
                 input,
-            } => PhysicalPlan::InSubqueryFilter {
+            } => Some(PhysicalPlan::InSubqueryFilter {
                 expr: expr.clone(),
                 subquery: Box::new(self.plan(subquery)),
                 negated: *negated,
                 input: Box::new(self.plan(input)),
                 cost,
-            },
+            }),
             LogicalPlan::ExistsSubqueryFilter {
                 subquery,
                 negated,
                 input,
-            } => PhysicalPlan::ExistsSubqueryFilter {
+            } => Some(PhysicalPlan::ExistsSubqueryFilter {
                 subquery: Box::new(self.plan(subquery)),
                 negated: *negated,
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Project { items, input } => PhysicalPlan::Projection {
+            }),
+            _ => None,
+        }
+    }
+
+    fn plan_projection(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
+            LogicalPlan::Project { items, input } => Some(PhysicalPlan::Projection {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Window { items, input } => PhysicalPlan::Window {
+            }),
+            LogicalPlan::Window { items, input } => Some(PhysicalPlan::Window {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Aggregate { items, input } => PhysicalPlan::Aggregate {
+            }),
+            _ => None,
+        }
+    }
+
+    fn plan_aggregate(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
+            LogicalPlan::Aggregate { items, input } => Some(PhysicalPlan::Aggregate {
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
+            }),
             LogicalPlan::GroupedAggregate {
                 group_by,
                 items,
                 input,
-            } => PhysicalPlan::GroupedAggregate {
+            } => Some(PhysicalPlan::GroupedAggregate {
                 group_by: group_by.clone(),
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
+            }),
             LogicalPlan::GroupingSetsAggregate {
                 group_by,
                 grouping_sets,
                 items,
                 input,
-            } => PhysicalPlan::GroupingSetsAggregate {
+            } => Some(PhysicalPlan::GroupingSetsAggregate {
                 group_by: group_by.clone(),
                 grouping_sets: grouping_sets.clone(),
                 items: items.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Distinct { input } => PhysicalPlan::Distinct {
+            }),
+            _ => None,
+        }
+    }
+
+    fn plan_ordering(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
+            LogicalPlan::Distinct { input } => Some(PhysicalPlan::Distinct {
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Sort { keys, input } => PhysicalPlan::Sort {
+            }),
+            LogicalPlan::Sort { keys, input } => Some(PhysicalPlan::Sort {
                 keys: keys.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Limit { count, input } => PhysicalPlan::Limit {
+            }),
+            LogicalPlan::Limit { count, input } => Some(PhysicalPlan::Limit {
                 count: *count,
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Offset { count, input } => PhysicalPlan::Offset {
+            }),
+            LogicalPlan::Offset { count, input } => Some(PhysicalPlan::Offset {
                 count: *count,
                 input: Box::new(self.plan(input)),
                 cost,
-            },
-            LogicalPlan::Union { all, left, right } => PhysicalPlan::SetOperation {
-                kind: SetOperationKind::Union,
-                all: *all,
-                left: Box::new(self.plan(left)),
-                right: Box::new(self.plan(right)),
-                cost,
-            },
-            LogicalPlan::Intersect { all, left, right } => PhysicalPlan::SetOperation {
-                kind: SetOperationKind::Intersect,
-                all: *all,
-                left: Box::new(self.plan(left)),
-                right: Box::new(self.plan(right)),
-                cost,
-            },
-            LogicalPlan::Except { all, left, right } => PhysicalPlan::SetOperation {
-                kind: SetOperationKind::Except,
-                all: *all,
-                left: Box::new(self.plan(left)),
-                right: Box::new(self.plan(right)),
-                cost,
-            },
-            LogicalPlan::Parallel { hint, input } => PhysicalPlan::Parallel {
+            }),
+            LogicalPlan::Parallel { hint, input } => Some(PhysicalPlan::Parallel {
                 hint: hint.clone(),
                 input: Box::new(self.plan(input)),
                 cost,
-            },
+            }),
+            _ => None,
+        }
+    }
+
+    fn plan_set_operation(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
+            LogicalPlan::Union { all, left, right } => {
+                Some(self.set_operation_plan(SetOperationKind::Union, *all, left, right, cost))
+            }
+            LogicalPlan::Intersect { all, left, right } => {
+                Some(self.set_operation_plan(SetOperationKind::Intersect, *all, left, right, cost))
+            }
+            LogicalPlan::Except { all, left, right } => {
+                Some(self.set_operation_plan(SetOperationKind::Except, *all, left, right, cost))
+            }
+            _ => None,
+        }
+    }
+
+    fn set_operation_plan(
+        &self,
+        kind: SetOperationKind,
+        all: bool,
+        left: &LogicalPlan,
+        right: &LogicalPlan,
+        cost: PlanCost,
+    ) -> PhysicalPlan {
+        PhysicalPlan::SetOperation {
+            kind,
+            all,
+            left: Box::new(self.plan(left)),
+            right: Box::new(self.plan(right)),
+            cost,
+        }
+    }
+
+    fn plan_mutation(&self, logical: &LogicalPlan, cost: PlanCost) -> Option<PhysicalPlan> {
+        match logical {
             LogicalPlan::Insert {
                 relation_id,
                 table,
@@ -715,16 +770,16 @@ impl PhysicalPlanner {
                 policy_predicates,
                 check_predicates,
                 ..
-            } => PhysicalPlan::Mutation {
-                kind: MutationKind::Insert,
+            } => Some(PhysicalPlan::Mutation {
                 relation_id: *relation_id,
+                kind: MutationKind::Insert,
                 table: table.clone(),
                 selection: None,
                 applied_row_policies: applied_row_policies.clone(),
                 policy_predicates: policy_predicates.clone(),
                 check_predicates: check_predicates.clone(),
                 cost,
-            },
+            }),
             LogicalPlan::Update {
                 relation_id,
                 table,
@@ -733,7 +788,7 @@ impl PhysicalPlanner {
                 policy_predicates,
                 check_predicates,
                 ..
-            } => PhysicalPlan::Mutation {
+            } => Some(PhysicalPlan::Mutation {
                 kind: MutationKind::Update,
                 relation_id: *relation_id,
                 table: table.clone(),
@@ -742,7 +797,7 @@ impl PhysicalPlanner {
                 policy_predicates: policy_predicates.clone(),
                 check_predicates: check_predicates.clone(),
                 cost,
-            },
+            }),
             LogicalPlan::Delete {
                 relation_id,
                 table,
@@ -750,7 +805,7 @@ impl PhysicalPlanner {
                 applied_row_policies,
                 policy_predicates,
                 check_predicates,
-            } => PhysicalPlan::Mutation {
+            } => Some(PhysicalPlan::Mutation {
                 kind: MutationKind::Delete,
                 relation_id: *relation_id,
                 table: table.clone(),
@@ -759,7 +814,13 @@ impl PhysicalPlanner {
                 policy_predicates: policy_predicates.clone(),
                 check_predicates: check_predicates.clone(),
                 cost,
-            },
+            }),
+            _ => None,
+        }
+    }
+
+    fn plan_command(&self, logical: &LogicalPlan, cost: PlanCost) -> PhysicalPlan {
+        match logical {
             LogicalPlan::Transaction { action } => PhysicalPlan::Transaction {
                 action: action.clone(),
                 cost,
@@ -874,6 +935,46 @@ impl PhysicalPlan {
 
 fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
     let prefix = "  ".repeat(indent);
+    let written = write_scan_family(plan, &prefix, out)
+        || write_relational_family(plan, &prefix, indent, out)
+        || write_command_family(plan, &prefix, indent, out);
+    assert!(written, "physical plan family must be handled");
+}
+
+fn write_scan_family(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    write_point_scans(plan, prefix, out)
+        || write_index_range_scan(plan, prefix, out)
+        || write_skip_scan(plan, prefix, out)
+        || write_search_scans(plan, prefix, out)
+        || write_summary_spatial_scans(plan, prefix, out)
+}
+
+fn write_relational_family(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
+    write_join_plan(plan, prefix, indent, out)
+        || write_filter_plan(plan, prefix, indent, out)
+        || write_projection_plan(plan, prefix, indent, out)
+        || write_aggregate_plan(plan, prefix, indent, out)
+}
+
+fn write_command_family(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
+    write_ordering_plan(plan, prefix, indent, out)
+        || write_set_operation_plan(plan, prefix, indent, out)
+        || write_parallel_plan(plan, prefix, indent, out)
+        || write_mutation_plan(plan, prefix, out)
+        || write_utility_plan(plan, prefix, indent, out)
+}
+
+fn write_point_scans(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
     match plan {
         PhysicalPlan::SeqScan { table, cost, .. } => {
             out.push_str(&format!(
@@ -907,6 +1008,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_index_range_scan(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::IndexRangeScan {
             table,
             index,
@@ -927,6 +1035,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_skip_scan(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::IndexSkipScan {
             table,
             index,
@@ -940,6 +1055,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_search_scans(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::TextSearchScan {
             table,
             column,
@@ -978,6 +1100,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_summary_spatial_scans(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::BlockSummaryScan {
             table,
             index,
@@ -1022,6 +1151,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_join_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::SidewaysIndexLookup {
             outer,
             inner_table,
@@ -1068,6 +1204,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             write_physical_plan(left, indent + 1, out);
             write_physical_plan(right, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_filter_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::Filter {
             predicate,
             input,
@@ -1108,6 +1251,18 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             write_physical_plan(input, indent + 1, out);
             write_physical_plan(subquery, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_projection_plan(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
+    match plan {
         PhysicalPlan::Projection { items, input, cost } => {
             let columns = items
                 .iter()
@@ -1128,6 +1283,18 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_aggregate_plan(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
+    match plan {
         PhysicalPlan::Aggregate { items, input, cost } => {
             out.push_str(&format!(
                 "{prefix}Aggregate items={}{}\n",
@@ -1166,6 +1333,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_ordering_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::Distinct { input, cost } => {
             out.push_str(&format!("{prefix}Distinct{}\n", cost_suffix(*cost)));
             write_physical_plan(input, indent + 1, out);
@@ -1192,6 +1366,18 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_set_operation_plan(
+    plan: &PhysicalPlan,
+    prefix: &str,
+    indent: usize,
+    out: &mut String,
+) -> bool {
+    match plan {
         PhysicalPlan::SetOperation {
             kind,
             all,
@@ -1204,6 +1390,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             write_physical_plan(left, indent + 1, out);
             write_physical_plan(right, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_parallel_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::Parallel { hint, input, cost } => {
             out.push_str(&format!(
                 "{prefix}Parallel workers={} reason={}{}\n",
@@ -1213,6 +1406,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_mutation_plan(plan: &PhysicalPlan, prefix: &str, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::Mutation {
             kind,
             table,
@@ -1228,6 +1428,13 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 cost_suffix(*cost)
             ));
         }
+        _ => return false,
+    }
+    true
+}
+
+fn write_utility_plan(plan: &PhysicalPlan, prefix: &str, indent: usize, out: &mut String) -> bool {
+    match plan {
         PhysicalPlan::Ddl { description, cost } => {
             out.push_str(&format!(
                 "{prefix}Ddl {description}{}\n",
@@ -1263,7 +1470,9 @@ fn write_physical_plan(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
             write_physical_plan(input, indent + 1, out);
         }
+        _ => return false,
     }
+    true
 }
 
 fn mutation_security_suffix(
@@ -1280,16 +1489,27 @@ fn mutation_security_suffix(
     format!(" {}", fields.join(" "))
 }
 
+struct SidewaysLookupContext<'a> {
+    outer: &'a LogicalPlan,
+    inner_relation_id: RelationId,
+    inner_table: &'a str,
+    inner_column: &'a str,
+    outer_column: &'a str,
+}
+
 impl PhysicalPlanner {
     fn sideways_lookup_plan(
         &self,
-        outer: &LogicalPlan,
-        inner_relation_id: RelationId,
-        inner_table: &str,
-        inner_column: &str,
-        outer_column: &str,
+        lookup: SidewaysLookupContext<'_>,
         fallback_cost: PlanCost,
     ) -> PhysicalPlan {
+        let SidewaysLookupContext {
+            outer,
+            inner_relation_id,
+            inner_table,
+            inner_column,
+            outer_column,
+        } = lookup;
         let outer = Box::new(self.plan(outer));
         if let Some(index) = self
             .indexes
