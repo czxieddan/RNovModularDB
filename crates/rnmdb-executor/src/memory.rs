@@ -1928,6 +1928,14 @@ struct CreateIndexInput<'a> {
     if_not_exists: bool,
 }
 
+struct UpdateMutationInput<'a> {
+    relation_id: RelationId,
+    table_name: &'a str,
+    assignments: &'a [(String, Expr)],
+    selection: Option<&'a Expr>,
+    policies: MutationPolicies<'a>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionResult {
     Batch(VectorBatch),
@@ -5237,14 +5245,13 @@ impl MemoryExecutor {
                 policy_predicates,
                 check_predicates,
                 ..
-            } => self.execute_update_mutation(
-                *relation_id,
-                table,
+            } => self.execute_update_mutation(UpdateMutationInput {
+                relation_id: *relation_id,
+                table_name: table,
                 assignments,
-                selection.as_ref(),
-                policy_predicates,
-                check_predicates,
-            ),
+                selection: selection.as_ref(),
+                policies: MutationPolicies::new(policy_predicates, check_predicates),
+            }),
             LogicalPlan::Delete {
                 relation_id,
                 table,
@@ -5293,15 +5300,16 @@ impl MemoryExecutor {
 
     fn execute_update_mutation(
         &mut self,
-        relation_id: RelationId,
-        table_name: &str,
-        assignments: &[(String, Expr)],
-        selection: Option<&Expr>,
-        policy_predicates: &[Expr],
-        check_predicates: &[Expr],
+        input: UpdateMutationInput<'_>,
     ) -> Result<(ExecutionResult, MutationDelta)> {
+        let UpdateMutationInput {
+            relation_id,
+            table_name,
+            assignments,
+            selection,
+            policies,
+        } = input;
         let column_crypto = self.column_crypto.clone();
-        let policies = MutationPolicies::new(policy_predicates, check_predicates);
         let context = RowMutationContext {
             relation_id,
             column_crypto: &column_crypto,
@@ -6365,33 +6373,49 @@ fn update_row(
     let logical_row = context
         .column_crypto
         .decrypt_row(context.relation_id, columns, row)?;
-    if !row_satisfies_policy_predicates(
-        columns,
-        &logical_row,
-        policies.visibility,
-        context.runtime,
-    )? {
+    if !row_matches_update_scope(columns, &logical_row, selection, policies, context.runtime)? {
         return Ok(None);
     }
-    if !row_matches(columns, &logical_row, selection, context.runtime)? {
-        return Ok(None);
-    }
-    let mut updated = logical_row.clone();
-    apply_update_assignments(
-        context.runtime,
+    let updated = build_updated_row(
         columns,
         &logical_row,
         assignments,
-        &mut updated,
+        policies.checks,
+        context.runtime,
     )?;
-    recompute_generated_values(columns, &mut updated)?;
-    enforce_row_policy_checks(columns, &updated, policies.checks, context.runtime)?;
     let encrypted = context
         .column_crypto
         .encrypt_row(context.relation_id, columns, &updated)?;
     validate_row_against_columns(columns, &encrypted)?;
     *row = encrypted;
     Ok(Some((logical_row, updated)))
+}
+
+fn row_matches_update_scope(
+    columns: &[ColumnSchema],
+    row: &Row,
+    selection: Option<&Expr>,
+    policies: MutationPolicies<'_>,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<bool> {
+    if !row_satisfies_policy_predicates(columns, row, policies.visibility, runtime)? {
+        return Ok(false);
+    }
+    row_matches(columns, row, selection, runtime)
+}
+
+fn build_updated_row(
+    columns: &[ColumnSchema],
+    source: &Row,
+    assignments: &[(usize, Expr)],
+    check_predicates: &[Expr],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<Row> {
+    let mut updated = source.clone();
+    apply_update_assignments(runtime, columns, source, assignments, &mut updated)?;
+    recompute_generated_values(columns, &mut updated)?;
+    enforce_row_policy_checks(columns, &updated, check_predicates, runtime)?;
+    Ok(updated)
 }
 
 fn apply_update_assignments(
