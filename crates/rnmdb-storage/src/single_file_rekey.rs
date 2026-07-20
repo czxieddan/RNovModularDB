@@ -155,35 +155,19 @@ fn validate_open_rekey_source(file: &File) -> Result<SourceIdentity> {
     };
 
     let information = windows_file_information(file)?;
-    let is_regular = information.dwFileAttributes
-        & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+    let is_regular = information.file_attributes()
+        & u64::from(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
         == 0;
-    validate_source_file_shape(is_regular, u64::from(information.nNumberOfLinks))?;
+    validate_source_file_shape(is_regular, information.number_of_links())?;
     Ok(SourceIdentity {
-        namespace: u64::from(information.dwVolumeSerialNumber),
-        file: u64::from(information.nFileIndexHigh) << 32 | u64::from(information.nFileIndexLow),
+        namespace: information.volume_serial_number(),
+        file: information.file_index(),
     })
 }
 
 #[cfg(windows)]
-fn windows_file_information(
-    file: &File,
-) -> Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
-    use std::{mem, os::windows::io::AsRawHandle};
-    use windows_sys::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
-    };
-
-    // SAFETY: This C output structure permits an all-zero initial buffer.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { mem::zeroed() };
-    // SAFETY: The owned file handle remains live and the output pointer is valid.
-    let result =
-        unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) };
-    if result != 0 {
-        return Ok(information);
-    }
-    Err(rekey_source_metadata_error(io::Error::last_os_error()))
+fn windows_file_information(file: &File) -> Result<winapi_util::file::Information> {
+    winapi_util::file::information(file).map_err(rekey_source_metadata_error)
 }
 
 #[cfg(not(any(unix, windows)))]
