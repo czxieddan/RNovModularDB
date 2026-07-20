@@ -1146,31 +1146,63 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundStatement> {
         let table = self.resolve_table(table_name)?;
         self.require_table_privilege(role_id, table.relation_id(), Privilege::Insert)?;
-        let mut bound_columns = Vec::with_capacity(columns.len());
-        let mut bound_values = Vec::with_capacity(values.len());
-        for (ident, value) in columns.iter().zip(values) {
-            let column = self.resolve_column(table, ident.as_str())?;
-            if column.generated.is_some() {
-                return Err(RnovError::new(
-                    ErrorKind::InvalidInput,
-                    format!(
-                        "cannot insert explicit value for generated column {}",
-                        column.name
-                    ),
-                ));
-            }
-            let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
-            let value = self.bind_function_calls(value, &mut infer)?;
-            self.ensure_expr_assignable(table, &column, &value)?;
-            bound_columns.push(column);
-            bound_values.push(value);
-        }
+        let (bound_columns, bound_values) = self.bind_insert_items(table, columns, values)?;
         Ok(BoundStatement::Insert {
             relation_id: table.relation_id(),
             table: table_name.clone(),
             columns: bound_columns,
             values: bound_values,
+            applied_row_policies: self.applied_row_policy_names(role_id, table.relation_id()),
+            row_policy_predicates: self.bind_row_policies(role_id, table)?,
         })
+    }
+
+    fn bind_insert_items(
+        &self,
+        table: &Table,
+        columns: &[Ident],
+        values: &[Expr],
+    ) -> Result<(Vec<BoundColumn>, Vec<Expr>)> {
+        if columns.len() != values.len() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "INSERT statement has {} columns but {} values",
+                    columns.len(),
+                    values.len()
+                ),
+            ));
+        }
+        let mut bound_columns = Vec::with_capacity(columns.len());
+        let mut bound_values = Vec::with_capacity(values.len());
+        for (ident, value) in columns.iter().zip(values) {
+            let (column, value) = self.bind_insert_item(table, ident, value)?;
+            bound_columns.push(column);
+            bound_values.push(value);
+        }
+        Ok((bound_columns, bound_values))
+    }
+
+    fn bind_insert_item(
+        &self,
+        table: &Table,
+        ident: &Ident,
+        value: &Expr,
+    ) -> Result<(BoundColumn, Expr)> {
+        let column = self.resolve_column(table, ident.as_str())?;
+        if column.generated.is_some() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "cannot insert explicit value for generated column {}",
+                    column.name
+                ),
+            ));
+        }
+        let mut infer = |candidate: &Expr| self.infer_expr_type(table, candidate);
+        let value = self.bind_function_calls(value, &mut infer)?;
+        self.ensure_expr_assignable(table, &column, &value)?;
+        Ok((column, value))
     }
 
     fn bind_update(
@@ -4211,8 +4243,7 @@ impl<'a> Binder<'a> {
             .row_policies(table.relation_id())
             .iter()
             .map(|policy| {
-                let predicate = parse_expr(policy.predicate())?;
-                self.validate_policy_predicate(table, &predicate)?;
+                let predicate = self.bind_row_policy_predicate(table, policy.predicate())?;
                 Ok(BoundRowPolicy {
                     name: policy.name().to_string(),
                     predicate,
@@ -4230,6 +4261,13 @@ impl<'a> Binder<'a> {
             });
         }
         Ok(policies)
+    }
+
+    fn bind_row_policy_predicate(&self, table: &Table, predicate: &str) -> Result<Expr> {
+        let parsed = parse_expr(predicate)?;
+        let bound = self.rewrite_table_qualified_expr(table, &parsed)?;
+        self.validate_policy_predicate(table, &bound)?;
+        Ok(bound)
     }
 
     fn bypasses_row_security(&self, role_id: RoleId, relation_id: RelationId) -> bool {

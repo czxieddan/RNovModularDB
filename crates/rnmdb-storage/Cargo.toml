@@ -11,6 +11,13 @@ crc = "3"
 rnmdb-common.workspace = true
 sha2 = "0.11.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 rand_core = { version = "0.9.3", features = ["os_rng"] }
 tempfile = "3.23.0"

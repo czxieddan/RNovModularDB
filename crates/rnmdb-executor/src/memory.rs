@@ -55,10 +55,15 @@ use crate::{
 };
 
 mod async_task;
+mod mutation_policy;
 mod set_ops;
 mod sort;
 
 use async_task::{BlockingMutationTask, BlockingResultTask};
+use mutation_policy::{
+    MutationPolicies, RowMutationContext, enforce_row_policy_checks,
+    row_satisfies_policy_predicates,
+};
 use set_ops::{
     apply_distinct_cancellable, apply_except_cancellable, apply_intersect_cancellable,
     apply_union_cancellable,
@@ -1921,6 +1926,14 @@ struct CreateIndexInput<'a> {
     method: IndexMethod,
     unique: bool,
     if_not_exists: bool,
+}
+
+struct UpdateMutationInput<'a> {
+    relation_id: RelationId,
+    table_name: &'a str,
+    assignments: &'a [(String, Expr)],
+    selection: Option<&'a Expr>,
+    policies: MutationPolicies<'a>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5219,20 +5232,38 @@ impl MemoryExecutor {
                 table,
                 columns,
                 values,
-            } => self.execute_insert_mutation(*relation_id, table, columns, values),
+                check_predicates,
+                ..
+            } => {
+                self.execute_insert_mutation(*relation_id, table, columns, values, check_predicates)
+            }
             LogicalPlan::Update {
                 relation_id,
                 table,
                 assignments,
                 selection,
+                policy_predicates,
+                check_predicates,
                 ..
-            } => self.execute_update_mutation(*relation_id, table, assignments, selection.as_ref()),
+            } => self.execute_update_mutation(UpdateMutationInput {
+                relation_id: *relation_id,
+                table_name: table,
+                assignments,
+                selection: selection.as_ref(),
+                policies: MutationPolicies::new(policy_predicates, check_predicates),
+            }),
             LogicalPlan::Delete {
                 relation_id,
                 table,
                 selection,
+                policy_predicates,
                 ..
-            } => self.execute_delete_mutation(*relation_id, table, selection.as_ref()),
+            } => self.execute_delete_mutation(
+                *relation_id,
+                table,
+                selection.as_ref(),
+                policy_predicates,
+            ),
             _ => Err(logical_plan_dispatch_error("row mutation")),
         }
     }
@@ -5243,9 +5274,17 @@ impl MemoryExecutor {
         table_name: &str,
         columns: &[String],
         values: &[Expr],
+        check_predicates: &[Expr],
     ) -> Result<(ExecutionResult, MutationDelta)> {
         let values = self.evaluate_insert_values(values)?;
         let column_crypto = self.column_crypto.clone();
+        let runtime = self.scalar_function_runtime.clone();
+        let context = RowMutationContext {
+            relation_id,
+            column_crypto: &column_crypto,
+            runtime: runtime.as_deref(),
+        };
+        let policies = MutationPolicies::new(&[], check_predicates);
         let mut tables = self.write_tables()?;
         let table = tables.get_mut(table_name).ok_or_else(|| {
             RnovError::new(
@@ -5253,7 +5292,7 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        let row = insert_values(table, relation_id, columns, &values, &column_crypto)?;
+        let row = insert_values(table, columns, &values, policies, context)?;
         let delta =
             MutationDelta::new(relation_id, table.columns().to_vec(), Vec::new(), vec![row])?;
         Ok((ExecutionResult::RowsAffected(1), delta))
@@ -5261,12 +5300,21 @@ impl MemoryExecutor {
 
     fn execute_update_mutation(
         &mut self,
-        relation_id: RelationId,
-        table_name: &str,
-        assignments: &[(String, Expr)],
-        selection: Option<&Expr>,
+        input: UpdateMutationInput<'_>,
     ) -> Result<(ExecutionResult, MutationDelta)> {
+        let UpdateMutationInput {
+            relation_id,
+            table_name,
+            assignments,
+            selection,
+            policies,
+        } = input;
         let column_crypto = self.column_crypto.clone();
+        let context = RowMutationContext {
+            relation_id,
+            column_crypto: &column_crypto,
+            runtime: self.scalar_function_runtime.as_deref(),
+        };
         let mut tables = self.write_tables()?;
         let table = tables.get_mut(table_name).ok_or_else(|| {
             RnovError::new(
@@ -5274,14 +5322,7 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        let delta = update_rows(
-            table,
-            relation_id,
-            assignments,
-            selection,
-            &column_crypto,
-            self.scalar_function_runtime.as_deref(),
-        )?;
+        let delta = update_rows(table, assignments, selection, policies, context)?;
         let affected = u64::try_from(delta.after().rows().len()).map_err(|_| {
             RnovError::new(ErrorKind::Internal, "updated row count does not fit u64")
         })?;
@@ -5293,8 +5334,15 @@ impl MemoryExecutor {
         relation_id: RelationId,
         table_name: &str,
         selection: Option<&Expr>,
+        policy_predicates: &[Expr],
     ) -> Result<(ExecutionResult, MutationDelta)> {
         let column_crypto = self.column_crypto.clone();
+        let policies = MutationPolicies::new(policy_predicates, &[]);
+        let context = RowMutationContext {
+            relation_id,
+            column_crypto: &column_crypto,
+            runtime: self.scalar_function_runtime.as_deref(),
+        };
         let mut tables = self.write_tables()?;
         let table = tables.get_mut(table_name).ok_or_else(|| {
             RnovError::new(
@@ -5302,13 +5350,7 @@ impl MemoryExecutor {
                 format!("table not found: {table_name}"),
             )
         })?;
-        let delta = delete_rows(
-            table,
-            relation_id,
-            selection,
-            &column_crypto,
-            self.scalar_function_runtime.as_deref(),
-        )?;
+        let delta = delete_rows(table, selection, policies, context)?;
         let affected = u64::try_from(delta.before().rows().len()).map_err(|_| {
             RnovError::new(ErrorKind::Internal, "deleted row count does not fit u64")
         })?;
@@ -6277,11 +6319,10 @@ fn axis_bound_value(bound: &RangeBound, label: &str) -> Result<i64> {
 
 fn update_rows(
     table: &mut MemoryTable,
-    relation_id: RelationId,
     assignments: &[(String, Expr)],
     selection: Option<&Expr>,
-    column_crypto: &ColumnCryptoState,
-    runtime: Option<&dyn ScalarFunctionRuntime>,
+    policies: MutationPolicies<'_>,
+    context: RowMutationContext<'_>,
 ) -> Result<MutationDelta> {
     let columns = table.columns.clone();
     let assignments = compile_assignments(&columns, assignments)?;
@@ -6290,38 +6331,30 @@ fn update_rows(
     let (rows, before, after) = build_updated_rows(
         &original_rows,
         &columns,
-        relation_id,
         &assignments,
         selection,
-        column_crypto,
-        runtime,
+        policies,
+        context,
     )?;
     replace_rows_and_rebuild_indexes(table, rows, original_rows, original_indexes)?;
-    MutationDelta::new(relation_id, columns, before, after)
+    MutationDelta::new(context.relation_id, columns, before, after)
 }
 
 fn build_updated_rows(
     original_rows: &[Row],
     columns: &[ColumnSchema],
-    relation_id: RelationId,
     assignments: &[(usize, Expr)],
     selection: Option<&Expr>,
-    column_crypto: &ColumnCryptoState,
-    runtime: Option<&dyn ScalarFunctionRuntime>,
+    policies: MutationPolicies<'_>,
+    context: RowMutationContext<'_>,
 ) -> Result<(Vec<Row>, Vec<Row>, Vec<Row>)> {
     let mut rows = original_rows.to_vec();
     let mut before = Vec::new();
     let mut after = Vec::new();
     for row in &mut rows {
-        if let Some((old_row, new_row)) = update_row(
-            row,
-            columns,
-            relation_id,
-            assignments,
-            selection,
-            column_crypto,
-            runtime,
-        )? {
+        if let Some((old_row, new_row)) =
+            update_row(row, columns, assignments, selection, policies, context)?
+        {
             before.push(old_row);
             after.push(new_row);
         }
@@ -6332,23 +6365,57 @@ fn build_updated_rows(
 fn update_row(
     row: &mut Row,
     columns: &[ColumnSchema],
-    relation_id: RelationId,
     assignments: &[(usize, Expr)],
     selection: Option<&Expr>,
-    column_crypto: &ColumnCryptoState,
-    runtime: Option<&dyn ScalarFunctionRuntime>,
+    policies: MutationPolicies<'_>,
+    context: RowMutationContext<'_>,
 ) -> Result<Option<(Row, Row)>> {
-    let logical_row = column_crypto.decrypt_row(relation_id, columns, row)?;
-    if !row_matches(columns, &logical_row, selection, runtime)? {
+    let logical_row = context
+        .column_crypto
+        .decrypt_row(context.relation_id, columns, row)?;
+    if !row_matches_update_scope(columns, &logical_row, selection, policies, context.runtime)? {
         return Ok(None);
     }
-    let mut updated = logical_row.clone();
-    apply_update_assignments(runtime, columns, &logical_row, assignments, &mut updated)?;
-    recompute_generated_values(columns, &mut updated)?;
-    let encrypted = column_crypto.encrypt_row(relation_id, columns, &updated)?;
+    let updated = build_updated_row(
+        columns,
+        &logical_row,
+        assignments,
+        policies.checks,
+        context.runtime,
+    )?;
+    let encrypted = context
+        .column_crypto
+        .encrypt_row(context.relation_id, columns, &updated)?;
     validate_row_against_columns(columns, &encrypted)?;
     *row = encrypted;
     Ok(Some((logical_row, updated)))
+}
+
+fn row_matches_update_scope(
+    columns: &[ColumnSchema],
+    row: &Row,
+    selection: Option<&Expr>,
+    policies: MutationPolicies<'_>,
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<bool> {
+    if !row_satisfies_policy_predicates(columns, row, policies.visibility, runtime)? {
+        return Ok(false);
+    }
+    row_matches(columns, row, selection, runtime)
+}
+
+fn build_updated_row(
+    columns: &[ColumnSchema],
+    source: &Row,
+    assignments: &[(usize, Expr)],
+    check_predicates: &[Expr],
+    runtime: Option<&dyn ScalarFunctionRuntime>,
+) -> Result<Row> {
+    let mut updated = source.clone();
+    apply_update_assignments(runtime, columns, source, assignments, &mut updated)?;
+    recompute_generated_values(columns, &mut updated)?;
+    enforce_row_policy_checks(columns, &updated, check_predicates, runtime)?;
+    Ok(updated)
 }
 
 fn apply_update_assignments(
@@ -6369,10 +6436,9 @@ fn apply_update_assignments(
 
 fn delete_rows(
     table: &mut MemoryTable,
-    relation_id: RelationId,
     selection: Option<&Expr>,
-    column_crypto: &ColumnCryptoState,
-    runtime: Option<&dyn ScalarFunctionRuntime>,
+    policies: MutationPolicies<'_>,
+    context: RowMutationContext<'_>,
 ) -> Result<MutationDelta> {
     let columns = table.columns.clone();
     let original_rows = table.rows.clone();
@@ -6381,8 +6447,16 @@ fn delete_rows(
     let mut removed = Vec::new();
 
     for row in original_rows.iter().cloned() {
-        let logical_row = column_crypto.decrypt_row(relation_id, &columns, &row)?;
-        if row_matches(&columns, &logical_row, selection, runtime)? {
+        let logical_row = context
+            .column_crypto
+            .decrypt_row(context.relation_id, &columns, &row)?;
+        if row_satisfies_policy_predicates(
+            &columns,
+            &logical_row,
+            policies.visibility,
+            context.runtime,
+        )? && row_matches(&columns, &logical_row, selection, context.runtime)?
+        {
             removed.push(logical_row);
         } else {
             kept.push(row);
@@ -6390,7 +6464,7 @@ fn delete_rows(
     }
 
     replace_rows_and_rebuild_indexes(table, kept, original_rows, original_indexes)?;
-    MutationDelta::new(relation_id, columns, removed, Vec::new())
+    MutationDelta::new(context.relation_id, columns, removed, Vec::new())
 }
 
 fn replace_rows_and_rebuild_indexes(
@@ -6437,10 +6511,10 @@ fn compile_assignments(
 
 fn insert_values(
     table: &mut MemoryTable,
-    relation_id: RelationId,
     columns: &[String],
     values: &[SqlValue],
-    column_crypto: &ColumnCryptoState,
+    policies: MutationPolicies<'_>,
+    context: RowMutationContext<'_>,
 ) -> Result<Row> {
     validate_insert_inputs(table.columns(), columns, values.len())?;
     let row_values = table
@@ -6451,7 +6525,16 @@ fn insert_values(
     let mut row = Row::new(row_values);
     recompute_generated_values(table.columns(), &mut row)?;
     let logical_row = row.clone();
-    let row = column_crypto.encrypt_insert_row(relation_id, table.columns(), &row)?;
+    enforce_row_policy_checks(
+        table.columns(),
+        &logical_row,
+        policies.checks,
+        context.runtime,
+    )?;
+    let row =
+        context
+            .column_crypto
+            .encrypt_insert_row(context.relation_id, table.columns(), &row)?;
     table.insert(row)?;
     Ok(logical_row)
 }

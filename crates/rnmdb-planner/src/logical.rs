@@ -3,9 +3,9 @@ use rnmdb_common::ids::{FunctionId, RelationId, RoleId};
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_fts::TextQuery;
 use rnmdb_sql::ast::{
-    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundStatement, BoundUnion, ColumnDef,
-    CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef, JoinKind, ObjectName,
-    OrderByExpr, TransactionAction,
+    BoundExcept, BoundIndexKey, BoundIntersect, BoundJoin, BoundRowPolicy, BoundStatement,
+    BoundUnion, ColumnDef, CreateFunctionImplementation, ExplainFormat, Expr, Ident, IndexKeyDef,
+    JoinKind, ObjectName, OrderByExpr, TransactionAction,
 };
 use rnmdb_types::SqlType;
 
@@ -128,17 +128,26 @@ pub enum LogicalPlan {
         table: String,
         columns: Vec<String>,
         values: Vec<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     Update {
         relation_id: RelationId,
         table: String,
         assignments: Vec<(String, Expr)>,
         selection: Option<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     Delete {
         relation_id: RelationId,
         table: String,
         selection: Option<Expr>,
+        applied_row_policies: Vec<String>,
+        policy_predicates: Vec<Expr>,
+        check_predicates: Vec<Expr>,
     },
     CreateTable {
         table: String,
@@ -363,6 +372,166 @@ impl LogicalPlanner {
 
     pub fn plan(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
         match statement {
+            BoundStatement::Select(_)
+            | BoundStatement::SelectJoin(_)
+            | BoundStatement::Union(_)
+            | BoundStatement::Intersect(_)
+            | BoundStatement::Except(_)
+            | BoundStatement::RecursiveCte(_)
+            | BoundStatement::Query(_)
+            | BoundStatement::Explain { .. } => self.plan_query_statement(statement),
+            BoundStatement::Insert { .. }
+            | BoundStatement::Update(_)
+            | BoundStatement::Delete(_) => self.plan_mutation_statement(statement),
+            BoundStatement::CreateTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateTrigger { .. }
+            | BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterColumnEncryption { .. } => {
+                Self::plan_table_definition_statement(statement)
+            }
+            BoundStatement::DropTable { .. }
+            | BoundStatement::DropIndex { .. }
+            | BoundStatement::DropTrigger { .. }
+            | BoundStatement::DropFunction { .. }
+            | BoundStatement::DropProcedure { .. }
+            | BoundStatement::DropOperator { .. }
+            | BoundStatement::DropRole { .. }
+            | BoundStatement::DropPolicy { .. } => Self::plan_drop_statement(statement),
+            BoundStatement::CreateFunction { .. }
+            | BoundStatement::CreateProcedure { .. }
+            | BoundStatement::CreateOperator { .. } => {
+                Self::plan_routine_definition_statement(statement)
+            }
+            BoundStatement::CreateRole { .. }
+            | BoundStatement::CreatePolicy { .. }
+            | BoundStatement::GrantTablePrivilege { .. }
+            | BoundStatement::GrantProcedurePrivilege { .. } => {
+                Self::plan_access_statement(statement)
+            }
+            BoundStatement::CallProcedure { .. } | BoundStatement::Transaction { .. } => {
+                Self::plan_session_statement(statement)
+            }
+        }
+    }
+
+    fn plan_query_statement(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::Select(_) | BoundStatement::SelectJoin(_) => {
+                self.plan_select_statement(statement)
+            }
+            BoundStatement::Union(_) | BoundStatement::Intersect(_) | BoundStatement::Except(_) => {
+                self.plan_set_statement(statement)
+            }
+            BoundStatement::RecursiveCte(_)
+            | BoundStatement::Query(_)
+            | BoundStatement::Explain { .. } => self.plan_query_wrapper_statement(statement),
+            _ => unreachable!("query statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_select_statement(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::Select(select) => {
+                let input = LogicalPlan::Scan {
+                    relation_id: select.relation_id,
+                    table: object_name(&select.table),
+                };
+                self.plan_select_with_input(select, input, true)
+            }
+            BoundStatement::SelectJoin(join_select) => {
+                let input = LogicalPlan::Scan {
+                    relation_id: join_select.select.relation_id,
+                    table: object_name(&join_select.select.table),
+                };
+                self.plan_select_join(&join_select.select, &join_select.join, input)
+            }
+            _ => unreachable!("select statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_set_statement(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::Union(union) => self.plan_union(union),
+            BoundStatement::Intersect(intersect) => self.plan_intersect(intersect),
+            BoundStatement::Except(except) => self.plan_except(except),
+            _ => unreachable!("set statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_query_wrapper_statement(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::RecursiveCte(cte) => self.plan_recursive_cte(cte),
+            BoundStatement::Query(query) => self.plan_query(query),
+            BoundStatement::Explain {
+                analyze,
+                format,
+                statement,
+            } => self.plan_explain(*analyze, *format, statement),
+            _ => unreachable!("query wrapper dispatcher received a different family"),
+        }
+    }
+
+    fn plan_mutation_statement(&self, statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::Insert {
+                relation_id,
+                table,
+                columns,
+                values,
+                applied_row_policies,
+                row_policy_predicates,
+            } => Ok(LogicalPlan::Insert {
+                relation_id: *relation_id,
+                table: object_name(table),
+                columns: columns.iter().map(|column| column.name.clone()).collect(),
+                values: values.clone(),
+                applied_row_policies: applied_row_policies.clone(),
+                policy_predicates: Vec::new(),
+                check_predicates: mutation_policy_predicates(row_policy_predicates),
+            }),
+            BoundStatement::Update(update) => Ok(LogicalPlan::Update {
+                relation_id: update.relation_id,
+                table: object_name(&update.table),
+                assignments: update
+                    .assignments
+                    .iter()
+                    .map(|assignment| (assignment.column.name.clone(), assignment.value.clone()))
+                    .collect(),
+                selection: update.selection.clone(),
+                applied_row_policies: update.applied_row_policies.clone(),
+                policy_predicates: mutation_policy_predicates(&update.row_policy_predicates),
+                check_predicates: mutation_policy_predicates(&update.row_policy_predicates),
+            }),
+            BoundStatement::Delete(delete) => Ok(LogicalPlan::Delete {
+                relation_id: delete.relation_id,
+                table: object_name(&delete.table),
+                selection: delete.selection.clone(),
+                applied_row_policies: delete.applied_row_policies.clone(),
+                policy_predicates: mutation_policy_predicates(&delete.row_policy_predicates),
+                check_predicates: Vec::new(),
+            }),
+            _ => unreachable!("mutation statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_definition_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::CreateTable { .. }
+            | BoundStatement::CreateIndex { .. }
+            | BoundStatement::CreateTrigger { .. } => {
+                Self::plan_table_creation_statement(statement)
+            }
+            BoundStatement::AlterTableAddColumn { .. }
+            | BoundStatement::AlterColumnEncryption { .. } => {
+                Self::plan_table_alteration_statement(statement)
+            }
+            _ => unreachable!("table definition dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_creation_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::CreateTable {
                 name,
                 columns,
@@ -406,6 +575,12 @@ impl LogicalPlanner {
                 body: body.clone(),
                 if_not_exists: *if_not_exists,
             }),
+            _ => unreachable!("table creation dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_alteration_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::AlterTableAddColumn {
                 relation_id,
                 table,
@@ -428,6 +603,27 @@ impl LogicalPlanner {
                 column: column.as_str().to_string(),
                 encrypted: *encrypted,
             }),
+            _ => unreachable!("table alteration dispatcher received a different family"),
+        }
+    }
+
+    fn plan_drop_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
+            BoundStatement::DropTable { .. }
+            | BoundStatement::DropIndex { .. }
+            | BoundStatement::DropTrigger { .. } => Self::plan_table_drop_statement(statement),
+            BoundStatement::DropFunction { .. }
+            | BoundStatement::DropProcedure { .. }
+            | BoundStatement::DropOperator { .. } => Self::plan_routine_drop_statement(statement),
+            BoundStatement::DropRole { .. } | BoundStatement::DropPolicy { .. } => {
+                Self::plan_access_drop_statement(statement)
+            }
+            _ => unreachable!("drop statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_table_drop_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::DropTable {
                 relation_id,
                 name,
@@ -452,6 +648,12 @@ impl LogicalPlanner {
                 table: object_name(table),
                 if_exists: *if_exists,
             }),
+            _ => unreachable!("table drop dispatcher received a different family"),
+        }
+    }
+
+    fn plan_routine_drop_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::DropFunction {
                 name,
                 argument_types,
@@ -481,6 +683,12 @@ impl LogicalPlanner {
                 right_type: right_type.clone(),
                 if_exists: *if_exists,
             }),
+            _ => unreachable!("routine drop dispatcher received a different family"),
+        }
+    }
+
+    fn plan_access_drop_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::DropRole { name, if_exists } => Ok(LogicalPlan::DropRole {
                 name: name.as_str().to_string(),
                 if_exists: *if_exists,
@@ -494,51 +702,12 @@ impl LogicalPlanner {
                 relation_id: *relation_id,
                 if_exists: *if_exists,
             }),
-            BoundStatement::Insert {
-                relation_id,
-                table,
-                columns,
-                values,
-            } => Ok(LogicalPlan::Insert {
-                relation_id: *relation_id,
-                table: object_name(table),
-                columns: columns.iter().map(|column| column.name.clone()).collect(),
-                values: values.clone(),
-            }),
-            BoundStatement::Update(update) => Ok(LogicalPlan::Update {
-                relation_id: update.relation_id,
-                table: object_name(&update.table),
-                assignments: update
-                    .assignments
-                    .iter()
-                    .map(|assignment| (assignment.column.name.clone(), assignment.value.clone()))
-                    .collect(),
-                selection: update.selection.clone(),
-            }),
-            BoundStatement::Delete(delete) => Ok(LogicalPlan::Delete {
-                relation_id: delete.relation_id,
-                table: object_name(&delete.table),
-                selection: delete.selection.clone(),
-            }),
-            BoundStatement::Select(select) => {
-                let input = LogicalPlan::Scan {
-                    relation_id: select.relation_id,
-                    table: object_name(&select.table),
-                };
-                self.plan_select_with_input(select, input, true)
-            }
-            BoundStatement::SelectJoin(join_select) => {
-                let input = LogicalPlan::Scan {
-                    relation_id: join_select.select.relation_id,
-                    table: object_name(&join_select.select.table),
-                };
-                self.plan_select_join(&join_select.select, &join_select.join, input)
-            }
-            BoundStatement::Union(union) => self.plan_union(union),
-            BoundStatement::Intersect(intersect) => self.plan_intersect(intersect),
-            BoundStatement::Except(except) => self.plan_except(except),
-            BoundStatement::RecursiveCte(cte) => self.plan_recursive_cte(cte),
-            BoundStatement::Query(query) => self.plan_query(query),
+            _ => unreachable!("access drop dispatcher received a different family"),
+        }
+    }
+
+    fn plan_routine_definition_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::CreateFunction {
                 name,
                 argument_types,
@@ -574,6 +743,12 @@ impl LogicalPlanner {
                 negator: signature.negator().map(str::to_string),
                 selectivity_function_id: signature.selectivity_function_id(),
             }),
+            _ => unreachable!("routine definition dispatcher received a different family"),
+        }
+    }
+
+    fn plan_access_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::CreateRole {
                 name,
                 if_not_exists,
@@ -610,6 +785,12 @@ impl LogicalPlanner {
                 procedure_id: *procedure_id,
                 privilege: format!("{privilege:?}"),
             }),
+            _ => unreachable!("access statement dispatcher received a different family"),
+        }
+    }
+
+    fn plan_session_statement(statement: &BoundStatement) -> Result<LogicalPlan> {
+        match statement {
             BoundStatement::CallProcedure { name, body, args } => Ok(LogicalPlan::CallProcedure {
                 name: name.as_str().to_string(),
                 body: body.clone(),
@@ -618,11 +799,7 @@ impl LogicalPlanner {
             BoundStatement::Transaction { action } => Ok(LogicalPlan::Transaction {
                 action: transaction_action_name(*action).to_string(),
             }),
-            BoundStatement::Explain {
-                analyze,
-                format,
-                statement,
-            } => self.plan_explain(*analyze, *format, statement),
+            _ => unreachable!("session statement dispatcher received a different family"),
         }
     }
 
@@ -925,16 +1102,113 @@ impl LogicalPlan {
 
 fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
     let prefix = "  ".repeat(indent);
+    match plan_write_family(plan) {
+        PlanWriteFamily::Source => write_source_plan(plan, &prefix, out),
+        PlanWriteFamily::Relational => write_relational_plan(plan, &prefix, indent, out),
+        PlanWriteFamily::Output => write_output_plan(plan, &prefix, indent, out),
+        PlanWriteFamily::Composition => write_composition_plan(plan, &prefix, indent, out),
+        PlanWriteFamily::Mutation => write_mutation_plan(plan, &prefix, out),
+        PlanWriteFamily::TableDefinition => write_table_definition_plan(plan, &prefix, out),
+        PlanWriteFamily::Routine => write_routine_plan(plan, &prefix, out),
+        PlanWriteFamily::AccessControl => write_access_control_plan(plan, &prefix, indent, out),
+    }
+}
+
+enum PlanWriteFamily {
+    Source,
+    Relational,
+    Output,
+    Composition,
+    Mutation,
+    TableDefinition,
+    Routine,
+    AccessControl,
+}
+
+#[rustfmt::skip]
+fn plan_write_family(plan: &LogicalPlan) -> PlanWriteFamily {
+    use LogicalPlan::*;
     match plan {
-        LogicalPlan::Scan { table, .. } => {
-            out.push_str(&format!("{prefix}Scan table={table}\n"));
-        }
-        LogicalPlan::RecursiveScan { name, columns } => {
-            out.push_str(&format!(
-                "{prefix}RecursiveScan {name}({})\n",
-                columns.join(", ")
-            ));
-        }
+        Scan { .. } | RecursiveScan { .. } | TextSearch { .. } => PlanWriteFamily::Source,
+        Filter { .. }
+        | InSubqueryFilter { .. }
+        | ExistsSubqueryFilter { .. }
+        | SidewaysLookup { .. }
+        | NestedLoopJoin { .. }
+        | HashJoin { .. } => PlanWriteFamily::Relational,
+        Project { .. }
+        | Window { .. }
+        | Aggregate { .. }
+        | GroupedAggregate { .. }
+        | GroupingSetsAggregate { .. }
+        | Distinct { .. } => PlanWriteFamily::Output,
+        Union { .. }
+        | Intersect { .. }
+        | Except { .. }
+        | RecursiveCte { .. }
+        | Sort { .. }
+        | Limit { .. }
+        | Offset { .. }
+        | Parallel { .. } => PlanWriteFamily::Composition,
+        Insert { .. } | Update { .. } | Delete { .. } => PlanWriteFamily::Mutation,
+        CreateTable { .. }
+        | CreateIndex { .. }
+        | CreateTrigger { .. }
+        | AlterTableAddColumn { .. }
+        | AlterColumnEncryption { .. }
+        | DropTable { .. }
+        | DropIndex { .. }
+        | DropTrigger { .. } => PlanWriteFamily::TableDefinition,
+        CreateFunction { .. }
+        | CreateProcedure { .. }
+        | CreateOperator { .. }
+        | DropFunction { .. }
+        | DropProcedure { .. }
+        | DropOperator { .. }
+        | CallProcedure { .. } => PlanWriteFamily::Routine,
+        CreateRole { .. } | CreatePolicy { .. }
+        | DropRole { .. }
+        | DropPolicy { .. }
+        | GrantTablePrivilege { .. }
+        | GrantProcedurePrivilege { .. }
+        | Transaction { .. }
+        | Explain { .. } => PlanWriteFamily::AccessControl,
+    }
+}
+
+fn write_source_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::Scan { table, .. } => out.push_str(&format!("{prefix}Scan table={table}\n")),
+        LogicalPlan::RecursiveScan { name, columns } => out.push_str(&format!(
+            "{prefix}RecursiveScan {name}({})\n",
+            columns.join(", ")
+        )),
+        LogicalPlan::TextSearch {
+            table,
+            column,
+            query,
+            ..
+        } => out.push_str(&format!(
+            "{prefix}TextSearch table={table} column={column} query='{query}'\n"
+        )),
+        _ => unreachable!("source plan writer received a different family"),
+    }
+}
+
+fn write_relational_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::Filter { .. }
+        | LogicalPlan::InSubqueryFilter { .. }
+        | LogicalPlan::ExistsSubqueryFilter { .. } => write_filter_plan(plan, prefix, indent, out),
+        LogicalPlan::SidewaysLookup { .. }
+        | LogicalPlan::NestedLoopJoin { .. }
+        | LogicalPlan::HashJoin { .. } => write_join_plan(plan, prefix, indent, out),
+        _ => unreachable!("relational plan writer received a different family"),
+    }
+}
+
+fn write_filter_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Filter { predicate, input } => {
             out.push_str(&format!("{prefix}Filter predicate={predicate}\n"));
             write_plan(input, indent + 1, out);
@@ -964,16 +1238,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(input, indent + 1, out);
             write_plan(subquery, indent + 1, out);
         }
-        LogicalPlan::TextSearch {
-            table,
-            column,
-            query,
-            ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}TextSearch table={table} column={column} query='{query}'\n"
-            ));
-        }
+        _ => unreachable!("filter plan writer received a different family"),
+    }
+}
+
+fn write_join_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::SidewaysLookup {
             outer,
             inner_table,
@@ -1013,37 +1283,52 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             write_plan(left, indent + 1, out);
             write_plan(right, indent + 1, out);
         }
+        _ => unreachable!("join plan writer received a different family"),
+    }
+}
+
+fn write_output_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::Project { .. } | LogicalPlan::Window { .. } | LogicalPlan::Distinct { .. } => {
+            write_projection_plan(plan, prefix, indent, out)
+        }
+        LogicalPlan::Aggregate { .. }
+        | LogicalPlan::GroupedAggregate { .. }
+        | LogicalPlan::GroupingSetsAggregate { .. } => {
+            write_aggregate_plan(plan, prefix, indent, out)
+        }
+        _ => unreachable!("output plan writer received a different family"),
+    }
+}
+
+fn write_projection_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Project { items, input } => {
-            let columns = items
-                .iter()
-                .map(|item| format!("{} := {}", item.name, item.expr))
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("{prefix}Project {columns}\n"));
+            out.push_str(&format!(
+                "{prefix}Project {}\n",
+                projection_item_list(items)
+            ));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::Window { items, input } => {
-            let functions = items
-                .iter()
-                .map(|item| format!("{} := {}", item.name, window_function_name(&item.function)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("{prefix}Window {functions}\n"));
+            out.push_str(&format!("{prefix}Window {}\n", window_item_list(items)));
             write_plan(input, indent + 1, out);
         }
+        LogicalPlan::Distinct { input } => {
+            out.push_str(&format!("{prefix}Distinct\n"));
+            write_plan(input, indent + 1, out);
+        }
+        _ => unreachable!("projection plan writer received a different family"),
+    }
+}
+
+fn write_aggregate_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Aggregate { items, input } => {
-            let aggregates = items
-                .iter()
-                .map(|item| {
-                    format!(
-                        "{} := {}",
-                        item.name,
-                        aggregate_function_name(&item.function)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            out.push_str(&format!("{prefix}Aggregate {aggregates}\n"));
+            out.push_str(&format!(
+                "{prefix}Aggregate {}\n",
+                aggregate_item_list(items)
+            ));
             write_plan(input, indent + 1, out);
         }
         LogicalPlan::GroupedAggregate {
@@ -1051,18 +1336,10 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             items,
             input,
         } => {
-            let group_by = group_by
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let items = items
-                .iter()
-                .map(grouped_aggregate_item_name)
-                .collect::<Vec<_>>()
-                .join(", ");
             out.push_str(&format!(
-                "{prefix}GroupedAggregate group_by={group_by} {items}\n"
+                "{prefix}GroupedAggregate group_by={} {}\n",
+                expression_list(group_by),
+                grouped_aggregate_item_list(items)
             ));
             write_plan(input, indent + 1, out);
         }
@@ -1072,30 +1349,36 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             items,
             input,
         } => {
-            let group_by = group_by
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let grouping_sets = grouping_sets
-                .iter()
-                .map(|grouping_set| grouping_set_name(grouping_set))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let items = items
-                .iter()
-                .map(grouped_aggregate_item_name)
-                .collect::<Vec<_>>()
-                .join(", ");
             out.push_str(&format!(
-                "{prefix}GroupingSetsAggregate group_by={group_by} sets={grouping_sets} {items}\n"
+                "{prefix}GroupingSetsAggregate group_by={} sets={} {}\n",
+                expression_list(group_by),
+                grouping_set_list(grouping_sets),
+                grouped_aggregate_item_list(items)
             ));
             write_plan(input, indent + 1, out);
         }
-        LogicalPlan::Distinct { input } => {
-            out.push_str(&format!("{prefix}Distinct\n"));
-            write_plan(input, indent + 1, out);
+        _ => unreachable!("aggregate plan writer received a different family"),
+    }
+}
+
+fn write_composition_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::Union { .. }
+        | LogicalPlan::Intersect { .. }
+        | LogicalPlan::Except { .. }
+        | LogicalPlan::RecursiveCte { .. } => {
+            write_set_or_recursive_plan(plan, prefix, indent, out)
         }
+        LogicalPlan::Sort { .. }
+        | LogicalPlan::Limit { .. }
+        | LogicalPlan::Offset { .. }
+        | LogicalPlan::Parallel { .. } => write_flow_plan(plan, prefix, indent, out),
+        _ => unreachable!("composition plan writer received a different family"),
+    }
+}
+
+fn write_set_or_recursive_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Union { all, left, right } => {
             out.push_str(&format!("{prefix}Union {}\n", set_operation_mode(*all)));
             write_plan(left, indent + 1, out);
@@ -1130,6 +1413,12 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{prefix}  Query\n"));
             write_plan(query, indent + 2, out);
         }
+        _ => unreachable!("set plan writer received a different family"),
+    }
+}
+
+fn write_flow_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::Sort { keys, input } => {
             let keys = keys
                 .iter()
@@ -1147,16 +1436,36 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{prefix}Offset count={count}\n"));
             write_plan(input, indent + 1, out);
         }
-        LogicalPlan::Insert { table, columns, .. } => {
+        LogicalPlan::Parallel { hint, input } => {
             out.push_str(&format!(
-                "{prefix}Insert table={table} columns={}\n",
-                columns.join(", ")
+                "{prefix}Parallel workers={} reason={}\n",
+                hint.workers, hint.reason
             ));
+            write_plan(input, indent + 1, out);
         }
+        _ => unreachable!("flow plan writer received a different family"),
+    }
+}
+
+fn write_mutation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::Insert {
+            table,
+            columns,
+            policy_predicates,
+            check_predicates,
+            ..
+        } => out.push_str(&format!(
+            "{prefix}Insert table={table} columns={}{}\n",
+            columns.join(", "),
+            mutation_security_summary(policy_predicates, check_predicates),
+        )),
         LogicalPlan::Update {
             table,
             assignments,
             selection,
+            policy_predicates,
+            check_predicates,
             ..
         } => {
             let assignments = assignments
@@ -1165,33 +1474,67 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
-                "{prefix}Update table={table} set={assignments}{}\n",
-                selection_suffix(selection.as_ref())
+                "{prefix}Update table={table} set={assignments}{}{}\n",
+                selection_suffix(selection.as_ref()),
+                mutation_security_summary(policy_predicates, check_predicates),
             ));
         }
         LogicalPlan::Delete {
-            table, selection, ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}Delete table={table}{}\n",
-                selection_suffix(selection.as_ref())
-            ));
+            table,
+            selection,
+            policy_predicates,
+            check_predicates,
+            ..
+        } => out.push_str(&format!(
+            "{prefix}Delete table={table}{}{}\n",
+            selection_suffix(selection.as_ref()),
+            mutation_security_summary(policy_predicates, check_predicates),
+        )),
+        _ => unreachable!("mutation plan writer received a different family"),
+    }
+}
+
+fn write_table_definition_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterColumnEncryption { .. } => write_table_creation_plan(plan, prefix, out),
+        LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::DropTrigger { .. } => write_table_drop_plan(plan, prefix, out),
+        _ => unreachable!("table definition writer received a different family"),
+    }
+}
+
+fn write_table_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreateTrigger { .. } => write_schema_object_creation_plan(plan, prefix, out),
+        LogicalPlan::AlterTableAddColumn { .. } | LogicalPlan::AlterColumnEncryption { .. } => {
+            write_table_alteration_plan(plan, prefix, out)
         }
+        _ => unreachable!("table creation writer received a different family"),
+    }
+}
+
+fn write_schema_object_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::CreateTable {
             table,
             columns,
             if_not_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateTable table={table} columns={}{}\n",
-                columns
-                    .iter()
-                    .map(|column| column.name.as_str().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateTable table={table} columns={}{}\n",
+            columns
+                .iter()
+                .map(|column| column.name.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if_not_exists_suffix(*if_not_exists)
+        )),
         LogicalPlan::CreateIndex {
             name,
             table,
@@ -1200,18 +1543,16 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             unique,
             if_not_exists,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateIndex {mode}name={name} table={table} method={} keys={}{}\n",
-                method.as_str(),
-                keys.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if_not_exists_suffix(*if_not_exists),
-                mode = unique_prefix(*unique)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateIndex {mode}name={name} table={table} method={} keys={}{}\n",
+            method.as_str(),
+            keys.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            if_not_exists_suffix(*if_not_exists),
+            mode = unique_prefix(*unique)
+        )),
         LogicalPlan::CreateTrigger {
             name,
             table,
@@ -1219,126 +1560,97 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             event,
             if_not_exists,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{}\n",
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateTrigger name={name} table={table} timing={timing:?} event={event:?}{}\n",
+            if_not_exists_suffix(*if_not_exists)
+        )),
+        _ => unreachable!("schema object creation writer received a different family"),
+    }
+}
+
+fn write_table_alteration_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::AlterTableAddColumn {
             table,
             column,
             if_not_exists,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}AlterTableAddColumn table={table} column={}{}\n",
-                column.name,
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}AlterTableAddColumn table={table} column={}{}\n",
+            column.name,
+            if_not_exists_suffix(*if_not_exists)
+        )),
         LogicalPlan::AlterColumnEncryption {
             table,
             column,
             encrypted,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}AlterColumnEncryption table={table} column={column} encrypted={encrypted}\n"
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}AlterColumnEncryption table={table} column={column} encrypted={encrypted}\n"
+        )),
+        _ => unreachable!("table alteration writer received a different family"),
+    }
+}
+
+fn write_table_drop_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::DropTable {
             table, if_exists, ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropTable table={table} if_exists={if_exists}\n"
-            ));
-        }
-        LogicalPlan::DropIndex { name, if_exists } => {
-            out.push_str(&format!(
-                "{prefix}DropIndex name={name} if_exists={if_exists}\n"
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}DropTable table={table} if_exists={if_exists}\n"
+        )),
+        LogicalPlan::DropIndex { name, if_exists } => out.push_str(&format!(
+            "{prefix}DropIndex name={name} if_exists={if_exists}\n"
+        )),
         LogicalPlan::DropTrigger {
             name,
             table,
             if_exists,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropTrigger name={name} table={table} if_exists={if_exists}\n"
-            ));
-        }
-        LogicalPlan::DropFunction {
-            name,
-            argument_types,
-            if_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropFunction name={name} args={} if_exists={if_exists}\n",
-                sql_type_list(argument_types)
-            ));
-        }
-        LogicalPlan::DropProcedure {
-            name,
-            argument_types,
-            if_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropProcedure name={name} args={} if_exists={if_exists}\n",
-                sql_type_list(argument_types)
-            ));
-        }
-        LogicalPlan::DropOperator {
-            symbol,
-            left_type,
-            right_type,
-            if_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropOperator symbol={symbol} left={left_type:?} right={right_type:?} if_exists={if_exists}\n"
-            ));
-        }
-        LogicalPlan::DropRole { name, if_exists } => {
-            out.push_str(&format!(
-                "{prefix}DropRole name={name} if_exists={if_exists}\n"
-            ));
-        }
-        LogicalPlan::DropPolicy {
-            name,
-            relation_id,
-            if_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}DropPolicy name={name} relation={relation_id} if_exists={if_exists}\n"
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}DropTrigger name={name} table={table} if_exists={if_exists}\n"
+        )),
+        _ => unreachable!("table drop writer received a different family"),
+    }
+}
+
+fn write_routine_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::CreateFunction { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::CreateOperator { .. } => write_routine_creation_plan(plan, prefix, out),
+        LogicalPlan::DropFunction { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::DropOperator { .. } => write_routine_drop_plan(plan, prefix, out),
+        LogicalPlan::CallProcedure { .. } => write_procedure_call_plan(plan, prefix, out),
+        _ => unreachable!("routine writer received a different family"),
+    }
+}
+
+fn write_routine_creation_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::CreateFunction {
             name,
             argument_types,
             return_type,
             implementation,
             if_not_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateFunction name={name} args={} returns={return_type:?}{} language={}\n",
-                sql_type_list(argument_types),
-                if_not_exists_suffix(*if_not_exists),
-                create_function_language(implementation)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateFunction name={name} args={} returns={return_type:?}{} language={}\n",
+            sql_type_list(argument_types),
+            if_not_exists_suffix(*if_not_exists),
+            create_function_language(implementation)
+        )),
         LogicalPlan::CreateProcedure {
             name,
             argument_types,
             if_not_exists,
             ..
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateProcedure name={name} args={}{}\n",
-                sql_type_list(argument_types),
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateProcedure name={name} args={}{}\n",
+            sql_type_list(argument_types),
+            if_not_exists_suffix(*if_not_exists)
+        )),
         LogicalPlan::CreateOperator {
             symbol,
             left_type,
@@ -1349,69 +1661,121 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             commutator,
             negator,
             selectivity_function_id,
-        } => {
-            let precedence = precedence
-                .map(|value| format!(" precedence={value}"))
-                .unwrap_or_default();
-            let commutator = commutator
-                .as_ref()
-                .map(|value| format!(" commutator={value}"))
-                .unwrap_or_default();
-            let negator = negator
-                .as_ref()
-                .map(|value| format!(" negator={value}"))
-                .unwrap_or_default();
-            let selectivity = selectivity_function_id
-                .map(|value| format!(" selectivity={value}"))
-                .unwrap_or_default();
-            out.push_str(&format!(
-                "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}{precedence}{commutator}{negator}{selectivity}\n"
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateOperator symbol={symbol} left={left_type:?} right={right_type:?} returns={result_type:?} function={function_id}{}\n",
+            create_operator_suffix(
+                *precedence,
+                commutator.as_deref(),
+                negator.as_deref(),
+                *selectivity_function_id,
+            )
+        )),
+        _ => unreachable!("routine creation writer received a different family"),
+    }
+}
+
+fn write_routine_drop_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::DropFunction {
+            name,
+            argument_types,
+            if_exists,
+        } => out.push_str(&format!(
+            "{prefix}DropFunction name={name} args={} if_exists={if_exists}\n",
+            sql_type_list(argument_types)
+        )),
+        LogicalPlan::DropProcedure {
+            name,
+            argument_types,
+            if_exists,
+        } => out.push_str(&format!(
+            "{prefix}DropProcedure name={name} args={} if_exists={if_exists}\n",
+            sql_type_list(argument_types)
+        )),
+        LogicalPlan::DropOperator {
+            symbol,
+            left_type,
+            right_type,
+            if_exists,
+        } => out.push_str(&format!(
+            "{prefix}DropOperator symbol={symbol} left={left_type:?} right={right_type:?} if_exists={if_exists}\n"
+        )),
+        _ => unreachable!("routine drop writer received a different family"),
+    }
+}
+
+fn write_procedure_call_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
+        LogicalPlan::CallProcedure { name, args, .. } => out.push_str(&format!(
+            "{prefix}CallProcedure name={name} args={}\n",
+            args.len()
+        )),
+        _ => unreachable!("procedure call writer received a different family"),
+    }
+}
+
+fn write_access_control_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
+        LogicalPlan::CreateRole { .. }
+        | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::DropPolicy { .. } => write_role_policy_plan(plan, prefix, out),
+        LogicalPlan::GrantTablePrivilege { .. }
+        | LogicalPlan::GrantProcedurePrivilege { .. }
+        | LogicalPlan::Transaction { .. }
+        | LogicalPlan::Explain { .. } => write_control_plan(plan, prefix, indent, out),
+        _ => unreachable!("access control writer received a different family"),
+    }
+}
+
+fn write_role_policy_plan(plan: &LogicalPlan, prefix: &str, out: &mut String) {
+    match plan {
         LogicalPlan::CreateRole {
             name,
             if_not_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreateRole name={name}{}\n",
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreateRole name={name}{}\n",
+            if_not_exists_suffix(*if_not_exists)
+        )),
         LogicalPlan::CreatePolicy {
             name,
             relation_id,
             predicate,
             if_not_exists,
-        } => {
-            out.push_str(&format!(
-                "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{}\n",
-                if_not_exists_suffix(*if_not_exists)
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}CreatePolicy name={name} relation={relation_id} predicate={predicate}{}\n",
+            if_not_exists_suffix(*if_not_exists)
+        )),
+        LogicalPlan::DropRole { name, if_exists } => out.push_str(&format!(
+            "{prefix}DropRole name={name} if_exists={if_exists}\n"
+        )),
+        LogicalPlan::DropPolicy {
+            name,
+            relation_id,
+            if_exists,
+        } => out.push_str(&format!(
+            "{prefix}DropPolicy name={name} relation={relation_id} if_exists={if_exists}\n"
+        )),
+        _ => unreachable!("role and policy writer received a different family"),
+    }
+}
+
+fn write_control_plan(plan: &LogicalPlan, prefix: &str, indent: usize, out: &mut String) {
+    match plan {
         LogicalPlan::GrantTablePrivilege {
             role_id,
             relation_id,
             privilege,
-        } => {
-            out.push_str(&format!(
-                "{prefix}GrantTablePrivilege role={role_id} relation={relation_id} privilege={privilege}\n"
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}GrantTablePrivilege role={role_id} relation={relation_id} privilege={privilege}\n"
+        )),
         LogicalPlan::GrantProcedurePrivilege {
             role_id,
             procedure_id,
             privilege,
-        } => {
-            out.push_str(&format!(
-                "{prefix}GrantProcedurePrivilege role={role_id} procedure={procedure_id} privilege={privilege}\n"
-            ));
-        }
-        LogicalPlan::CallProcedure { name, args, .. } => {
-            out.push_str(&format!(
-                "{prefix}CallProcedure name={name} args={}\n",
-                args.len()
-            ));
-        }
+        } => out.push_str(&format!(
+            "{prefix}GrantProcedurePrivilege role={role_id} procedure={procedure_id} privilege={privilege}\n"
+        )),
         LogicalPlan::Transaction { action } => {
             out.push_str(&format!("{prefix}Transaction action={action}\n"));
         }
@@ -1426,14 +1790,83 @@ fn write_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             write_plan(input, indent + 1, out);
         }
-        LogicalPlan::Parallel { hint, input } => {
-            out.push_str(&format!(
-                "{prefix}Parallel workers={} reason={}\n",
-                hint.workers, hint.reason
-            ));
-            write_plan(input, indent + 1, out);
-        }
+        _ => unreachable!("control writer received a different family"),
     }
+}
+
+fn projection_item_list(items: &[ProjectionItem]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{} := {}", item.name, item.expr))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn window_item_list(items: &[WindowItem]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{} := {}", item.name, window_function_name(&item.function)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn aggregate_item_list(items: &[AggregateItem]) -> String {
+    items
+        .iter()
+        .map(|item| {
+            format!(
+                "{} := {}",
+                item.name,
+                aggregate_function_name(&item.function)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn expression_list(expressions: &[Expr]) -> String {
+    expressions
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn grouped_aggregate_item_list(items: &[GroupedAggregateItem]) -> String {
+    items
+        .iter()
+        .map(grouped_aggregate_item_name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn grouping_set_list(grouping_sets: &[Vec<Expr>]) -> String {
+    grouping_sets
+        .iter()
+        .map(|grouping_set| grouping_set_name(grouping_set))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn create_operator_suffix(
+    precedence: Option<u8>,
+    commutator: Option<&str>,
+    negator: Option<&str>,
+    selectivity_function_id: Option<FunctionId>,
+) -> String {
+    let precedence = precedence
+        .map(|value| format!(" precedence={value}"))
+        .unwrap_or_default();
+    let commutator = commutator
+        .map(|value| format!(" commutator={value}"))
+        .unwrap_or_default();
+    let negator = negator
+        .map(|value| format!(" negator={value}"))
+        .unwrap_or_default();
+    let selectivity = selectivity_function_id
+        .map(|value| format!(" selectivity={value}"))
+        .unwrap_or_default();
+    format!("{precedence}{commutator}{negator}{selectivity}")
 }
 
 fn subquery_operator(negated: bool, operator: &str) -> String {
@@ -1471,6 +1904,14 @@ fn selection_suffix(selection: Option<&Expr>) -> String {
     selection
         .map(|selection| format!(" where={selection}"))
         .unwrap_or_default()
+}
+
+fn mutation_security_summary(policy_predicates: &[Expr], check_predicates: &[Expr]) -> String {
+    format!(
+        " rls_visibility={} rls_checks={}",
+        policy_predicates.len(),
+        check_predicates.len()
+    )
 }
 
 fn if_not_exists_suffix(if_not_exists: bool) -> &'static str {
@@ -1888,6 +2329,13 @@ fn bound_select_from_statement(statement: &BoundStatement) -> Result<&rnmdb_sql:
 
 fn object_name(name: &ObjectName) -> String {
     name.to_string()
+}
+
+fn mutation_policy_predicates(policies: &[BoundRowPolicy]) -> Vec<Expr> {
+    policies
+        .iter()
+        .map(|policy| policy.predicate.clone())
+        .collect()
 }
 
 fn index_key_def_from_bound(key: &BoundIndexKey) -> IndexKeyDef {
