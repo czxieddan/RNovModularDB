@@ -244,30 +244,49 @@ fn rekey_single_file_locked(
         metadata: &source_metadata,
         page_key: source_page_key,
     };
-    let (temporary_path, mut temporary_file) = create_rekey_temporary_file(path)?;
-    let result = with_new_single_file_exclusive(&mut temporary_file, |target_file| {
-        write_rekey_target(target_file, &temporary_path, &mut source, target_page_key)
-    });
-    drop(temporary_file);
-    let report = match result {
-        Ok(report) => report,
-        Err(error) => return Err(remove_temporary_after_error(&temporary_path, error)),
-    };
-    if let Err(error) = ensure_no_live_local_backend(access_lock) {
-        return Err(remove_temporary_after_error(&temporary_path, error));
-    }
-    if let Err(error) = ensure_rekey_source_unchanged(path, source_identity) {
-        return Err(remove_temporary_after_error(&temporary_path, error));
-    }
-    if let Err(err) = rename(&temporary_path, path) {
-        let error = RnovError::new(
-            ErrorKind::Io,
-            format!("failed to atomically replace database after rekey: {err}"),
-        );
-        return Err(remove_temporary_after_error(&temporary_path, error));
-    }
+    let (temporary_path, temporary_file) = create_rekey_temporary_file(path)?;
+    let report = write_rekey_temporary_target(
+        temporary_file,
+        &temporary_path,
+        &mut source,
+        target_page_key,
+    )?;
+    commit_rekey_target(path, &temporary_path, access_lock, source_identity)?;
     sync_rekey_parent(path)?;
     Ok(report)
+}
+
+fn write_rekey_temporary_target(
+    mut temporary_file: File,
+    temporary_path: &Path,
+    source: &mut RekeySource<'_>,
+    target_page_key: PageCryptoKey,
+) -> Result<SingleFileRekeyReport> {
+    let result = with_new_single_file_exclusive(&mut temporary_file, |target_file| {
+        write_rekey_target(target_file, temporary_path, source, target_page_key)
+    });
+    drop(temporary_file);
+    result.map_err(|error| remove_temporary_after_error(temporary_path, error))
+}
+
+fn commit_rekey_target(
+    path: &Path,
+    temporary_path: &Path,
+    access_lock: &Arc<std::sync::Mutex<()>>,
+    source_identity: SourceIdentity,
+) -> Result<()> {
+    let result = (|| {
+        ensure_no_live_local_backend(access_lock)?;
+        ensure_rekey_source_unchanged(path, source_identity)?;
+        rename(temporary_path, path).map_err(|err| {
+            RnovError::new(
+                ErrorKind::Io,
+                format!("failed to atomically replace database after rekey: {err}"),
+            )
+        })?;
+        Ok(())
+    })();
+    result.map_err(|error| remove_temporary_after_error(temporary_path, error))
 }
 
 fn ensure_rekey_source_unchanged(path: &Path, expected: SourceIdentity) -> Result<()> {
@@ -335,6 +354,28 @@ fn write_rekey_target(
     source: &mut RekeySource<'_>,
     target_page_key: PageCryptoKey,
 ) -> Result<SingleFileRekeyReport> {
+    initialize_rekey_target(target_file, source)?;
+    let page_reports = write_rekey_pages(target_file, source, target_page_key)?;
+    sync_rekey_target(target_file)?;
+    let target_inspection =
+        inspect_single_file_with_key_locked(target_path, target_page_key, target_file)?;
+    let target_metadata = read_single_file_metadata(target_file)?;
+    validate_rekey_target(
+        source.inspection,
+        source.metadata,
+        &target_inspection,
+        &target_metadata,
+        page_reports.len() as u64,
+    )?;
+    validate_rekey_page_contents(target_file, source, target_page_key)?;
+    Ok(build_rekey_report(
+        source.inspection,
+        &target_inspection,
+        page_reports,
+    ))
+}
+
+fn initialize_rekey_target(target_file: &mut File, source: &RekeySource<'_>) -> Result<()> {
     write_single_file_header_with_roots(
         target_file,
         source.metadata.page_size,
@@ -347,33 +388,32 @@ fn write_rekey_target(
         .map_err(|err| {
             RnovError::new(ErrorKind::Io, format!("failed to size rekey target: {err}"))
         })?;
-    let page_reports = write_rekey_pages(target_file, source, target_page_key)?;
-    target_file.sync_all().map_err(|err| {
-        RnovError::new(ErrorKind::Io, format!("failed to sync rekey target: {err}"))
-    })?;
-    let target_inspection =
-        inspect_single_file_with_key_locked(target_path, target_page_key, target_file)?;
-    let target_metadata = read_single_file_metadata(target_file)?;
-    validate_rekey_target(
-        source.inspection,
-        source.metadata,
-        &target_inspection,
-        &target_metadata,
-        page_reports.len() as u64,
-    )?;
-    validate_rekey_page_contents(target_file, source, target_page_key)?;
-    Ok(SingleFileRekeyReport {
-        path: source.inspection.path().to_path_buf(),
+    Ok(())
+}
+
+fn sync_rekey_target(target_file: &File) -> Result<()> {
+    target_file
+        .sync_all()
+        .map_err(|err| RnovError::new(ErrorKind::Io, format!("failed to sync rekey target: {err}")))
+}
+
+fn build_rekey_report(
+    source: &SingleFileInspection,
+    target: &SingleFileInspection,
+    page_reports: Vec<SingleFileRekeyPageReport>,
+) -> SingleFileRekeyReport {
+    SingleFileRekeyReport {
+        path: source.path().to_path_buf(),
         source_format_version: SINGLE_FILE_FORMAT_VERSION,
         target_format_version: SINGLE_FILE_FORMAT_VERSION,
         key_rotated: true,
-        bytes_written: target_inspection.file_len_bytes(),
-        page_size: target_inspection.page_size(),
-        superblock_generation: target_inspection.superblock_generation(),
-        page_record_slots: target_inspection.page_record_slots(),
+        bytes_written: target.file_len_bytes(),
+        page_size: target.page_size(),
+        superblock_generation: target.superblock_generation(),
+        page_record_slots: target.page_record_slots(),
         pages_rekeyed: page_reports.len() as u64,
         page_reports,
-    })
+    }
 }
 
 fn validate_rekey_page_contents(
