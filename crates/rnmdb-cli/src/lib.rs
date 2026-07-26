@@ -1,8 +1,8 @@
+mod tenant_context;
+
 use std::{
     collections::HashSet,
-    fmt,
     path::Path,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -14,16 +14,14 @@ use rnmdb_catalog::{
 };
 use rnmdb_common::{
     ErrorKind, Result, RnovError,
-    ids::{DatabaseId, FunctionId, RelationId, RoleId},
+    ids::{DatabaseId, RelationId, RoleId},
 };
 use rnmdb_executor::{
     durable::{
         DurableExecutorImage, read_image_from_single_file_backend,
         write_image_to_single_file_backend,
     },
-    memory::{
-        ExecutionResult, MemoryExecutor, MutationDelta, ParallelQueryConfig, ScalarFunctionRuntime,
-    },
+    memory::{ExecutionResult, MemoryExecutor, MutationDelta, ParallelQueryConfig},
     vector::VectorBatch,
 };
 use rnmdb_planner::{
@@ -53,6 +51,8 @@ use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
 use rnmdb_types::{SqlType, SqlValue};
 use rnmdb_udf::{UdfBudget, UdfDefinition, UdfRegistry, UdfSandboxPolicy, WasmScalarRuntime};
 
+use tenant_context::{TenantContextState, is_current_tenant_signature};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutput {
     Rows(VectorBatch),
@@ -67,6 +67,7 @@ pub struct LocalSession {
     executor: MemoryExecutor,
     udf_registry: UdfRegistry,
     wasm_runtime: WasmScalarRuntime,
+    tenant_context: TenantContextState,
     planner: LogicalPlanner,
     optimizer: RuleOptimizer,
     execution: LocalExecutionConfig,
@@ -86,36 +87,6 @@ struct LocalTransactionState {
     catalog_snapshot: Catalog,
     executor_snapshot: MemoryExecutor,
     udf_registry_snapshot: UdfRegistry,
-}
-
-struct SessionWasmRuntime {
-    registry: UdfRegistry,
-    runtime: WasmScalarRuntime,
-}
-
-impl fmt::Debug for SessionWasmRuntime {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SessionWasmRuntime")
-            .field("registered_functions", &self.registry.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl ScalarFunctionRuntime for SessionWasmRuntime {
-    fn return_type(&self, function_id: FunctionId) -> Option<SqlType> {
-        self.registry
-            .resolve_by_id(function_id)
-            .and_then(UdfDefinition::return_type)
-            .cloned()
-    }
-
-    fn execute(&self, function_id: FunctionId, arguments: &[SqlValue]) -> Result<Option<SqlValue>> {
-        let Some(definition) = self.registry.resolve_by_id(function_id) else {
-            return Ok(None);
-        };
-        self.runtime.execute_scalar(definition, arguments).map(Some)
-    }
 }
 
 impl LocalTransactionState {
@@ -156,6 +127,7 @@ impl LocalSession {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.ensure_checkpoint_allowed()?;
         if self.in_transaction() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
@@ -182,6 +154,7 @@ impl LocalSession {
     }
 
     pub fn set_active_role(&mut self, role_id: RoleId) -> Result<()> {
+        self.ensure_role_change_allowed()?;
         if self.catalog.get_role_by_id(role_id).is_none() {
             return Err(RnovError::new(ErrorKind::NotFound, "role does not exist"));
         }
@@ -197,6 +170,7 @@ impl LocalSession {
         column_name: &str,
         key: ColumnKeyMaterial,
     ) -> Result<()> {
+        self.ensure_column_encryption_configuration_allowed()?;
         let schema_name = Ident::new(schema_name);
         let table_name = Ident::new(table_name);
         let column_name = Ident::new(column_name);
@@ -234,12 +208,17 @@ impl LocalSession {
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
+        self.ensure_usable()?;
+        if let Some(output) = self.execute_session_query(sql)? {
+            return Ok(output);
+        }
         let statement = parse_statement(sql)?;
         let bound = Binder::new(&self.catalog).bind_for_role(&statement, self.role_id)?;
         self.execute_bound_statement(&bound)
     }
 
     fn execute_bound_statement(&mut self, bound: &BoundStatement) -> Result<CommandOutput> {
+        self.validate_tenant_context_statement(bound)?;
         match bound {
             BoundStatement::Transaction { action } => self.execute_transaction(*action),
             BoundStatement::CreateTable { .. }
@@ -639,12 +618,13 @@ impl LocalSession {
     }
 
     fn from_parts(
-        catalog: Catalog,
+        mut catalog: Catalog,
         role_id: RoleId,
         mut executor: MemoryExecutor,
         execution: LocalExecutionConfig,
         durable: Option<LocalDurableStore>,
     ) -> Result<Self> {
+        let tenant_context = TenantContextState::new(&mut catalog)?;
         executor.set_active_role(role_id);
         let wasm_runtime = WasmScalarRuntime::new()?;
         let udf_registry = rebuild_udf_registry(&catalog, &wasm_runtime)?;
@@ -654,6 +634,7 @@ impl LocalSession {
             executor,
             udf_registry,
             wasm_runtime,
+            tenant_context,
             planner: LogicalPlanner::new(),
             optimizer: RuleOptimizer::new(),
             execution,
@@ -665,14 +646,6 @@ impl LocalSession {
         };
         session.refresh_scalar_function_runtime();
         Ok(session)
-    }
-
-    fn refresh_scalar_function_runtime(&mut self) {
-        self.executor
-            .set_scalar_function_runtime(Some(Arc::new(SessionWasmRuntime {
-                registry: self.udf_registry.clone(),
-                runtime: self.wasm_runtime.clone(),
-            })));
     }
 
     fn encode_durable_image(&self) -> Result<Vec<u8>> {
@@ -1124,6 +1097,12 @@ impl LocalSession {
         argument_types: &[SqlType],
         if_exists: bool,
     ) -> Result<()> {
+        if is_current_tenant_signature(name, argument_types) {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot drop the current_tenant built-in",
+            ));
+        }
         let catalog_snapshot = self.catalog.clone();
         match self.catalog.drop_function(name, argument_types)? {
             Some(function) => self.finish_drop_function(function, catalog_snapshot),
