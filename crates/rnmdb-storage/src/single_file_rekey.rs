@@ -18,14 +18,11 @@ use super::{
     single_file_access_lock_for, single_file_data_start, single_file_page_record_size,
     with_new_single_file_exclusive, write_single_file_header_with_roots, write_single_file_page,
 };
+use source_identity::{SourceIdentity, open_rekey_source};
+
+mod source_identity;
 
 static NEXT_REKEY_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SourceIdentity {
-    namespace: u64,
-    file: u64,
-}
 
 struct RekeySource<'a> {
     file: &'a mut File,
@@ -90,112 +87,6 @@ fn validate_rekey_keys(
         return Err(RnovError::new(
             ErrorKind::Security,
             "single-file rekey requires a different target page key",
-        ));
-    }
-    Ok(())
-}
-
-fn open_rekey_source(path: &Path) -> Result<(File, SourceIdentity)> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    configure_rekey_source_open(&mut options);
-    let file = options.open(path).map_err(rekey_source_open_error)?;
-    let identity = validate_open_rekey_source(&file)?;
-    Ok((file, identity))
-}
-
-#[cfg(unix)]
-fn configure_rekey_source_open(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    options.custom_flags(libc::O_NOFOLLOW);
-}
-
-#[cfg(windows)]
-fn configure_rekey_source_open(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_rekey_source_open(_options: &mut OpenOptions) {}
-
-fn rekey_source_open_error(err: io::Error) -> RnovError {
-    #[cfg(unix)]
-    if err.raw_os_error() == Some(libc::ELOOP) {
-        return RnovError::new(
-            ErrorKind::InvalidInput,
-            "rekey source cannot be a symbolic link",
-        );
-    }
-    RnovError::new(
-        ErrorKind::Io,
-        format!("failed to open database file for rekey: {err}"),
-    )
-}
-
-#[cfg(unix)]
-fn validate_open_rekey_source(file: &File) -> Result<SourceIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata().map_err(rekey_source_metadata_error)?;
-    validate_source_file_shape(metadata.is_file(), metadata.nlink())?;
-    Ok(SourceIdentity {
-        namespace: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn validate_open_rekey_source(file: &File) -> Result<SourceIdentity> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    };
-
-    let information = windows_file_information(file)?;
-    let is_regular = information.file_attributes()
-        & u64::from(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
-        == 0;
-    validate_source_file_shape(is_regular, information.number_of_links())?;
-    Ok(SourceIdentity {
-        namespace: information.volume_serial_number(),
-        file: information.file_index(),
-    })
-}
-
-#[cfg(windows)]
-fn windows_file_information(file: &File) -> Result<winapi_util::file::Information> {
-    winapi_util::file::information(file).map_err(rekey_source_metadata_error)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_open_rekey_source(_file: &File) -> Result<SourceIdentity> {
-    Err(RnovError::new(
-        ErrorKind::Storage,
-        "single-file rekey cannot verify source identity on this platform",
-    ))
-}
-
-fn rekey_source_metadata_error(err: io::Error) -> RnovError {
-    RnovError::new(
-        ErrorKind::Io,
-        format!("failed to inspect opened rekey source: {err}"),
-    )
-}
-
-fn validate_source_file_shape(is_regular: bool, links: u64) -> Result<()> {
-    if !is_regular {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "rekey source must be a regular file and cannot be a symbolic link",
-        ));
-    }
-    if links > 1 {
-        return Err(RnovError::new(
-            ErrorKind::InvalidInput,
-            "single-file rekey rejects hard links because another name would retain old-key ciphertext",
         ));
     }
     Ok(())
@@ -450,11 +341,15 @@ fn write_rekey_pages(
                     )
                 })?;
         write_single_file_page(target_file, target_page_key, page, data_start, record_size)?;
+        let source_counter = record.encryption_counter().ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::Corruption,
+                "authenticated source page is missing its encryption counter",
+            )
+        })?;
         reports.push(SingleFileRekeyPageReport {
             page_id: record.page_id(),
-            source_counter: record
-                .encryption_counter()
-                .expect("present record has a counter"),
+            source_counter,
             target_counter: 1,
         });
     }

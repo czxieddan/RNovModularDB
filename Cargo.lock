@@ -1060,12 +1060,12 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "crc",
- "libc",
  "rand_core 0.9.5",
  "rnmdb-common",
+ "rustix",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
- "winapi-util",
  "windows-sys",
 ]
 
