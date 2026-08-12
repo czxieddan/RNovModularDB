@@ -263,6 +263,11 @@ certificate authority, replication layer, or high-availability coordinator.
 
 ## License
 
-RNovModularDB is offered under a commercial license and under the GNU Affero
-General Public License. For AGPL licensing, see [LICENSE](LICENSE). For custom
-commercial licensing, contact [licensing@aperip.com](mailto:licensing@aperip.com).
+RNovModularDB is licensed under the Aperip Heimdall Commons License 1.0.
+AHCL includes source and history disclosure duties for internal use, builds,
+deployment, network operation, modified versions, and dependent projects. See
+[LICENSE](LICENSE) and the complete [AHCL notice set](AHCL/).
+
+Separate commercial licenses are available from
+[licensing@aperip.com](mailto:licensing@aperip.com). Contact information does
+not itself grant a commercial license or change the AHCL terms.
