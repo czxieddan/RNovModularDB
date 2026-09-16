@@ -264,10 +264,25 @@ impl LocalSession {
         column_name: &str,
         role_name: &str,
     ) -> Result<(RelationId, String, RoleId)> {
+        let (relation_id, column_name) =
+            self.resolve_column_decrypt_target(schema_name, table_name, column_name)?;
+        let role_name = Ident::new(role_name);
+        let role = self
+            .catalog
+            .get_role(role_name.as_str())
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "column grant role not found"))?;
+        Ok((relation_id, column_name, role.role_id()))
+    }
+
+    fn resolve_column_decrypt_target(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(RelationId, String)> {
         let schema_name = Ident::new(schema_name);
         let table_name = Ident::new(table_name);
         let column_name = Ident::new(column_name);
-        let role_name = Ident::new(role_name);
         let table = self
             .catalog
             .get_table(schema_name.as_str(), table_name.as_str())
@@ -284,15 +299,7 @@ impl LocalSession {
                 "column grant requires an encrypted column",
             ));
         }
-        let role = self
-            .catalog
-            .get_role(role_name.as_str())
-            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "column grant role not found"))?;
-        Ok((
-            table.relation_id(),
-            column.name().to_owned(),
-            role.role_id(),
-        ))
+        Ok((table.relation_id(), column.name().to_owned()))
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
