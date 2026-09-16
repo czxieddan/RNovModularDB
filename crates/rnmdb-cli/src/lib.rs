@@ -227,6 +227,74 @@ impl LocalSession {
         )
     }
 
+    /// Grants one named role decryption of one configured encrypted column.
+    ///
+    /// This session-local control-plane operation requires the active role to
+    /// own the table or be a superuser. It does not grant SQL table privileges,
+    /// bypass row policies, persist a key or grant, or run inside a transaction
+    /// or tenant context. Callers must reapply the grant after reopening and
+    /// configuring a session. Each identifier is limited to 256 UTF-8 bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a security error for a tenant-scoped or non-owner caller, an
+    /// invalid-input error inside a transaction or for an oversized identifier,
+    /// or a not-found/security error for an unknown table, role, column, or
+    /// unconfigured column key. Validation failures leave existing grants intact.
+    pub fn grant_column_decrypt(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        role_name: &str,
+    ) -> Result<()> {
+        self.ensure_column_encryption_configuration_allowed()?;
+        validate_column_decrypt_identifiers([schema_name, table_name, column_name, role_name])?;
+        require_idle_column_decrypt_configuration(self.in_transaction())?;
+        let (relation_id, column_name, role_id) =
+            self.resolve_column_decrypt_grant(schema_name, table_name, column_name, role_name)?;
+        self.executor
+            .grant_column_decrypt(relation_id, column_name, role_id)
+    }
+
+    fn resolve_column_decrypt_grant(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        column_name: &str,
+        role_name: &str,
+    ) -> Result<(RelationId, String, RoleId)> {
+        let schema_name = Ident::new(schema_name);
+        let table_name = Ident::new(table_name);
+        let column_name = Ident::new(column_name);
+        let role_name = Ident::new(role_name);
+        let table = self
+            .catalog
+            .get_table(schema_name.as_str(), table_name.as_str())
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "column grant table not found"))?;
+        require_column_grant_owner(&self.catalog, self.role_id, table.relation_id())?;
+        let column = table
+            .columns()
+            .iter()
+            .find(|column| column.name() == column_name.as_str())
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "column grant column not found"))?;
+        if !column.is_encrypted() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "column grant requires an encrypted column",
+            ));
+        }
+        let role = self
+            .catalog
+            .get_role(role_name.as_str())
+            .ok_or_else(|| RnovError::new(ErrorKind::NotFound, "column grant role not found"))?;
+        Ok((
+            table.relation_id(),
+            column.name().to_owned(),
+            role.role_id(),
+        ))
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<CommandOutput> {
         self.ensure_usable()?;
         if let Some(output) = self.execute_session_query(sql)? {
@@ -1788,6 +1856,44 @@ fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
         .get_role("local")
         .map(|role| role.role_id())
         .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
+}
+
+fn validate_column_decrypt_identifiers(names: [&str; 4]) -> Result<()> {
+    const MAX_COLUMN_GRANT_IDENTIFIER_BYTES: usize = 1 << 8;
+    if names
+        .iter()
+        .any(|name| name.len() > MAX_COLUMN_GRANT_IDENTIFIER_BYTES)
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "column grant identifier exceeds its byte limit",
+        ));
+    }
+    Ok(())
+}
+
+fn require_idle_column_decrypt_configuration(in_transaction: bool) -> Result<()> {
+    if in_transaction {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "column decryption grants require an idle session",
+        ));
+    }
+    Ok(())
+}
+
+fn require_column_grant_owner(
+    catalog: &Catalog,
+    role_id: RoleId,
+    relation_id: RelationId,
+) -> Result<()> {
+    if catalog.role_owns_relation(role_id, relation_id) || catalog.role_is_superuser(role_id) {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::Security,
+        "only the table owner can grant column decryption",
+    ))
 }
 
 fn mutation_rows_affected(output: &ExecutionResult) -> u64 {
