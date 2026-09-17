@@ -1,12 +1,19 @@
-This project is licensed under version 1.0 of the Aperip Heimdall Commons
-License (AHCL 1.0).
+This project is licensed under version 1.1 of the Aperip Heimdall Commons
+License (AHCL 1.1).
 
-Official AHCL English text, announcements, and public notices:
+Official AHCL text, announcements, and public notices:
 https://ahcl.aperip.com
 
-Verbatim AHCL 1.0 copy in this repository:
-AHCL/AHCL-1.0.md
+AHCL Materials Directory:
+.ahcl/
+
+Official or recognized AHCL 1.1 copy in this repository:
+.ahcl/AHCL-1.1.md
 
 Channels for Non-AHCL Special Authorizations
 Commercial licenses and other separate authorizations: licensing@aperip.com
 
+The channel above is solely for applying for or obtaining a separate Special
+Authorization. Channel information does not itself constitute a Special
+Authorization, does not modify AHCL 1.1, and does not waive or reduce any AHCL
+obligation not expressly covered by a valid written Special Authorization.

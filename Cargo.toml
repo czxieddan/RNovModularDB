@@ -20,7 +20,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "LicenseRef-AHCL-1.0 OR LicenseRef-RNovModularDB-Commercial"
+license = "LicenseRef-AHCL-1.1 OR LicenseRef-RNovModularDB-Commercial"
 repository = "https://github.com/czxieddan/RNovModularDB"
 rust-version = "1.95"
 
