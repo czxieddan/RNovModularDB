@@ -1,0 +1,29 @@
+# AHCL Kit project configuration.
+schema = 1
+materials-directory = ".ahcl"
+languages:
+  - "rust"
+
+[project]
+name = "RNovModularDB"
+canonical-repository = "https://github.com/czxieddan/RNovModularDB"
+canonical-branch = "master"
+right-holders:
+  - "czxieddan"
+contact = "licensing@aperip.com"
+adoption-date = "2026-08-12"
+
+[license]
+version = "1.2"
+enabled = true
+covered-scope = "the RNovModularDB source code and project-maintained documentation; third-party dependencies retain their own licenses"
+special-authorization-channel = "licensing@aperip.com"
+
+[generation]
+strict-license-files = true
+
+[rust.cargo]
+manifests:
+  - "Cargo.toml"
+packages = []
+rules = []

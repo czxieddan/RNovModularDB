@@ -1,19 +1,30 @@
-This project is licensed under version 1.1 of the Aperip Heimdall Commons
-License (AHCL 1.1).
+----- BEGIN AHCL NOTICE -----
+
+This license notice applies to:
+RNovModularDB
+
+AHCL-covered portions:
+the RNovModularDB source code and project-maintained documentation; third-party dependencies retain their own licenses
+
+The portions identified above are licensed under version 1.2 of the
+Aperip Heimdall Commons License (AHCL 1.2), subject to its provisions
+concerning migration to later official versions.
 
 Official AHCL text, announcements, and public notices:
 https://ahcl.aperip.com
 
-AHCL Materials Directory:
+AHCL Materials Directory (relative to the directory containing this LICENSE):
 .ahcl/
 
-Official or recognized AHCL 1.1 copy in this repository:
-.ahcl/AHCL-1.1.md
+Official or recognized AHCL 1.2 copy:
+.ahcl/AHCL-1.2.md
 
-Channels for Non-AHCL Special Authorizations
-Commercial licenses and other separate authorizations: licensing@aperip.com
+Channels for Non-AHCL Special Authorizations:
+licensing@aperip.com
 
-The channel above is solely for applying for or obtaining a separate Special
-Authorization. Channel information does not itself constitute a Special
-Authorization, does not modify AHCL 1.1, and does not waive or reduce any AHCL
+The channel above is solely for applying for or obtaining a separate
+Special Authorization. Channel information does not itself constitute a Special
+Authorization, does not modify AHCL 1.2, and does not waive or reduce any AHCL
 obligation not expressly covered by a valid written Special Authorization.
+
+----- END AHCL NOTICE -----

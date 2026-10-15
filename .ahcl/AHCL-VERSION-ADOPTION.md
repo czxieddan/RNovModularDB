@@ -1,6 +1,12 @@
-# AHCL Version Adoption Records
+# AHCL Version Adoption
 
-## AHCL 1.1 Adoption
+- Covered scope: the RNovModularDB source code and project-maintained documentation; third-party dependencies retain their own licenses
+- Initial AHCL adoption date: 2026-08-12
+- Applicable version: AHCL 1.2
+
+## Version Adoption Events
+
+### AHCL 1.1 Adoption
 
 - Project: RNovModularDB
 - Canonical repository: https://github.com/czxieddan/RNovModularDB
@@ -12,3 +18,15 @@
 - Signature: czxieddan, Project License Administrator
 - Official Publication Location: https://ahcl.aperip.com/licenses/ahcl-1-1
 - Public notice location: https://ahcl.aperip.com/licenses/ahcl-1-1
+
+### AHCL 1.2 Adoption
+
+<!-- BEGIN AHCL KIT MANAGED SCOPE: the-rnovmodulardb-source-code-and-project-maintained-documentation-third-party-dependencies-retain-their-own-licenses -->
+- Version adoption event: AHCL 1.2 for the RNovModularDB source code and project-maintained documentation; third-party dependencies retain their own licenses
+- Former version: AHCL 1.1
+- New version: AHCL 1.2
+- Effective Date: 2026-10-15
+- Authority: czxieddan, the copyright holder identified in `.ahcl/AHCL-PROJECT-NOTICE.md`, acting as Project License Administrator
+- Signature: czxieddan, Project License Administrator
+- Official Publication Location: https://ahcl.aperip.com
+<!-- END AHCL KIT MANAGED SCOPE: the-rnovmodulardb-source-code-and-project-maintained-documentation-third-party-dependencies-retain-their-own-licenses -->
