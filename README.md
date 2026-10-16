@@ -253,7 +253,8 @@ timeout, a five-second graceful drain, and a one-second forced drain. The
 library equivalent is `SqlTcpServer::bind_with_options` with a validated
 `SqlServerOptions`; `SqlTcpServer::bind` retains these defaults. Configured
 client counts are capped at 4,096 and command sizes at 16 MiB to prevent an
-accidental configuration from removing the server's admission boundary.
+accidental configuration from removing the server's admission boundary. Client
+I/O and drain timeouts must be greater than zero and no longer than 24 hours.
 
 Each connection has independent authentication and transaction state, while
 all connections share one committed database state. Autocommit changes become
@@ -270,7 +271,9 @@ single-line response reports lifecycle, database health, runtime mode,
 authentication policy, active clients, committed generation, and the same
 process-local counters exposed by `SqlServerHandle::metrics`. This keeps
 `PING` as the minimal anonymous liveness probe while reserving operational
-detail for an authenticated session.
+detail for an authenticated session. `failed_client_sessions` counts every
+client handler that returns an error, including setup, protocol, I/O, and
+session-close failures.
 
 Embedded service managers can retain `SqlTcpServer::management_handle` before
 moving the server into a worker thread. The cloneable handle reports protocol

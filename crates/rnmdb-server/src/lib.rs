@@ -63,6 +63,7 @@ const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_CONFIGURED_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Validated resource and shutdown limits for one SQL TCP server.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,14 +129,14 @@ impl SqlServerOptions {
     }
 
     pub fn with_client_io_timeout(mut self, value: Duration) -> Result<Self> {
-        validate_nonzero_duration("SQL client I/O timeout", value)?;
+        validate_bounded_duration("SQL client I/O timeout", value)?;
         self.client_io_timeout = value;
         Ok(self)
     }
 
     pub fn with_drain_timeouts(mut self, graceful: Duration, forced: Duration) -> Result<Self> {
-        validate_nonzero_duration("SQL client drain timeout", graceful)?;
-        validate_nonzero_duration("forced SQL client drain timeout", forced)?;
+        validate_bounded_duration("SQL client drain timeout", graceful)?;
+        validate_bounded_duration("forced SQL client drain timeout", forced)?;
         self.client_drain_timeout = graceful;
         self.forced_client_drain_timeout = forced;
         Ok(self)
@@ -152,9 +153,9 @@ impl SqlServerOptions {
             self.max_command_bytes,
             MAX_CONFIGURED_SQL_COMMAND_BYTES,
         )?;
-        validate_nonzero_duration("SQL client I/O timeout", self.client_io_timeout)?;
-        validate_nonzero_duration("SQL client drain timeout", self.client_drain_timeout)?;
-        validate_nonzero_duration(
+        validate_bounded_duration("SQL client I/O timeout", self.client_io_timeout)?;
+        validate_bounded_duration("SQL client drain timeout", self.client_drain_timeout)?;
+        validate_bounded_duration(
             "forced SQL client drain timeout",
             self.forced_client_drain_timeout,
         )
@@ -640,7 +641,12 @@ impl SqlTcpServer {
     }
 
     fn drain_clients(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            RnovError::new(
+                ErrorKind::InvalidInput,
+                "SQL client drain timeout exceeds the platform deadline range",
+            )
+        })?;
         while self.active_client_count() != 0 && Instant::now() < deadline {
             thread::sleep(SERVER_ACCEPT_RETRY_DELAY);
         }
@@ -1039,11 +1045,20 @@ fn validate_bounded_nonzero(name: &'static str, value: usize, maximum: usize) ->
     Ok(())
 }
 
-fn validate_nonzero_duration(name: &'static str, value: Duration) -> Result<()> {
+fn validate_bounded_duration(name: &'static str, value: Duration) -> Result<()> {
     if value.is_zero() {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             format!("{name} must be greater than zero"),
+        ));
+    }
+    if value > MAX_CONFIGURED_TIMEOUT {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{name} must not exceed {} seconds",
+                MAX_CONFIGURED_TIMEOUT.as_secs()
+            ),
         ));
     }
     Ok(())
