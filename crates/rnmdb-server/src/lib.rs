@@ -62,6 +62,7 @@ const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Whether the shared database can safely execute more commands.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlDatabaseHealth {
     /// The shared committed state is available.
@@ -111,7 +112,11 @@ impl SqlProtocolCapabilities {
     }
 }
 
-/// A point-in-time, read-only view of one SQL server runtime.
+/// A best-effort, read-only view of one SQL server runtime.
+///
+/// Collecting the database fields acquires internal synchronization and may
+/// briefly block. Individual fields are sampled separately, so callers should
+/// not treat the value as an atomic point-in-time snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SqlServerStatus {
     runtime_mode: EmbeddedRuntimeMode,
@@ -181,13 +186,25 @@ impl fmt::Debug for SingleFileRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EmbeddedRuntimeConfig {
     instance: InstanceConfig,
     mode: EmbeddedRuntimeMode,
     temporary: bool,
     single_file: Option<SingleFileRuntimeConfig>,
     credentials: Option<LocalCredentialStore>,
+}
+
+impl fmt::Debug for EmbeddedRuntimeConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmbeddedRuntimeConfig")
+            .field("instance", &self.instance)
+            .field("mode", &self.mode)
+            .field("temporary", &self.temporary)
+            .field("single_file", &self.single_file)
+            .field("authentication_required", &self.authentication_required())
+            .finish()
+    }
 }
 
 impl EmbeddedRuntimeConfig {
@@ -286,6 +303,7 @@ pub struct SqlTcpServer {
     listener: TcpListener,
     runtime: SqlServerRuntime,
     clients: Arc<ClientRegistry>,
+    serving: AtomicBool,
 }
 
 /// A cloneable control-plane handle that does not expose mutable database state.
@@ -345,6 +363,7 @@ impl SqlTcpServer {
                 shutdown,
             },
             clients: Arc::new(ClientRegistry::new()),
+            serving: AtomicBool::new(false),
         })
     }
 
@@ -370,6 +389,7 @@ impl SqlTcpServer {
     }
 
     pub fn accept_one(&self) -> Result<()> {
+        let _permit = ServerLoopPermit::acquire(self)?;
         let stream = self.accept_client()?;
         handle_sql_client(stream, &self.runtime)
     }
@@ -387,6 +407,7 @@ impl SqlTcpServer {
     }
 
     fn serve_until_requested(&self, shutdown: Option<&AtomicBool>) -> Result<()> {
+        let _permit = ServerLoopPermit::acquire(self)?;
         self.listener
             .set_nonblocking(true)
             .map_err(|err| io_error("failed to enable nonblocking SQL listener", err))?;
@@ -396,18 +417,29 @@ impl SqlTcpServer {
             .listener
             .set_nonblocking(false)
             .map_err(|err| io_error("failed to restore blocking SQL listener", err));
-        let drain_result = self.drain_clients(CLIENT_DRAIN_TIMEOUT);
-        let forced_shutdown_result = if drain_result.is_err() {
-            self.clients
-                .shutdown_all()
-                .and_then(|()| self.drain_clients(FORCED_CLIENT_DRAIN_TIMEOUT))
-        } else {
-            Ok(())
-        };
-        serve_result
-            .and(blocking_result)
-            .and(drain_result)
-            .and(forced_shutdown_result)
+        let shutdown_result = self.drain_clients_with_forced_shutdown();
+        let result = combine_phase_results(
+            serve_result,
+            blocking_result,
+            "restoring the blocking listener failed",
+        );
+        combine_phase_results(result, shutdown_result, "client shutdown cleanup failed")
+    }
+
+    fn drain_clients_with_forced_shutdown(&self) -> Result<()> {
+        let graceful_result = self.drain_clients(CLIENT_DRAIN_TIMEOUT);
+        if graceful_result.is_ok() {
+            return graceful_result;
+        }
+        let forced_result = self
+            .clients
+            .shutdown_all()
+            .and_then(|()| self.drain_clients(FORCED_CLIENT_DRAIN_TIMEOUT));
+        combine_phase_results(
+            graceful_result,
+            forced_result,
+            "forced SQL client shutdown failed",
+        )
     }
 
     fn drain_clients(&self, timeout: Duration) -> Result<()> {
@@ -464,6 +496,46 @@ impl SqlTcpServer {
             return Ok(());
         };
         spawn_client_thread(stream, self.runtime.clone(), permit)
+    }
+}
+
+struct ServerLoopPermit<'a> {
+    serving: &'a AtomicBool,
+}
+
+impl<'a> ServerLoopPermit<'a> {
+    fn acquire(server: &'a SqlTcpServer) -> Result<Self> {
+        if server.runtime.shutdown_requested() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "SQL TCP server cannot start after shutdown has been requested",
+            ));
+        }
+        server
+            .serving
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                RnovError::new(
+                    ErrorKind::InvalidInput,
+                    "SQL TCP server is already serving clients",
+                )
+            })?;
+        if server.runtime.shutdown_requested() {
+            server.serving.store(false, Ordering::Release);
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "SQL TCP server cannot start after shutdown has been requested",
+            ));
+        }
+        Ok(Self {
+            serving: &server.serving,
+        })
+    }
+}
+
+impl Drop for ServerLoopPermit<'_> {
+    fn drop(&mut self) {
+        self.serving.store(false, Ordering::Release);
     }
 }
 
@@ -631,6 +703,23 @@ impl TokioEmbeddedRuntime {
 
 fn io_error(context: &'static str, err: std::io::Error) -> RnovError {
     RnovError::new(ErrorKind::Io, format!("{context}: {err}"))
+}
+
+fn combine_phase_results(
+    primary: Result<()>,
+    secondary: Result<()>,
+    secondary_context: &'static str,
+) -> Result<()> {
+    match (primary, secondary) {
+        (Ok(()), result) | (result, Ok(())) => result,
+        (Err(primary), Err(secondary)) => {
+            let kind = secondary.kind();
+            Err(RnovError::new(
+                kind,
+                format!("{primary}; {secondary_context}: {secondary}"),
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "tokio-runtime")]
