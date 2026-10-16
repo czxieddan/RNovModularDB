@@ -66,6 +66,14 @@ pub(super) fn reject_busy_client(mut stream: TcpStream, runtime: &SqlServerRunti
 }
 
 pub(super) fn handle_sql_client(stream: TcpStream, runtime: &SqlServerRuntime) -> Result<()> {
+    let result = handle_sql_client_inner(stream, runtime);
+    if result.is_err() {
+        runtime.metrics().record_failed_client_session();
+    }
+    result
+}
+
+fn handle_sql_client_inner(stream: TcpStream, runtime: &SqlServerRuntime) -> Result<()> {
     let reader_stream = configured_reader_stream(&stream, runtime)?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
@@ -93,6 +101,7 @@ pub(super) fn handle_sql_client(stream: TcpStream, runtime: &SqlServerRuntime) -
             close_client_session(runtime, &mut session)?;
             return Ok(());
         }
+        runtime.metrics().record_command();
         if execute_sql_command_line(runtime, &mut session, &mut writer, command.trim())? {
             return Ok(());
         }

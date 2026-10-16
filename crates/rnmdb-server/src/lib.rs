@@ -297,6 +297,43 @@ impl SqlServerStatus {
     }
 }
 
+/// Monotonic process-local counters for one SQL TCP server runtime.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SqlServerMetrics {
+    active_clients: usize,
+    accepted_clients: u64,
+    rejected_clients: u64,
+    completed_clients: u64,
+    commands_received: u64,
+    failed_client_sessions: u64,
+}
+
+impl SqlServerMetrics {
+    pub fn active_clients(&self) -> usize {
+        self.active_clients
+    }
+
+    pub fn accepted_clients(&self) -> u64 {
+        self.accepted_clients
+    }
+
+    pub fn rejected_clients(&self) -> u64 {
+        self.rejected_clients
+    }
+
+    pub fn completed_clients(&self) -> u64 {
+        self.completed_clients
+    }
+
+    pub fn commands_received(&self) -> u64 {
+        self.commands_received
+    }
+
+    pub fn failed_client_sessions(&self) -> u64 {
+        self.failed_client_sessions
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
     TemporaryMemory,
@@ -489,6 +526,10 @@ impl SqlServerHandle {
     pub fn options(&self) -> SqlServerOptions {
         *self.runtime.options()
     }
+
+    pub fn metrics(&self) -> SqlServerMetrics {
+        self.runtime.metrics().snapshot(self.clients.active_count())
+    }
 }
 
 impl SqlTcpServer {
@@ -509,6 +550,7 @@ impl SqlTcpServer {
             embedded.open_session()?,
             embedded.config().disk_writes_allowed(),
         );
+        let metrics = Arc::new(RuntimeMetrics::default());
         Ok(Self {
             listener,
             runtime: SqlServerRuntime {
@@ -516,8 +558,9 @@ impl SqlTcpServer {
                 database,
                 options,
                 lifecycle: Arc::new(AtomicU8::new(SqlServerLifecycle::Idle as u8)),
+                metrics: Arc::clone(&metrics),
             },
-            clients: Arc::new(ClientRegistry::new(options.max_active_clients())),
+            clients: Arc::new(ClientRegistry::new(options.max_active_clients(), metrics)),
         })
     }
 
@@ -546,9 +589,17 @@ impl SqlTcpServer {
         self.management_handle().options()
     }
 
+    pub fn metrics(&self) -> SqlServerMetrics {
+        self.management_handle().metrics()
+    }
+
     pub fn accept_one(&self) -> Result<()> {
         let _permit = ServerLoopPermit::acquire(self)?;
         let stream = self.accept_client()?;
+        let Some(_client_permit) = ClientPermit::acquire(&self.clients, &stream)? else {
+            reject_busy_client(stream, &self.runtime);
+            return Ok(());
+        };
         handle_sql_client(stream, &self.runtime)
     }
 
@@ -681,6 +732,7 @@ struct SqlServerRuntime {
     database: Arc<SharedDatabase>,
     options: SqlServerOptions,
     lifecycle: Arc<AtomicU8>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl SqlServerRuntime {
@@ -694,6 +746,10 @@ impl SqlServerRuntime {
 
     fn options(&self) -> &SqlServerOptions {
         &self.options
+    }
+
+    fn metrics(&self) -> &RuntimeMetrics {
+        &self.metrics
     }
 
     fn lifecycle(&self) -> SqlServerLifecycle {
@@ -771,15 +827,17 @@ struct ClientRegistry {
     max_active: usize,
     next_id: AtomicU64,
     streams: Mutex<BTreeMap<u64, TcpStream>>,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 impl ClientRegistry {
-    fn new(max_active: usize) -> Self {
+    fn new(max_active: usize, metrics: Arc<RuntimeMetrics>) -> Self {
         Self {
             active: AtomicUsize::new(0),
             max_active,
             next_id: AtomicU64::new(1),
             streams: Mutex::new(BTreeMap::new()),
+            metrics,
         }
     }
 
@@ -813,6 +871,7 @@ impl ClientPermit {
             })
             .is_err()
         {
+            clients.metrics.record_rejected_client();
             return Ok(None);
         }
         let id = clients.next_id.fetch_add(1, Ordering::AcqRel);
@@ -835,6 +894,7 @@ impl ClientPermit {
         };
         streams.insert(id, tracked);
         drop(streams);
+        clients.metrics.record_accepted_client();
         Ok(Some(Self {
             clients: Arc::clone(clients),
             id,
@@ -848,6 +908,49 @@ impl Drop for ClientPermit {
             streams.remove(&self.id);
         }
         self.clients.active.fetch_sub(1, Ordering::AcqRel);
+        self.clients.metrics.record_completed_client();
+    }
+}
+
+#[derive(Debug, Default)]
+struct RuntimeMetrics {
+    accepted_clients: AtomicU64,
+    rejected_clients: AtomicU64,
+    completed_clients: AtomicU64,
+    commands_received: AtomicU64,
+    failed_client_sessions: AtomicU64,
+}
+
+impl RuntimeMetrics {
+    fn snapshot(&self, active_clients: usize) -> SqlServerMetrics {
+        SqlServerMetrics {
+            active_clients,
+            accepted_clients: self.accepted_clients.load(Ordering::Acquire),
+            rejected_clients: self.rejected_clients.load(Ordering::Acquire),
+            completed_clients: self.completed_clients.load(Ordering::Acquire),
+            commands_received: self.commands_received.load(Ordering::Acquire),
+            failed_client_sessions: self.failed_client_sessions.load(Ordering::Acquire),
+        }
+    }
+
+    fn record_accepted_client(&self) {
+        saturating_increment(&self.accepted_clients);
+    }
+
+    fn record_rejected_client(&self) {
+        saturating_increment(&self.rejected_clients);
+    }
+
+    fn record_completed_client(&self) {
+        saturating_increment(&self.completed_clients);
+    }
+
+    fn record_command(&self) {
+        saturating_increment(&self.commands_received);
+    }
+
+    fn record_failed_client_session(&self) {
+        saturating_increment(&self.failed_client_sessions);
     }
 }
 
@@ -926,6 +1029,12 @@ fn validate_nonzero_duration(name: &'static str, value: Duration) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(1))
+    });
 }
 
 fn combine_phase_results(
