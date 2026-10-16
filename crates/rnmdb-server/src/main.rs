@@ -22,7 +22,8 @@ use rnmdb_storage::PageCryptoKey;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7432";
 const PAGE_KEY_ENVIRONMENT_VARIABLE: &str = "RNMDB_PAGE_KEY_HEX";
-const MAX_SECRET_BYTES: usize = MAX_CREDENTIAL_PASSWORD_BYTES;
+const MAX_PAGE_KEY_FILE_BYTES: usize = 4096;
+const MAX_PASSWORD_FILE_BYTES: usize = MAX_CREDENTIAL_PASSWORD_BYTES + 2;
 
 enum ServerMode {
     Memory,
@@ -358,7 +359,7 @@ fn page_key_from_source(source: PageKeySource) -> Result<PageCryptoKey> {
                     format!("{PAGE_KEY_ENVIRONMENT_VARIABLE} is not set or not valid UTF-8"),
                 )
             })?,
-        PageKeySource::File(path) => read_secret_file(&path, "page key")?,
+        PageKeySource::File(path) => read_secret_file(&path, "page key", MAX_PAGE_KEY_FILE_BYTES)?,
     };
     let hex = strip_one_line_ending(secret.as_slice());
     let hex = std::str::from_utf8(hex)
@@ -367,8 +368,14 @@ fn page_key_from_source(source: PageKeySource) -> Result<PageCryptoKey> {
 }
 
 fn read_password_file(path: &Path) -> Result<SecretBytes> {
-    let secret = read_secret_file(path, "password")?;
+    let secret = read_secret_file(path, "password", MAX_PASSWORD_FILE_BYTES)?;
     let stripped = strip_one_line_ending(secret.as_slice());
+    if stripped.len() > MAX_CREDENTIAL_PASSWORD_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("password exceeds the {MAX_CREDENTIAL_PASSWORD_BYTES}-byte limit"),
+        ));
+    }
     if stripped.is_empty()
         || stripped
             .iter()
@@ -382,28 +389,28 @@ fn read_password_file(path: &Path) -> Result<SecretBytes> {
     Ok(SecretBytes(stripped.to_vec()))
 }
 
-fn read_secret_file(path: &Path, kind: &str) -> Result<SecretBytes> {
+fn read_secret_file(path: &Path, kind: &str, maximum: usize) -> Result<SecretBytes> {
     let file = File::open(path).map_err(|error| {
         RnovError::new(
             ErrorKind::Io,
             format!("failed to open {kind} file '{}': {error}", path.display()),
         )
     })?;
-    read_bounded_secret(file, kind)
+    read_bounded_secret(file, kind, maximum)
 }
 
-fn read_bounded_secret(reader: impl Read, kind: &str) -> Result<SecretBytes> {
+fn read_bounded_secret(reader: impl Read, kind: &str, maximum: usize) -> Result<SecretBytes> {
     let mut bytes = Vec::new();
     reader
-        .take((MAX_SECRET_BYTES + 1) as u64)
+        .take((maximum + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             RnovError::new(ErrorKind::Io, format!("failed to read {kind}: {error}"))
         })?;
-    if bytes.len() > MAX_SECRET_BYTES {
+    if bytes.len() > maximum {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
-            format!("{kind} exceeds the {MAX_SECRET_BYTES}-byte limit"),
+            format!("{kind} file exceeds the {maximum}-byte limit"),
         ));
     }
     Ok(SecretBytes(bytes))

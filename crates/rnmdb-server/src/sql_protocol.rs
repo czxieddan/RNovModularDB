@@ -237,9 +237,14 @@ fn execute_sql_command_line(
     command_bytes: usize,
 ) -> Result<bool> {
     let command_kind = classify_client_command(command);
-    if command_kind == ClientCommandKind::Sql {
-        ensure_command_length(command_bytes, runtime.options().max_command_bytes())?;
-    }
+    let (command_name, maximum) = match command_kind {
+        ClientCommandKind::Sql => ("SQL command", runtime.options().max_command_bytes()),
+        _ => (
+            "protocol control command",
+            MAX_PROTOCOL_CONTROL_COMMAND_BYTES,
+        ),
+    };
+    ensure_command_length(command_name, command_bytes, maximum)?;
     runtime.metrics().record_command();
     match command_kind {
         ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
@@ -252,13 +257,13 @@ fn execute_sql_command_line(
     }
 }
 
-fn ensure_command_length(command_bytes: usize, maximum: usize) -> Result<()> {
+fn ensure_command_length(name: &'static str, command_bytes: usize, maximum: usize) -> Result<()> {
     if command_bytes <= maximum {
         return Ok(());
     }
     Err(RnovError::new(
         ErrorKind::InvalidInput,
-        format!("SQL command exceeds {maximum} bytes"),
+        format!("{name} exceeds {maximum} bytes"),
     ))
 }
 
