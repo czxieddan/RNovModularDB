@@ -54,6 +54,11 @@ const COLUMN_VALUE_MAGIC: [u8; 8] = *b"RNOVCV01";
 const COLUMN_VALUE_VERSION: u8 = 1;
 const COLUMN_VALUE_HEADER_LEN: usize = 8 + 1 + 12;
 
+/// Maximum UTF-8 byte length accepted for a local credential username.
+pub const MAX_CREDENTIAL_USERNAME_BYTES: usize = 256;
+/// Maximum UTF-8 byte length accepted for a local credential password.
+pub const MAX_CREDENTIAL_PASSWORD_BYTES: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditEventKind {
     Authentication,
@@ -1398,6 +1403,21 @@ fn validate_username(username: &str) -> Result<()> {
             "user name cannot be empty",
         ));
     }
+    if username.len() > MAX_CREDENTIAL_USERNAME_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("user name exceeds the {MAX_CREDENTIAL_USERNAME_BYTES}-byte limit"),
+        ));
+    }
+    if username
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "user name cannot contain whitespace or control characters",
+        ));
+    }
     Ok(())
 }
 
@@ -1406,6 +1426,18 @@ fn validate_password(password: &str) -> Result<()> {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
             "password cannot be empty",
+        ));
+    }
+    if password.len() > MAX_CREDENTIAL_PASSWORD_BYTES {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("password exceeds the {MAX_CREDENTIAL_PASSWORD_BYTES}-byte limit"),
+        ));
+    }
+    if password.trim() != password || password.contains(['\r', '\n', '\0']) {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            "password must be one line without leading or trailing whitespace or NUL bytes",
         ));
     }
     Ok(())

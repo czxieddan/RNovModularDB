@@ -16,13 +16,13 @@ use rnmdb_common::{
     ErrorKind, Result, RnovError,
     ids::{DatabaseId, InstanceId, RoleId},
 };
-use rnmdb_security::LocalCredentialStore;
+use rnmdb_security::{LocalCredentialStore, MAX_CREDENTIAL_PASSWORD_BYTES};
 use rnmdb_server::{EmbeddedRuntimeConfig, SqlServerOptions, SqlTcpServer};
 use rnmdb_storage::PageCryptoKey;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7432";
 const PAGE_KEY_ENVIRONMENT_VARIABLE: &str = "RNMDB_PAGE_KEY_HEX";
-const MAX_SECRET_BYTES: usize = 4096;
+const MAX_SECRET_BYTES: usize = MAX_CREDENTIAL_PASSWORD_BYTES;
 
 enum ServerMode {
     Memory,
@@ -496,7 +496,7 @@ fn invalid_arguments(message: impl Into<String>) -> RnovError {
 fn print_help() -> Result<()> {
     let defaults = SqlServerOptions::default();
     println!(
-        "RNovModularDB server {}\n\nUSAGE:\n  rnmdbd serve (--memory | --database <PATH> (--page-key-env | --page-key-file <KEY_PATH>)) [OPTIONS]\n  rnmdbd help\n  rnmdbd version\n\nSECURITY OPTIONS:\n  --auth-user <USER> --auth-password-file <PATH> [--auth-role-id <ID>]\n  --allow-unauthenticated\n  --allow-remote-plaintext\n\nSERVER OPTIONS:\n  --bind <ADDRESS>                     default: {DEFAULT_BIND_ADDRESS}\n  --instance-id <ID>                   default: 1\n  --database-id <ID>                   default: 1\n  --max-clients <COUNT>                default: {}\n  --max-command-bytes <BYTES>          range: 256..=16777216, default: {}\n  --client-io-timeout-ms <MILLISECONDS> default: {}\n  --graceful-drain-timeout-ms <MS>     default: {}\n  --forced-drain-timeout-ms <MS>       default: {}\n  --once                               accept one client and exit\n  --shutdown-on-stdin                  stop accepting after one stdin line or EOF\n\nThe line protocol has no TLS. Non-loopback listeners are rejected unless --allow-remote-plaintext is explicit.",
+        "RNovModularDB server {}\n\nUSAGE:\n  rnmdbd serve (--memory | --database <PATH> (--page-key-env | --page-key-file <KEY_PATH>)) [OPTIONS]\n  rnmdbd help\n  rnmdbd version\n\nSECURITY OPTIONS:\n  --auth-user <USER> --auth-password-file <PATH> [--auth-role-id <ID>]\n  --allow-unauthenticated\n  --allow-remote-plaintext\n\nSERVER OPTIONS:\n  --bind <ADDRESS>                     default: {DEFAULT_BIND_ADDRESS}\n  --instance-id <ID>                   default: 1\n  --database-id <ID>                   default: 1\n  --max-clients <COUNT>                default: {}\n  --max-command-bytes <BYTES>          SQL range: 1..=16777216, default: {}\n  --client-io-timeout-ms <MILLISECONDS> default: {}\n  --graceful-drain-timeout-ms <MS>     default: {}\n  --forced-drain-timeout-ms <MS>       default: {}\n  --once                               accept one client and exit\n  --shutdown-on-stdin                  stop accepting after one stdin line or EOF\n\nThe line protocol has no TLS. Non-loopback listeners are rejected unless --allow-remote-plaintext is explicit.",
         env!("CARGO_PKG_VERSION"),
         defaults.max_active_clients(),
         defaults.max_command_bytes(),

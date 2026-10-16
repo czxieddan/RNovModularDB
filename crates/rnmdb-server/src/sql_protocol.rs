@@ -37,11 +37,16 @@ use std::{
 
 use rnmdb_cli::CommandOutput;
 use rnmdb_common::{ErrorKind, Result, RnovError};
-use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider};
+use rnmdb_security::{
+    AuthenticatedPrincipal, AuthenticationProvider, MAX_CREDENTIAL_PASSWORD_BYTES,
+    MAX_CREDENTIAL_USERNAME_BYTES,
+};
 
 use super::{ClientPermit, SqlServerRuntime, io_error, shared::SharedConnection};
 
 const CLIENT_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_PROTOCOL_CONTROL_COMMAND_BYTES: usize =
+    b"AUTH ".len() + MAX_CREDENTIAL_USERNAME_BYTES + 1 + MAX_CREDENTIAL_PASSWORD_BYTES;
 
 pub(super) fn spawn_client_thread(
     stream: TcpStream,
@@ -85,7 +90,7 @@ fn handle_sql_client_inner(stream: TcpStream, runtime: &SqlServerRuntime) -> Res
             return Ok(());
         }
         command.clear();
-        let bytes_read = match read_sql_command(&mut reader, &mut command, runtime) {
+        let bytes_read = match read_protocol_command(&mut reader, &mut command, runtime) {
             Ok(bytes_read) => bytes_read,
             Err(_) if runtime.shutdown_requested() => {
                 close_client_session(runtime, &mut session)?;
@@ -101,8 +106,13 @@ fn handle_sql_client_inner(stream: TcpStream, runtime: &SqlServerRuntime) -> Res
             close_client_session(runtime, &mut session)?;
             return Ok(());
         }
-        runtime.metrics().record_command();
-        if execute_sql_command_line(runtime, &mut session, &mut writer, command.trim())? {
+        if execute_sql_command_line(
+            runtime,
+            &mut session,
+            &mut writer,
+            command.trim(),
+            command_payload_len(command.as_bytes()),
+        )? {
             return Ok(());
         }
     }
@@ -132,13 +142,16 @@ struct ClientSession {
     protocol_version: u16,
 }
 
-fn read_sql_command(
+fn read_protocol_command(
     reader: &mut BufReader<TcpStream>,
     command: &mut String,
     runtime: &SqlServerRuntime,
 ) -> Result<usize> {
-    let max_command_bytes = runtime.options().max_command_bytes();
-    let max_read_bytes = max_command_bytes + 2;
+    let max_protocol_command_bytes = runtime
+        .options()
+        .max_command_bytes()
+        .max(MAX_PROTOCOL_CONTROL_COMMAND_BYTES);
+    let max_read_bytes = max_protocol_command_bytes + 2;
     let client_io_timeout = runtime.options().client_io_timeout();
     let mut bytes = Vec::new();
     let mut last_progress = Instant::now();
@@ -148,7 +161,7 @@ fn read_sql_command(
         }
         let remaining = max_read_bytes.saturating_sub(bytes.len());
         if remaining == 0 {
-            ensure_command_size(&bytes, max_command_bytes)?;
+            ensure_protocol_command_size(&bytes, max_protocol_command_bytes)?;
         }
         let mut limited = reader.by_ref().take(remaining as u64);
         match limited.read_until(b'\n', &mut bytes) {
@@ -156,7 +169,7 @@ fn read_sql_command(
             Ok(_) if bytes.ends_with(b"\n") => break bytes.len(),
             Ok(_) => {
                 last_progress = Instant::now();
-                ensure_command_size(&bytes, max_command_bytes)?;
+                ensure_protocol_command_size(&bytes, max_protocol_command_bytes)?;
             }
             Err(error) if is_transient_read_error(&error) => {
                 if last_progress.elapsed() >= client_io_timeout {
@@ -172,7 +185,7 @@ fn read_sql_command(
             Err(error) => return Err(io_error("failed to read SQL TCP command", error)),
         }
     };
-    ensure_command_size(&bytes, max_command_bytes)?;
+    ensure_protocol_command_size(&bytes, max_protocol_command_bytes)?;
     append_utf8_command(command, &bytes)?;
     Ok(bytes_read)
 }
@@ -184,13 +197,13 @@ fn is_transient_read_error(error: &std::io::Error) -> bool {
     )
 }
 
-fn ensure_command_size(bytes: &[u8], max_command_bytes: usize) -> Result<()> {
-    if command_payload_len(bytes) <= max_command_bytes {
+fn ensure_protocol_command_size(bytes: &[u8], maximum: usize) -> Result<()> {
+    if command_payload_len(bytes) <= maximum {
         return Ok(());
     }
     Err(RnovError::new(
         ErrorKind::InvalidInput,
-        format!("SQL command exceeds {max_command_bytes} bytes"),
+        format!("protocol command exceeds {maximum} bytes"),
     ))
 }
 
@@ -221,8 +234,14 @@ fn execute_sql_command_line(
     session: &mut ClientSession,
     writer: &mut TcpStream,
     command: &str,
+    command_bytes: usize,
 ) -> Result<bool> {
-    match classify_client_command(command) {
+    let command_kind = classify_client_command(command);
+    if command_kind == ClientCommandKind::Sql {
+        ensure_command_length(command_bytes, runtime.options().max_command_bytes())?;
+    }
+    runtime.metrics().record_command();
+    match command_kind {
         ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
         ClientCommandKind::Ping => execute_ping_command(writer),
         ClientCommandKind::Hello => execute_hello_command(runtime, session, writer, command),
@@ -231,6 +250,16 @@ fn execute_sql_command_line(
         ClientCommandKind::Auth => execute_auth_command(runtime, session, writer, command),
         ClientCommandKind::Sql => execute_session_sql(runtime, session, writer, command),
     }
+}
+
+fn ensure_command_length(command_bytes: usize, maximum: usize) -> Result<()> {
+    if command_bytes <= maximum {
+        return Ok(());
+    }
+    Err(RnovError::new(
+        ErrorKind::InvalidInput,
+        format!("SQL command exceeds {maximum} bytes"),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

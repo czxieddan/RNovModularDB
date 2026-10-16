@@ -252,11 +252,14 @@ The defaults remain 64 clients, 65,536 command bytes, a 30-second client I/O
 timeout, a five-second graceful drain, and a one-second forced drain. The
 library equivalent is `SqlTcpServer::bind_with_options` with a validated
 `SqlServerOptions`; `SqlTcpServer::bind` retains these defaults. Configured
-client counts are capped at 4,096. Command limits must be between 256 bytes and
-16 MiB, preserving enough space for authentication and protocol negotiation
-while preventing an accidental configuration from removing the server's
-admission boundary. Client I/O and drain timeouts must be greater than zero and
-no longer than 24 hours.
+client counts are capped at 4,096 and SQL command sizes at 16 MiB to prevent an
+accidental configuration from removing the server's admission boundary. The
+SQL limit may be as small as one byte; bounded protocol control commands use a
+separate limit sized for the documented credential boundaries. Usernames are
+limited to 256 UTF-8 bytes and cannot contain whitespace or control characters.
+Passwords are limited to 4,096 UTF-8 bytes, must fit on one line, and cannot
+start or end with whitespace. Client I/O and drain timeouts must be greater
+than zero and no longer than 24 hours.
 
 Each connection has independent authentication and transaction state, while
 all connections share one committed database state. Autocommit changes become

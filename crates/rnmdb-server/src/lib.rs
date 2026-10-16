@@ -60,7 +60,6 @@ const SQL_LINE_PROTOCOL_STATUS_VERSION: u16 = 2;
 const DEFAULT_MAX_ACTIVE_CLIENTS: usize = 64;
 const DEFAULT_MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_CONFIGURED_ACTIVE_CLIENTS: usize = 4_096;
-const MIN_CONFIGURED_SQL_COMMAND_BYTES: usize = 256;
 const MAX_CONFIGURED_SQL_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -126,7 +125,7 @@ impl SqlServerOptions {
         validate_bounded(
             "maximum SQL command bytes",
             value,
-            MIN_CONFIGURED_SQL_COMMAND_BYTES,
+            1,
             MAX_CONFIGURED_SQL_COMMAND_BYTES,
         )?;
         self.max_command_bytes = value;
@@ -157,7 +156,7 @@ impl SqlServerOptions {
         validate_bounded(
             "maximum SQL command bytes",
             self.max_command_bytes,
-            MIN_CONFIGURED_SQL_COMMAND_BYTES,
+            1,
             MAX_CONFIGURED_SQL_COMMAND_BYTES,
         )?;
         validate_bounded_duration("SQL client I/O timeout", self.client_io_timeout)?;
