@@ -60,6 +60,7 @@ const SQL_LINE_PROTOCOL_STATUS_VERSION: u16 = 2;
 const DEFAULT_MAX_ACTIVE_CLIENTS: usize = 64;
 const DEFAULT_MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_CONFIGURED_ACTIVE_CLIENTS: usize = 4_096;
+const MIN_CONFIGURED_SQL_COMMAND_BYTES: usize = 256;
 const MAX_CONFIGURED_SQL_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -111,9 +112,10 @@ impl SqlServerOptions {
     }
 
     pub fn with_max_active_clients(mut self, value: usize) -> Result<Self> {
-        validate_bounded_nonzero(
+        validate_bounded(
             "maximum active SQL clients",
             value,
+            1,
             MAX_CONFIGURED_ACTIVE_CLIENTS,
         )?;
         self.max_active_clients = value;
@@ -121,9 +123,10 @@ impl SqlServerOptions {
     }
 
     pub fn with_max_command_bytes(mut self, value: usize) -> Result<Self> {
-        validate_bounded_nonzero(
+        validate_bounded(
             "maximum SQL command bytes",
             value,
+            MIN_CONFIGURED_SQL_COMMAND_BYTES,
             MAX_CONFIGURED_SQL_COMMAND_BYTES,
         )?;
         self.max_command_bytes = value;
@@ -145,14 +148,16 @@ impl SqlServerOptions {
     }
 
     fn validate(&self) -> Result<()> {
-        validate_bounded_nonzero(
+        validate_bounded(
             "maximum active SQL clients",
             self.max_active_clients,
+            1,
             MAX_CONFIGURED_ACTIVE_CLIENTS,
         )?;
-        validate_bounded_nonzero(
+        validate_bounded(
             "maximum SQL command bytes",
             self.max_command_bytes,
+            MIN_CONFIGURED_SQL_COMMAND_BYTES,
             MAX_CONFIGURED_SQL_COMMAND_BYTES,
         )?;
         validate_bounded_duration("SQL client I/O timeout", self.client_io_timeout)?;
@@ -1082,11 +1087,16 @@ fn io_error(context: &'static str, err: std::io::Error) -> RnovError {
     RnovError::new(ErrorKind::Io, format!("{context}: {err}"))
 }
 
-fn validate_bounded_nonzero(name: &'static str, value: usize, maximum: usize) -> Result<()> {
-    if value == 0 || value > maximum {
+fn validate_bounded(
+    name: &'static str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<()> {
+    if value < minimum || value > maximum {
         return Err(RnovError::new(
             ErrorKind::InvalidInput,
-            format!("{name} must be between 1 and {maximum}"),
+            format!("{name} must be between {minimum} and {maximum}"),
         ));
     }
     Ok(())
