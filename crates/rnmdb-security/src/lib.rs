@@ -28,7 +28,10 @@
 // Dependencies and licenses: .ahcl/AHCL-DEPENDENCIES.md
 // Additional Restrictions: None.
 // SPDX-License-Identifier: LicenseRef-AHCL-1.2
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use argon2::{
     Argon2,
@@ -97,12 +100,24 @@ pub trait AuthenticationProvider {
     ) -> Result<Option<AuthenticatedPrincipal>>;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct LocalCredential {
     username: String,
     password_hash: String,
     role_id: Option<RoleId>,
     enabled: bool,
+}
+
+impl fmt::Debug for LocalCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalCredential")
+            .field("username", &self.username)
+            .field("password_hash", &"<redacted>")
+            .field("role_id", &self.role_id)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 impl LocalCredential {
@@ -123,9 +138,19 @@ impl LocalCredential {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct LocalCredentialStore {
     credentials: std::collections::BTreeMap<String, LocalCredential>,
+}
+
+impl fmt::Debug for LocalCredentialStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalCredentialStore")
+            .field("usernames", &self.credentials.keys().collect::<Vec<_>>())
+            .field("credential_count", &self.credentials.len())
+            .finish()
+    }
 }
 
 impl LocalCredentialStore {
