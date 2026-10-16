@@ -115,12 +115,21 @@ fn configured_reader_stream(stream: &TcpStream, runtime: &SqlServerRuntime) -> R
         .map_err(|err| io_error("failed to clone SQL TCP client stream", err))
 }
 
-fn initial_client_session(runtime: &SqlServerRuntime) -> Result<Option<SharedConnection>> {
-    if runtime.config().authentication_required() {
-        Ok(None)
+fn initial_client_session(runtime: &SqlServerRuntime) -> Result<ClientSession> {
+    let connection = if runtime.config().authentication_required() {
+        None
     } else {
-        Ok(Some(runtime.open_connection(None)))
-    }
+        Some(runtime.open_connection(None))
+    };
+    Ok(ClientSession {
+        connection,
+        protocol_version: runtime.protocol_capabilities().protocol_version(),
+    })
+}
+
+struct ClientSession {
+    connection: Option<SharedConnection>,
+    protocol_version: u16,
 }
 
 fn read_sql_command(
@@ -209,13 +218,14 @@ fn configure_client_stream(stream: &TcpStream, client_io_timeout: Duration) -> R
 
 fn execute_sql_command_line(
     runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
+    session: &mut ClientSession,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
     match classify_client_command(command) {
         ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
         ClientCommandKind::Ping => execute_ping_command(writer),
+        ClientCommandKind::Hello => execute_hello_command(runtime, session, writer, command),
         ClientCommandKind::Status => execute_status_command(runtime, session, writer),
         ClientCommandKind::Empty => execute_empty_command(writer),
         ClientCommandKind::Auth => execute_auth_command(runtime, session, writer, command),
@@ -227,6 +237,7 @@ fn execute_sql_command_line(
 enum ClientCommandKind {
     Quit,
     Ping,
+    Hello,
     Status,
     Empty,
     Auth,
@@ -239,6 +250,9 @@ fn classify_client_command(command: &str) -> ClientCommandKind {
     }
     if command.eq_ignore_ascii_case("ping") {
         return ClientCommandKind::Ping;
+    }
+    if hello_command_tail(command).is_some() {
+        return ClientCommandKind::Hello;
     }
     if command.eq_ignore_ascii_case("status") {
         return ClientCommandKind::Status;
@@ -257,12 +271,73 @@ fn execute_ping_command(writer: &mut TcpStream) -> Result<bool> {
     Ok(false)
 }
 
+fn execute_hello_command(
+    runtime: &SqlServerRuntime,
+    session: &mut ClientSession,
+    writer: &mut TcpStream,
+    command: &str,
+) -> Result<bool> {
+    let capabilities = runtime.protocol_capabilities();
+    let requested = match parse_hello_request(command) {
+        Ok(requested) => requested,
+        Err(()) => {
+            write_protocol_line(
+                writer,
+                "ERR usage: HELLO [<minimum-version> <maximum-version>]",
+            )?;
+            return Ok(false);
+        }
+    };
+    let selected = match requested {
+        Some((minimum, maximum)) => {
+            match capabilities.negotiate_protocol_version(minimum, maximum) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    write_protocol_line(
+                        writer,
+                        &format!("ERR {}", protocol_text(&error.to_string())),
+                    )?;
+                    return Ok(false);
+                }
+            }
+        }
+        None => capabilities.protocol_version(),
+    };
+    session.protocol_version = selected;
+    write_protocol_line(
+        writer,
+        &format!(
+            "HELLO protocol_version={} server_min_protocol_version={} server_max_protocol_version={} authentication_required={} max_active_clients={} max_command_bytes={} authentication={} health_check={} explicit_transactions={} runtime_status={} protocol_negotiation={} transport_security={}",
+            selected,
+            capabilities.minimum_protocol_version(),
+            capabilities.protocol_version(),
+            runtime.config().authentication_required(),
+            capabilities.max_active_clients(),
+            capabilities.max_command_bytes(),
+            capabilities.supports_authentication(),
+            capabilities.supports_health_check(),
+            capabilities.supports_explicit_transactions(),
+            capabilities.supports_runtime_status_at(selected),
+            capabilities.supports_protocol_negotiation(),
+            capabilities.supports_transport_security(),
+        ),
+    )?;
+    Ok(false)
+}
+
 fn execute_status_command(
     runtime: &SqlServerRuntime,
-    session: &Option<SharedConnection>,
+    session: &ClientSession,
     writer: &mut TcpStream,
 ) -> Result<bool> {
-    if session.is_none() {
+    if !runtime
+        .protocol_capabilities()
+        .supports_runtime_status_at(session.protocol_version)
+    {
+        write_protocol_line(writer, "ERR STATUS requires protocol version 2 or newer")?;
+        return Ok(false);
+    }
+    if session.connection.is_none() {
         write_protocol_line(writer, "ERR authentication required")?;
         return Ok(false);
     }
@@ -297,7 +372,7 @@ fn execute_status_command(
 
 fn execute_quit_command(
     runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
+    session: &mut ClientSession,
     writer: &mut TcpStream,
 ) -> Result<bool> {
     close_client_session(runtime, session)?;
@@ -312,11 +387,11 @@ fn execute_empty_command(writer: &mut TcpStream) -> Result<bool> {
 
 fn execute_session_sql(
     runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
+    session: &mut ClientSession,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
-    let Some(connection) = session.as_mut() else {
+    let Some(connection) = session.connection.as_mut() else {
         write_protocol_line(writer, "ERR authentication required")?;
         return Ok(false);
     };
@@ -343,7 +418,7 @@ fn execute_session_command(session: &mut SharedConnection, command: &str) -> Res
 
 fn execute_auth_command(
     runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
+    session: &mut ClientSession,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
@@ -354,10 +429,10 @@ fn execute_auth_command(
 
 fn auth_command_response(
     runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
+    session: &mut ClientSession,
     command: &str,
 ) -> Result<&'static str> {
-    if session.is_some() {
+    if session.connection.is_some() {
         return Ok("OK authenticated");
     }
     let Some((username, password)) = parse_auth_command(command) else {
@@ -366,7 +441,7 @@ fn auth_command_response(
     let Some(principal) = authenticate_client(runtime, username, password)? else {
         return Ok("ERR authentication failed");
     };
-    *session = Some(open_authenticated_session(runtime, &principal)?);
+    session.connection = Some(open_authenticated_session(runtime, &principal)?);
     Ok("OK authenticated")
 }
 
@@ -388,14 +463,37 @@ fn open_authenticated_session(
     Ok(runtime.open_connection(principal.role_id()))
 }
 
-fn close_client_session(
-    _runtime: &SqlServerRuntime,
-    session: &mut Option<SharedConnection>,
-) -> Result<()> {
-    let Some(mut session) = session.take() else {
+fn close_client_session(_runtime: &SqlServerRuntime, session: &mut ClientSession) -> Result<()> {
+    let Some(mut connection) = session.connection.take() else {
         return Ok(());
     };
-    session.close()
+    connection.close()
+}
+
+fn parse_hello_request(command: &str) -> std::result::Result<Option<(u16, u16)>, ()> {
+    let tail = hello_command_tail(command).ok_or(())?.trim();
+    if tail.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = tail.split_whitespace();
+    let minimum = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    let maximum = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    if parts.next().is_some() {
+        return Err(());
+    }
+    Ok(Some((minimum, maximum)))
+}
+
+fn hello_command_tail(command: &str) -> Option<&str> {
+    if command.eq_ignore_ascii_case("hello") {
+        return Some("");
+    }
+    let (head, tail) = command.split_once(char::is_whitespace)?;
+    if head.eq_ignore_ascii_case("hello") {
+        Some(tail)
+    } else {
+        None
+    }
 }
 
 fn parse_auth_command(command: &str) -> Option<(&str, &str)> {

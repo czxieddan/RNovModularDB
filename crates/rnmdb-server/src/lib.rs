@@ -54,7 +54,9 @@ mod sql_protocol;
 use shared::{SharedConnection, SharedDatabase};
 use sql_protocol::{handle_sql_client, reject_busy_client, spawn_client_thread};
 
-const SQL_LINE_PROTOCOL_VERSION: u16 = 2;
+const MIN_SQL_LINE_PROTOCOL_VERSION: u16 = 1;
+const SQL_LINE_PROTOCOL_VERSION: u16 = 3;
+const SQL_LINE_PROTOCOL_STATUS_VERSION: u16 = 2;
 const DEFAULT_MAX_ACTIVE_CLIENTS: usize = 64;
 const DEFAULT_MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_CONFIGURED_ACTIVE_CLIENTS: usize = 4_096;
@@ -201,17 +203,49 @@ pub enum SqlDatabaseHealth {
 /// Stable limits and feature flags for the built-in SQL line protocol.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SqlProtocolCapabilities {
+    minimum_protocol_version: u16,
     protocol_version: u16,
     max_active_clients: usize,
     max_command_bytes: usize,
 }
 
 impl SqlProtocolCapabilities {
-    /// Returns the management-visible protocol revision.
-    ///
-    /// The line protocol does not currently negotiate this value on the wire.
+    /// Returns the oldest wire protocol revision accepted by this server.
+    pub fn minimum_protocol_version(&self) -> u16 {
+        self.minimum_protocol_version
+    }
+
+    /// Returns the latest wire protocol revision accepted by this server.
     pub fn protocol_version(&self) -> u16 {
         self.protocol_version
+    }
+
+    /// Selects the highest server revision in the requested inclusive range.
+    pub fn negotiate_protocol_version(&self, minimum: u16, maximum: u16) -> Result<u16> {
+        if minimum == 0 || maximum == 0 {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "protocol versions must be greater than zero",
+            ));
+        }
+        if minimum > maximum {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "minimum protocol version must not exceed maximum protocol version",
+            ));
+        }
+        let compatible_minimum = minimum.max(self.minimum_protocol_version);
+        let compatible_maximum = maximum.min(self.protocol_version);
+        if compatible_minimum > compatible_maximum {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "unsupported protocol range {minimum}..={maximum}; server supports {}..={}",
+                    self.minimum_protocol_version, self.protocol_version
+                ),
+            ));
+        }
+        Ok(compatible_maximum)
     }
 
     pub fn max_active_clients(&self) -> usize {
@@ -235,6 +269,14 @@ impl SqlProtocolCapabilities {
     }
 
     pub fn supports_runtime_status(&self) -> bool {
+        true
+    }
+
+    pub fn supports_runtime_status_at(&self, protocol_version: u16) -> bool {
+        (SQL_LINE_PROTOCOL_STATUS_VERSION..=self.protocol_version).contains(&protocol_version)
+    }
+
+    pub fn supports_protocol_negotiation(&self) -> bool {
         true
     }
 
@@ -507,11 +549,7 @@ impl SqlServerHandle {
     }
 
     pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
-        SqlProtocolCapabilities {
-            protocol_version: SQL_LINE_PROTOCOL_VERSION,
-            max_active_clients: self.runtime.options().max_active_clients(),
-            max_command_bytes: self.runtime.options().max_command_bytes(),
-        }
+        self.runtime.protocol_capabilities()
     }
 
     pub fn options(&self) -> SqlServerOptions {
@@ -745,6 +783,15 @@ impl SqlServerRuntime {
 
     fn metrics(&self) -> &RuntimeMetrics {
         &self.metrics
+    }
+
+    fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
+        SqlProtocolCapabilities {
+            minimum_protocol_version: MIN_SQL_LINE_PROTOCOL_VERSION,
+            protocol_version: SQL_LINE_PROTOCOL_VERSION,
+            max_active_clients: self.options.max_active_clients(),
+            max_command_bytes: self.options.max_command_bytes(),
+        }
     }
 
     fn status(&self) -> Result<SqlServerStatus> {
