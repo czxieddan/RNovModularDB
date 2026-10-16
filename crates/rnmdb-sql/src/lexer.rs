@@ -298,6 +298,7 @@ impl<'a> Lexer<'a> {
                 b'\'' => tokens.push(self.lex_string()?),
                 b'0'..=b'9' => tokens.push(self.lex_number()?),
                 b'-' if self.peek_next_byte() == Some(b'-') => self.skip_line_comment(),
+                b'/' if self.peek_next_byte() == Some(b'*') => self.skip_block_comment()?,
                 _ if is_identifier_start(byte) => tokens.push(self.lex_identifier_or_keyword()),
                 _ if is_operator_byte(byte) => tokens.push(self.lex_operator()),
                 _ => {
@@ -434,6 +435,41 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
+    }
+
+    fn skip_block_comment(&mut self) -> Result<()> {
+        let start = self.position;
+        self.position += 2;
+        let mut depth = 1_usize;
+        while self.position < self.input.len() {
+            match (self.peek_byte(), self.peek_next_byte()) {
+                (Some(b'/'), Some(b'*')) => {
+                    depth = depth.checked_add(1).ok_or_else(|| {
+                        RnovError::new(ErrorKind::InvalidInput, "block comment nesting is too deep")
+                    })?;
+                    self.position += 2;
+                }
+                (Some(b'*'), Some(b'/')) => {
+                    depth -= 1;
+                    self.position += 2;
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                (Some(byte), _) if byte.is_ascii() => self.position += 1,
+                (Some(_), _) => {
+                    let ch = self.input[self.position..].chars().next().ok_or_else(|| {
+                        RnovError::new(ErrorKind::InvalidInput, "unterminated block comment")
+                    })?;
+                    self.position += ch.len_utf8();
+                }
+                (None, _) => break,
+            }
+        }
+        Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("unterminated block comment at {start}"),
+        ))
     }
 
     fn peek_byte(&self) -> Option<u8> {

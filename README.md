@@ -49,13 +49,37 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Run the `rnmdb` binary without arguments to execute semicolon-separated SQL
-from standard input in a temporary in-memory session:
+Run the `rnmdb` binary without arguments to execute a bounded SQL script from
+standard input in a temporary in-memory session. Script boundaries are parsed
+with the SQL lexer, so semicolons inside strings, line comments, block comments,
+trigger bodies, and procedure bodies are not treated as statement separators:
 
 ```bash
 printf "CREATE TABLE items (id INT64, name TEXT); SELECT id FROM items;" \
   | cargo run -q -p rnmdb-cli --bin rnmdb
 ```
+
+Use the explicit `run` command for scripts from a file or for durable SQL. A
+durable run requires a page key and checkpoints each successful autocommit
+change before reporting it as successful:
+
+```bash
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  run --memory --file schema.sql
+
+cargo run -q -p rnmdb-cli --bin rnmdb -- \
+  run --database data/app.rnmdb \
+  --page-key-file /secure/page-key.hex \
+  --file migrations/001-bootstrap.sql
+```
+
+When SQL is read from standard input, use `--page-key-env` or
+`--page-key-file`. `--page-key-stdin` is accepted only with `--file`, so key
+material and SQL can never compete for the same input stream. A script that
+ends with an active transaction is rolled back and exits with an error.
+
+Run `rnmdb help` for command usage and `rnmdb version` for the installed
+version.
 
 ## Storage CLI
 

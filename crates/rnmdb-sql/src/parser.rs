@@ -57,6 +57,36 @@ pub fn parse_statement(input: &str) -> Result<Statement> {
     Ok(statement)
 }
 
+/// Splits a SQL script at lexer-recognized statement terminators.
+///
+/// Semicolons inside string literals and comments are preserved as part of the
+/// containing statement rather than treated as script boundaries. Empty
+/// statements and comment-only regions are ignored.
+pub fn split_statements(input: &str) -> Result<Vec<&str>> {
+    let tokens = lex(input)?;
+    let mut statements = Vec::new();
+    let mut statement_start = None;
+    let mut statement_end = None;
+
+    for token in tokens {
+        let span = token.span();
+        if matches!(token.kind(), TokenKind::Semicolon) {
+            if let Some(start) = statement_start.take() {
+                statements.push(&input[start..span.end]);
+            }
+            statement_end = None;
+            continue;
+        }
+        statement_start.get_or_insert(span.start);
+        statement_end = Some(span.end);
+    }
+
+    if let (Some(start), Some(end)) = (statement_start, statement_end) {
+        statements.push(&input[start..end]);
+    }
+    Ok(statements)
+}
+
 pub fn parse_expr(input: &str) -> Result<Expr> {
     let tokens = lex(input)?;
     let mut parser = Parser::new(tokens);
