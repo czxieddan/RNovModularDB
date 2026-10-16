@@ -54,7 +54,7 @@ mod sql_protocol;
 use shared::{SharedConnection, SharedDatabase};
 use sql_protocol::{handle_sql_client, reject_busy_client, spawn_client_thread};
 
-const SQL_LINE_PROTOCOL_VERSION: u16 = 1;
+const SQL_LINE_PROTOCOL_VERSION: u16 = 2;
 const DEFAULT_MAX_ACTIVE_CLIENTS: usize = 64;
 const DEFAULT_MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_CONFIGURED_ACTIVE_CLIENTS: usize = 4_096;
@@ -230,6 +230,10 @@ impl SqlProtocolCapabilities {
     }
 
     pub fn supports_explicit_transactions(&self) -> bool {
+        true
+    }
+
+    pub fn supports_runtime_status(&self) -> bool {
         true
     }
 
@@ -488,7 +492,6 @@ pub struct SqlTcpServer {
 #[derive(Clone, Debug)]
 pub struct SqlServerHandle {
     runtime: SqlServerRuntime,
-    clients: Arc<ClientRegistry>,
 }
 
 impl SqlServerHandle {
@@ -499,20 +502,7 @@ impl SqlServerHandle {
     }
 
     pub fn status(&self) -> Result<SqlServerStatus> {
-        let database = self.runtime.database.status()?;
-        let lifecycle = self.runtime.lifecycle();
-        Ok(SqlServerStatus {
-            runtime_mode: self.runtime.config().mode(),
-            authentication_required: self.runtime.config().authentication_required(),
-            active_clients: self.clients.active_count(),
-            committed_generation: database.committed_generation,
-            database_health: if database.restart_required {
-                SqlDatabaseHealth::RestartRequired
-            } else {
-                SqlDatabaseHealth::Available
-            },
-            lifecycle,
-        })
+        self.runtime.status()
     }
 
     pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
@@ -528,7 +518,7 @@ impl SqlServerHandle {
     }
 
     pub fn metrics(&self) -> SqlServerMetrics {
-        self.runtime.metrics().snapshot(self.clients.active_count())
+        self.runtime.metrics().snapshot()
     }
 }
 
@@ -573,7 +563,6 @@ impl SqlTcpServer {
     pub fn management_handle(&self) -> SqlServerHandle {
         SqlServerHandle {
             runtime: self.runtime.clone(),
-            clients: Arc::clone(&self.clients),
         }
     }
 
@@ -752,6 +741,22 @@ impl SqlServerRuntime {
         &self.metrics
     }
 
+    fn status(&self) -> Result<SqlServerStatus> {
+        let database = self.database.status()?;
+        Ok(SqlServerStatus {
+            runtime_mode: self.config().mode(),
+            authentication_required: self.config().authentication_required(),
+            active_clients: self.metrics.active_count(),
+            committed_generation: database.committed_generation,
+            database_health: if database.restart_required {
+                SqlDatabaseHealth::RestartRequired
+            } else {
+                SqlDatabaseHealth::Available
+            },
+            lifecycle: self.lifecycle(),
+        })
+    }
+
     fn lifecycle(&self) -> SqlServerLifecycle {
         SqlServerLifecycle::from_raw(self.lifecycle.load(Ordering::Acquire))
     }
@@ -823,7 +828,6 @@ impl SqlServerRuntime {
 
 #[derive(Debug)]
 struct ClientRegistry {
-    active: AtomicUsize,
     max_active: usize,
     next_id: AtomicU64,
     streams: Mutex<BTreeMap<u64, TcpStream>>,
@@ -833,7 +837,6 @@ struct ClientRegistry {
 impl ClientRegistry {
     fn new(max_active: usize, metrics: Arc<RuntimeMetrics>) -> Self {
         Self {
-            active: AtomicUsize::new(0),
             max_active,
             next_id: AtomicU64::new(1),
             streams: Mutex::new(BTreeMap::new()),
@@ -842,7 +845,7 @@ impl ClientRegistry {
     }
 
     fn active_count(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.metrics.active_count()
     }
 
     fn shutdown_all(&self) -> Result<()> {
@@ -865,7 +868,8 @@ struct ClientPermit {
 impl ClientPermit {
     fn acquire(clients: &Arc<ClientRegistry>, stream: &TcpStream) -> Result<Option<Self>> {
         if clients
-            .active
+            .metrics
+            .active_clients
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < clients.max_active).then_some(active + 1)
             })
@@ -878,14 +882,20 @@ impl ClientPermit {
         let tracked = match stream.try_clone() {
             Ok(tracked) => tracked,
             Err(error) => {
-                clients.active.fetch_sub(1, Ordering::AcqRel);
+                clients
+                    .metrics
+                    .active_clients
+                    .fetch_sub(1, Ordering::AcqRel);
                 return Err(io_error("failed to track SQL TCP client", error));
             }
         };
         let mut streams = match clients.streams.lock() {
             Ok(streams) => streams,
             Err(_) => {
-                clients.active.fetch_sub(1, Ordering::AcqRel);
+                clients
+                    .metrics
+                    .active_clients
+                    .fetch_sub(1, Ordering::AcqRel);
                 return Err(RnovError::new(
                     ErrorKind::Internal,
                     "SQL client registry lock is poisoned",
@@ -907,13 +917,17 @@ impl Drop for ClientPermit {
         if let Ok(mut streams) = self.clients.streams.lock() {
             streams.remove(&self.id);
         }
-        self.clients.active.fetch_sub(1, Ordering::AcqRel);
+        self.clients
+            .metrics
+            .active_clients
+            .fetch_sub(1, Ordering::AcqRel);
         self.clients.metrics.record_completed_client();
     }
 }
 
 #[derive(Debug, Default)]
 struct RuntimeMetrics {
+    active_clients: AtomicUsize,
     accepted_clients: AtomicU64,
     rejected_clients: AtomicU64,
     completed_clients: AtomicU64,
@@ -922,15 +936,19 @@ struct RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
-    fn snapshot(&self, active_clients: usize) -> SqlServerMetrics {
+    fn snapshot(&self) -> SqlServerMetrics {
         SqlServerMetrics {
-            active_clients,
+            active_clients: self.active_count(),
             accepted_clients: self.accepted_clients.load(Ordering::Acquire),
             rejected_clients: self.rejected_clients.load(Ordering::Acquire),
             completed_clients: self.completed_clients.load(Ordering::Acquire),
             commands_received: self.commands_received.load(Ordering::Acquire),
             failed_client_sessions: self.failed_client_sessions.load(Ordering::Acquire),
         }
+    }
+
+    fn active_count(&self) -> usize {
+        self.active_clients.load(Ordering::Acquire)
     }
 
     fn record_accepted_client(&self) {

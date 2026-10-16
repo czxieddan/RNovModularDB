@@ -264,6 +264,14 @@ conflict and the client can roll back and retry. `PING` returns `OK pong`
 without authentication for local health checks, and `QUIT` closes a session
 after rolling back any active transaction.
 
+Protocol version 2 adds `STATUS`. In authenticated deployments it is available
+only after `AUTH`; unauthenticated deployments can use it directly. The
+single-line response reports lifecycle, database health, runtime mode,
+authentication policy, active clients, committed generation, and the same
+process-local counters exposed by `SqlServerHandle::metrics`. This keeps
+`PING` as the minimal anonymous liveness probe while reserving operational
+detail for an authenticated session.
+
 Embedded service managers can retain `SqlTcpServer::management_handle` before
 moving the server into a worker thread. The cloneable handle reports protocol
 limits, active connections, authentication and storage mode, the process-local

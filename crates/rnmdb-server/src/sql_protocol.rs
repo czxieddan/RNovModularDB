@@ -216,6 +216,7 @@ fn execute_sql_command_line(
     match classify_client_command(command) {
         ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
         ClientCommandKind::Ping => execute_ping_command(writer),
+        ClientCommandKind::Status => execute_status_command(runtime, session, writer),
         ClientCommandKind::Empty => execute_empty_command(writer),
         ClientCommandKind::Auth => execute_auth_command(runtime, session, writer, command),
         ClientCommandKind::Sql => execute_session_sql(runtime, session, writer, command),
@@ -226,6 +227,7 @@ fn execute_sql_command_line(
 enum ClientCommandKind {
     Quit,
     Ping,
+    Status,
     Empty,
     Auth,
     Sql,
@@ -238,6 +240,9 @@ fn classify_client_command(command: &str) -> ClientCommandKind {
     if command.eq_ignore_ascii_case("ping") {
         return ClientCommandKind::Ping;
     }
+    if command.eq_ignore_ascii_case("status") {
+        return ClientCommandKind::Status;
+    }
     if command.is_empty() {
         return ClientCommandKind::Empty;
     }
@@ -249,6 +254,44 @@ fn classify_client_command(command: &str) -> ClientCommandKind {
 
 fn execute_ping_command(writer: &mut TcpStream) -> Result<bool> {
     write_protocol_line(writer, "OK pong")?;
+    Ok(false)
+}
+
+fn execute_status_command(
+    runtime: &SqlServerRuntime,
+    session: &Option<SharedConnection>,
+    writer: &mut TcpStream,
+) -> Result<bool> {
+    if session.is_none() {
+        write_protocol_line(writer, "ERR authentication required")?;
+        return Ok(false);
+    }
+    let status = match runtime.status() {
+        Ok(status) => status,
+        Err(error) => {
+            write_protocol_line(
+                writer,
+                &format!("ERR {}", protocol_text(&error.to_string())),
+            )?;
+            return Ok(false);
+        }
+    };
+    let metrics = runtime.metrics().snapshot();
+    let line = format!(
+        "STATUS lifecycle={} health={} mode={} authentication_required={} active_clients={} committed_generation={} accepted_clients={} rejected_clients={} completed_clients={} commands_received={} failed_client_sessions={}",
+        lifecycle_text(status.lifecycle()),
+        database_health_text(status.database_health()),
+        runtime_mode_text(status.runtime_mode()),
+        status.authentication_required(),
+        metrics.active_clients(),
+        status.committed_generation(),
+        metrics.accepted_clients(),
+        metrics.rejected_clients(),
+        metrics.completed_clients(),
+        metrics.commands_received(),
+        metrics.failed_client_sessions(),
+    );
+    write_protocol_line(writer, &line)?;
     Ok(false)
 }
 
@@ -389,6 +432,29 @@ fn protocol_output_line(output: CommandOutput) -> String {
 
 fn protocol_text(text: &str) -> String {
     text.replace(['\r', '\n'], " ")
+}
+
+fn lifecycle_text(lifecycle: super::SqlServerLifecycle) -> &'static str {
+    match lifecycle {
+        super::SqlServerLifecycle::Idle => "idle",
+        super::SqlServerLifecycle::Serving => "serving",
+        super::SqlServerLifecycle::ShuttingDown => "shutting_down",
+        super::SqlServerLifecycle::Stopped => "stopped",
+    }
+}
+
+fn database_health_text(health: super::SqlDatabaseHealth) -> &'static str {
+    match health {
+        super::SqlDatabaseHealth::Available => "available",
+        super::SqlDatabaseHealth::RestartRequired => "restart_required",
+    }
+}
+
+fn runtime_mode_text(mode: super::EmbeddedRuntimeMode) -> &'static str {
+    match mode {
+        super::EmbeddedRuntimeMode::TemporaryMemory => "temporary_memory",
+        super::EmbeddedRuntimeMode::SingleFile => "single_file",
+    }
 }
 
 fn write_protocol_line(writer: &mut TcpStream, line: &str) -> Result<()> {
