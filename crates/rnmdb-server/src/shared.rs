@@ -16,6 +16,12 @@ pub(super) struct SharedDatabase {
     durable: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SharedDatabaseStatus {
+    pub(super) committed_generation: u64,
+    pub(super) restart_required: bool,
+}
+
 struct SharedDatabaseState {
     session: LocalSession,
     generation: u64,
@@ -63,6 +69,14 @@ impl SharedDatabase {
             transaction: None,
             close_after_response: false,
         }
+    }
+
+    pub(super) fn status(&self) -> Result<SharedDatabaseStatus> {
+        let state = self.lock()?;
+        Ok(SharedDatabaseStatus {
+            committed_generation: state.generation,
+            restart_required: state.poisoned,
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, SharedDatabaseState>> {

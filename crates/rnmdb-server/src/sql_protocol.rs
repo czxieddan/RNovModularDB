@@ -39,9 +39,10 @@ use rnmdb_cli::CommandOutput;
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider};
 
-use super::{ClientPermit, SqlServerRuntime, io_error, shared::SharedConnection};
+use super::{
+    ClientPermit, MAX_SQL_COMMAND_BYTES, SqlServerRuntime, io_error, shared::SharedConnection,
+};
 
-const MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_SQL_COMMAND_READ_BYTES: usize = MAX_SQL_COMMAND_BYTES + 2;
 const CLIENT_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);

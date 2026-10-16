@@ -246,6 +246,13 @@ conflict and the client can roll back and retry. `PING` returns `OK pong`
 without authentication for local health checks, and `QUIT` closes a session
 after rolling back any active transaction.
 
+Embedded service managers can retain `SqlTcpServer::management_handle` before
+moving the server into a worker thread. The cloneable handle reports protocol
+limits, active connections, authentication and storage mode, the process-local
+committed generation, and whether an indeterminate durable commit requires a
+restart. It can also request shutdown of `SqlTcpServer::serve`; the server then
+uses the same bounded drain path as `serve_until`.
+
 This protocol is not PostgreSQL, MySQL, or SQLite wire compatible. It is a
 small operational interface for controlled embedded deployments, not a general
 database proxy protocol. It does not provide TLS; expose it remotely only

@@ -54,10 +54,101 @@ mod sql_protocol;
 use shared::{SharedConnection, SharedDatabase};
 use sql_protocol::{handle_sql_client, reject_busy_client, spawn_client_thread};
 
+const SQL_LINE_PROTOCOL_VERSION: u16 = 1;
 const MAX_ACTIVE_CLIENTS: usize = 64;
+const MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether the shared database can safely execute more commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlDatabaseHealth {
+    /// The shared committed state is available.
+    Available,
+    /// A durable commit had an indeterminate outcome and the process must be restarted.
+    RestartRequired,
+}
+
+/// Stable limits and feature flags for the built-in SQL line protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlProtocolCapabilities {
+    protocol_version: u16,
+    max_active_clients: usize,
+    max_command_bytes: usize,
+}
+
+impl SqlProtocolCapabilities {
+    /// Returns the management-visible protocol revision.
+    ///
+    /// The line protocol does not currently negotiate this value on the wire.
+    pub fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    pub fn max_active_clients(&self) -> usize {
+        self.max_active_clients
+    }
+
+    pub fn max_command_bytes(&self) -> usize {
+        self.max_command_bytes
+    }
+
+    pub fn supports_authentication(&self) -> bool {
+        true
+    }
+
+    pub fn supports_health_check(&self) -> bool {
+        true
+    }
+
+    pub fn supports_explicit_transactions(&self) -> bool {
+        true
+    }
+
+    pub fn supports_transport_security(&self) -> bool {
+        false
+    }
+}
+
+/// A point-in-time, read-only view of one SQL server runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlServerStatus {
+    runtime_mode: EmbeddedRuntimeMode,
+    authentication_required: bool,
+    active_clients: usize,
+    committed_generation: u64,
+    database_health: SqlDatabaseHealth,
+    shutdown_requested: bool,
+}
+
+impl SqlServerStatus {
+    pub fn runtime_mode(&self) -> EmbeddedRuntimeMode {
+        self.runtime_mode
+    }
+
+    pub fn authentication_required(&self) -> bool {
+        self.authentication_required
+    }
+
+    pub fn active_clients(&self) -> usize {
+        self.active_clients
+    }
+
+    /// Returns a process-local generation that advances after each published
+    /// state change. It is not a durable database format revision.
+    pub fn committed_generation(&self) -> u64 {
+        self.committed_generation
+    }
+
+    pub fn database_health(&self) -> SqlDatabaseHealth {
+        self.database_health
+    }
+
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
@@ -197,6 +288,45 @@ pub struct SqlTcpServer {
     clients: Arc<ClientRegistry>,
 }
 
+/// A cloneable control-plane handle that does not expose mutable database state.
+#[derive(Clone, Debug)]
+pub struct SqlServerHandle {
+    runtime: SqlServerRuntime,
+    clients: Arc<ClientRegistry>,
+}
+
+impl SqlServerHandle {
+    /// Requests shutdown of a server running through [`SqlTcpServer::serve`] or
+    /// [`SqlTcpServer::serve_until`].
+    pub fn request_shutdown(&self) {
+        self.runtime.request_shutdown();
+    }
+
+    pub fn status(&self) -> Result<SqlServerStatus> {
+        let database = self.runtime.database.status()?;
+        Ok(SqlServerStatus {
+            runtime_mode: self.runtime.config().mode(),
+            authentication_required: self.runtime.config().authentication_required(),
+            active_clients: self.clients.active_count(),
+            committed_generation: database.committed_generation,
+            database_health: if database.restart_required {
+                SqlDatabaseHealth::RestartRequired
+            } else {
+                SqlDatabaseHealth::Available
+            },
+            shutdown_requested: self.runtime.shutdown_requested(),
+        })
+    }
+
+    pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
+        SqlProtocolCapabilities {
+            protocol_version: SQL_LINE_PROTOCOL_VERSION,
+            max_active_clients: MAX_ACTIVE_CLIENTS,
+            max_command_bytes: MAX_SQL_COMMAND_BYTES,
+        }
+    }
+}
+
 impl SqlTcpServer {
     pub fn bind(address: impl ToSocketAddrs, config: EmbeddedRuntimeConfig) -> Result<Self> {
         let listener = TcpListener::bind(address)
@@ -224,20 +354,39 @@ impl SqlTcpServer {
             .map_err(|err| io_error("failed to read SQL TCP listener address", err))
     }
 
+    pub fn management_handle(&self) -> SqlServerHandle {
+        SqlServerHandle {
+            runtime: self.runtime.clone(),
+            clients: Arc::clone(&self.clients),
+        }
+    }
+
+    pub fn status(&self) -> Result<SqlServerStatus> {
+        self.management_handle().status()
+    }
+
+    pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
+        self.management_handle().protocol_capabilities()
+    }
+
     pub fn accept_one(&self) -> Result<()> {
         let stream = self.accept_client()?;
         handle_sql_client(stream, &self.runtime)
     }
 
+    /// Serves clients until a management handle requests shutdown, then drains
+    /// active clients for a bounded period.
     pub fn serve(&self) -> Result<()> {
-        loop {
-            self.serve_next()?;
-        }
+        self.serve_until_requested(None)
     }
 
     /// Serves clients until `shutdown` is set, then stops client I/O and waits
     /// for a bounded drain period.
     pub fn serve_until(&self, shutdown: &AtomicBool) -> Result<()> {
+        self.serve_until_requested(Some(shutdown))
+    }
+
+    fn serve_until_requested(&self, shutdown: Option<&AtomicBool>) -> Result<()> {
         self.listener
             .set_nonblocking(true)
             .map_err(|err| io_error("failed to enable nonblocking SQL listener", err))?;
@@ -280,8 +429,10 @@ impl SqlTcpServer {
         self.clients.active_count()
     }
 
-    fn serve_nonblocking_until(&self, shutdown: &AtomicBool) -> Result<()> {
-        while !shutdown.load(Ordering::Acquire) {
+    fn serve_nonblocking_until(&self, shutdown: Option<&AtomicBool>) -> Result<()> {
+        while !self.runtime.shutdown_requested()
+            && !shutdown.is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
+        {
             match self.listener.accept() {
                 Ok((stream, _)) => self.dispatch_client(stream)?,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -292,10 +443,6 @@ impl SqlTcpServer {
             }
         }
         Ok(())
-    }
-
-    fn serve_next(&self) -> Result<()> {
-        self.dispatch_client(self.accept_client()?)
     }
 
     fn accept_client(&self) -> Result<TcpStream> {
