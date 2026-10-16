@@ -49,7 +49,7 @@ use rnmdb_common::{
 use rnmdb_executor::{
     durable::{
         DurableExecutorImage, read_image_from_single_file_backend,
-        write_image_to_single_file_backend,
+        write_image_to_single_file_backend_with_outcome,
     },
     memory::{ExecutionResult, MemoryExecutor, MutationDelta, ParallelQueryConfig},
     vector::VectorBatch,
@@ -70,12 +70,13 @@ use rnmdb_sql::{
     parser::parse_statement,
 };
 use rnmdb_storage::{
-    PageCryptoKey, SingleFileBackend, SingleFileBackupReport, SingleFileFormatCompatibility,
-    SingleFileInspection, SingleFileOptions, SingleFileRestoreDryRun, SingleFileRestoreReport,
-    SingleFileUpgradeReport, SingleFileVerificationReport, backup_single_file,
-    check_single_file_format_compatibility, inspect_single_file, inspect_single_file_with_key,
-    restore_single_file, restore_single_file_dry_run, upgrade_single_file,
-    upgrade_single_file_with_key, verify_single_file, verify_single_file_with_key,
+    CatalogCommitFailure, PageCryptoKey, SingleFileBackend, SingleFileBackupReport,
+    SingleFileFormatCompatibility, SingleFileInspection, SingleFileOptions,
+    SingleFileRestoreDryRun, SingleFileRestoreReport, SingleFileUpgradeReport,
+    SingleFileVerificationReport, backup_single_file, check_single_file_format_compatibility,
+    inspect_single_file, inspect_single_file_with_key, restore_single_file,
+    restore_single_file_dry_run, upgrade_single_file, upgrade_single_file_with_key,
+    verify_single_file, verify_single_file_with_key,
 };
 use rnmdb_txn::{IsolationLevel, Transaction, TransactionManager};
 use rnmdb_types::{SqlType, SqlValue};
@@ -106,6 +107,23 @@ pub struct LocalSession {
     durable: Option<LocalDurableStore>,
     transaction_manager: TransactionManager,
     transaction: Option<LocalTransactionState>,
+}
+
+/// An executor-independent copy of one fully committed local database state.
+///
+/// Runtime coordinators can use this value to create isolated connection
+/// sessions and to publish a completed transaction without sharing active
+/// roles, transaction bookkeeping, or durable file handles.
+pub struct CommittedSessionSnapshot {
+    catalog: Catalog,
+    executor: MemoryExecutor,
+    execution: LocalExecutionConfig,
+}
+
+impl CommittedSessionSnapshot {
+    fn encode_durable_image(&self) -> Result<Vec<u8>> {
+        encode_durable_image(&self.catalog, &self.executor)
+    }
 }
 
 struct LocalDurableStore {
@@ -157,26 +175,133 @@ impl LocalSession {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_with_outcome()
+            .map_err(CatalogCommitFailure::into_error)
+    }
+
+    pub fn checkpoint_with_outcome(&mut self) -> std::result::Result<(), CatalogCommitFailure> {
+        self.ensure_checkpoint_allowed()
+            .map_err(CatalogCommitFailure::not_published)?;
+        if self.in_transaction() {
+            return Err(CatalogCommitFailure::not_published(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot checkpoint while a transaction is active",
+            )));
+        }
+        self.checkpoint_current_state_with_outcome()
+    }
+
+    /// Returns the active database role for this session.
+    pub fn active_role_id(&self) -> RoleId {
+        self.role_id
+    }
+
+    /// Copies the current committed state for use by a runtime coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while a transaction or tenant scope is active, after a
+    /// tenant cleanup failure, or when the in-memory executor cannot be copied.
+    pub fn committed_snapshot(&self) -> Result<CommittedSessionSnapshot> {
         self.ensure_checkpoint_allowed()?;
         if self.in_transaction() {
             return Err(RnovError::new(
                 ErrorKind::InvalidInput,
-                "cannot checkpoint while a transaction is active",
+                "cannot snapshot a local session while a transaction is active",
             ));
         }
-        self.checkpoint_current_state()
+        Ok(CommittedSessionSnapshot {
+            catalog: self.catalog.clone(),
+            executor: self.executor.snapshot()?,
+            execution: self.execution,
+        })
+    }
+
+    /// Creates a detached local session from a committed snapshot.
+    ///
+    /// The returned session has no durable backend. Callers publish its state
+    /// through [`Self::replace_committed_state`] after conflict checks.
+    pub fn from_committed_snapshot(snapshot: CommittedSessionSnapshot) -> Result<Self> {
+        let role_id = local_role_id(&snapshot.catalog)?;
+        Self::from_parts(
+            snapshot.catalog,
+            role_id,
+            snapshot.executor,
+            snapshot.execution,
+            None,
+        )
+    }
+
+    /// Replaces this session's committed database state while preserving its
+    /// durable backend and current role when that role still exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error while a transaction or tenant scope is active, or when
+    /// the snapshot contains invalid durable function metadata.
+    pub fn replace_committed_state(&mut self, snapshot: CommittedSessionSnapshot) -> Result<()> {
+        self.ensure_checkpoint_allowed()?;
+        if self.in_transaction() {
+            return Err(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot replace local session state while a transaction is active",
+            ));
+        }
+
+        let current_role = self.role_id;
+        let mut replacement = Self::from_committed_snapshot(snapshot)?;
+        if replacement.catalog.get_role_by_id(current_role).is_some() {
+            replacement.set_active_role(current_role)?;
+        }
+        replacement.durable = self.durable.take();
+        *self = replacement;
+        Ok(())
+    }
+
+    pub fn checkpoint_committed_snapshot_with_outcome(
+        &mut self,
+        snapshot: &CommittedSessionSnapshot,
+    ) -> std::result::Result<(), CatalogCommitFailure> {
+        self.ensure_checkpoint_allowed()
+            .map_err(CatalogCommitFailure::not_published)?;
+        if self.in_transaction() {
+            return Err(CatalogCommitFailure::not_published(RnovError::new(
+                ErrorKind::InvalidInput,
+                "cannot checkpoint a committed snapshot while a transaction is active",
+            )));
+        }
+        let image = snapshot
+            .encode_durable_image()
+            .map_err(CatalogCommitFailure::not_published)?;
+        self.write_durable_image_with_outcome(&image)
     }
 
     fn checkpoint_current_state(&mut self) -> Result<()> {
-        let image = self.encode_durable_image()?;
+        self.checkpoint_current_state_with_outcome()
+            .map_err(CatalogCommitFailure::into_error)
+    }
+
+    fn checkpoint_current_state_with_outcome(
+        &mut self,
+    ) -> std::result::Result<(), CatalogCommitFailure> {
+        let image = self
+            .encode_durable_image()
+            .map_err(CatalogCommitFailure::not_published)?;
+        self.write_durable_image_with_outcome(&image)
+    }
+
+    fn write_durable_image_with_outcome(
+        &mut self,
+        image: &[u8],
+    ) -> std::result::Result<(), CatalogCommitFailure> {
         let durable = self.durable.as_mut().ok_or_else(|| {
-            RnovError::new(
+            CatalogCommitFailure::not_published(RnovError::new(
                 ErrorKind::InvalidInput,
                 "local session has no durable storage backend",
-            )
+            ))
         })?;
         let page_size = durable.backend.page_size();
-        write_image_to_single_file_backend(&mut durable.backend, page_size, &image)
+        write_image_to_single_file_backend_with_outcome(&mut durable.backend, page_size, image)
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -754,11 +879,7 @@ impl LocalSession {
     }
 
     fn encode_durable_image(&self) -> Result<Vec<u8>> {
-        DurableExecutorImage::new(
-            CatalogCodec::encode(&self.catalog)?,
-            self.executor.snapshot_tables()?,
-        )
-        .encode()
+        encode_durable_image(&self.catalog, &self.executor)
     }
 
     fn execute_mutation_with_constraints(
@@ -1279,6 +1400,17 @@ impl LocalSession {
     }
 
     fn apply_catalog_drop_role(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        let local_role = local_role_id(&self.catalog)?;
+        if self
+            .catalog
+            .get_role(name)
+            .is_some_and(|role| role.role_id() == local_role)
+        {
+            return Err(rnmdb_common::RnovError::new(
+                rnmdb_common::ErrorKind::InvalidInput,
+                "cannot drop the mandatory local role",
+            ));
+        }
         if self
             .catalog
             .get_role(name)
@@ -1873,6 +2005,10 @@ fn local_role_id(catalog: &Catalog) -> Result<RoleId> {
         .get_role("local")
         .map(|role| role.role_id())
         .ok_or_else(|| RnovError::new(ErrorKind::Corruption, "durable catalog has no local role"))
+}
+
+fn encode_durable_image(catalog: &Catalog, executor: &MemoryExecutor) -> Result<Vec<u8>> {
+    DurableExecutorImage::new(CatalogCodec::encode(catalog)?, executor.snapshot_tables()?).encode()
 }
 
 fn validate_column_decrypt_identifiers(names: [&str; 4]) -> Result<()> {

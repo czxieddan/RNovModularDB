@@ -30,7 +30,7 @@
 // SPDX-License-Identifier: LicenseRef-AHCL-1.2
 use crc::{CRC_32_ISCSI, Crc};
 use rnmdb_common::{ErrorKind, Result, RnovError, ids::PageId};
-use rnmdb_storage::{Page, PageSize, SingleFileBackend, StorageBackend};
+use rnmdb_storage::{CatalogCommitFailure, Page, PageSize, SingleFileBackend, StorageBackend};
 
 const IMAGE_MAGIC: [u8; 8] = *b"RNOVSQL1";
 const IMAGE_VERSION: u16 = 1;
@@ -122,12 +122,21 @@ pub fn write_image_to_single_file_backend(
     page_size: PageSize,
     image: &[u8],
 ) -> Result<()> {
-    let frame = encode_page_frame(page_size, image)?;
+    write_image_to_single_file_backend_with_outcome(backend, page_size, image)
+        .map_err(CatalogCommitFailure::into_error)
+}
+
+pub fn write_image_to_single_file_backend_with_outcome(
+    backend: &mut SingleFileBackend,
+    page_size: PageSize,
+    image: &[u8],
+) -> std::result::Result<(), CatalogCommitFailure> {
+    let frame = encode_page_frame(page_size, image).map_err(CatalogCommitFailure::not_published)?;
     let payloads = frame
         .chunks(page_size.bytes())
         .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
-    backend.commit_catalog_pages(&payloads)?;
+    backend.commit_catalog_pages_with_outcome(&payloads)?;
     Ok(())
 }
 

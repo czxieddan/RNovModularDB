@@ -32,29 +32,32 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use rnmdb_cli::{CommandOutput, LocalSession};
+use rnmdb_cli::CommandOutput;
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider};
 
-use super::{ClientPermit, EmbeddedRuntime, io_error};
+use super::{ClientPermit, SqlServerRuntime, io_error, shared::SharedConnection};
 
 const MAX_SQL_COMMAND_BYTES: usize = 65_536;
 const MAX_SQL_COMMAND_READ_BYTES: usize = MAX_SQL_COMMAND_BYTES + 2;
+const CLIENT_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn spawn_client_thread(
     stream: TcpStream,
-    runtime: EmbeddedRuntime,
+    runtime: SqlServerRuntime,
     permit: ClientPermit,
 ) -> Result<()> {
     thread::Builder::new()
         .name("rnmdb-sql-client".to_string())
         .spawn(move || {
             let _permit = permit;
-            let _ = handle_sql_client(stream, &runtime);
+            if let Err(error) = handle_sql_client(stream, &runtime) {
+                eprintln!("rnmdbd client session error: {error}");
+            }
         })
         .map(|_| ())
         .map_err(|err| io_error("failed to spawn SQL TCP client worker", err))
@@ -65,15 +68,31 @@ pub(super) fn reject_busy_client(mut stream: TcpStream) {
     let _ = write_protocol_line(&mut stream, "ERR server busy");
 }
 
-pub(super) fn handle_sql_client(stream: TcpStream, runtime: &EmbeddedRuntime) -> Result<()> {
+pub(super) fn handle_sql_client(stream: TcpStream, runtime: &SqlServerRuntime) -> Result<()> {
     let reader_stream = configured_reader_stream(&stream)?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut session = initial_client_session(runtime)?;
     let mut command = String::new();
     loop {
+        if runtime.shutdown_requested() {
+            close_client_session(runtime, &mut session)?;
+            return Ok(());
+        }
         command.clear();
-        if read_sql_command(&mut reader, &mut command)? == 0 {
+        let bytes_read = match read_sql_command(&mut reader, &mut command, runtime) {
+            Ok(bytes_read) => bytes_read,
+            Err(_) if runtime.shutdown_requested() => {
+                close_client_session(runtime, &mut session)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if bytes_read == 0 {
+            close_client_session(runtime, &mut session)?;
+            return Ok(());
+        }
+        if runtime.shutdown_requested() {
             close_client_session(runtime, &mut session)?;
             return Ok(());
         }
@@ -90,23 +109,61 @@ fn configured_reader_stream(stream: &TcpStream) -> Result<TcpStream> {
         .map_err(|err| io_error("failed to clone SQL TCP client stream", err))
 }
 
-fn initial_client_session(runtime: &EmbeddedRuntime) -> Result<Option<LocalSession>> {
+fn initial_client_session(runtime: &SqlServerRuntime) -> Result<Option<SharedConnection>> {
     if runtime.config().authentication_required() {
         Ok(None)
     } else {
-        runtime.open_session().map(Some)
+        Ok(Some(runtime.open_connection(None)))
     }
 }
 
-fn read_sql_command(reader: &mut BufReader<TcpStream>, command: &mut String) -> Result<usize> {
+fn read_sql_command(
+    reader: &mut BufReader<TcpStream>,
+    command: &mut String,
+    runtime: &SqlServerRuntime,
+) -> Result<usize> {
     let mut bytes = Vec::new();
-    let mut limited = reader.by_ref().take(MAX_SQL_COMMAND_READ_BYTES as u64);
-    let bytes_read = limited
-        .read_until(b'\n', &mut bytes)
-        .map_err(|err| io_error("failed to read SQL TCP command", err))?;
+    let mut last_progress = Instant::now();
+    let bytes_read = loop {
+        if runtime.shutdown_requested() {
+            return Ok(0);
+        }
+        let remaining = MAX_SQL_COMMAND_READ_BYTES.saturating_sub(bytes.len());
+        if remaining == 0 {
+            ensure_command_size(&bytes)?;
+        }
+        let mut limited = reader.by_ref().take(remaining as u64);
+        match limited.read_until(b'\n', &mut bytes) {
+            Ok(0) => break bytes.len(),
+            Ok(_) if bytes.ends_with(b"\n") => break bytes.len(),
+            Ok(_) => {
+                last_progress = Instant::now();
+                ensure_command_size(&bytes)?;
+            }
+            Err(error) if is_transient_read_error(&error) => {
+                if last_progress.elapsed() >= CLIENT_IO_TIMEOUT {
+                    return Err(io_error(
+                        "failed to read SQL TCP command",
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "SQL client read timed out",
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(io_error("failed to read SQL TCP command", error)),
+        }
+    };
     ensure_command_size(&bytes)?;
     append_utf8_command(command, &bytes)?;
     Ok(bytes_read)
+}
+
+fn is_transient_read_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
 }
 
 fn ensure_command_size(bytes: &[u8]) -> Result<()> {
@@ -133,7 +190,7 @@ fn append_utf8_command(command: &mut String, bytes: &[u8]) -> Result<()> {
 
 fn configure_client_stream(stream: &TcpStream) -> Result<()> {
     stream
-        .set_read_timeout(Some(CLIENT_IO_TIMEOUT))
+        .set_read_timeout(Some(CLIENT_SHUTDOWN_POLL_INTERVAL))
         .map_err(|err| io_error("failed to set SQL TCP client read timeout", err))?;
     stream
         .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
@@ -141,13 +198,14 @@ fn configure_client_stream(stream: &TcpStream) -> Result<()> {
 }
 
 fn execute_sql_command_line(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
     match classify_client_command(command) {
         ClientCommandKind::Quit => execute_quit_command(runtime, session, writer),
+        ClientCommandKind::Ping => execute_ping_command(writer),
         ClientCommandKind::Empty => execute_empty_command(writer),
         ClientCommandKind::Auth => execute_auth_command(runtime, session, writer, command),
         ClientCommandKind::Sql => execute_session_sql(runtime, session, writer, command),
@@ -157,6 +215,7 @@ fn execute_sql_command_line(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientCommandKind {
     Quit,
+    Ping,
     Empty,
     Auth,
     Sql,
@@ -165,6 +224,9 @@ enum ClientCommandKind {
 fn classify_client_command(command: &str) -> ClientCommandKind {
     if command.eq_ignore_ascii_case("quit") {
         return ClientCommandKind::Quit;
+    }
+    if command.eq_ignore_ascii_case("ping") {
+        return ClientCommandKind::Ping;
     }
     if command.is_empty() {
         return ClientCommandKind::Empty;
@@ -175,9 +237,14 @@ fn classify_client_command(command: &str) -> ClientCommandKind {
     ClientCommandKind::Sql
 }
 
+fn execute_ping_command(writer: &mut TcpStream) -> Result<bool> {
+    write_protocol_line(writer, "OK pong")?;
+    Ok(false)
+}
+
 fn execute_quit_command(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
     writer: &mut TcpStream,
 ) -> Result<bool> {
     close_client_session(runtime, session)?;
@@ -191,47 +258,39 @@ fn execute_empty_command(writer: &mut TcpStream) -> Result<bool> {
 }
 
 fn execute_session_sql(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
-    let Some(session) = session.as_mut() else {
+    let Some(connection) = session.as_mut() else {
         write_protocol_line(writer, "ERR authentication required")?;
         return Ok(false);
     };
-    let line = execute_session_command(runtime, session, command)?;
+    let line = execute_session_command(connection, command)?;
+    let close_after_response = connection.close_after_response();
     write_protocol_line(writer, &line)?;
+    if close_after_response {
+        close_client_session(runtime, session)?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
-fn execute_session_command(
-    runtime: &EmbeddedRuntime,
-    session: &mut LocalSession,
-    command: &str,
-) -> Result<String> {
+fn execute_session_command(session: &mut SharedConnection, command: &str) -> Result<String> {
     match session.execute(command) {
-        Ok(output) => successful_command_line(runtime, session, output),
+        Ok(output) => Ok(protocol_output_line(output)),
+        Err(err) if session.close_after_response() => Ok(format!(
+            "ERR {}; connection closing",
+            protocol_text(&err.to_string())
+        )),
         Err(err) => Ok(format!("ERR {}", protocol_text(&err.to_string()))),
     }
 }
 
-fn successful_command_line(
-    runtime: &EmbeddedRuntime,
-    session: &mut LocalSession,
-    output: CommandOutput,
-) -> Result<String> {
-    let should_checkpoint = command_output_needs_checkpoint(&output);
-    let line = protocol_output_line(output);
-    if should_checkpoint {
-        checkpoint_local_session(runtime, session)?;
-    }
-    Ok(line)
-}
-
 fn execute_auth_command(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
     writer: &mut TcpStream,
     command: &str,
 ) -> Result<bool> {
@@ -241,8 +300,8 @@ fn execute_auth_command(
 }
 
 fn auth_command_response(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
     command: &str,
 ) -> Result<&'static str> {
     if session.is_some() {
@@ -259,7 +318,7 @@ fn auth_command_response(
 }
 
 fn authenticate_client(
-    runtime: &EmbeddedRuntime,
+    runtime: &SqlServerRuntime,
     username: &str,
     password: &str,
 ) -> Result<Option<AuthenticatedPrincipal>> {
@@ -270,46 +329,20 @@ fn authenticate_client(
 }
 
 fn open_authenticated_session(
-    runtime: &EmbeddedRuntime,
+    runtime: &SqlServerRuntime,
     principal: &AuthenticatedPrincipal,
-) -> Result<LocalSession> {
-    let mut session = runtime.open_session()?;
-    if let Some(role_id) = principal.role_id() {
-        session.set_active_role(role_id)?;
-    }
-    Ok(session)
-}
-
-fn command_output_needs_checkpoint(output: &CommandOutput) -> bool {
-    matches!(
-        output,
-        CommandOutput::RowsAffected(_) | CommandOutput::SchemaChanged
-    )
+) -> Result<SharedConnection> {
+    Ok(runtime.open_connection(principal.role_id()))
 }
 
 fn close_client_session(
-    runtime: &EmbeddedRuntime,
-    session: &mut Option<LocalSession>,
+    _runtime: &SqlServerRuntime,
+    session: &mut Option<SharedConnection>,
 ) -> Result<()> {
-    let Some(session) = session.as_mut() else {
+    let Some(mut session) = session.take() else {
         return Ok(());
     };
-    rollback_client_transaction(session)?;
-    checkpoint_local_session(runtime, session)
-}
-
-fn rollback_client_transaction(session: &mut LocalSession) -> Result<()> {
-    if !session.in_transaction() {
-        return Ok(());
-    }
-    session.execute("ROLLBACK;").map(|_| ())
-}
-
-fn checkpoint_local_session(runtime: &EmbeddedRuntime, session: &mut LocalSession) -> Result<()> {
-    if runtime.config().disk_writes_allowed() && !session.in_transaction() {
-        session.checkpoint()?;
-    }
-    Ok(())
+    session.close()
 }
 
 fn parse_auth_command(command: &str) -> Option<(&str, &str)> {

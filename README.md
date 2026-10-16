@@ -192,7 +192,7 @@ use rnmdb_storage::PageCryptoKey;
 fn write_event(path: &Path, page_key: PageCryptoKey) -> rnmdb_common::Result<()> {
     let mut session = LocalSession::single_file_with_key(path, page_key)?;
     session.execute("CREATE TABLE events (id INT64, payload TEXT);")?;
-    session.execute("INSERT INTO events VALUES (1, 'created');")?;
+    session.execute("INSERT INTO events (id, payload) VALUES (1, 'created');")?;
     session.checkpoint()?;
     Ok(())
 }
@@ -214,9 +214,40 @@ authenticated catalog role to authorization and column decryption. The server
 limits active clients, command size, and socket I/O time, and isolates client
 errors from the accept loop.
 
+The `rnmdbd` binary provides an operational entry point. It binds to
+`127.0.0.1:7432` by default, requires authentication unless
+`--allow-unauthenticated` is explicit, and refuses non-loopback listeners unless
+the operator explicitly accepts the unencrypted transport with
+`--allow-remote-plaintext`:
+
+```bash
+cargo run -q -p rnmdb-server --bin rnmdbd -- \
+  serve --database data/app.rnmdb \
+  --page-key-file /secure/page-key.hex \
+  --auth-user app \
+  --auth-password-file /secure/app-password.txt
+```
+
+Use `--auth-role-id <ID>` to bind the credential to an existing catalog role.
+Omitting it creates an authenticated administrative connection. Passwords and
+page keys are never accepted as command-line values. `--shutdown-on-stdin`
+stops accepting after one stdin line or EOF, signals active clients, and uses a
+bounded five-second graceful drain period; embedded hosts can call
+`SqlTcpServer::serve_until` with their own shutdown signal.
+
+Each connection has independent authentication and transaction state, while
+all connections share one committed database state. Autocommit changes become
+visible to later commands and connections after a successful durable
+checkpoint. Explicit transactions publish atomically at `COMMIT`; if another
+connection committed since `BEGIN`, the commit is rejected with a transaction
+conflict and the client can roll back and retry. `PING` returns `OK pong`
+without authentication for local health checks, and `QUIT` closes a session
+after rolling back any active transaction.
+
 This protocol is not PostgreSQL, MySQL, or SQLite wire compatible. It is a
 small operational interface for controlled embedded deployments, not a general
-database proxy protocol.
+database proxy protocol. It does not provide TLS; expose it remotely only
+behind an authenticated encrypted tunnel or a transport-security terminator.
 
 ## SQL Support
 

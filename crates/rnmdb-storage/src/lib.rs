@@ -1396,6 +1396,42 @@ struct CatalogPageCommit {
     metadata: SingleFileMetadata,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogCommitFailureKind {
+    NotPublished,
+    OutcomeUnknown,
+}
+
+#[derive(Debug)]
+pub struct CatalogCommitFailure {
+    kind: CatalogCommitFailureKind,
+    error: RnovError,
+}
+
+impl CatalogCommitFailure {
+    pub fn not_published(error: RnovError) -> Self {
+        Self {
+            kind: CatalogCommitFailureKind::NotPublished,
+            error,
+        }
+    }
+
+    fn outcome_unknown(error: RnovError) -> Self {
+        Self {
+            kind: CatalogCommitFailureKind::OutcomeUnknown,
+            error,
+        }
+    }
+
+    pub fn kind(&self) -> CatalogCommitFailureKind {
+        self.kind
+    }
+
+    pub fn into_error(self) -> RnovError {
+        self.error
+    }
+}
+
 struct SingleFileProcessLock {
     file: File,
     locked: bool,
@@ -2315,22 +2351,48 @@ impl SingleFileBackend {
     }
 
     pub fn commit_catalog_pages(&mut self, payloads: &[Vec<u8>]) -> Result<PageId> {
-        validate_catalog_page_payloads(payloads, self.page_size)?;
-        let file = clone_single_file_handle(&self.file)?;
-        let access_lock = Arc::clone(&self.access_lock);
-        with_single_file_handle_exclusive(&file, &access_lock, |file| {
-            self.commit_catalog_pages_locked(file, payloads)
-        })
+        self.commit_catalog_pages_with_outcome(payloads)
+            .map_err(CatalogCommitFailure::into_error)
     }
 
-    fn commit_catalog_pages_locked(
+    pub fn commit_catalog_pages_with_outcome(
+        &mut self,
+        payloads: &[Vec<u8>],
+    ) -> std::result::Result<PageId, CatalogCommitFailure> {
+        validate_catalog_page_payloads(payloads, self.page_size)
+            .map_err(CatalogCommitFailure::not_published)?;
+        let file =
+            clone_single_file_handle(&self.file).map_err(CatalogCommitFailure::not_published)?;
+        let access_lock = Arc::clone(&self.access_lock);
+        let _access_guard = access_lock.lock().map_err(|_| {
+            CatalogCommitFailure::not_published(RnovError::new(
+                ErrorKind::Internal,
+                "single-file backend access lock poisoned",
+            ))
+        })?;
+        let mut process_lock = SingleFileProcessLock::acquire_exclusive(&file)
+            .map_err(CatalogCommitFailure::not_published)?;
+        let result =
+            self.commit_catalog_pages_locked_with_outcome(process_lock.file_mut(), payloads);
+        let unlock_result = process_lock.release();
+        match result {
+            Ok(root) => unlock_result
+                .map(|()| root)
+                .map_err(CatalogCommitFailure::outcome_unknown),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit_catalog_pages_locked_with_outcome(
         &mut self,
         file: &mut File,
         payloads: &[Vec<u8>],
-    ) -> Result<PageId> {
-        let commit = self.prepare_catalog_page_commit(file)?;
+    ) -> std::result::Result<PageId, CatalogCommitFailure> {
+        let commit = self
+            .prepare_catalog_page_commit(file)
+            .map_err(CatalogCommitFailure::not_published)?;
         let root = commit.root;
-        let next = persist_catalog_page_commit(
+        let next = persist_catalog_page_commit_with_outcome(
             file,
             commit,
             payloads,
@@ -2553,13 +2615,13 @@ fn validate_catalog_page_payloads(payloads: &[Vec<u8>], page_size: PageSize) -> 
     Ok(())
 }
 
-fn persist_catalog_page_commit(
+fn persist_catalog_page_commit_with_outcome(
     file: &mut File,
     commit: CatalogPageCommit,
     payloads: &[Vec<u8>],
     data_start: u64,
     record_size: u64,
-) -> Result<SelectedSuperblock> {
+) -> std::result::Result<SelectedSuperblock, CatalogCommitFailure> {
     write_catalog_pages(
         file,
         commit.key,
@@ -2567,11 +2629,16 @@ fn persist_catalog_page_commit(
         payloads,
         data_start,
         record_size,
-    )?;
-    sync_single_file(file, "catalog checkpoint pages")?;
-    let next = next_catalog_superblock(commit.metadata.superblock, commit.root)?;
-    write_superblock_at(file, commit.metadata.superblock_offset(next.slot), next)?;
-    sync_single_file(file, "catalog checkpoint superblock")?;
+    )
+    .map_err(CatalogCommitFailure::not_published)?;
+    sync_single_file(file, "catalog checkpoint pages")
+        .map_err(CatalogCommitFailure::not_published)?;
+    let next = next_catalog_superblock(commit.metadata.superblock, commit.root)
+        .map_err(CatalogCommitFailure::not_published)?;
+    write_superblock_at(file, commit.metadata.superblock_offset(next.slot), next)
+        .map_err(CatalogCommitFailure::not_published)?;
+    sync_single_file(file, "catalog checkpoint superblock")
+        .map_err(CatalogCommitFailure::outcome_unknown)?;
     Ok(next)
 }
 

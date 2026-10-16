@@ -29,15 +29,16 @@
 // Additional Restrictions: None.
 // SPDX-License-Identifier: LicenseRef-AHCL-1.2
 use std::{
+    collections::BTreeMap,
     fmt,
-    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rnmdb_cli::LocalSession;
@@ -47,12 +48,16 @@ use rnmdb_instance::{InstanceConfig, InstanceManager, ResourceLimits, ResourceUs
 use rnmdb_security::LocalCredentialStore;
 use rnmdb_storage::PageCryptoKey;
 
+mod shared;
 mod sql_protocol;
 
+use shared::{SharedConnection, SharedDatabase};
 use sql_protocol::{handle_sql_client, reject_busy_client, spawn_client_thread};
 
 const MAX_ACTIVE_CLIENTS: usize = 64;
 const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EmbeddedRuntimeMode {
@@ -188,18 +193,28 @@ impl EmbeddedRuntimeConfig {
 #[derive(Debug)]
 pub struct SqlTcpServer {
     listener: TcpListener,
-    runtime: EmbeddedRuntime,
-    active_clients: Arc<AtomicUsize>,
+    runtime: SqlServerRuntime,
+    clients: Arc<ClientRegistry>,
 }
 
 impl SqlTcpServer {
     pub fn bind(address: impl ToSocketAddrs, config: EmbeddedRuntimeConfig) -> Result<Self> {
         let listener = TcpListener::bind(address)
             .map_err(|err| io_error("failed to bind SQL TCP listener", err))?;
+        let embedded = EmbeddedRuntime::new(config)?;
+        let database = SharedDatabase::new(
+            embedded.open_session()?,
+            embedded.config().disk_writes_allowed(),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
         Ok(Self {
             listener,
-            runtime: EmbeddedRuntime::new(config)?,
-            active_clients: Arc::new(AtomicUsize::new(0)),
+            runtime: SqlServerRuntime {
+                embedded,
+                database,
+                shutdown,
+            },
+            clients: Arc::new(ClientRegistry::new()),
         })
     }
 
@@ -216,10 +231,67 @@ impl SqlTcpServer {
 
     pub fn serve(&self) -> Result<()> {
         loop {
-            if self.serve_next().is_err() {
-                thread::sleep(SERVER_ACCEPT_RETRY_DELAY);
+            self.serve_next()?;
+        }
+    }
+
+    /// Serves clients until `shutdown` is set, then stops client I/O and waits
+    /// for a bounded drain period.
+    pub fn serve_until(&self, shutdown: &AtomicBool) -> Result<()> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|err| io_error("failed to enable nonblocking SQL listener", err))?;
+        let serve_result = self.serve_nonblocking_until(shutdown);
+        self.runtime.request_shutdown();
+        let blocking_result = self
+            .listener
+            .set_nonblocking(false)
+            .map_err(|err| io_error("failed to restore blocking SQL listener", err));
+        let drain_result = self.drain_clients(CLIENT_DRAIN_TIMEOUT);
+        let forced_shutdown_result = if drain_result.is_err() {
+            self.clients
+                .shutdown_all()
+                .and_then(|()| self.drain_clients(FORCED_CLIENT_DRAIN_TIMEOUT))
+        } else {
+            Ok(())
+        };
+        serve_result
+            .and(blocking_result)
+            .and(drain_result)
+            .and(forced_shutdown_result)
+    }
+
+    fn drain_clients(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        while self.active_client_count() != 0 && Instant::now() < deadline {
+            thread::sleep(SERVER_ACCEPT_RETRY_DELAY);
+        }
+        let remaining = self.active_client_count();
+        if remaining == 0 {
+            return Ok(());
+        }
+        Err(RnovError::new(
+            ErrorKind::Canceled,
+            format!("shutdown timed out with {remaining} active SQL client(s)"),
+        ))
+    }
+
+    pub fn active_client_count(&self) -> usize {
+        self.clients.active_count()
+    }
+
+    fn serve_nonblocking_until(&self, shutdown: &AtomicBool) -> Result<()> {
+        while !shutdown.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((stream, _)) => self.dispatch_client(stream)?,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(SERVER_ACCEPT_RETRY_DELAY);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(io_error("failed to accept SQL TCP client", error)),
             }
         }
+        Ok(())
     }
 
     fn serve_next(&self) -> Result<()> {
@@ -227,14 +299,20 @@ impl SqlTcpServer {
     }
 
     fn accept_client(&self) -> Result<TcpStream> {
-        self.listener
-            .accept()
-            .map(|(stream, _)| stream)
-            .map_err(|err| io_error("failed to accept SQL TCP client", err))
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => return Ok(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(io_error("failed to accept SQL TCP client", error)),
+            }
+        }
     }
 
     fn dispatch_client(&self, stream: TcpStream) -> Result<()> {
-        let Some(permit) = ClientPermit::acquire(&self.active_clients) else {
+        stream
+            .set_nonblocking(false)
+            .map_err(|err| io_error("failed to configure accepted SQL client", err))?;
+        let Some(permit) = ClientPermit::acquire(&self.clients, &stream)? else {
             reject_busy_client(stream);
             return Ok(());
         };
@@ -242,26 +320,112 @@ impl SqlTcpServer {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SqlServerRuntime {
+    embedded: EmbeddedRuntime,
+    database: Arc<SharedDatabase>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl SqlServerRuntime {
+    fn config(&self) -> &EmbeddedRuntimeConfig {
+        self.embedded.config()
+    }
+
+    fn open_connection(&self, role_id: Option<rnmdb_common::ids::RoleId>) -> SharedConnection {
+        self.database.connect(role_id)
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct ClientRegistry {
+    active: AtomicUsize,
+    next_id: AtomicU64,
+    streams: Mutex<BTreeMap<u64, TcpStream>>,
+}
+
+impl ClientRegistry {
+    fn new() -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
+            streams: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn shutdown_all(&self) -> Result<()> {
+        let streams = self.streams.lock().map_err(|_| {
+            RnovError::new(ErrorKind::Internal, "SQL client registry lock is poisoned")
+        })?;
+        for stream in streams.values() {
+            let _ = stream.set_nonblocking(true);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Ok(())
+    }
+}
+
 struct ClientPermit {
-    active_clients: Arc<AtomicUsize>,
+    clients: Arc<ClientRegistry>,
+    id: u64,
 }
 
 impl ClientPermit {
-    fn acquire(active_clients: &Arc<AtomicUsize>) -> Option<Self> {
-        active_clients
+    fn acquire(clients: &Arc<ClientRegistry>, stream: &TcpStream) -> Result<Option<Self>> {
+        if clients
+            .active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ACTIVE_CLIENTS).then_some(active + 1)
             })
-            .ok()?;
-        Some(Self {
-            active_clients: Arc::clone(active_clients),
-        })
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let id = clients.next_id.fetch_add(1, Ordering::AcqRel);
+        let tracked = match stream.try_clone() {
+            Ok(tracked) => tracked,
+            Err(error) => {
+                clients.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(io_error("failed to track SQL TCP client", error));
+            }
+        };
+        let mut streams = match clients.streams.lock() {
+            Ok(streams) => streams,
+            Err(_) => {
+                clients.active.fetch_sub(1, Ordering::AcqRel);
+                return Err(RnovError::new(
+                    ErrorKind::Internal,
+                    "SQL client registry lock is poisoned",
+                ));
+            }
+        };
+        streams.insert(id, tracked);
+        drop(streams);
+        Ok(Some(Self {
+            clients: Arc::clone(clients),
+            id,
+        }))
     }
 }
 
 impl Drop for ClientPermit {
     fn drop(&mut self) {
-        self.active_clients.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(mut streams) = self.clients.streams.lock() {
+            streams.remove(&self.id);
+        }
+        self.clients.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
