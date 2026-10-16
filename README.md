@@ -290,8 +290,9 @@ atomic reservation. A server admits only one accept loop at a time and cannot
 be restarted after shutdown; create and bind a new server for a clean restart.
 The same handle exposes a lock-free metrics snapshot with current active
 clients and monotonic counters for accepted, capacity-rejected, and completed
-clients, received commands, and client sessions that ended on protocol or I/O
-errors. These counters are process-local and saturate instead of wrapping.
+clients, received commands, and client handlers that returned setup, protocol,
+I/O, or session-close errors. These counters are process-local and saturate
+instead of wrapping.
 
 This protocol is not PostgreSQL, MySQL, or SQLite wire compatible. It is a
 small operational interface for controlled embedded deployments, not a general
