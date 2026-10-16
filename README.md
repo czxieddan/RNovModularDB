@@ -13,10 +13,12 @@ tooling into focused crates.
 
 ## Status
 
-RNovModularDB is pre-1.0 software. Durable embedded SQL sessions and the
-versioned single-file format are implemented, but public APIs and compatibility
-guarantees may still evolve before a stable release. It is not a drop-in
-replacement for SQLite or PostgreSQL.
+RNovModularDB 1.0 is the first supported production release for controlled
+embedded and edge deployments. Public Rust APIs follow semantic versioning,
+and the version 2 encrypted single-file format is the stable durable format for
+the 1.x release line. It is not a drop-in replacement for SQLite or PostgreSQL,
+and operators remain responsible for keys, backups, transport security, and
+deployment access controls.
 
 Implemented product surfaces include:
 

@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-catalog"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-catalog",
  "rnmdb-common",
@@ -966,11 +966,11 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-common"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "rnmdb-executor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crc",
  "rnmdb-catalog",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-fts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-index"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
@@ -1002,14 +1002,14 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-instance"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
 ]
 
 [[package]]
 name = "rnmdb-planner"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-catalog",
  "rnmdb-common",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-security"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-cli",
  "rnmdb-common",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-sql"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "phf",
  "rnmdb-catalog",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-storage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chacha20poly1305",
  "crc",
@@ -1072,14 +1072,14 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-txn"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
 ]
 
 [[package]]
 name = "rnmdb-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
  "serde_json",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "rnmdb-udf"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rnmdb-common",
  "rnmdb-types",
