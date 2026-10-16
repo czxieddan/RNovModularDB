@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use rnmdb_common::{
@@ -16,7 +17,7 @@ use rnmdb_common::{
     ids::{DatabaseId, InstanceId, RoleId},
 };
 use rnmdb_security::LocalCredentialStore;
-use rnmdb_server::{EmbeddedRuntimeConfig, SqlTcpServer};
+use rnmdb_server::{EmbeddedRuntimeConfig, SqlServerOptions, SqlTcpServer};
 use rnmdb_storage::PageCryptoKey;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7432";
@@ -52,6 +53,7 @@ struct ServeOptions {
     allow_remote_plaintext: bool,
     accept_once: bool,
     shutdown_on_stdin: bool,
+    server_options: SqlServerOptions,
 }
 
 struct SecretBytes(Vec<u8>);
@@ -104,6 +106,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions> {
     let mut allow_remote_plaintext = false;
     let mut accept_once = false;
     let mut shutdown_on_stdin = false;
+    let mut server_options = SqlServerOptions::default();
     let mut position = 0;
 
     while position < args.len() {
@@ -182,6 +185,48 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions> {
                 shutdown_on_stdin = true;
                 position += 1;
             }
+            "--max-clients" => {
+                server_options = server_options.with_max_active_clients(parse_usize_option(
+                    args,
+                    position,
+                    "--max-clients",
+                )?)?;
+                position += 2;
+            }
+            "--max-command-bytes" => {
+                server_options = server_options.with_max_command_bytes(parse_usize_option(
+                    args,
+                    position,
+                    "--max-command-bytes",
+                )?)?;
+                position += 2;
+            }
+            "--client-io-timeout-ms" => {
+                server_options = server_options.with_client_io_timeout(Duration::from_millis(
+                    parse_u64_option(args, position, "--client-io-timeout-ms")?,
+                ))?;
+                position += 2;
+            }
+            "--graceful-drain-timeout-ms" => {
+                let graceful = Duration::from_millis(parse_u64_option(
+                    args,
+                    position,
+                    "--graceful-drain-timeout-ms",
+                )?);
+                server_options = server_options
+                    .with_drain_timeouts(graceful, server_options.forced_client_drain_timeout())?;
+                position += 2;
+            }
+            "--forced-drain-timeout-ms" => {
+                let forced = Duration::from_millis(parse_u64_option(
+                    args,
+                    position,
+                    "--forced-drain-timeout-ms",
+                )?);
+                server_options = server_options
+                    .with_drain_timeouts(server_options.client_drain_timeout(), forced)?;
+                position += 2;
+            }
             unknown => {
                 return Err(invalid_arguments(format!(
                     "unsupported serve option '{unknown}'"
@@ -248,6 +293,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions> {
         allow_remote_plaintext,
         accept_once,
         shutdown_on_stdin,
+        server_options,
     })
 }
 
@@ -274,13 +320,16 @@ fn run_server(options: ServeOptions) -> Result<()> {
         config = config.with_credentials(credentials);
     }
 
-    let server = SqlTcpServer::bind(options.bind.as_slice(), config)?;
+    let server =
+        SqlTcpServer::bind_with_options(options.bind.as_slice(), config, options.server_options)?;
     let address = server.local_addr()?;
     println!(
-        "rnmdbd {} listening on {address} (authentication={}, remote_plaintext={})",
+        "rnmdbd {} listening on {address} (authentication={}, remote_plaintext={}, max_clients={}, max_command_bytes={})",
         env!("CARGO_PKG_VERSION"),
         !options.allow_unauthenticated,
-        options.allow_remote_plaintext
+        options.allow_remote_plaintext,
+        options.server_options.max_active_clients(),
+        options.server_options.max_command_bytes()
     );
     if options.accept_once {
         return server.accept_one();
@@ -415,6 +464,12 @@ fn parse_u64_option(args: &[String], position: usize, option: &str) -> Result<u6
         .map_err(|_| invalid_arguments(format!("{option} requires an unsigned 64-bit integer")))
 }
 
+fn parse_usize_option(args: &[String], position: usize, option: &str) -> Result<usize> {
+    option_value(args, position, option)?
+        .parse()
+        .map_err(|_| invalid_arguments(format!("{option} requires a positive integer")))
+}
+
 fn option_value<'a>(args: &'a [String], position: usize, option: &str) -> Result<&'a str> {
     args.get(position + 1)
         .map(String::as_str)
@@ -439,9 +494,15 @@ fn invalid_arguments(message: impl Into<String>) -> RnovError {
 }
 
 fn print_help() -> Result<()> {
+    let defaults = SqlServerOptions::default();
     println!(
-        "RNovModularDB server {}\n\nUSAGE:\n  rnmdbd serve (--memory | --database <PATH> (--page-key-env | --page-key-file <KEY_PATH>)) [OPTIONS]\n  rnmdbd help\n  rnmdbd version\n\nSECURITY OPTIONS:\n  --auth-user <USER> --auth-password-file <PATH> [--auth-role-id <ID>]\n  --allow-unauthenticated\n  --allow-remote-plaintext\n\nSERVER OPTIONS:\n  --bind <ADDRESS>              default: {DEFAULT_BIND_ADDRESS}\n  --instance-id <ID>            default: 1\n  --database-id <ID>            default: 1\n  --once                        accept one client and exit\n  --shutdown-on-stdin           stop accepting after one stdin line or EOF\n\nThe line protocol has no TLS. Non-loopback listeners are rejected unless --allow-remote-plaintext is explicit.",
-        env!("CARGO_PKG_VERSION")
+        "RNovModularDB server {}\n\nUSAGE:\n  rnmdbd serve (--memory | --database <PATH> (--page-key-env | --page-key-file <KEY_PATH>)) [OPTIONS]\n  rnmdbd help\n  rnmdbd version\n\nSECURITY OPTIONS:\n  --auth-user <USER> --auth-password-file <PATH> [--auth-role-id <ID>]\n  --allow-unauthenticated\n  --allow-remote-plaintext\n\nSERVER OPTIONS:\n  --bind <ADDRESS>                     default: {DEFAULT_BIND_ADDRESS}\n  --instance-id <ID>                   default: 1\n  --database-id <ID>                   default: 1\n  --max-clients <COUNT>                default: {}\n  --max-command-bytes <BYTES>          default: {}\n  --client-io-timeout-ms <MILLISECONDS> default: {}\n  --graceful-drain-timeout-ms <MS>     default: {}\n  --forced-drain-timeout-ms <MS>       default: {}\n  --once                               accept one client and exit\n  --shutdown-on-stdin                  stop accepting after one stdin line or EOF\n\nThe line protocol has no TLS. Non-loopback listeners are rejected unless --allow-remote-plaintext is explicit.",
+        env!("CARGO_PKG_VERSION"),
+        defaults.max_active_clients(),
+        defaults.max_command_bytes(),
+        defaults.client_io_timeout().as_millis(),
+        defaults.client_drain_timeout().as_millis(),
+        defaults.forced_client_drain_timeout().as_millis(),
     );
     Ok(())
 }

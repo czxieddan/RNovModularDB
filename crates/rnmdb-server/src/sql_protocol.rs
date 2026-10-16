@@ -39,13 +39,9 @@ use rnmdb_cli::CommandOutput;
 use rnmdb_common::{ErrorKind, Result, RnovError};
 use rnmdb_security::{AuthenticatedPrincipal, AuthenticationProvider};
 
-use super::{
-    ClientPermit, MAX_SQL_COMMAND_BYTES, SqlServerRuntime, io_error, shared::SharedConnection,
-};
+use super::{ClientPermit, SqlServerRuntime, io_error, shared::SharedConnection};
 
-const MAX_SQL_COMMAND_READ_BYTES: usize = MAX_SQL_COMMAND_BYTES + 2;
 const CLIENT_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(super) fn spawn_client_thread(
     stream: TcpStream,
@@ -64,13 +60,13 @@ pub(super) fn spawn_client_thread(
         .map_err(|err| io_error("failed to spawn SQL TCP client worker", err))
 }
 
-pub(super) fn reject_busy_client(mut stream: TcpStream) {
-    let _ = configure_client_stream(&stream);
+pub(super) fn reject_busy_client(mut stream: TcpStream, runtime: &SqlServerRuntime) {
+    let _ = configure_client_stream(&stream, runtime.options().client_io_timeout());
     let _ = write_protocol_line(&mut stream, "ERR server busy");
 }
 
 pub(super) fn handle_sql_client(stream: TcpStream, runtime: &SqlServerRuntime) -> Result<()> {
-    let reader_stream = configured_reader_stream(&stream)?;
+    let reader_stream = configured_reader_stream(&stream, runtime)?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
     let mut session = initial_client_session(runtime)?;
@@ -103,8 +99,8 @@ pub(super) fn handle_sql_client(stream: TcpStream, runtime: &SqlServerRuntime) -
     }
 }
 
-fn configured_reader_stream(stream: &TcpStream) -> Result<TcpStream> {
-    configure_client_stream(stream)?;
+fn configured_reader_stream(stream: &TcpStream, runtime: &SqlServerRuntime) -> Result<TcpStream> {
+    configure_client_stream(stream, runtime.options().client_io_timeout())?;
     stream
         .try_clone()
         .map_err(|err| io_error("failed to clone SQL TCP client stream", err))
@@ -123,15 +119,18 @@ fn read_sql_command(
     command: &mut String,
     runtime: &SqlServerRuntime,
 ) -> Result<usize> {
+    let max_command_bytes = runtime.options().max_command_bytes();
+    let max_read_bytes = max_command_bytes + 2;
+    let client_io_timeout = runtime.options().client_io_timeout();
     let mut bytes = Vec::new();
     let mut last_progress = Instant::now();
     let bytes_read = loop {
         if runtime.shutdown_requested() {
             return Ok(0);
         }
-        let remaining = MAX_SQL_COMMAND_READ_BYTES.saturating_sub(bytes.len());
+        let remaining = max_read_bytes.saturating_sub(bytes.len());
         if remaining == 0 {
-            ensure_command_size(&bytes)?;
+            ensure_command_size(&bytes, max_command_bytes)?;
         }
         let mut limited = reader.by_ref().take(remaining as u64);
         match limited.read_until(b'\n', &mut bytes) {
@@ -139,10 +138,10 @@ fn read_sql_command(
             Ok(_) if bytes.ends_with(b"\n") => break bytes.len(),
             Ok(_) => {
                 last_progress = Instant::now();
-                ensure_command_size(&bytes)?;
+                ensure_command_size(&bytes, max_command_bytes)?;
             }
             Err(error) if is_transient_read_error(&error) => {
-                if last_progress.elapsed() >= CLIENT_IO_TIMEOUT {
+                if last_progress.elapsed() >= client_io_timeout {
                     return Err(io_error(
                         "failed to read SQL TCP command",
                         std::io::Error::new(
@@ -155,7 +154,7 @@ fn read_sql_command(
             Err(error) => return Err(io_error("failed to read SQL TCP command", error)),
         }
     };
-    ensure_command_size(&bytes)?;
+    ensure_command_size(&bytes, max_command_bytes)?;
     append_utf8_command(command, &bytes)?;
     Ok(bytes_read)
 }
@@ -167,13 +166,13 @@ fn is_transient_read_error(error: &std::io::Error) -> bool {
     )
 }
 
-fn ensure_command_size(bytes: &[u8]) -> Result<()> {
-    if command_payload_len(bytes) <= MAX_SQL_COMMAND_BYTES {
+fn ensure_command_size(bytes: &[u8], max_command_bytes: usize) -> Result<()> {
+    if command_payload_len(bytes) <= max_command_bytes {
         return Ok(());
     }
     Err(RnovError::new(
         ErrorKind::InvalidInput,
-        format!("SQL command exceeds {MAX_SQL_COMMAND_BYTES} bytes"),
+        format!("SQL command exceeds {max_command_bytes} bytes"),
     ))
 }
 
@@ -189,12 +188,13 @@ fn append_utf8_command(command: &mut String, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn configure_client_stream(stream: &TcpStream) -> Result<()> {
+fn configure_client_stream(stream: &TcpStream, client_io_timeout: Duration) -> Result<()> {
+    let read_poll_interval = client_io_timeout.min(CLIENT_SHUTDOWN_POLL_INTERVAL);
     stream
-        .set_read_timeout(Some(CLIENT_SHUTDOWN_POLL_INTERVAL))
+        .set_read_timeout(Some(read_poll_interval))
         .map_err(|err| io_error("failed to set SQL TCP client read timeout", err))?;
     stream
-        .set_write_timeout(Some(CLIENT_IO_TIMEOUT))
+        .set_write_timeout(Some(client_io_timeout))
         .map_err(|err| io_error("failed to set SQL TCP client write timeout", err))
 }
 

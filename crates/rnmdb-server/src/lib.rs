@@ -35,7 +35,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -55,11 +55,137 @@ use shared::{SharedConnection, SharedDatabase};
 use sql_protocol::{handle_sql_client, reject_busy_client, spawn_client_thread};
 
 const SQL_LINE_PROTOCOL_VERSION: u16 = 1;
-const MAX_ACTIVE_CLIENTS: usize = 64;
-const MAX_SQL_COMMAND_BYTES: usize = 65_536;
+const DEFAULT_MAX_ACTIVE_CLIENTS: usize = 64;
+const DEFAULT_MAX_SQL_COMMAND_BYTES: usize = 65_536;
+const MAX_CONFIGURED_ACTIVE_CLIENTS: usize = 4_096;
+const MAX_CONFIGURED_SQL_COMMAND_BYTES: usize = 16 * 1024 * 1024;
 const SERVER_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_FORCED_CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Validated resource and shutdown limits for one SQL TCP server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SqlServerOptions {
+    max_active_clients: usize,
+    max_command_bytes: usize,
+    client_io_timeout: Duration,
+    client_drain_timeout: Duration,
+    forced_client_drain_timeout: Duration,
+}
+
+impl Default for SqlServerOptions {
+    fn default() -> Self {
+        Self {
+            max_active_clients: DEFAULT_MAX_ACTIVE_CLIENTS,
+            max_command_bytes: DEFAULT_MAX_SQL_COMMAND_BYTES,
+            client_io_timeout: DEFAULT_CLIENT_IO_TIMEOUT,
+            client_drain_timeout: DEFAULT_CLIENT_DRAIN_TIMEOUT,
+            forced_client_drain_timeout: DEFAULT_FORCED_CLIENT_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+impl SqlServerOptions {
+    pub fn max_active_clients(&self) -> usize {
+        self.max_active_clients
+    }
+
+    pub fn max_command_bytes(&self) -> usize {
+        self.max_command_bytes
+    }
+
+    pub fn client_io_timeout(&self) -> Duration {
+        self.client_io_timeout
+    }
+
+    pub fn client_drain_timeout(&self) -> Duration {
+        self.client_drain_timeout
+    }
+
+    pub fn forced_client_drain_timeout(&self) -> Duration {
+        self.forced_client_drain_timeout
+    }
+
+    pub fn with_max_active_clients(mut self, value: usize) -> Result<Self> {
+        validate_bounded_nonzero(
+            "maximum active SQL clients",
+            value,
+            MAX_CONFIGURED_ACTIVE_CLIENTS,
+        )?;
+        self.max_active_clients = value;
+        Ok(self)
+    }
+
+    pub fn with_max_command_bytes(mut self, value: usize) -> Result<Self> {
+        validate_bounded_nonzero(
+            "maximum SQL command bytes",
+            value,
+            MAX_CONFIGURED_SQL_COMMAND_BYTES,
+        )?;
+        self.max_command_bytes = value;
+        Ok(self)
+    }
+
+    pub fn with_client_io_timeout(mut self, value: Duration) -> Result<Self> {
+        validate_nonzero_duration("SQL client I/O timeout", value)?;
+        self.client_io_timeout = value;
+        Ok(self)
+    }
+
+    pub fn with_drain_timeouts(mut self, graceful: Duration, forced: Duration) -> Result<Self> {
+        validate_nonzero_duration("SQL client drain timeout", graceful)?;
+        validate_nonzero_duration("forced SQL client drain timeout", forced)?;
+        self.client_drain_timeout = graceful;
+        self.forced_client_drain_timeout = forced;
+        Ok(self)
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_bounded_nonzero(
+            "maximum active SQL clients",
+            self.max_active_clients,
+            MAX_CONFIGURED_ACTIVE_CLIENTS,
+        )?;
+        validate_bounded_nonzero(
+            "maximum SQL command bytes",
+            self.max_command_bytes,
+            MAX_CONFIGURED_SQL_COMMAND_BYTES,
+        )?;
+        validate_nonzero_duration("SQL client I/O timeout", self.client_io_timeout)?;
+        validate_nonzero_duration("SQL client drain timeout", self.client_drain_timeout)?;
+        validate_nonzero_duration(
+            "forced SQL client drain timeout",
+            self.forced_client_drain_timeout,
+        )
+    }
+}
+
+/// Current lifecycle phase of the TCP listener and its client workers.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SqlServerLifecycle {
+    /// The listener is bound but no accept loop is running.
+    Idle = 0,
+    /// An accept loop is running and can admit clients.
+    Serving = 1,
+    /// Shutdown was requested and active clients are being drained.
+    ShuttingDown = 2,
+    /// Shutdown completed; the server cannot be restarted.
+    Stopped = 3,
+}
+
+impl SqlServerLifecycle {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Idle as u8 => Self::Idle,
+            value if value == Self::Serving as u8 => Self::Serving,
+            value if value == Self::ShuttingDown as u8 => Self::ShuttingDown,
+            _ => Self::Stopped,
+        }
+    }
+}
 
 /// Whether the shared database can safely execute more commands.
 #[non_exhaustive]
@@ -124,7 +250,7 @@ pub struct SqlServerStatus {
     active_clients: usize,
     committed_generation: u64,
     database_health: SqlDatabaseHealth,
-    shutdown_requested: bool,
+    lifecycle: SqlServerLifecycle,
 }
 
 impl SqlServerStatus {
@@ -150,8 +276,24 @@ impl SqlServerStatus {
         self.database_health
     }
 
+    pub fn lifecycle(&self) -> SqlServerLifecycle {
+        self.lifecycle
+    }
+
+    /// Returns whether the server is accepting work and the database is usable.
+    ///
+    /// This is a best-effort readiness signal from the sampled status, not a
+    /// reservation that a subsequent connection will be admitted.
+    pub fn is_ready(&self) -> bool {
+        self.lifecycle == SqlServerLifecycle::Serving
+            && self.database_health == SqlDatabaseHealth::Available
+    }
+
     pub fn shutdown_requested(&self) -> bool {
-        self.shutdown_requested
+        matches!(
+            self.lifecycle,
+            SqlServerLifecycle::ShuttingDown | SqlServerLifecycle::Stopped
+        )
     }
 }
 
@@ -303,7 +445,6 @@ pub struct SqlTcpServer {
     listener: TcpListener,
     runtime: SqlServerRuntime,
     clients: Arc<ClientRegistry>,
-    serving: AtomicBool,
 }
 
 /// A cloneable control-plane handle that does not expose mutable database state.
@@ -322,6 +463,7 @@ impl SqlServerHandle {
 
     pub fn status(&self) -> Result<SqlServerStatus> {
         let database = self.runtime.database.status()?;
+        let lifecycle = self.runtime.lifecycle();
         Ok(SqlServerStatus {
             runtime_mode: self.runtime.config().mode(),
             authentication_required: self.runtime.config().authentication_required(),
@@ -332,21 +474,34 @@ impl SqlServerHandle {
             } else {
                 SqlDatabaseHealth::Available
             },
-            shutdown_requested: self.runtime.shutdown_requested(),
+            lifecycle,
         })
     }
 
     pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
         SqlProtocolCapabilities {
             protocol_version: SQL_LINE_PROTOCOL_VERSION,
-            max_active_clients: MAX_ACTIVE_CLIENTS,
-            max_command_bytes: MAX_SQL_COMMAND_BYTES,
+            max_active_clients: self.runtime.options().max_active_clients(),
+            max_command_bytes: self.runtime.options().max_command_bytes(),
         }
+    }
+
+    pub fn options(&self) -> SqlServerOptions {
+        *self.runtime.options()
     }
 }
 
 impl SqlTcpServer {
     pub fn bind(address: impl ToSocketAddrs, config: EmbeddedRuntimeConfig) -> Result<Self> {
+        Self::bind_with_options(address, config, SqlServerOptions::default())
+    }
+
+    pub fn bind_with_options(
+        address: impl ToSocketAddrs,
+        config: EmbeddedRuntimeConfig,
+        options: SqlServerOptions,
+    ) -> Result<Self> {
+        options.validate()?;
         let listener = TcpListener::bind(address)
             .map_err(|err| io_error("failed to bind SQL TCP listener", err))?;
         let embedded = EmbeddedRuntime::new(config)?;
@@ -354,16 +509,15 @@ impl SqlTcpServer {
             embedded.open_session()?,
             embedded.config().disk_writes_allowed(),
         );
-        let shutdown = Arc::new(AtomicBool::new(false));
         Ok(Self {
             listener,
             runtime: SqlServerRuntime {
                 embedded,
                 database,
-                shutdown,
+                options,
+                lifecycle: Arc::new(AtomicU8::new(SqlServerLifecycle::Idle as u8)),
             },
-            clients: Arc::new(ClientRegistry::new()),
-            serving: AtomicBool::new(false),
+            clients: Arc::new(ClientRegistry::new(options.max_active_clients())),
         })
     }
 
@@ -386,6 +540,10 @@ impl SqlTcpServer {
 
     pub fn protocol_capabilities(&self) -> SqlProtocolCapabilities {
         self.management_handle().protocol_capabilities()
+    }
+
+    pub fn options(&self) -> SqlServerOptions {
+        self.management_handle().options()
     }
 
     pub fn accept_one(&self) -> Result<()> {
@@ -427,14 +585,13 @@ impl SqlTcpServer {
     }
 
     fn drain_clients_with_forced_shutdown(&self) -> Result<()> {
-        let graceful_result = self.drain_clients(CLIENT_DRAIN_TIMEOUT);
+        let graceful_result = self.drain_clients(self.runtime.options().client_drain_timeout());
         if graceful_result.is_ok() {
             return graceful_result;
         }
-        let forced_result = self
-            .clients
-            .shutdown_all()
-            .and_then(|()| self.drain_clients(FORCED_CLIENT_DRAIN_TIMEOUT));
+        let forced_result = self.clients.shutdown_all().and_then(|()| {
+            self.drain_clients(self.runtime.options().forced_client_drain_timeout())
+        });
         combine_phase_results(
             graceful_result,
             forced_result,
@@ -492,7 +649,7 @@ impl SqlTcpServer {
             .set_nonblocking(false)
             .map_err(|err| io_error("failed to configure accepted SQL client", err))?;
         let Some(permit) = ClientPermit::acquire(&self.clients, &stream)? else {
-            reject_busy_client(stream);
+            reject_busy_client(stream, &self.runtime);
             return Ok(());
         };
         spawn_client_thread(stream, self.runtime.clone(), permit)
@@ -500,42 +657,21 @@ impl SqlTcpServer {
 }
 
 struct ServerLoopPermit<'a> {
-    serving: &'a AtomicBool,
+    runtime: &'a SqlServerRuntime,
 }
 
 impl<'a> ServerLoopPermit<'a> {
     fn acquire(server: &'a SqlTcpServer) -> Result<Self> {
-        if server.runtime.shutdown_requested() {
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "SQL TCP server cannot start after shutdown has been requested",
-            ));
-        }
-        server
-            .serving
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| {
-                RnovError::new(
-                    ErrorKind::InvalidInput,
-                    "SQL TCP server is already serving clients",
-                )
-            })?;
-        if server.runtime.shutdown_requested() {
-            server.serving.store(false, Ordering::Release);
-            return Err(RnovError::new(
-                ErrorKind::InvalidInput,
-                "SQL TCP server cannot start after shutdown has been requested",
-            ));
-        }
+        server.runtime.begin_serving()?;
         Ok(Self {
-            serving: &server.serving,
+            runtime: &server.runtime,
         })
     }
 }
 
 impl Drop for ServerLoopPermit<'_> {
     fn drop(&mut self) {
-        self.serving.store(false, Ordering::Release);
+        self.runtime.finish_serving();
     }
 }
 
@@ -543,7 +679,8 @@ impl Drop for ServerLoopPermit<'_> {
 struct SqlServerRuntime {
     embedded: EmbeddedRuntime,
     database: Arc<SharedDatabase>,
-    shutdown: Arc<AtomicBool>,
+    options: SqlServerOptions,
+    lifecycle: Arc<AtomicU8>,
 }
 
 impl SqlServerRuntime {
@@ -555,26 +692,92 @@ impl SqlServerRuntime {
         self.database.connect(role_id)
     }
 
+    fn options(&self) -> &SqlServerOptions {
+        &self.options
+    }
+
+    fn lifecycle(&self) -> SqlServerLifecycle {
+        SqlServerLifecycle::from_raw(self.lifecycle.load(Ordering::Acquire))
+    }
+
+    fn begin_serving(&self) -> Result<()> {
+        self.lifecycle
+            .compare_exchange(
+                SqlServerLifecycle::Idle as u8,
+                SqlServerLifecycle::Serving as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|current| {
+                let message = match SqlServerLifecycle::from_raw(current) {
+                    SqlServerLifecycle::Serving => "SQL TCP server is already serving clients",
+                    SqlServerLifecycle::ShuttingDown | SqlServerLifecycle::Stopped => {
+                        "SQL TCP server cannot start after shutdown has been requested"
+                    }
+                    SqlServerLifecycle::Idle => "SQL TCP server lifecycle transition failed",
+                };
+                RnovError::new(ErrorKind::InvalidInput, message)
+            })
+    }
+
     fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            let next = match SqlServerLifecycle::from_raw(current) {
+                SqlServerLifecycle::Idle => SqlServerLifecycle::Stopped,
+                SqlServerLifecycle::Serving => SqlServerLifecycle::ShuttingDown,
+                SqlServerLifecycle::ShuttingDown | SqlServerLifecycle::Stopped => return,
+            } as u8;
+            if self
+                .lifecycle
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     fn shutdown_requested(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
+        matches!(
+            self.lifecycle(),
+            SqlServerLifecycle::ShuttingDown | SqlServerLifecycle::Stopped
+        )
+    }
+
+    fn finish_serving(&self) {
+        loop {
+            let current = self.lifecycle.load(Ordering::Acquire);
+            let next = match SqlServerLifecycle::from_raw(current) {
+                SqlServerLifecycle::Serving => SqlServerLifecycle::Idle,
+                SqlServerLifecycle::ShuttingDown => SqlServerLifecycle::Stopped,
+                SqlServerLifecycle::Idle | SqlServerLifecycle::Stopped => return,
+            } as u8;
+            if self
+                .lifecycle
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 }
 
 #[derive(Debug)]
 struct ClientRegistry {
     active: AtomicUsize,
+    max_active: usize,
     next_id: AtomicU64,
     streams: Mutex<BTreeMap<u64, TcpStream>>,
 }
 
 impl ClientRegistry {
-    fn new() -> Self {
+    fn new(max_active: usize) -> Self {
         Self {
             active: AtomicUsize::new(0),
+            max_active,
             next_id: AtomicU64::new(1),
             streams: Mutex::new(BTreeMap::new()),
         }
@@ -606,7 +809,7 @@ impl ClientPermit {
         if clients
             .active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_ACTIVE_CLIENTS).then_some(active + 1)
+                (active < clients.max_active).then_some(active + 1)
             })
             .is_err()
         {
@@ -703,6 +906,26 @@ impl TokioEmbeddedRuntime {
 
 fn io_error(context: &'static str, err: std::io::Error) -> RnovError {
     RnovError::new(ErrorKind::Io, format!("{context}: {err}"))
+}
+
+fn validate_bounded_nonzero(name: &'static str, value: usize, maximum: usize) -> Result<()> {
+    if value == 0 || value > maximum {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("{name} must be between 1 and {maximum}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nonzero_duration(name: &'static str, value: Duration) -> Result<()> {
+    if value.is_zero() {
+        return Err(RnovError::new(
+            ErrorKind::InvalidInput,
+            format!("{name} must be greater than zero"),
+        ));
+    }
+    Ok(())
 }
 
 fn combine_phase_results(

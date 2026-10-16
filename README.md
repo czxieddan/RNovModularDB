@@ -237,6 +237,24 @@ stops accepting after one stdin line or EOF, signals active clients, and uses a
 bounded five-second graceful drain period; embedded hosts can call
 `SqlTcpServer::serve_until` with their own shutdown signal.
 
+Production limits can be set without rebuilding the server:
+
+```bash
+rnmdbd serve --memory --allow-unauthenticated \
+  --max-clients 128 \
+  --max-command-bytes 262144 \
+  --client-io-timeout-ms 15000 \
+  --graceful-drain-timeout-ms 10000 \
+  --forced-drain-timeout-ms 2000
+```
+
+The defaults remain 64 clients, 65,536 command bytes, a 30-second client I/O
+timeout, a five-second graceful drain, and a one-second forced drain. The
+library equivalent is `SqlTcpServer::bind_with_options` with a validated
+`SqlServerOptions`; `SqlTcpServer::bind` retains these defaults. Configured
+client counts are capped at 4,096 and command sizes at 16 MiB to prevent an
+accidental configuration from removing the server's admission boundary.
+
 Each connection has independent authentication and transaction state, while
 all connections share one committed database state. Autocommit changes become
 visible to later commands and connections after a successful durable
@@ -252,6 +270,13 @@ limits, active connections, authentication and storage mode, the process-local
 committed generation, and whether an indeterminate durable commit requires a
 restart. It can also request shutdown of `SqlTcpServer::serve`; the server then
 uses the same bounded drain path as `serve_until`.
+
+Management status also reports the lifecycle as `Idle`, `Serving`,
+`ShuttingDown`, or `Stopped`. `is_ready` is true only while the accept loop is
+serving and the shared database is available. Status collection can briefly
+block on database synchronization and is a best-effort view rather than an
+atomic reservation. A server admits only one accept loop at a time and cannot
+be restarted after shutdown; create and bind a new server for a clean restart.
 
 This protocol is not PostgreSQL, MySQL, or SQLite wire compatible. It is a
 small operational interface for controlled embedded deployments, not a general
