@@ -27,3 +27,153 @@ manifests:
   - "Cargo.toml"
 packages = []
 rules = []
+
+[rust.cargo.evidence.cranelift-assembler-x64-meta]
+package = "cranelift-assembler-x64-meta"
+version = "0.133.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.cranelift-assembler-x64]
+package = "cranelift-assembler-x64"
+version = "0.133.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.cranelift-bitset]
+package = "cranelift-bitset"
+version = "0.133.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.cranelift-isle]
+package = "cranelift-isle"
+version = "0.133.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.cranelift-srcgen]
+package = "cranelift-srcgen"
+version = "0.133.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.pulley-interpreter]
+package = "pulley-interpreter"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.pulley-macros]
+package = "pulley-macros"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.wasmtime-internal-component-util]
+package = "wasmtime-internal-component-util"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.wasmtime-internal-core]
+package = "wasmtime-internal-core"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.wasmtime-internal-jit-debug]
+package = "wasmtime-internal-jit-debug"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.wasmtime-internal-jit-icache-coherence]
+package = "wasmtime-internal-jit-icache-coherence"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.wasmtime-internal-versioned-export-macros]
+package = "wasmtime-internal-versioned-export-macros"
+version = "46.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/bytecodealliance/wasmtime"
+revision = "823d1b8f251494a06288194d0df746191f535ff7"
+path = "LICENSE"
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/823d1b8f251494a06288194d0df746191f535ff7/LICENSE"
+kind = "license"
+
+[rust.cargo.evidence.r-efi-5]
+package = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/r-efi/r-efi"
+revision = "97b55bed1c2c91dcbf787674849f05337ff80b33"
+path = "AUTHORS"
+url = "https://raw.githubusercontent.com/r-efi/r-efi/97b55bed1c2c91dcbf787674849f05337ff80b33/AUTHORS"
+kind = "license"
+
+[rust.cargo.evidence.r-efi-6]
+package = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/r-efi/r-efi"
+revision = "7e1b0322d31d625f81a5656096330934f9cd835d"
+path = "AUTHORS"
+url = "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS"
+kind = "license"
+
+[rust.cargo.evidence.crc-catalog-mit]
+package = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+repository = "https://github.com/akhilles/crc-catalog"
+revision = "ed4ad631f22b05055c21a3a4127eb7cf6d75bb62"
+path = "LICENSES/MIT.txt"
+url = "https://raw.githubusercontent.com/akhilles/crc-catalog/ed4ad631f22b05055c21a3a4127eb7cf6d75bb62/LICENSES/MIT.txt"
+kind = "license"

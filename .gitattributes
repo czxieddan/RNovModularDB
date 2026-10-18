@@ -1,0 +1,7 @@
+# Generated AHCL documents use stable line endings.
+/.ahcl/** text eol=lf
+/.ahclkitconfigs text eol=lf
+/LICENSE text eol=lf
+
+# Retained upstream evidence is hashed and must keep its original bytes.
+/.ahcl/THIRD-PARTY-LICENSES/** -text !eol
